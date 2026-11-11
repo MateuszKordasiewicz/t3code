@@ -79,6 +79,15 @@ describe("staged task events", () => {
     };
     expect(decodeReceipt(receipt)).toEqual(receipt);
     expect(() => decodeReceipt({ ...receipt, completionPolicyRevision: 0 })).toThrow();
+    for (const type of ["task.created", "task.definition-updated"]) {
+      const event = { ...base, type, definition };
+      expect(decode(event)).toBeDefined();
+      expect(() => decode({ ...event, definition: { ...definition, revision: 99 } })).toThrow();
+      expect(() => decode({ ...event, definitionRevision: 2 })).toThrow();
+      expect(
+        decode({ ...event, definitionRevision: 2, definition: { ...definition, revision: 2 } }),
+      ).toBeDefined();
+    }
   });
 
   it("keeps server-recorded human action decisions distinct from validation", () => {
@@ -123,6 +132,16 @@ describe("staged task events", () => {
       human: { subject: "human", sessionId: "session" },
     };
     expect(decode(result)).toBeDefined();
+    for (const key of ["managerThreadId", "runId"] as const) {
+      expect(decode({ ...result, [key]: "x".repeat(2_000) })).toBeDefined();
+      expect(() => decode({ ...result, [key]: "x".repeat(2_001) })).toThrow();
+    }
+    expect(
+      decode({ ...result, human: { ...result.human, sessionId: "x".repeat(2_000) } }),
+    ).toBeDefined();
+    expect(() =>
+      decode({ ...result, human: { ...result.human, sessionId: "x".repeat(2_001) } }),
+    ).toThrow();
     for (const invalid of [
       {
         ...result,

@@ -707,12 +707,12 @@ export const WorkTaskEvent = Schema.Union([
     type: Schema.Literal("task.created"),
     projectId: Schema.optional(ProjectId),
     definition: WorkTaskDraftDefinition,
-  }),
+  }).check(Schema.makeFilter((event) => event.definitionRevision === event.definition.revision)),
   Schema.Struct({
     ...eventBase,
     type: Schema.Literal("task.definition-updated"),
     definition: WorkTaskDraftDefinition,
-  }),
+  }).check(Schema.makeFilter((event) => event.definitionRevision === event.definition.revision)),
   Schema.Struct({
     ...eventBase,
     type: Schema.Literals(["task.thread-linked", "task.thread-unlinked"]),
@@ -802,10 +802,11 @@ export const WorkTaskEvent = Schema.Union([
     reviewId,
     reviewRevision: PositiveInt,
     ...managerIdentity,
-    runId: RunId,
+    managerThreadId: referenceThreadId,
+    runId: referenceRunId,
     payloadIdentity: WorkTaskActionPayloadIdentity,
     decision: WorkTaskActionReviewDecision,
-    human: Schema.Struct({ subject: shortText, sessionId: AuthSessionId }),
+    human: Schema.Struct({ subject: shortText, sessionId: humanDecision.sessionId }),
     feedback: Schema.optional(shortText),
   }),
 ]);
