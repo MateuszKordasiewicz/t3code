@@ -75,6 +75,13 @@ export {
   resolveSourceControlWriterModelSelection,
 } from "@t3tools/shared/serverSettings";
 
+function applySettingsPatch(current: ServerSettings, patch: ServerSettingsPatch): ServerSettings {
+  const updated = applyServerSettingsPatch(current, patch);
+  return patch.workTaskCompletionPolicy === undefined
+    ? updated
+    : { ...updated, workTaskCompletionPolicy: patch.workTaskCompletionPolicy };
+}
+
 const encodeServerSettings = Schema.encodeEffect(ServerSettings);
 const encodeServerSettingsJson = Schema.encodeUnknownEffect(fromJsonStringPretty(ServerSettings));
 const decodeServerSettings = Schema.decodeUnknownEffect(ServerSettings);
@@ -326,13 +333,13 @@ const makeTest = Effect.fn("serverSettings.makeTest")(function* (
     getSettings,
     updateSettings: (patch) =>
       updateTestSettings((currentSettings) =>
-        Effect.succeed(applyServerSettingsPatch(currentSettings, patch)),
+        Effect.succeed(applySettingsPatch(currentSettings, patch)),
       ),
     updateProviderInstance: (mutation, patch = {}) =>
       updateTestSettings((currentSettings) =>
         Effect.gen(function* () {
           yield* ensureProviderInstanceMutationAllowed(currentSettings, mutation, "test settings");
-          const patched = applyServerSettingsPatch(currentSettings, patch);
+          const patched = applySettingsPatch(currentSettings, patch);
           return applyProviderInstanceMutation(patched, mutation);
         }),
       ),
@@ -548,6 +555,7 @@ const ATOMIC_SETTINGS_KEYS: ReadonlySet<string> = new Set([
   "textGenerationModelSelection",
   "fallbackModelSelection",
   "pullRequestMergeMethod",
+  "workTaskCompletionPolicy",
   // Empty by default, these hold one whole value, which a managed policy can default.
   ...Object.entries(DEFAULT_SERVER_SETTINGS).flatMap(([key, value]) =>
     value === null ? [key] : [],
@@ -1370,7 +1378,7 @@ const make = Effect.gen(function* () {
     updateSettings: (patch) =>
       updateAndPersistSettings(patch, (current) =>
         ensureSecretProviderWritesAllowed(patch, settingsPath).pipe(
-          Effect.as(applyServerSettingsPatch(current, patch)),
+          Effect.as(applySettingsPatch(current, patch)),
         ),
       ),
     updateProviderInstance: (mutation, patch = {}) =>
@@ -1378,7 +1386,7 @@ const make = Effect.gen(function* () {
         Effect.gen(function* () {
           yield* ensureSecretProviderWritesAllowed(patch, settingsPath);
           yield* ensureProviderInstanceMutationAllowed(current, mutation, settingsPath);
-          const patched = applyServerSettingsPatch(current, patch);
+          const patched = applySettingsPatch(current, patch);
           return applyProviderInstanceMutation(patched, mutation);
         }),
       ),

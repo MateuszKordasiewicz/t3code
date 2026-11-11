@@ -136,6 +136,64 @@ function strictSecretReferencePaths(
 }
 
 it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("server settings", (it) => {
+  it.effect("persists and replaces task settings without changing unrelated settings", () =>
+    Effect.gen(function* () {
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      const config = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      const validator = {
+        projectId: "project",
+        modelSelection: {
+          instanceId: "codex",
+          model: "model",
+          options: [{ id: "reasoningEffort", value: "high" }],
+        },
+        workspace: { type: "root", branch: "old" },
+      };
+      const first = yield* decodeServerSettingsPatch({
+        workTaskFollowUpAllowance: 3,
+        workTaskCompletionPolicy: { type: "automatic", validator },
+        workTaskExecutionEnabled: true,
+      });
+      yield* service.updateSettings(first);
+      const replacement = {
+        type: "automatic",
+        validator: {
+          projectId: "other",
+          modelSelection: { instanceId: "codex", model: "other" },
+          workspace: { type: "root" },
+        },
+      };
+      const replacementPatch = yield* decodeServerSettingsPatch({
+        workTaskCompletionPolicy: replacement,
+        defaultAutoPull: true,
+      });
+      yield* service.updateSettings(replacementPatch);
+      const settings = yield* service.getSettings;
+      assert.deepEqual(
+        settings.workTaskCompletionPolicy,
+        replacementPatch.workTaskCompletionPolicy,
+      );
+      assert.equal(settings.workTaskFollowUpAllowance, 3);
+      assert.isTrue(settings.workTaskExecutionEnabled);
+      const stored = yield* decodeServerSettingsJson(yield* fs.readFileString(config.settingsPath));
+      assert.deepEqual(stored.workTaskCompletionPolicy, replacementPatch.workTaskCompletionPolicy);
+      assert.equal(stored.workTaskFollowUpAllowance, 3);
+      assert.isTrue(stored.defaultAutoPull);
+      yield* service.updateSettings(
+        yield* decodeServerSettingsPatch({
+          workTaskFollowUpAllowance: null,
+          workTaskCompletionPolicy: { type: "manual" },
+          workTaskExecutionEnabled: false,
+        }),
+      );
+      const reset = yield* decodeServerSettingsJson(yield* fs.readFileString(config.settingsPath));
+      assert.isNull(reset.workTaskFollowUpAllowance);
+      assert.deepEqual(reset.workTaskCompletionPolicy, { type: "manual" });
+      assert.isFalse(reset.workTaskExecutionEnabled);
+      assert.isTrue(reset.defaultAutoPull);
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
   it.effect("serializes concurrent model preference edits without cancelling duplicate adds", () =>
     Effect.gen(function* () {
       const service = yield* ServerSettingsModule.ServerSettingsService;
