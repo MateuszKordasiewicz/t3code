@@ -252,6 +252,10 @@ const copySourceSlice = Effect.fn("copyDevDbSourceSlice")(function* (sourcePath:
   yield* sql.withTransaction(
     Effect.gen(function* () {
       for (const table of tables) yield* sql.unsafe(table.sql).unprepared;
+      // Explicit unique indexes must exist before inserts validate foreign-key parent keys.
+      for (const entry of schema) {
+        if (entry.type === "index") yield* sql.unsafe(entry.sql).unprepared;
+      }
       if (filtered) {
         yield* sql`CREATE TEMP TABLE copied_threads (thread_id TEXT PRIMARY KEY)`;
         yield* sql`INSERT OR IGNORE INTO copied_threads
@@ -278,7 +282,8 @@ const copySourceSlice = Effect.fn("copyDevDbSourceSlice")(function* (sourcePath:
       yield* sql`DELETE FROM main.sqlite_sequence`;
       yield* sql`INSERT INTO main.sqlite_sequence SELECT name, seq FROM src.sqlite_sequence`;
       for (const entry of schema) {
-        if (entry.type !== "table") yield* sql.unsafe(entry.sql).unprepared;
+        if (entry.type !== "table" && entry.type !== "index")
+          yield* sql.unsafe(entry.sql).unprepared;
       }
       yield* rebuildMessageSearch(sql);
     }),
