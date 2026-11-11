@@ -737,3 +737,170 @@ describe("task waits, results and completion claims", () => {
       expect(() => result({ ...receipt, [key]: undefined })).toThrow();
   });
 });
+
+describe("task action review contracts", () => {
+  const preview = {
+    content: "Complete action",
+    artifacts: [{ uri: "artifact", hash: "sha256:abc" }],
+  };
+  const proposal = {
+    action: "git.push",
+    label: "Push",
+    target: "origin/main",
+    preview,
+    fingerprint: "sha256:123",
+  };
+  const request = {
+    taskId: "task",
+    commandId: "command",
+    expectedDefinitionRevision: 1,
+    expectedActionPolicyRevision: 2,
+    expectedManagerGeneration: 3,
+    ...proposal,
+  };
+  const review = {
+    taskId: "task",
+    reviewId: "review",
+    revision: 1,
+    managerThreadId: "thread",
+    managerGeneration: 3,
+    providerSessionId: "session",
+    runId: "run",
+    ruleId: "rule",
+    definitionRevision: 1,
+    actionPolicyRevision: 2,
+    ...proposal,
+    state: { type: "pending" },
+    createdSequence: 4,
+    createdAt: "2026-11-11T00:00:00Z",
+  };
+  const response = {
+    taskId: "task",
+    commandId: "command",
+    reviewId: "review",
+    expectedReviewRevision: 1,
+    expectedActionPolicyRevision: 2,
+    expectedManagerGeneration: 3,
+    expectedFingerprint: "sha256:123",
+    decision: "approve",
+  };
+
+  it("bounds the complete serialized preview in UTF-8 bytes", () => {
+    const decode = Schema.decodeUnknownSync(task.WorkTaskActionPreview);
+    const overhead = new TextEncoder().encode(
+      JSON.stringify({ content: "", artifacts: [] }),
+    ).byteLength;
+    const limit = 32 * 1024 - overhead;
+    expect(decode({ content: "a".repeat(limit), artifacts: [] })).toBeDefined();
+    expect(() => decode({ content: "a".repeat(limit + 1), artifacts: [] })).toThrow();
+    expect(
+      decode({ content: "é".repeat(Math.floor(limit / 2)) + "a".repeat(limit % 2), artifacts: [] }),
+    ).toBeDefined();
+    expect(() =>
+      decode({
+        content: "é".repeat(Math.floor(limit / 2)) + "a".repeat((limit % 2) + 1),
+        artifacts: [],
+      }),
+    ).toThrow();
+    expect(() => decode({ content: '"'.repeat(limit), artifacts: [] })).toThrow();
+    expect(() => decode({ content: " ", artifacts: [] })).toThrow();
+  });
+
+  it("bounds artifact count and every review reference and text field", () => {
+    const decode = Schema.decodeUnknownSync(task.WorkTaskActionPreview);
+    const artifact = { uri: "u".repeat(2_000), hash: "h".repeat(2_000) };
+    expect(
+      decode({
+        content: "x",
+        artifacts: Array.from({ length: 16 }, () => ({ uri: "u", hash: "h" })),
+      }),
+    ).toBeDefined();
+    expect(() =>
+      decode({
+        content: "x",
+        artifacts: Array.from({ length: 17 }, () => ({ uri: "u", hash: "h" })),
+      }),
+    ).toThrow();
+    expect(decode({ content: "x", artifacts: [artifact] })).toBeDefined();
+    for (const key of ["uri", "hash"])
+      expect(() =>
+        decode({ content: "x", artifacts: [{ ...artifact, [key]: "x".repeat(2_001) }] }),
+      ).toThrow();
+    const requestDecode = Schema.decodeUnknownSync(task.WorkTaskRequestActionReviewInput);
+    for (const key of ["taskId", "commandId", "label", "target", "fingerprint"]) {
+      expect(requestDecode({ ...request, [key]: "x".repeat(2_000) })).toBeDefined();
+      expect(() => requestDecode({ ...request, [key]: "x".repeat(2_001) })).toThrow();
+    }
+    expect(() => requestDecode({ ...request, action: "x".repeat(121) })).toThrow();
+    const responseDecode = Schema.decodeUnknownSync(task.WorkTaskRespondActionReviewInput);
+    for (const key of ["reviewId", "expectedFingerprint", "feedback"]) {
+      expect(responseDecode({ ...response, [key]: "x".repeat(2_000) })).toBeDefined();
+      expect(() => responseDecode({ ...response, [key]: "x".repeat(2_001) })).toThrow();
+    }
+  });
+
+  it("binds review request, read and human decision to exact revisions and payload without caller authority", () => {
+    const requestDecode = Schema.decodeUnknownSync(task.WorkTaskRequestActionReviewInput);
+    expect(requestDecode({ ...request, caller: { type: "manager" } })).toEqual(request);
+    for (const key of [
+      "expectedDefinitionRevision",
+      "expectedActionPolicyRevision",
+      "expectedManagerGeneration",
+      "fingerprint",
+      "preview",
+    ]) {
+      expect(() => requestDecode({ ...request, [key]: undefined })).toThrow();
+    }
+    const respond = Schema.decodeUnknownSync(task.WorkTaskRespondActionReviewInput);
+    for (const decision of ["approve", "reject", "request_changes"])
+      expect(respond({ ...response, decision, caller: { type: "user" } })).toEqual({
+        ...response,
+        decision,
+      });
+    for (const decision of ["allow", "always", "session", "changes_requested", "agent_approve"])
+      expect(() => respond({ ...response, decision })).toThrow();
+    for (const key of [
+      "reviewId",
+      "expectedReviewRevision",
+      "expectedActionPolicyRevision",
+      "expectedManagerGeneration",
+      "expectedFingerprint",
+      "decision",
+    ])
+      expect(() => respond({ ...response, [key]: undefined })).toThrow();
+    const detail = Schema.decodeUnknownSync(task.WorkTaskActionReviewDetailInput);
+    expect(detail({ taskId: "task", reviewId: "review" })).toEqual({
+      taskId: "task",
+      reviewId: "review",
+    });
+    expect(() => detail({ taskId: "task" })).toThrow();
+    for (const schema of [
+      task.WorkTaskActionReviewDetailResult,
+      task.WorkTaskRequestActionReviewResult,
+      task.WorkTaskRespondActionReviewResult,
+    ]) {
+      const decode = Schema.decodeUnknownSync(schema);
+      expect(decode({ sequence: 4, review })).toBeDefined();
+      for (const key of ["fingerprint", "actionPolicyRevision", "managerGeneration", "revision"])
+        expect(() => decode({ sequence: 4, review: { ...review, [key]: undefined } })).toThrow();
+    }
+    const state = Schema.decodeUnknownSync(task.WorkTaskActionReviewState);
+    for (const type of ["approved", "rejected", "changes_requested"]) {
+      expect(
+        state({
+          type,
+          subject: "human",
+          sessionId: "session",
+          resolvedSequence: 5,
+          resolvedAt: "2026-11-11T00:00:00Z",
+        }),
+      ).toBeDefined();
+      expect(() => state({ type, resolvedSequence: 5 })).toThrow();
+    }
+    for (const type of ["invalidated", "cancelled"])
+      expect(
+        state({ type, reason: "changed", resolvedSequence: 5, resolvedAt: "2026-11-11T00:00:00Z" }),
+      ).toBeDefined();
+    expect(() => state({ type: "approve" })).toThrow();
+  });
+});

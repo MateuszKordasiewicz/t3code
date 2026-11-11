@@ -537,3 +537,123 @@ export const WorkTaskSubmitCompletionClaimResult = Schema.Struct({
   evidenceId: shortText,
 });
 export type WorkTaskSubmitCompletionClaimResult = typeof WorkTaskSubmitCompletionClaimResult.Type;
+
+const reviewTaskId = WorkTaskId.check(Schema.isMaxLength(2_000));
+const reviewCommandId = CommandId.check(Schema.isMaxLength(2_000));
+const reviewId = shortText;
+const actionFingerprint = shortText;
+const reviewArtifact = Schema.Struct({ uri: shortText, hash: shortText });
+const utf8 = new TextEncoder();
+
+export const WorkTaskActionPreview = Schema.Struct({
+  content: Schema.String.check(Schema.isMaxLength(32 * 1024), nonBlank),
+  artifacts: Schema.Array(reviewArtifact).check(Schema.isMaxLength(16)),
+}).check(
+  Schema.makeFilter((preview) => utf8.encode(JSON.stringify(preview)).byteLength <= 32 * 1024, {
+    expected: "a complete preview of at most 32768 UTF-8 bytes",
+  }),
+);
+export type WorkTaskActionPreview = typeof WorkTaskActionPreview.Type;
+
+export const WorkTaskActionReviewDecision = Schema.Literals([
+  "approve",
+  "reject",
+  "request_changes",
+]);
+export type WorkTaskActionReviewDecision = typeof WorkTaskActionReviewDecision.Type;
+
+const humanDecision = {
+  subject: shortText,
+  sessionId: AuthSessionId.check(Schema.isMaxLength(2_000)),
+  feedback: Schema.optional(shortText),
+  resolvedSequence: NonNegativeInt,
+  resolvedAt: shortText,
+};
+export const WorkTaskActionReviewState = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("pending") }),
+  Schema.Struct({ type: Schema.Literal("approved"), ...humanDecision }),
+  Schema.Struct({ type: Schema.Literal("rejected"), ...humanDecision }),
+  Schema.Struct({ type: Schema.Literal("changes_requested"), ...humanDecision }),
+  Schema.Struct({
+    type: Schema.Literal("invalidated"),
+    reason: shortText,
+    resolvedSequence: NonNegativeInt,
+    resolvedAt: shortText,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("cancelled"),
+    reason: shortText,
+    resolvedSequence: NonNegativeInt,
+    resolvedAt: shortText,
+  }),
+]);
+export type WorkTaskActionReviewState = typeof WorkTaskActionReviewState.Type;
+
+const reviewProposal = {
+  action: exactScope.check(Schema.isMaxLength(120)),
+  label: shortText,
+  target: exactScope,
+  preview: WorkTaskActionPreview,
+  fingerprint: actionFingerprint,
+};
+export const WorkTaskActionReview = Schema.Struct({
+  taskId: reviewTaskId,
+  reviewId,
+  revision: PositiveInt,
+  managerThreadId: referenceThreadId,
+  managerGeneration: PositiveInt,
+  providerSessionId: ProviderSessionId.check(Schema.isMaxLength(2_000)),
+  runId: referenceRunId,
+  ruleId: WorkTaskActionRuleId.check(Schema.isMaxLength(2_000)),
+  definitionRevision: PositiveInt,
+  actionPolicyRevision: PositiveInt,
+  ...reviewProposal,
+  state: WorkTaskActionReviewState,
+  createdSequence: NonNegativeInt,
+  createdAt: shortText,
+  runtimeRequestId: Schema.optional(shortText),
+  continuationId: Schema.optional(shortText),
+});
+export type WorkTaskActionReview = typeof WorkTaskActionReview.Type;
+
+// Service authorization and caller identity are independent of these input fields.
+export const WorkTaskActionReviewDetailInput = Schema.Struct({ taskId: reviewTaskId, reviewId });
+export type WorkTaskActionReviewDetailInput = typeof WorkTaskActionReviewDetailInput.Type;
+export const WorkTaskActionReviewDetailResult = Schema.Struct({
+  sequence: NonNegativeInt,
+  review: WorkTaskActionReview,
+});
+export type WorkTaskActionReviewDetailResult = typeof WorkTaskActionReviewDetailResult.Type;
+
+export const WorkTaskRequestActionReviewInput = Schema.Struct({
+  taskId: reviewTaskId,
+  commandId: reviewCommandId,
+  expectedDefinitionRevision: PositiveInt,
+  expectedActionPolicyRevision: PositiveInt,
+  expectedManagerGeneration: PositiveInt,
+  ...reviewProposal,
+});
+export type WorkTaskRequestActionReviewInput = typeof WorkTaskRequestActionReviewInput.Type;
+export const WorkTaskRequestActionReviewResult = Schema.Struct({
+  sequence: NonNegativeInt,
+  review: WorkTaskActionReview,
+});
+export type WorkTaskRequestActionReviewResult = typeof WorkTaskRequestActionReviewResult.Type;
+
+export const WorkTaskRespondActionReviewInput = Schema.Struct({
+  taskId: reviewTaskId,
+  commandId: reviewCommandId,
+  reviewId,
+  expectedReviewRevision: PositiveInt,
+  expectedActionPolicyRevision: PositiveInt,
+  expectedManagerGeneration: PositiveInt,
+  expectedFingerprint: actionFingerprint,
+  decision: WorkTaskActionReviewDecision,
+  feedback: Schema.optional(shortText),
+});
+export type WorkTaskRespondActionReviewInput = typeof WorkTaskRespondActionReviewInput.Type;
+export const WorkTaskRespondActionReviewResult = Schema.Struct({
+  sequence: NonNegativeInt,
+  review: WorkTaskActionReview,
+});
+export type WorkTaskRespondActionReviewResult = typeof WorkTaskRespondActionReviewResult.Type;
