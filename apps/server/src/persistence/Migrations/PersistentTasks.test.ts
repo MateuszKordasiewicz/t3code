@@ -14,6 +14,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
     const migrations = yield* runMigrations();
     assert.deepInclude(migrations, [81, "WorkTaskFoundation"]);
     assert.deepInclude(migrations, [82, "WorkTaskManagerCustody"]);
+    assert.deepInclude(migrations, [83, "WorkTaskValidation"]);
     const tables = yield* sql<{ readonly name: string }>`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'work_task_%' ORDER BY name
     `;
@@ -25,6 +26,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
         "work_task_manager_bindings",
         "work_task_projections",
         "work_task_thread_links",
+        "work_task_validation_attempts",
         "work_task_wake_reservations",
         "work_task_wake_sources",
       ],
@@ -53,6 +55,7 @@ it.effect("upgrades predecessor rows and events without changing their bytes or 
     assert.deepStrictEqual(yield* runMigrations(), [
       [81, "WorkTaskFoundation"],
       [82, "WorkTaskManagerCustody"],
+      [83, "WorkTaskValidation"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM projection_projects ORDER BY project_id`,
@@ -85,6 +88,7 @@ it.effect("rolls back a failed migration and succeeds on rerun", () =>
     assert.deepStrictEqual(yield* runMigrations(), [
       [81, "WorkTaskFoundation"],
       [82, "WorkTaskManagerCustody"],
+      [83, "WorkTaskValidation"],
     ]);
     assert.deepStrictEqual(yield* runMigrations(), []);
   }).pipe(Effect.provide(db)),
@@ -196,7 +200,10 @@ it.effect(
         [],
       );
       yield* sql`DROP TABLE work_task_wake_reservations`;
-      assert.deepStrictEqual(yield* runMigrations(), [[82, "WorkTaskManagerCustody"]]);
+      assert.deepStrictEqual(yield* runMigrations(), [
+        [82, "WorkTaskManagerCustody"],
+        [83, "WorkTaskValidation"],
+      ]);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_thread_links`, links);
@@ -319,4 +326,135 @@ it.effect("constrains manager custody, source identity and finite wake reservati
       [{ configured_cap: 2, consumed: 2 }],
     );
   }).pipe(Effect.provide(db)),
+);
+
+it.effect("preserves task custody through validation upgrade and rolls back migration 83", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations({ toMigrationInclusive: 82 });
+    yield* sql`INSERT INTO work_task_projections VALUES ('a', 'p', 1, 1, 1, 1, '{"task":1}', 't', 't')`;
+    yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('a', 1, 1, '{"definition":1}', '{}', 'def', 't')`;
+    yield* sql`INSERT INTO work_task_thread_links VALUES ('link', 'a', 'thread', 't', '{}', NULL, NULL, NULL)`;
+    yield* sql`INSERT INTO work_task_manager_bindings VALUES ('a', 1, 'manager', 't', NULL)`;
+    yield* sql`INSERT INTO work_task_allowances VALUES ('a', 2, 1)`;
+    yield* sql`INSERT INTO work_task_wake_reservations VALUES ('r', 'a', 1, 'c', 'm', 'run', 1, 1, 0, 't', 't')`;
+    yield* sql`INSERT INTO work_task_wake_sources VALUES ('a', 'event', 'source', 'r', 'result')`;
+    const tasks = yield* sql`SELECT * FROM work_task_projections`;
+    const definitions = yield* sql`SELECT * FROM work_task_accepted_definitions`;
+    const links = yield* sql`SELECT * FROM work_task_thread_links`;
+    const managers = yield* sql`SELECT * FROM work_task_manager_bindings`;
+    const allowances = yield* sql`SELECT * FROM work_task_allowances`;
+    const reservations = yield* sql`SELECT * FROM work_task_wake_reservations`;
+    const sources = yield* sql`SELECT * FROM work_task_wake_sources`;
+    yield* sql`CREATE INDEX work_task_validation_task_idx ON work_task_projections(task_id)`;
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(runMigrations())));
+    assert.deepStrictEqual(
+      yield* sql`SELECT name FROM sqlite_master WHERE name = 'work_task_validation_attempts'`,
+      [],
+    );
+    assert.deepStrictEqual(
+      yield* sql`SELECT migration_id FROM effect_sql_migrations WHERE migration_id = 83`,
+      [],
+    );
+    yield* sql`DROP INDEX work_task_validation_task_idx`;
+    assert.deepStrictEqual(yield* runMigrations(), [[83, "WorkTaskValidation"]]);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_thread_links`, links);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_manager_bindings`, managers);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_allowances`, allowances);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_wake_reservations`, reservations);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_wake_sources`, sources);
+    assert.deepStrictEqual(yield* runMigrations(), []);
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect(
+  "binds distinct validation attempts to definitions, managers, evidence and run provenance",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      yield* sql`PRAGMA foreign_keys = ON`;
+      yield* sql`INSERT INTO work_task_projections VALUES
+      ('a', NULL, 1, 1, 1, 1, '{}', 't', 't'), ('b', NULL, 1, 1, 1, 1, '{}', 't', 't')`;
+      yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('a', 1, 1, '{}', '{}', 'def', 't')`;
+      yield* sql`INSERT INTO work_task_manager_bindings VALUES ('a', 1, 'manager', 't', NULL)`;
+      yield* sql`INSERT INTO work_task_validation_attempts VALUES
+      ('v1', 'a', 1, 1, 1, 'evidence', 'watermark', '{"provider":"codex","model":"validator"}', 'run1', 'result', '{"outcome":"pass"}', 't', 't', 't'),
+      ('v2', 'a', 1, 1, 1, 'evidence', 'watermark', '{"provider":"claude","model":"validator"}', NULL, 'reserved', NULL, 't', NULL, NULL)`;
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(sql`INSERT INTO work_task_validation_attempts VALUES
+      ('v1', 'a', 1, 1, 1, 'other', 'w', '{}', NULL, 'reserved', NULL, 't', NULL, NULL)`),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(sql`INSERT INTO work_task_validation_attempts VALUES
+      ('v3', 'a', 1, 1, 1, 'e', 'w', '{}', 'run1', 'reserved', NULL, 't', NULL, NULL)`),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(sql`INSERT INTO work_task_validation_attempts VALUES
+      ('v3', 'a', 2, 1, 1, 'e', 'w', '{}', NULL, 'reserved', NULL, 't', NULL, NULL)`),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(sql`INSERT INTO work_task_validation_attempts VALUES
+      ('v3', 'b', 1, 1, 1, 'e', 'w', '{}', NULL, 'reserved', NULL, 't', NULL, NULL)`),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(sql`INSERT INTO work_task_validation_attempts VALUES
+      ('v3', 'a', 1, 2, 1, 'e', 'w', '{}', NULL, 'reserved', NULL, 't', NULL, NULL)`),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(sql`INSERT INTO work_task_validation_attempts VALUES
+      ('v3', 'a', 1, 1, 0, 'e', 'w', '{}', NULL, 'reserved', NULL, 't', NULL, NULL)`),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(sql`INSERT INTO work_task_validation_attempts VALUES
+      ('v3', 'a', 1, 1, 1, NULL, 'w', '{}', NULL, 'reserved', NULL, 't', NULL, NULL)`),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`UPDATE work_task_validation_attempts SET state = 'result' WHERE attempt_id = 'v2'`,
+          ),
+        ),
+      );
+      yield* sql`UPDATE work_task_validation_attempts SET state = 'started', started_at = 'later', run_id = 'run2' WHERE attempt_id = 'v2'`;
+      yield* sql`UPDATE work_task_validation_attempts SET state = 'uncertain', finished_at = 'later' WHERE attempt_id = 'v2'`;
+      assert.deepStrictEqual(
+        yield* sql`SELECT attempt_id, evidence_id, validator_json, run_id, state, outcome_json
+      FROM work_task_validation_attempts ORDER BY attempt_id`,
+        [
+          {
+            attempt_id: "v1",
+            evidence_id: "evidence",
+            validator_json: '{"provider":"codex","model":"validator"}',
+            run_id: "run1",
+            state: "result",
+            outcome_json: '{"outcome":"pass"}',
+          },
+          {
+            attempt_id: "v2",
+            evidence_id: "evidence",
+            validator_json: '{"provider":"claude","model":"validator"}',
+            run_id: "run2",
+            state: "uncertain",
+            outcome_json: null,
+          },
+        ],
+      );
+    }).pipe(Effect.provide(db)),
 );

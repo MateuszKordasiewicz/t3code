@@ -62,6 +62,7 @@ describe("V2 preview upgrade", () => {
         [80, "ScheduledTaskThreadMode"],
         [81, "WorkTaskFoundation"],
         [82, "WorkTaskManagerCustody"],
+        [83, "WorkTaskValidation"],
       ]);
       assert.deepStrictEqual(yield* runMigrations(), []);
       assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_legacy_imports`, imports);
@@ -167,6 +168,7 @@ describe("V2 preview upgrade", () => {
         [80, "ScheduledTaskThreadMode"],
         [81, "WorkTaskFoundation"],
         [82, "WorkTaskManagerCustody"],
+        [83, "WorkTaskValidation"],
       ]);
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
