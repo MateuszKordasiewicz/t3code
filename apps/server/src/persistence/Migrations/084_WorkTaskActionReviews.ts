@@ -67,11 +67,21 @@ export default Effect.gen(function* () {
         REFERENCES work_task_action_review_decisions(review_id, task_id, review_revision, action_policy_revision, fingerprint, manager_generation)
     )
   `;
+  // Count UTF-16 units from UTF-8 bytes so NUL and supplementary characters match the contract.
   yield* sql`CREATE TRIGGER work_task_action_reviews_artifacts_insert BEFORE INSERT ON work_task_action_reviews
     WHEN EXISTS (SELECT 1 FROM json_each(NEW.preview_json, '$.artifacts')
       WHERE type != 'object' OR json_type(value, '$.uri') IS NOT 'text' OR json_type(value, '$.hash') IS NOT 'text'
         OR length(trim(json_extract(value, '$.uri'))) = 0 OR length(trim(json_extract(value, '$.hash'))) = 0
-        OR length(json_extract(value, '$.uri')) > 2000 OR length(json_extract(value, '$.hash')) > 2000)
+        OR EXISTS (
+          WITH RECURSIVE units(bytes, position, count) AS (
+            SELECT hex(CAST(json_extract(value, '$.uri') AS BLOB)), 1, 0
+            UNION ALL SELECT hex(CAST(json_extract(value, '$.hash') AS BLOB)), 1, 0
+            UNION ALL SELECT bytes, position + 2, count + CASE
+              WHEN substr(bytes, position, 1) IN ('8', '9', 'A', 'B') THEN 0
+              WHEN substr(bytes, position, 1) = 'F' THEN 2 ELSE 1 END
+              FROM units WHERE position <= length(bytes) AND count <= 2000
+          ) SELECT 1 FROM units WHERE count > 2000
+        ))
     BEGIN SELECT RAISE(ABORT, 'invalid artifact'); END`;
   yield* sql`CREATE INDEX work_task_action_reviews_task_idx ON work_task_action_reviews(task_id, created_sequence)`;
   yield* sql`CREATE TRIGGER work_task_action_reviews_no_replace BEFORE INSERT ON work_task_action_reviews

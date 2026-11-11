@@ -648,6 +648,31 @@ it.effect(
       assert.isTrue(
         Exit.isFailure(yield* Effect.exit(sql`DELETE FROM work_task_action_review_releases`)),
       );
+      for (const key of ["uri", "hash"]) {
+        for (const text of ["u\0" + "x".repeat(2000), "😀".repeat(1001)]) {
+          const preview = JSON.stringify({
+            content: "x",
+            artifacts: [{ uri: "u", hash: "h", [key]: text }],
+          });
+          assert.isTrue(
+            Exit.isFailure(
+              yield* Effect.exit(
+                sql`INSERT INTO work_task_action_reviews SELECT 'bounds', task_id, revision, manager_generation, manager_thread_id, provider_session_id, run_id, 'bounds-cmd', 'bounds-req', rule_id, definition_revision, action_policy_revision, action, label, target, ${preview}, fingerprint, created_sequence, created_at FROM work_task_action_reviews WHERE review_id = 'review'`,
+              ),
+            ),
+          );
+        }
+        for (const text of ["u\0" + "x".repeat(1998), "😀".repeat(1000)]) {
+          const preview = JSON.stringify({
+            content: "x",
+            artifacts: [{ uri: "u", hash: "h", [key]: text }],
+          });
+          yield* sql`SAVEPOINT artifact_bounds`;
+          yield* sql`INSERT INTO work_task_action_reviews SELECT 'bounds', task_id, revision, manager_generation, manager_thread_id, provider_session_id, run_id, 'bounds-cmd', 'bounds-req', rule_id, definition_revision, action_policy_revision, action, label, target, ${preview}, fingerprint, created_sequence, created_at FROM work_task_action_reviews WHERE review_id = 'review'`;
+          yield* sql`ROLLBACK TO artifact_bounds`;
+          yield* sql`RELEASE artifact_bounds`;
+        }
+      }
       assert.deepStrictEqual(yield* sql`SELECT preview_json FROM work_task_action_reviews`, [
         {
           preview_json: '{"content":"full payload","artifacts":[{"uri":"artifact","hash":"hash"}]}',
