@@ -385,8 +385,14 @@ export const WorkTaskThreadLinksResult = Schema.Struct({
 });
 export type WorkTaskThreadLinksResult = typeof WorkTaskThreadLinksResult.Type;
 
+const referenceThreadId = ThreadId.check(Schema.isMaxLength(2_000));
+const referenceRunId = RunId.check(Schema.isMaxLength(2_000));
 export const WorkTaskResultReference = Schema.Union([
-  Schema.Struct({ type: Schema.Literal("run"), threadId: ThreadId, runId: RunId }),
+  Schema.Struct({
+    type: Schema.Literal("run"),
+    threadId: referenceThreadId,
+    runId: referenceRunId,
+  }),
   Schema.Struct({ type: Schema.Literal("artifact"), uri: shortText, hash: shortText }),
   Schema.Struct({
     type: Schema.Literal("source_revision"),
@@ -463,7 +469,11 @@ const managerGuards = {
 };
 
 export const WorkTaskWaitTarget = Schema.Union([
-  Schema.Struct({ type: Schema.Literal("run"), threadId: ThreadId, runId: RunId }),
+  Schema.Struct({
+    type: Schema.Literal("run"),
+    threadId: referenceThreadId,
+    runId: referenceRunId,
+  }),
   Schema.Struct({ type: Schema.Literal("source"), sourceId: shortText }),
   Schema.Struct({ type: Schema.Literal("result"), result: WorkTaskResultReference }),
 ]);

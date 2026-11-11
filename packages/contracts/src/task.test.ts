@@ -624,6 +624,35 @@ describe("task waits, results and completion claims", () => {
       summary: "Results",
       results: [run, artifact, source],
     };
+    const register = Schema.decodeUnknownSync(task.WorkTaskRegisterWaitInput);
+    const claim = Schema.decodeUnknownSync(task.WorkTaskSubmitCompletionClaimInput);
+    const referenceInputs = [
+      (reference: typeof run) =>
+        register({ ...command, ...guards, waitId: "wait", target: reference }),
+      (reference: typeof run) =>
+        register({
+          ...command,
+          ...guards,
+          waitId: "wait",
+          target: { type: "result", result: reference },
+        }),
+      (reference: typeof run) => submit({ ...input, results: [reference] }),
+      (reference: typeof run) =>
+        claim({
+          ...command,
+          ...guards,
+          expectedCompletionPolicyRevision: 4,
+          summary: "Ready",
+          evidence: [reference],
+        }),
+    ];
+    for (const decode of referenceInputs) {
+      expect(
+        decode({ ...run, threadId: "t".repeat(2_000), runId: "r".repeat(2_000) }),
+      ).toBeDefined();
+      for (const key of ["threadId", "runId"])
+        expect(() => decode({ ...run, [key]: "x".repeat(2_001) })).toThrow();
+    }
     expect(submit({ ...input, caller: { type: "manager" } })).toEqual(input);
     expect(
       submit({ ...input, results: Array.from({ length: 32 }, () => ({ ...run })) }).results,
