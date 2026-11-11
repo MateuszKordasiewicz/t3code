@@ -15,6 +15,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
     assert.deepInclude(migrations, [81, "WorkTaskFoundation"]);
     assert.deepInclude(migrations, [82, "WorkTaskManagerCustody"]);
     assert.deepInclude(migrations, [83, "WorkTaskValidation"]);
+    assert.deepInclude(migrations, [84, "WorkTaskActionReviews"]);
     const tables = yield* sql<{ readonly name: string }>`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'work_task_%' ORDER BY name
     `;
@@ -22,6 +23,9 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
       tables.map((row) => row.name),
       [
         "work_task_accepted_definitions",
+        "work_task_action_review_decisions",
+        "work_task_action_review_releases",
+        "work_task_action_reviews",
         "work_task_allowances",
         "work_task_manager_bindings",
         "work_task_projections",
@@ -56,6 +60,7 @@ it.effect("upgrades predecessor rows and events without changing their bytes or 
       [81, "WorkTaskFoundation"],
       [82, "WorkTaskManagerCustody"],
       [83, "WorkTaskValidation"],
+      [84, "WorkTaskActionReviews"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM projection_projects ORDER BY project_id`,
@@ -89,6 +94,7 @@ it.effect("rolls back a failed migration and succeeds on rerun", () =>
       [81, "WorkTaskFoundation"],
       [82, "WorkTaskManagerCustody"],
       [83, "WorkTaskValidation"],
+      [84, "WorkTaskActionReviews"],
     ]);
     assert.deepStrictEqual(yield* runMigrations(), []);
   }).pipe(Effect.provide(db)),
@@ -203,6 +209,7 @@ it.effect(
       assert.deepStrictEqual(yield* runMigrations(), [
         [82, "WorkTaskManagerCustody"],
         [83, "WorkTaskValidation"],
+        [84, "WorkTaskActionReviews"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -357,7 +364,10 @@ it.effect("preserves task custody through validation upgrade and rolls back migr
       [],
     );
     yield* sql`DROP INDEX work_task_validation_task_idx`;
-    assert.deepStrictEqual(yield* runMigrations(), [[83, "WorkTaskValidation"]]);
+    assert.deepStrictEqual(yield* runMigrations(), [
+      [83, "WorkTaskValidation"],
+      [84, "WorkTaskActionReviews"],
+    ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_thread_links`, links);
@@ -456,5 +466,192 @@ it.effect(
           },
         ],
       );
+    }).pipe(Effect.provide(db)),
+);
+
+it.effect("upgrades validation data atomically to action reviews and preserves prior records", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations({ toMigrationInclusive: 83 });
+    yield* sql`INSERT INTO work_task_projections VALUES ('a', NULL, 1, 1, 1, 1, '{}', 't', 't')`;
+    yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('a', 1, 1, '{}', '{}', 'def', 't')`;
+    yield* sql`INSERT INTO work_task_manager_bindings VALUES ('a', 1, 'manager', 't', NULL)`;
+    yield* sql`INSERT INTO work_task_validation_attempts VALUES ('v', 'a', 1, 1, 1, 'e', 'w', '{}', NULL, 'reserved', NULL, 't', NULL, NULL)`;
+    yield* sql`INSERT INTO orchestration_events (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, actor_kind, payload_json, metadata_json)
+      VALUES ('event', 'project', 'p', 1, 'project.created', 't', 'client', '{ "original": true }', '{}')`;
+    const tasks = yield* sql`SELECT * FROM work_task_projections`;
+    const definitions = yield* sql`SELECT * FROM work_task_accepted_definitions`;
+    const managers = yield* sql`SELECT * FROM work_task_manager_bindings`;
+    const validations = yield* sql`SELECT * FROM work_task_validation_attempts`;
+    const events = yield* sql`SELECT * FROM orchestration_events ORDER BY sequence`;
+    yield* sql`CREATE INDEX work_task_action_reviews_task_idx ON work_task_projections(task_id)`;
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(runMigrations())));
+    assert.deepStrictEqual(
+      yield* sql`SELECT name FROM sqlite_master WHERE name = 'work_task_action_reviews'`,
+      [],
+    );
+    assert.deepStrictEqual(
+      yield* sql`SELECT migration_id FROM effect_sql_migrations WHERE migration_id = 84`,
+      [],
+    );
+    yield* sql`DROP INDEX work_task_action_reviews_task_idx`;
+    assert.deepStrictEqual(yield* runMigrations(), [[84, "WorkTaskActionReviews"]]);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_manager_bindings`, managers);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_attempts`, validations);
+    assert.deepStrictEqual(
+      yield* sql`SELECT * FROM orchestration_events ORDER BY sequence`,
+      events,
+    );
+    assert.deepStrictEqual(yield* runMigrations(), []);
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect(
+  "binds immutable reviews, human decisions and once-only releases to exact provenance",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      yield* sql`PRAGMA foreign_keys = ON`;
+      yield* sql`INSERT INTO work_task_projections VALUES ('a', NULL, 1, 1, 1, 1, '{}', 't', 't')`;
+      yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('a', 1, 1, '{}', '{}', 'def', 't')`;
+      yield* sql`INSERT INTO work_task_manager_bindings VALUES ('a', 1, 'manager', 't', NULL)`;
+      yield* sql`INSERT INTO work_task_action_reviews VALUES
+      ('review', 'a', 1, 1, 'manager', 'session', 'run', 'command', 'request', 'rule', 1, 1,
+       'send', 'label', 'target', '{"content":"full payload","artifacts":[{"uri":"artifact","hash":"hash"}]}', 'fingerprint', 1, 't')`;
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`INSERT OR REPLACE INTO work_task_action_reviews SELECT * FROM work_task_action_reviews`,
+          ),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`UPDATE work_task_action_reviews SET fingerprint = 'other' WHERE review_id = 'review'`,
+          ),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(sql`DELETE FROM work_task_action_reviews WHERE review_id = 'review'`),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`INSERT INTO work_task_action_reviews SELECT 'duplicate', task_id, revision, manager_generation, manager_thread_id, provider_session_id, run_id, command_id, 'request2', rule_id, definition_revision, action_policy_revision, action, label, target, preview_json, fingerprint, created_sequence, created_at FROM work_task_action_reviews`,
+          ),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`INSERT INTO work_task_action_reviews SELECT 'wrong', task_id, revision, manager_generation, 'foreign', provider_session_id, run_id, 'cmd2', 'req2', rule_id, definition_revision, action_policy_revision, action, label, target, preview_json, fingerprint, created_sequence, created_at FROM work_task_action_reviews`,
+          ),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`INSERT INTO work_task_action_reviews SELECT 'wrong', task_id, revision, manager_generation, manager_thread_id, provider_session_id, run_id, 'cmd2', 'req2', rule_id, definition_revision, 2, action, label, target, preview_json, fingerprint, created_sequence, created_at FROM work_task_action_reviews`,
+          ),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`INSERT INTO work_task_action_reviews SELECT 'wrong', task_id, revision, manager_generation, manager_thread_id, provider_session_id, run_id, 'cmd2', 'req2', rule_id, definition_revision, action_policy_revision, action, label, target, '{"content":"x"}', fingerprint, created_sequence, created_at FROM work_task_action_reviews`,
+          ),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`INSERT INTO work_task_action_reviews SELECT 'wrong', task_id, revision, manager_generation, manager_thread_id, provider_session_id, run_id, 'cmd2', 'req2', rule_id, definition_revision, action_policy_revision, action, label, target, json_object('content', printf('%.*c', 32768, 'x'), 'artifacts', json('[]')), fingerprint, created_sequence, created_at FROM work_task_action_reviews`,
+          ),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`INSERT INTO work_task_action_reviews SELECT 'wrong', task_id, revision, manager_generation, manager_thread_id, provider_session_id, run_id, 'cmd2', 'req2', rule_id, definition_revision, action_policy_revision, action, label, target, '{"content":"x","artifacts":[{"uri":"x"}]}', fingerprint, created_sequence, created_at FROM work_task_action_reviews`,
+          ),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`INSERT INTO work_task_action_review_decisions VALUES ('review', 'a', 1, 1, 'wrong', 1, 'approve', 'human', 'auth-session', NULL, 2, 't')`,
+          ),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`INSERT INTO work_task_action_review_decisions VALUES ('review', 'a', 1, 1, 'fingerprint', 1, 'approve', '', 'auth-session', NULL, 2, 't')`,
+          ),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`INSERT INTO work_task_action_review_releases VALUES ('review', 'a', 1, 1, 'fingerprint', 1, 'continuation', 't')`,
+          ),
+        ),
+      );
+      yield* sql`INSERT INTO work_task_action_review_decisions VALUES ('review', 'a', 1, 1, 'fingerprint', 1, 'approve', 'human', 'auth-session', NULL, 2, 't')`;
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`INSERT INTO work_task_action_review_decisions VALUES ('review', 'a', 1, 1, 'fingerprint', 1, 'reject', 'human', 'auth-session', NULL, 3, 't')`,
+          ),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`INSERT OR REPLACE INTO work_task_action_review_decisions SELECT * FROM work_task_action_review_decisions`,
+          ),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(sql`UPDATE work_task_action_review_decisions SET decision = 'reject'`),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`INSERT INTO work_task_action_review_releases VALUES ('review', 'a', 1, 1, 'fingerprint', 2, 'continuation', 't')`,
+          ),
+        ),
+      );
+      yield* sql`INSERT INTO work_task_action_review_releases VALUES ('review', 'a', 1, 1, 'fingerprint', 1, 'continuation', 't')`;
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`INSERT INTO work_task_action_review_releases VALUES ('review', 'a', 1, 1, 'fingerprint', 1, 'another', 't')`,
+          ),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`INSERT OR REPLACE INTO work_task_action_review_releases SELECT * FROM work_task_action_review_releases`,
+          ),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(yield* Effect.exit(sql`DELETE FROM work_task_action_review_releases`)),
+      );
+      assert.deepStrictEqual(yield* sql`SELECT preview_json FROM work_task_action_reviews`, [
+        {
+          preview_json: '{"content":"full payload","artifacts":[{"uri":"artifact","hash":"hash"}]}',
+        },
+      ]);
     }).pipe(Effect.provide(db)),
 );
