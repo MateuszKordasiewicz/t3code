@@ -575,3 +575,136 @@ describe("task configuration and lifecycle", () => {
     expect(() => detail({ ...snapshot, completionPolicyRevision: undefined })).toThrow();
   });
 });
+
+const decodeRegisterWaitResult = Schema.decodeUnknownSync(task.WorkTaskRegisterWaitResult);
+const decodeClearWaitResult = Schema.decodeUnknownSync(task.WorkTaskClearWaitResult);
+const decodeReportBlockerResult = Schema.decodeUnknownSync(task.WorkTaskReportBlockerResult);
+
+describe("task waits, results and completion claims", () => {
+  const command = { taskId: "task", commandId: "command" };
+  const guards = { expectedDefinitionRevision: 2, expectedManagerGeneration: 3 };
+  const run = { type: "run", threadId: "source-thread", runId: "source-run" };
+  const artifact = { type: "artifact", uri: "artifact", hash: "sha256:abc" };
+  const source = { type: "source_revision", repository: "repo", revision: "revision" };
+  const committed = {
+    taskId: "task",
+    definitionRevision: 2,
+    lifecycleRevision: 1,
+    actionPolicyRevision: 1,
+    sequence: 4,
+  };
+
+  it("requires concrete wait targets and manager guards without taking acting identity", () => {
+    const register = Schema.decodeUnknownSync(task.WorkTaskRegisterWaitInput);
+    const clear = Schema.decodeUnknownSync(task.WorkTaskClearWaitInput);
+    const input = { ...command, ...guards, waitId: "wait", target: run };
+    expect(register({ ...input, caller: { type: "manager" } })).toEqual(input);
+    expect(register({ ...input, target: { type: "source", sourceId: "event" } })).toBeDefined();
+    expect(register({ ...input, target: { type: "result", result: source } })).toBeDefined();
+    for (const target of [
+      { type: "run", threadId: "thread" },
+      { type: "source" },
+      { type: "other" },
+    ])
+      expect(() => register({ ...input, target })).toThrow();
+    for (const key of ["expectedDefinitionRevision", "expectedManagerGeneration", "waitId"]) {
+      expect(() => register({ ...input, [key]: undefined })).toThrow();
+      expect(() => clear({ ...command, ...guards, waitId: "wait", [key]: undefined })).toThrow();
+    }
+    expect(decodeRegisterWaitResult({ ...committed, waitId: "wait" })).toBeDefined();
+    expect(decodeClearWaitResult({ ...committed, waitId: "wait" })).toBeDefined();
+  });
+
+  it("bounds result batches and requires source and server-attributed caller", () => {
+    const submit = Schema.decodeUnknownSync(task.WorkTaskSubmitResultsInput);
+    const input = {
+      ...command,
+      expectedDefinitionRevision: 2,
+      sourceId: "event",
+      summary: "Results",
+      results: [run, artifact, source],
+    };
+    expect(submit({ ...input, caller: { type: "manager" } })).toEqual(input);
+    expect(
+      submit({ ...input, results: Array.from({ length: 32 }, () => ({ ...run })) }).results,
+    ).toHaveLength(32);
+    for (const results of [
+      [],
+      Array.from({ length: 33 }, () => ({ ...run })),
+      [{ type: "run", runId: "run" }],
+    ])
+      expect(() => submit({ ...input, results })).toThrow();
+    for (const key of ["sourceId", "expectedDefinitionRevision", "summary"])
+      expect(() => submit({ ...input, [key]: undefined })).toThrow();
+    const result = Schema.decodeUnknownSync(task.WorkTaskSubmitResultsResult);
+    const attribution = {
+      type: "agent",
+      threadId: "actor-thread",
+      providerSessionId: "session",
+      runId: "actor-run",
+    };
+    expect(result({ ...committed, sourceId: "event", attribution }).attribution).toEqual(
+      attribution,
+    );
+    expect(() => result({ ...committed, sourceId: "event" })).toThrow();
+    expect(() =>
+      result({
+        ...committed,
+        sourceId: "event",
+        attribution: { ...attribution, runId: undefined },
+      }),
+    ).toThrow();
+  });
+
+  it("binds blockers and completion claims to current revision and generation and immutable evidence", () => {
+    const blocker = Schema.decodeUnknownSync(task.WorkTaskReportBlockerInput);
+    const claim = Schema.decodeUnknownSync(task.WorkTaskSubmitCompletionClaimInput);
+    const input = {
+      ...command,
+      ...guards,
+      expectedCompletionPolicyRevision: 4,
+      summary: "Ready",
+      evidence: [run, artifact, source],
+    };
+    expect(
+      blocker({ ...command, ...guards, reason: "Waiting for access", caller: "manager" }),
+    ).toEqual({ ...command, ...guards, reason: "Waiting for access" });
+    expect(claim({ ...input, caller: "manager", status: "done" })).toEqual(input);
+    for (const key of [
+      "expectedDefinitionRevision",
+      "expectedManagerGeneration",
+      "expectedCompletionPolicyRevision",
+      "summary",
+      "evidence",
+    ])
+      expect(() => claim({ ...input, [key]: undefined })).toThrow();
+    for (const evidence of [
+      [],
+      Array.from({ length: 33 }, () => ({ ...run })),
+      [{ type: "artifact", uri: "path" }],
+    ])
+      expect(() => claim({ ...input, evidence })).toThrow();
+    expect(
+      claim({ ...input, evidence: Array.from({ length: 32 }, () => ({ ...artifact })) }).evidence,
+    ).toHaveLength(32);
+    expect(() => blocker({ ...command, ...guards, reason: " " })).toThrow();
+    expect(decodeReportBlockerResult(committed)).toEqual(committed);
+    const result = Schema.decodeUnknownSync(task.WorkTaskSubmitCompletionClaimResult);
+    const receipt = {
+      ...committed,
+      managerGeneration: 3,
+      completionPolicyRevision: 4,
+      claimId: "claim",
+      evidenceId: "evidence",
+    };
+    expect(result(receipt)).toEqual(receipt);
+    for (const key of [
+      "definitionRevision",
+      "managerGeneration",
+      "completionPolicyRevision",
+      "claimId",
+      "evidenceId",
+    ])
+      expect(() => result({ ...receipt, [key]: undefined })).toThrow();
+  });
+});

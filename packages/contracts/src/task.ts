@@ -452,3 +452,78 @@ export const WorkTaskSubscriptionEvent = Schema.Union([
   }),
 ]);
 export type WorkTaskSubscriptionEvent = typeof WorkTaskSubscriptionEvent.Type;
+
+const workTaskReferenceBatch = Schema.Array(WorkTaskResultReference).check(
+  Schema.isMinLength(1),
+  Schema.isMaxLength(32),
+);
+const managerGuards = {
+  expectedDefinitionRevision: PositiveInt,
+  expectedManagerGeneration: PositiveInt,
+};
+
+export const WorkTaskWaitTarget = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("run"), threadId: ThreadId, runId: RunId }),
+  Schema.Struct({ type: Schema.Literal("source"), sourceId: shortText }),
+  Schema.Struct({ type: Schema.Literal("result"), result: WorkTaskResultReference }),
+]);
+export type WorkTaskWaitTarget = typeof WorkTaskWaitTarget.Type;
+export const WorkTaskRegisterWaitInput = Schema.Struct({
+  ...taskCommand,
+  ...managerGuards,
+  waitId: shortText,
+  target: WorkTaskWaitTarget,
+});
+export type WorkTaskRegisterWaitInput = typeof WorkTaskRegisterWaitInput.Type;
+export const WorkTaskRegisterWaitResult = Schema.Struct({ ...committed, waitId: shortText });
+export type WorkTaskRegisterWaitResult = typeof WorkTaskRegisterWaitResult.Type;
+export const WorkTaskClearWaitInput = Schema.Struct({
+  ...taskCommand,
+  ...managerGuards,
+  waitId: shortText,
+});
+export type WorkTaskClearWaitInput = typeof WorkTaskClearWaitInput.Type;
+export const WorkTaskClearWaitResult = Schema.Struct({ ...committed, waitId: shortText });
+export type WorkTaskClearWaitResult = typeof WorkTaskClearWaitResult.Type;
+
+export const WorkTaskSubmitResultsInput = Schema.Struct({
+  ...taskCommand,
+  expectedDefinitionRevision: PositiveInt,
+  sourceId: shortText,
+  summary: shortText,
+  results: workTaskReferenceBatch,
+});
+export type WorkTaskSubmitResultsInput = typeof WorkTaskSubmitResultsInput.Type;
+export const WorkTaskSubmitResultsResult = Schema.Struct({
+  ...committed,
+  sourceId: shortText,
+  attribution: WorkTaskCallerContext,
+});
+export type WorkTaskSubmitResultsResult = typeof WorkTaskSubmitResultsResult.Type;
+
+export const WorkTaskReportBlockerInput = Schema.Struct({
+  ...taskCommand,
+  ...managerGuards,
+  reason: shortText,
+});
+export type WorkTaskReportBlockerInput = typeof WorkTaskReportBlockerInput.Type;
+export const WorkTaskReportBlockerResult = Schema.Struct(committed);
+export type WorkTaskReportBlockerResult = typeof WorkTaskReportBlockerResult.Type;
+
+export const WorkTaskSubmitCompletionClaimInput = Schema.Struct({
+  ...taskCommand,
+  ...managerGuards,
+  expectedCompletionPolicyRevision: PositiveInt,
+  summary: shortText,
+  evidence: workTaskReferenceBatch,
+});
+export type WorkTaskSubmitCompletionClaimInput = typeof WorkTaskSubmitCompletionClaimInput.Type;
+// Claim and evidence identities are assigned by the service for subsequent guarded review.
+export const WorkTaskSubmitCompletionClaimResult = Schema.Struct({
+  ...committed,
+  managerGeneration: PositiveInt,
+  completionPolicyRevision: PositiveInt,
+  claimId: shortText,
+  evidenceId: shortText,
+});
+export type WorkTaskSubmitCompletionClaimResult = typeof WorkTaskSubmitCompletionClaimResult.Type;
