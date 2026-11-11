@@ -41,6 +41,43 @@ const encodeServerSettings = Schema.encodeSync(ServerSettings);
 const encodeServerSettingsPatch = Schema.encodeSync(ServerSettingsPatch);
 const decodeClaudeSettings = Schema.decodeUnknownSync(ClaudeSettings);
 
+describe("task environment settings", () => {
+  it("defaults to manual, disabled and unconfigured and validates task configuration", () => {
+    const defaults = decodeServerSettings({});
+    expect(defaults).toMatchObject({
+      workTaskFollowUpAllowance: null,
+      workTaskCompletionPolicy: { type: "manual" },
+      workTaskExecutionEnabled: false,
+    });
+    const validator = {
+      projectId: "project",
+      modelSelection: { instanceId: "codex", model: "model" },
+      workspace: { type: "root" },
+    };
+    const settings = {
+      workTaskFollowUpAllowance: 2,
+      workTaskCompletionPolicy: { type: "automatic", validator },
+      workTaskExecutionEnabled: true,
+    };
+    expect(decodeServerSettings(settings)).toMatchObject(settings);
+    expect(decodeServerSettingsPatch(settings)).toEqual(settings);
+    expect(decodeServerSettingsPatch({ workTaskFollowUpAllowance: null })).toEqual({
+      workTaskFollowUpAllowance: null,
+    });
+    for (const value of [0, -1, 1.5, Infinity, NaN]) {
+      expect(() => decodeServerSettings({ workTaskFollowUpAllowance: value })).toThrow();
+      expect(() => decodeServerSettingsPatch({ workTaskFollowUpAllowance: value })).toThrow();
+    }
+    for (const value of [
+      { type: "automatic" },
+      { type: "inherit" },
+      { type: "automatic", validator: { ...validator, workspace: undefined } },
+    ]) {
+      expect(() => decodeServerSettingsPatch({ workTaskCompletionPolicy: value })).toThrow();
+    }
+  });
+});
+
 describe("storage cleanup settings", () => {
   it("keeps cleanup disabled for existing installations", () => {
     expect(decodeServerSettings({}).worktreeCleanup).toBeNull();
