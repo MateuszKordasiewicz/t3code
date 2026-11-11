@@ -1,6 +1,6 @@
 import * as Schema from "effect/Schema";
 
-import { PositiveInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { CommandId, NonNegativeInt, PositiveInt, ProjectId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 
 export const WorkTaskId = TrimmedNonEmptyString.pipe(Schema.brand("WorkTaskId"));
 export type WorkTaskId = typeof WorkTaskId.Type;
@@ -94,3 +94,67 @@ export class WorkTaskError extends Schema.TaggedError<WorkTaskError>()("WorkTask
   message: Schema.String,
   taskId: Schema.optional(WorkTaskId),
 }) {}
+
+
+// Caller context is supplied by the server, never by a mutation input.
+export const WorkTaskActor = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("user") }),
+  Schema.Struct({ type: Schema.Literal("agent") }),
+  Schema.Struct({ type: Schema.Literal("manager"), threadId: ThreadId, generation: PositiveInt }),
+  Schema.Struct({ type: Schema.Literal("server") }),
+]);
+export type WorkTaskActor = typeof WorkTaskActor.Type;
+
+const pageSize = PositiveInt.check(Schema.isLessThanOrEqualTo(100));
+const pageToken = TrimmedNonEmptyString.check(Schema.isMaxLength(2_048));
+const pageFields = { limit: Schema.optional(pageSize), pageToken: Schema.optional(pageToken) };
+const revisionFields = { taskId: WorkTaskId, expectedRevision: PositiveInt, commandId: CommandId };
+
+export const WorkTaskSummary = Schema.Struct({
+  id: WorkTaskId,
+  title,
+  projectId: Schema.NullOr(ProjectId),
+  mode: Schema.Literals(["not_started", "active", "paused", "closed"]),
+  revision: PositiveInt,
+});
+export type WorkTaskSummary = typeof WorkTaskSummary.Type;
+
+export const WorkTaskListInput = Schema.Struct({
+  ...pageFields,
+  projectId: Schema.optional(ProjectId),
+});
+export type WorkTaskListInput = typeof WorkTaskListInput.Type;
+export const WorkTaskListResult = Schema.Struct({
+  tasks: Schema.Array(WorkTaskSummary).check(Schema.isMaxLength(100)),
+  nextPageToken: Schema.NullOr(pageToken),
+  sequence: NonNegativeInt,
+});
+export type WorkTaskListResult = typeof WorkTaskListResult.Type;
+export const WorkTaskGetInput = Schema.Struct({ taskId: WorkTaskId });
+export type WorkTaskGetInput = typeof WorkTaskGetInput.Type;
+export const WorkTaskGetResult = Schema.Struct({
+  task: WorkTaskSummary,
+  definition: WorkTaskDraftDefinition,
+  managerThreadId: Schema.NullOr(ThreadId),
+  managerGeneration: NonNegativeInt,
+  sequence: NonNegativeInt,
+});
+export type WorkTaskGetResult = typeof WorkTaskGetResult.Type;
+
+export const WorkTaskMutationInput = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("create"), commandId: CommandId, definition: WorkTaskDraftDefinition, projectId: Schema.optional(ProjectId) }),
+  Schema.Struct({ type: Schema.Literal("update-definition"), ...revisionFields, definition: WorkTaskDraftDefinition }),
+  Schema.Struct({ type: Schema.Literals(["link-thread", "unlink-thread"]), ...revisionFields, threadId: ThreadId }),
+  Schema.Struct({ type: Schema.Literals(["start", "pause", "resume", "replace-manager", "reopen", "archive", "unarchive", "complete-manually"]), ...revisionFields }),
+]);
+export type WorkTaskMutationInput = typeof WorkTaskMutationInput.Type;
+export const WorkTaskMutationResult = Schema.Struct({ taskId: WorkTaskId, revision: PositiveInt, sequence: NonNegativeInt });
+export type WorkTaskMutationResult = typeof WorkTaskMutationResult.Type;
+
+export const WorkTaskSubscriptionInput = Schema.Struct({ afterSequence: NonNegativeInt });
+export type WorkTaskSubscriptionInput = typeof WorkTaskSubscriptionInput.Type;
+export const WorkTaskSubscriptionEvent = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("invalidated"), taskId: WorkTaskId, revision: PositiveInt, sequence: NonNegativeInt, change: TrimmedNonEmptyString }),
+  Schema.Struct({ type: Schema.Literal("resync-required"), sequence: NonNegativeInt, reason: Schema.Literals(["cursor-expired", "buffer-overflow", "replay-unavailable"]) }),
+]);
+export type WorkTaskSubscriptionEvent = typeof WorkTaskSubscriptionEvent.Type;

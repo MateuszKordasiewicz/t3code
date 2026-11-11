@@ -1,11 +1,17 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
+import { ServerConfig } from "./server.ts";
 
 import {
   WorkTaskAcceptedDefinition,
   WorkTaskActionPolicy,
   WorkTaskDraftDefinition,
   WorkTaskError,
+  WorkTaskListInput,
+  WorkTaskListResult,
+  WorkTaskMutationInput,
+  WorkTaskMutationResult,
+  WorkTaskSubscriptionEvent,
 } from "./task.ts";
 
 const criterion = { id: "criterion-1", condition: "Works", verification: "Run tests" };
@@ -103,5 +109,35 @@ describe("work task definitions", () => {
       }).code,
     ).toBe("revision_conflict");
     expect(() => decode({ _tag: "WorkTaskError", code: "other", message: "bad" })).toThrow();
+  });
+});
+
+
+describe("work task API", () => {
+  it("leaves work tasks unavailable when the capability is absent", () => {
+    const decode = Schema.decodeUnknownSync(Schema.Struct({ workTasks: ServerConfig.fields.workTasks }));
+    expect(decode({}).workTasks).toBeUndefined();
+    expect(decode({ workTasks: true }).workTasks).toBe(true);
+  });
+  it("bounds pages and carries a snapshot sequence", () => {
+    const input = Schema.decodeUnknownSync(WorkTaskListInput);
+    expect(input({ limit: 100 })).toEqual({ limit: 100 });
+    for (const limit of [0, 101]) expect(() => input({ limit })).toThrow();
+    const result = Schema.decodeUnknownSync(WorkTaskListResult);
+    expect(result({ tasks: [], nextPageToken: null, sequence: 0 }).sequence).toBe(0);
+    expect(() => result({ tasks: Array(101).fill({ id: "t", title: "T", projectId: null, mode: "active", revision: 1 }), nextPageToken: null, sequence: 0 })).toThrow();
+  });
+
+  it("keeps caller identity out of mutation payloads and requires revisions", () => {
+    const decode = Schema.decodeUnknownSync(WorkTaskMutationInput);
+    expect(decode({ type: "pause", taskId: "t", expectedRevision: 1, commandId: "c", actor: { type: "user" } })).toEqual({ type: "pause", taskId: "t", expectedRevision: 1, commandId: "c" });
+    expect(() => decode({ type: "pause", taskId: "t", commandId: "c" })).toThrow();
+    expect(Schema.decodeUnknownSync(WorkTaskMutationResult)({ taskId: "t", revision: 2, sequence: 3 }).sequence).toBe(3);
+  });
+
+  it("distinguishes invalidation from an explicit resync", () => {
+    const decode = Schema.decodeUnknownSync(WorkTaskSubscriptionEvent);
+    expect(decode({ type: "resync-required", sequence: 4, reason: "buffer-overflow" }).type).toBe("resync-required");
+    expect(() => decode({ type: "resync-required", sequence: 4, reason: "partial" })).toThrow();
   });
 });
