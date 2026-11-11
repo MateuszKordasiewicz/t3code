@@ -3,6 +3,9 @@ import * as Schema from "effect/Schema";
 import {
   AuthSessionId,
   CommandId,
+  EventId,
+  IsoDateTime,
+  MessageId,
   NonNegativeInt,
   PositiveInt,
   ProjectId,
@@ -657,3 +660,163 @@ export const WorkTaskRespondActionReviewResult = Schema.Struct({
   review: WorkTaskActionReview,
 });
 export type WorkTaskRespondActionReviewResult = typeof WorkTaskRespondActionReviewResult.Type;
+
+// Only dedicated manager runs carry this binding; contributor links do not imply ownership.
+export const WorkTaskManagerRunBinding = Schema.Struct({
+  taskId: WorkTaskId,
+  managerGeneration: PositiveInt,
+  definitionRevision: PositiveInt,
+  lifecycleRevision: PositiveInt,
+  completionPolicyRevision: PositiveInt,
+  actionPolicyRevision: PositiveInt,
+});
+export type WorkTaskManagerRunBinding = typeof WorkTaskManagerRunBinding.Type;
+
+export const WorkTaskActionPayloadIdentity = Schema.Struct({
+  action: exactScope.check(Schema.isMaxLength(120)),
+  target: exactScope,
+  fingerprint: actionFingerprint,
+});
+export type WorkTaskActionPayloadIdentity = typeof WorkTaskActionPayloadIdentity.Type;
+
+const eventRevisions = {
+  definitionRevision: PositiveInt,
+  lifecycleRevision: PositiveInt,
+  completionPolicyRevision: PositiveInt,
+  actionPolicyRevision: PositiveInt,
+};
+const eventBase = {
+  id: EventId,
+  taskId: WorkTaskId,
+  occurredAt: IsoDateTime,
+  attribution: WorkTaskCallerContext,
+  ...eventRevisions,
+};
+const managerIdentity = { managerThreadId: ThreadId, managerGeneration: PositiveInt };
+const completionIdentity = {
+  ...managerIdentity,
+  claimId: shortText,
+  evidenceId: shortText,
+  observedWorkSequence: NonNegativeInt,
+};
+
+// Staged independently of the application event and persistence unions until atomic registration.
+export const WorkTaskEvent = Schema.Union([
+  Schema.Struct({
+    ...eventBase,
+    type: Schema.Literal("task.created"),
+    projectId: Schema.optional(ProjectId),
+    definition: WorkTaskDraftDefinition,
+  }),
+  Schema.Struct({
+    ...eventBase,
+    type: Schema.Literal("task.definition-updated"),
+    definition: WorkTaskDraftDefinition,
+  }),
+  Schema.Struct({
+    ...eventBase,
+    type: Schema.Literals(["task.thread-linked", "task.thread-unlinked"]),
+    threadId: ThreadId,
+  }),
+  Schema.Struct({
+    ...eventBase,
+    type: Schema.Literal("task.configuration-updated"),
+    allowanceOverride: Schema.NullOr(PositiveInt),
+    completionPolicy: WorkTaskCompletionPolicyOverride,
+  }),
+  Schema.Struct({
+    ...eventBase,
+    type: Schema.Literal("task.execution-updated"),
+    desiredMode: Schema.Literals(["not_started", "active", "paused", "closed"]),
+    previousManagerGeneration: Schema.NullOr(PositiveInt),
+    manager: Schema.NullOr(Schema.Struct(managerIdentity)),
+    reason: shortText,
+    runId: Schema.optional(RunId),
+    messageId: Schema.optional(MessageId),
+    effectId: Schema.optional(shortText),
+  }),
+  Schema.Struct({
+    ...eventBase,
+    type: Schema.Literal("task.wait-updated"),
+    ...managerIdentity,
+    waitId: shortText,
+    target: WorkTaskWaitTarget,
+    state: Schema.Literals(["registered", "cleared"]),
+  }),
+  Schema.Struct({
+    ...eventBase,
+    type: Schema.Literal("task.result-recorded"),
+    sourceId: shortText,
+    summary: shortText,
+    results: workTaskReferenceBatch,
+  }),
+  Schema.Struct({
+    ...eventBase,
+    type: Schema.Literal("task.continuation-accepted"),
+    ...managerIdentity,
+    sourceIds: Schema.Array(shortText).check(Schema.isMinLength(1), Schema.isMaxLength(32)),
+    runId: RunId,
+    messageId: MessageId,
+    effectId: shortText,
+    dirtyGeneration: PositiveInt,
+  }),
+  Schema.Struct({
+    ...eventBase,
+    type: Schema.Literal("task.completion-submitted"),
+    ...completionIdentity,
+    summary: shortText,
+    evidence: workTaskReferenceBatch,
+  }),
+  Schema.Struct({
+    ...eventBase,
+    type: Schema.Literal("task.validation-recorded"),
+    ...completionIdentity,
+    attemptId: shortText,
+    validator: WorkTaskLaunchSelection,
+    outcome: Schema.Literals(["pass", "fail", "inconclusive", "error"]),
+    findings: Schema.Array(shortText).check(Schema.isMaxLength(64)),
+  }),
+  Schema.Struct({ ...eventBase, type: Schema.Literal("task.completed"), ...completionIdentity }),
+  Schema.Struct({ ...eventBase, type: Schema.Literal("task.reopened") }),
+  Schema.Struct({ ...eventBase, type: Schema.Literal("task.archived"), archived: Schema.Boolean }),
+  Schema.Struct({
+    ...eventBase,
+    type: Schema.Literal("task.action-review-requested"),
+    attribution: Schema.Struct({ type: Schema.Literal("server") }),
+    review: WorkTaskActionReview.mapFields((fields) => ({
+      ...fields,
+      state: Schema.Struct({ type: Schema.Literal("pending") }),
+    })),
+  }).check(
+    Schema.makeFilter(
+      (event) =>
+        event.taskId === event.review.taskId &&
+        event.definitionRevision === event.review.definitionRevision &&
+        event.actionPolicyRevision === event.review.actionPolicyRevision,
+    ),
+  ),
+  Schema.Struct({
+    ...eventBase,
+    type: Schema.Literal("task.action-review-result-recorded"),
+    attribution: Schema.Struct({ type: Schema.Literal("server") }),
+    reviewId,
+    reviewRevision: PositiveInt,
+    ...managerIdentity,
+    runId: RunId,
+    payloadIdentity: WorkTaskActionPayloadIdentity,
+    decision: WorkTaskActionReviewDecision,
+    human: Schema.Struct({ subject: shortText, sessionId: AuthSessionId }),
+    feedback: Schema.optional(shortText),
+  }),
+]);
+export type WorkTaskEvent = typeof WorkTaskEvent.Type;
+
+export const WorkTaskReceipt = Schema.Struct({
+  commandId: CommandId,
+  taskId: WorkTaskId,
+  commandType: shortText,
+  sequence: NonNegativeInt,
+  ...eventRevisions,
+  managerGeneration: Schema.NullOr(PositiveInt),
+});
+export type WorkTaskReceipt = typeof WorkTaskReceipt.Type;

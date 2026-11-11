@@ -56,6 +56,7 @@ import {
   OrchestrationGetTurnDiffResult,
 } from "./checkpointDiff.ts";
 import { ModelSelection } from "./modelSelection.ts";
+import { WorkTaskManagerRunBinding } from "./task.ts";
 import {
   ThreadLinkedPullRequest,
   ThreadPullRequestLink,
@@ -684,6 +685,7 @@ export const ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE = "workspace_pr
 export const OrchestrationV2Run = Schema.Struct({
   id: RunId,
   threadId: ThreadId,
+  taskManagerBinding: Schema.optional(WorkTaskManagerRunBinding),
   ordinal: PositiveInt,
   providerInstanceId: ProviderInstanceId,
   modelSelection: ModelSelection,

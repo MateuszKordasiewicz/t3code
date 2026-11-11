@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 import { ServerConfig } from "./server.ts";
 import * as task from "./task.ts";
+import { OrchestrationV2Run, OrchestrationV2RunJson } from "./orchestrationV2.ts";
 
 import {
   WorkTaskAcceptedDefinition,
@@ -37,6 +38,110 @@ const decodeThreadLink = Schema.decodeUnknownSync(task.WorkTaskThreadLink);
 const decodeProposalResult = Schema.decodeUnknownSync(WorkTaskProposeDefinitionResult);
 const decodeAdoptDefinition = Schema.decodeUnknownSync(WorkTaskAdoptDefinitionInput);
 const decodeResume = Schema.decodeUnknownSync(task.WorkTaskResumeInput);
+const decodeManagerRunBinding = Schema.decodeUnknownSync(task.WorkTaskManagerRunBinding);
+const decodeReceipt = Schema.decodeUnknownSync(task.WorkTaskReceipt);
+
+describe("staged task events", () => {
+  const revisions = {
+    definitionRevision: 1,
+    lifecycleRevision: 2,
+    completionPolicyRevision: 3,
+    actionPolicyRevision: 4,
+  };
+  const base = {
+    id: "event",
+    taskId: "task",
+    occurredAt: "2026-11-11T00:00:00.000Z",
+    attribution: { type: "server" },
+    ...revisions,
+  };
+  const identity = { action: "git.push", target: "origin/main", fingerprint: "sha256:123" };
+  const decode = Schema.decodeUnknownSync(task.WorkTaskEvent);
+
+  it("retains independent revisions and a manager-only run binding", () => {
+    const binding = { taskId: "task", managerGeneration: 5, ...revisions };
+    expect(decodeManagerRunBinding(binding)).toEqual(binding);
+    expect(OrchestrationV2Run.fields.taskManagerBinding).toBeDefined();
+    expect(OrchestrationV2RunJson.fields.taskManagerBinding).toBeDefined();
+    expect(() =>
+      decodeManagerRunBinding({
+        ...binding,
+        managerGeneration: 0,
+      }),
+    ).toThrow();
+    const receipt = {
+      commandId: "command",
+      taskId: "task",
+      commandType: "task.start",
+      sequence: 5,
+      managerGeneration: 5,
+      ...revisions,
+    };
+    expect(decodeReceipt(receipt)).toEqual(receipt);
+    expect(() => decodeReceipt({ ...receipt, completionPolicyRevision: 0 })).toThrow();
+  });
+
+  it("keeps server-recorded human action decisions distinct from validation", () => {
+    const request = {
+      ...base,
+      type: "task.action-review-requested",
+      review: {
+        taskId: "task",
+        reviewId: "review",
+        revision: 1,
+        managerThreadId: "manager",
+        managerGeneration: 5,
+        providerSessionId: "session",
+        runId: "run",
+        ruleId: "rule",
+        definitionRevision: 1,
+        actionPolicyRevision: 4,
+        ...identity,
+        label: "Push",
+        preview: { content: "Push changes", artifacts: [] },
+        state: { type: "pending" },
+        createdSequence: 1,
+        createdAt: "2026-11-11T00:00:00Z",
+      },
+    };
+    expect(decode(request)).toBeDefined();
+    expect(() => decode({ ...request, taskId: "other" })).toThrow();
+    expect(() => decode({ ...request, actionPolicyRevision: 5 })).toThrow();
+    expect(() =>
+      decode({ ...request, review: { ...request.review, state: { type: "approved" } } }),
+    ).toThrow();
+    const result = {
+      ...base,
+      type: "task.action-review-result-recorded",
+      reviewId: "review",
+      reviewRevision: 1,
+      managerThreadId: "manager",
+      managerGeneration: 5,
+      runId: "run",
+      payloadIdentity: identity,
+      decision: "approve",
+      human: { subject: "human", sessionId: "session" },
+    };
+    expect(decode(result)).toBeDefined();
+    for (const invalid of [
+      {
+        ...result,
+        attribution: {
+          type: "agent",
+          threadId: "manager",
+          providerSessionId: "session",
+          runId: "run",
+        },
+      },
+      { ...result, human: undefined },
+      { ...result, payloadIdentity: { ...identity, fingerprint: "" } },
+      { ...result, actionPolicyRevision: 0 },
+      { ...result, decision: "pass" },
+    ])
+      expect(() => decode(invalid)).toThrow();
+    expect(() => decode({ ...result, type: "task.validation-recorded" })).toThrow();
+  });
+});
 
 describe("work task definitions", () => {
   it("allows incomplete drafts but requires executable accepted definitions", () => {
