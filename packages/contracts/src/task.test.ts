@@ -1,11 +1,23 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
+import { ServerConfig } from "./server.ts";
 
 import {
   WorkTaskAcceptedDefinition,
   WorkTaskActionPolicy,
   WorkTaskDraftDefinition,
   WorkTaskError,
+  WorkTaskAdoptDefinitionInput,
+  WorkTaskAdoptDefinitionResult,
+  WorkTaskCallerContext,
+  WorkTaskCreateDraftInput,
+  WorkTaskCreateDraftResult,
+  WorkTaskLinkThreadInput,
+  WorkTaskLinkThreadResult,
+  WorkTaskProposeDefinitionInput,
+  WorkTaskProposeDefinitionResult,
+  WorkTaskUnlinkThreadInput,
+  WorkTaskUnlinkThreadResult,
 } from "./task.ts";
 
 const criterion = { id: "criterion-1", condition: "Works", verification: "Run tests" };
@@ -18,6 +30,8 @@ const definition = {
 };
 const decodeDraft = Schema.decodeUnknownSync(WorkTaskDraftDefinition);
 const decodeAccepted = Schema.decodeUnknownSync(WorkTaskAcceptedDefinition);
+const decodeCreateDraft = Schema.decodeUnknownSync(WorkTaskCreateDraftInput);
+const decodeProposalResult = Schema.decodeUnknownSync(WorkTaskProposeDefinitionResult);
 
 describe("work task definitions", () => {
   it("allows incomplete drafts but requires executable accepted definitions", () => {
@@ -102,6 +116,123 @@ describe("work task definitions", () => {
         taskId: "task-1",
       }).code,
     ).toBe("revision_conflict");
+    for (const code of ["feature_disabled", "unsupported", "unavailable"]) {
+      expect(
+        decode({ _tag: "WorkTaskError", code, message: "unavailable", snapshot: definition }),
+      ).not.toHaveProperty("snapshot");
+    }
     expect(() => decode({ _tag: "WorkTaskError", code: "other", message: "bad" })).toThrow();
+  });
+});
+
+describe("work task API", () => {
+  it("decodes absent, disabled and enabled capability", () => {
+    const decode = Schema.decodeUnknownSync(
+      Schema.Struct({ workTasks: ServerConfig.fields.workTasks }),
+    );
+    expect(decode({}).workTasks).toBeUndefined();
+    expect(decode({ workTasks: false }).workTasks).toBe(false);
+    expect(decode({ workTasks: true }).workTasks).toBe(true);
+  });
+
+  it("saves incomplete drafts and keeps server-derived identity out of inputs", () => {
+    const content = { ...definition, revision: undefined, title: "", objective: "", criteria: [] };
+    const payload = {
+      taskId: "t",
+      commandId: "c",
+      definition: content,
+      actor: { type: "user" },
+      caller: { type: "server" },
+    };
+    const decoded = decodeCreateDraft(payload);
+    expect(decoded).toEqual({
+      taskId: "t",
+      commandId: "c",
+      definition: { title: "", objective: "", criteria: [], actionPolicy: definition.actionPolicy },
+    });
+    const caller = Schema.decodeUnknownSync(WorkTaskCallerContext);
+    expect(caller({ type: "user", sessionId: "session", subject: "person" }).type).toBe("user");
+    expect(
+      caller({
+        type: "manager",
+        threadId: "thread",
+        providerSessionId: "session",
+        runId: "run",
+        generation: 1,
+      }).type,
+    ).toBe("manager");
+    expect(() => caller({ type: "manager", threadId: "thread", generation: 1 })).toThrow();
+  });
+
+  it("requires the appropriate revision domains for proposals, adoption and links", () => {
+    const content = {
+      title: "",
+      objective: "",
+      criteria: [],
+      actionPolicy: definition.actionPolicy,
+    };
+    const proposal = {
+      taskId: "t",
+      commandId: "c",
+      expectedDefinitionRevision: 1,
+      expectedActionPolicyRevision: 2,
+      definition: content,
+    };
+    const propose = Schema.decodeUnknownSync(WorkTaskProposeDefinitionInput);
+    const adopt = Schema.decodeUnknownSync(WorkTaskAdoptDefinitionInput);
+    expect(propose(proposal)).toEqual(proposal);
+    expect(() => adopt(proposal)).toThrow();
+    expect(adopt({ ...proposal, expectedLifecycleRevision: 3 }).expectedLifecycleRevision).toBe(3);
+    for (const key of [
+      "expectedDefinitionRevision",
+      "expectedActionPolicyRevision",
+      "expectedLifecycleRevision",
+    ] as const) {
+      expect(() =>
+        adopt({ ...proposal, expectedLifecycleRevision: 3, [key]: undefined }),
+      ).toThrow();
+    }
+    for (const key of ["expectedDefinitionRevision", "expectedActionPolicyRevision"] as const) {
+      expect(() => propose({ ...proposal, [key]: undefined })).toThrow();
+    }
+    for (const schema of [WorkTaskLinkThreadInput, WorkTaskUnlinkThreadInput]) {
+      const decode = Schema.decodeUnknownSync(schema);
+      expect(
+        decode({
+          taskId: "t",
+          commandId: "c",
+          threadId: "thread",
+          expectedLifecycleRevision: 1,
+          actor: { type: "user" },
+        }),
+      ).toEqual({ taskId: "t", commandId: "c", threadId: "thread", expectedLifecycleRevision: 1 });
+      expect(() => decode({ taskId: "t", commandId: "c", threadId: "thread" })).toThrow();
+    }
+  });
+
+  it("returns committed revision domains and sequence for each operation", () => {
+    const result = {
+      taskId: "t",
+      definitionRevision: 1,
+      lifecycleRevision: 2,
+      actionPolicyRevision: 3,
+      sequence: 4,
+    };
+    for (const schema of [
+      WorkTaskCreateDraftResult,
+      WorkTaskAdoptDefinitionResult,
+      WorkTaskLinkThreadResult,
+      WorkTaskUnlinkThreadResult,
+    ]) {
+      const decode = Schema.decodeUnknownSync(schema);
+      expect(decode(result)).toEqual(result);
+      expect(() => decode({ ...result, lifecycleRevision: undefined })).toThrow();
+    }
+    expect(
+      decodeProposalResult({
+        ...result,
+        proposal: { title: "", objective: "", criteria: [], actionPolicy: definition.actionPolicy },
+      }).sequence,
+    ).toBe(4);
   });
 });

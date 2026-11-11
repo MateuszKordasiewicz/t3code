@@ -1,6 +1,16 @@
 import * as Schema from "effect/Schema";
 
-import { PositiveInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import {
+  AuthSessionId,
+  CommandId,
+  NonNegativeInt,
+  PositiveInt,
+  ProjectId,
+  ProviderSessionId,
+  RunId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
 
 export const WorkTaskId = TrimmedNonEmptyString.pipe(Schema.brand("WorkTaskId"));
 export type WorkTaskId = typeof WorkTaskId.Type;
@@ -90,7 +100,103 @@ export const WorkTaskAcceptedDefinition = Schema.Struct({
 export type WorkTaskAcceptedDefinition = typeof WorkTaskAcceptedDefinition.Type;
 
 export class WorkTaskError extends Schema.TaggedError<WorkTaskError>()("WorkTaskError", {
-  code: Schema.Literals(["not_found", "invalid_definition", "revision_conflict", "invalid_state"]),
+  code: Schema.Literals([
+    "not_found",
+    "invalid_definition",
+    "revision_conflict",
+    "invalid_state",
+    "feature_disabled",
+    "unsupported",
+    "unavailable",
+  ]),
   message: Schema.String,
   taskId: Schema.optional(WorkTaskId),
 }) {}
+
+// This describes server-derived context; authorization is performed by the service.
+export const WorkTaskCallerContext = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("user"),
+    sessionId: AuthSessionId,
+    subject: TrimmedNonEmptyString,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("agent"),
+    threadId: ThreadId,
+    providerSessionId: ProviderSessionId,
+    runId: RunId,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("manager"),
+    threadId: ThreadId,
+    providerSessionId: ProviderSessionId,
+    runId: RunId,
+    generation: PositiveInt,
+  }),
+  Schema.Struct({ type: Schema.Literal("server") }),
+]);
+export type WorkTaskCallerContext = typeof WorkTaskCallerContext.Type;
+
+const { revision: _revision, ...definitionFields } = WorkTaskDraftDefinition.fields;
+const definitionContent = Schema.Struct(definitionFields);
+const definitionGuards = {
+  expectedDefinitionRevision: PositiveInt,
+  expectedActionPolicyRevision: PositiveInt,
+};
+const taskCommand = { taskId: WorkTaskId, commandId: CommandId };
+const committed = {
+  taskId: WorkTaskId,
+  definitionRevision: PositiveInt,
+  lifecycleRevision: PositiveInt,
+  actionPolicyRevision: PositiveInt,
+  sequence: NonNegativeInt,
+};
+
+export const WorkTaskCreateDraftInput = Schema.Struct({
+  ...taskCommand,
+  projectId: Schema.optional(ProjectId),
+  definition: definitionContent,
+});
+export type WorkTaskCreateDraftInput = typeof WorkTaskCreateDraftInput.Type;
+export const WorkTaskCreateDraftResult = Schema.Struct(committed);
+export type WorkTaskCreateDraftResult = typeof WorkTaskCreateDraftResult.Type;
+
+export const WorkTaskProposeDefinitionInput = Schema.Struct({
+  ...taskCommand,
+  ...definitionGuards,
+  definition: definitionContent,
+});
+export type WorkTaskProposeDefinitionInput = typeof WorkTaskProposeDefinitionInput.Type;
+export const WorkTaskProposeDefinitionResult = Schema.Struct({
+  ...committed,
+  proposal: definitionContent,
+});
+export type WorkTaskProposeDefinitionResult = typeof WorkTaskProposeDefinitionResult.Type;
+
+export const WorkTaskAdoptDefinitionInput = Schema.Struct({
+  ...taskCommand,
+  ...definitionGuards,
+  expectedLifecycleRevision: PositiveInt,
+  definition: definitionContent,
+});
+export type WorkTaskAdoptDefinitionInput = typeof WorkTaskAdoptDefinitionInput.Type;
+export const WorkTaskAdoptDefinitionResult = Schema.Struct(committed);
+export type WorkTaskAdoptDefinitionResult = typeof WorkTaskAdoptDefinitionResult.Type;
+
+export const WorkTaskLinkThreadInput = Schema.Struct({
+  ...taskCommand,
+  expectedLifecycleRevision: PositiveInt,
+  threadId: ThreadId,
+});
+export type WorkTaskLinkThreadInput = typeof WorkTaskLinkThreadInput.Type;
+export const WorkTaskLinkThreadResult = Schema.Struct(committed);
+export type WorkTaskLinkThreadResult = typeof WorkTaskLinkThreadResult.Type;
+
+export const WorkTaskUnlinkThreadInput = Schema.Struct({
+  ...taskCommand,
+  expectedLifecycleRevision: PositiveInt,
+  threadId: ThreadId,
+});
+export type WorkTaskUnlinkThreadInput = typeof WorkTaskUnlinkThreadInput.Type;
+export const WorkTaskUnlinkThreadResult = Schema.Struct(committed);
+export type WorkTaskUnlinkThreadResult = typeof WorkTaskUnlinkThreadResult.Type;
