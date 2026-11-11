@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 import { ServerConfig } from "./server.ts";
+import * as task from "./task.ts";
 
 import {
   WorkTaskAcceptedDefinition,
@@ -31,6 +32,8 @@ const definition = {
 const decodeDraft = Schema.decodeUnknownSync(WorkTaskDraftDefinition);
 const decodeAccepted = Schema.decodeUnknownSync(WorkTaskAcceptedDefinition);
 const decodeCreateDraft = Schema.decodeUnknownSync(WorkTaskCreateDraftInput);
+const decodeDetailInput = Schema.decodeUnknownSync(task.WorkTaskDetailInput);
+const decodeThreadLink = Schema.decodeUnknownSync(task.WorkTaskThreadLink);
 const decodeProposalResult = Schema.decodeUnknownSync(WorkTaskProposeDefinitionResult);
 
 describe("work task definitions", () => {
@@ -234,5 +237,164 @@ describe("work task API", () => {
         proposal: { title: "", objective: "", criteria: [], actionPolicy: definition.actionPolicy },
       }).sequence,
     ).toBe(4);
+  });
+});
+
+describe("bounded task reads", () => {
+  const summary = {
+    taskId: "task",
+    title: "Task",
+    definitionRevision: 1,
+    lifecycleRevision: 1,
+    desiredMode: "active",
+    execution: { state: "waiting" },
+    attention: { state: "none" },
+    completion: "incomplete",
+  };
+  const reference = { type: "run", threadId: "thread", runId: "run" };
+  const contribution = {
+    id: "result",
+    threadId: "thread",
+    sequence: 3,
+    summary: "Result",
+    results: [reference],
+  };
+
+  it("bounds page requests and requires snapshot sequences on all read results", () => {
+    for (const schema of [
+      task.WorkTaskListInput,
+      task.WorkTaskThreadLinksInput,
+      task.WorkTaskHistoryInput,
+      task.WorkTaskMembershipsInput,
+    ]) {
+      const decode = Schema.decodeUnknownSync(schema);
+      const input = {
+        taskId: "task",
+        threadId: "thread",
+        limit: 100,
+        pageToken: "x".repeat(2_000),
+      };
+      expect(decode(input)).toBeDefined();
+      expect(decode({ ...input, limit: undefined }).limit).toBeUndefined();
+      for (const invalid of [
+        { limit: 0 },
+        { limit: 101 },
+        { limit: 1.5 },
+        { pageToken: "" },
+        { pageToken: "x".repeat(2_001) },
+      ]) {
+        expect(() => decode({ ...input, ...invalid })).toThrow();
+      }
+    }
+    const pages = [
+      [task.WorkTaskListResult, "tasks", summary],
+      [task.WorkTaskThreadLinksResult, "links", { threadId: "thread", role: "contributor" }],
+      [task.WorkTaskHistoryResult, "contributions", contribution],
+      [task.WorkTaskMembershipsResult, "tasks", summary],
+    ] as const;
+    for (const [schema, key, item] of pages) {
+      const decode = Schema.decodeUnknownSync(schema);
+      expect(
+        decode({ sequence: 0, [key]: Array(100).fill(item), nextPageToken: "next" }),
+      ).toBeDefined();
+      expect(() => decode({ sequence: 0, [key]: Array(101).fill(item) })).toThrow();
+      expect(() => decode({ [key]: [] })).toThrow();
+      expect(() => decode({ sequence: -1, [key]: [] })).toThrow();
+      expect(() => decode({ sequence: 0, [key]: [], nextPageToken: "x".repeat(2_001) })).toThrow();
+    }
+    const detail = Schema.decodeUnknownSync(task.WorkTaskDetailResult);
+    expect(detail({ sequence: 1, summary, definition })).toBeDefined();
+    expect(() => detail({ summary, definition })).toThrow();
+    expect(() => decodeDetailInput({})).toThrow();
+  });
+
+  it("separates desired mode, execution, attention and completion and bounds text", () => {
+    const decode = Schema.decodeUnknownSync(task.WorkTaskSummary);
+    expect(
+      decode({
+        ...summary,
+        desiredMode: "paused",
+        execution: { state: "running" },
+        attention: { state: "needed", reason: "x".repeat(2_000) },
+        completion: "ready_for_review",
+      }),
+    ).toBeDefined();
+    for (const invalid of [
+      { desiredMode: "running" },
+      { execution: { state: "active" } },
+      { attention: { state: "needed" } },
+      { attention: { state: "needed", reason: "x".repeat(2_001) } },
+      { completion: "approved" },
+      { title: "x".repeat(241) },
+      { definitionRevision: 0 },
+    ])
+      expect(() => decode({ ...summary, ...invalid })).toThrow();
+    expect(() => decodeThreadLink({ threadId: "thread", role: "owner" })).toThrow();
+  });
+
+  it("bounds contribution batches and validates concrete reference variants", () => {
+    const decode = Schema.decodeUnknownSync(task.WorkTaskContribution);
+    const references = [
+      reference,
+      { type: "artifact", uri: "file", hash: "sha256:abc" },
+      { type: "source_revision", repository: "repo", revision: "abc" },
+    ];
+    expect(
+      decode({
+        ...contribution,
+        summary: "x".repeat(2_000),
+        results: Array.from({ length: 32 }, () => ({ ...reference })),
+      }),
+    ).toBeDefined();
+    expect(decode({ ...contribution, results: references })).toBeDefined();
+    for (const invalid of [
+      { results: Array.from({ length: 33 }, () => ({ ...reference })) },
+      { results: [{ type: "run", runId: "run" }] },
+      { results: [{ type: "artifact", uri: "file" }] },
+      { results: [{ type: "source_revision", repository: "repo" }] },
+      { results: [{ type: "unknown" }] },
+      { summary: "x".repeat(2_001) },
+      { id: "" },
+      { results: [{ type: "artifact", uri: "x".repeat(2_001), hash: "hash" }] },
+    ])
+      expect(() => decode({ ...contribution, ...invalid })).toThrow();
+  });
+
+  it("requires typed invalidations or an explicit resync reason and bounded cursor", () => {
+    const decode = Schema.decodeUnknownSync(task.WorkTaskSubscriptionEvent);
+    const invalidation = { taskId: "task", revision: 1, sequence: 1, change: "membership" };
+    for (const change of [
+      "definition",
+      "lifecycle",
+      "execution",
+      "membership",
+      "contribution",
+      "completion",
+      "deleted",
+    ]) {
+      expect(
+        decode({
+          type: "invalidation",
+          invalidation: { ...invalidation, change },
+          cursor: "x".repeat(2_000),
+        }),
+      ).toBeDefined();
+    }
+    for (const reason of ["cursor-expired", "buffer-overflow", "replay-unavailable"]) {
+      expect(decode({ type: "resync-required", reason, sequence: 1 })).toBeDefined();
+    }
+    for (const invalid of [
+      { type: "invalidation", invalidation, cursor: "" },
+      { type: "invalidation", invalidation, cursor: "x".repeat(2_001) },
+      { type: "invalidation", invalidation: { ...invalidation, change: "other" }, cursor: "x" },
+      { type: "invalidation", invalidation: { ...invalidation, revision: 0 }, cursor: "x" },
+      { type: "resync-required", reason: "other", sequence: 1 },
+      { type: "resync-required", reason: "cursor-expired" },
+      { type: "other" },
+    ])
+      expect(() => decode(invalid)).toThrow();
+    const subscribe = Schema.decodeUnknownSync(task.WorkTaskSubscribeInput);
+    expect(subscribe({})).toEqual({});
+    expect(() => subscribe({ cursor: "x".repeat(2_001) })).toThrow();
   });
 });
