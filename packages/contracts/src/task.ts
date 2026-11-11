@@ -52,14 +52,14 @@ const exactScope = TrimmedNonEmptyString.check(
 );
 export const WorkTaskActionRule = Schema.Struct({
   id: WorkTaskActionRuleId,
-  action: exactScope,
+  action: exactScope.check(Schema.isMaxLength(120)),
   target: exactScope,
   decision: Schema.Literals(["allow", "review-first", "deny"]),
 });
 export type WorkTaskActionRule = typeof WorkTaskActionRule.Type;
 export const WorkTaskActionPolicy = Schema.Struct({
   version: Schema.Literal(1),
-  rules: Schema.Array(WorkTaskActionRule).check(uniqueIds),
+  rules: Schema.Array(WorkTaskActionRule).check(Schema.isMaxLength(32), uniqueIds),
 }).annotate({ description: "Review-first requires a human decision and cannot grant authority." });
 export type WorkTaskActionPolicy = typeof WorkTaskActionPolicy.Type;
 

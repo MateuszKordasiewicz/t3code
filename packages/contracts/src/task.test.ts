@@ -71,7 +71,18 @@ describe("work task definitions", () => {
       decision: "review-first",
     };
     expect(decode({ version: 1, rules: [rule] })).toBeDefined();
+    const rules = Array.from({ length: 32 }, (_, i) => ({ ...rule, id: String(i) }));
+    expect(decode({ version: 1, rules })).toBeDefined();
+    expect(
+      decode({
+        version: 1,
+        rules: [{ ...rule, action: "x".repeat(120), target: "x".repeat(2_000) }],
+      }),
+    ).toBeDefined();
     for (const policy of [
+      { version: 1, rules: [...rules, { ...rule, id: "33" }] },
+      { version: 1, rules: [{ ...rule, action: "x".repeat(121) }] },
+      { version: 1, rules: [{ ...rule, target: "x".repeat(2_001) }] },
       { version: 2, rules: [] },
       { version: 1, rules: [rule, rule] },
       { version: 1, rules: [{ ...rule, target: "*" }] },
