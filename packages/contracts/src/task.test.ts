@@ -35,6 +35,7 @@ const decodeCreateDraft = Schema.decodeUnknownSync(WorkTaskCreateDraftInput);
 const decodeDetailInput = Schema.decodeUnknownSync(task.WorkTaskDetailInput);
 const decodeThreadLink = Schema.decodeUnknownSync(task.WorkTaskThreadLink);
 const decodeProposalResult = Schema.decodeUnknownSync(WorkTaskProposeDefinitionResult);
+const decodeAdoptDefinition = Schema.decodeUnknownSync(WorkTaskAdoptDefinitionInput);
 
 describe("work task definitions", () => {
   it("allows incomplete drafts but requires executable accepted definitions", () => {
@@ -303,8 +304,22 @@ describe("bounded task reads", () => {
       expect(() => decode({ sequence: 0, [key]: [], nextPageToken: "x".repeat(2_001) })).toThrow();
     }
     const detail = Schema.decodeUnknownSync(task.WorkTaskDetailResult);
-    expect(detail({ sequence: 1, summary, definition })).toBeDefined();
-    expect(() => detail({ summary, definition })).toThrow();
+    const decoded = detail({ sequence: 1, summary, definition, actionPolicyRevision: 2 });
+    expect(decoded.actionPolicyRevision).toBe(2);
+    expect(
+      decodeAdoptDefinition({
+        taskId: decoded.summary.taskId,
+        commandId: "adopt",
+        expectedDefinitionRevision: decoded.summary.definitionRevision,
+        expectedLifecycleRevision: decoded.summary.lifecycleRevision,
+        expectedActionPolicyRevision: decoded.actionPolicyRevision,
+        definition: decoded.definition,
+      }),
+    ).toBeDefined();
+    for (const actionPolicyRevision of [undefined, 0]) {
+      expect(() => detail({ sequence: 1, summary, definition, actionPolicyRevision })).toThrow();
+    }
+    expect(() => detail({ summary, definition, actionPolicyRevision: 2 })).toThrow();
     expect(() => decodeDetailInput({})).toThrow();
   });
 

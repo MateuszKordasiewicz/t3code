@@ -254,6 +254,7 @@ export const WorkTaskDetailResult = Schema.Struct({
   sequence: NonNegativeInt,
   summary: WorkTaskSummary,
   definition: WorkTaskDraftDefinition,
+  actionPolicyRevision: PositiveInt,
 });
 export type WorkTaskDetailResult = typeof WorkTaskDetailResult.Type;
 
