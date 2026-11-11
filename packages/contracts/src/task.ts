@@ -200,3 +200,141 @@ export const WorkTaskUnlinkThreadInput = Schema.Struct({
 export type WorkTaskUnlinkThreadInput = typeof WorkTaskUnlinkThreadInput.Type;
 export const WorkTaskUnlinkThreadResult = Schema.Struct(committed);
 export type WorkTaskUnlinkThreadResult = typeof WorkTaskUnlinkThreadResult.Type;
+
+// Tokens are opaque and must be bound to the environment and query by the service.
+export const WorkTaskPageToken = TrimmedNonEmptyString.check(Schema.isMaxLength(2_000)).pipe(
+  Schema.brand("WorkTaskPageToken"),
+);
+export type WorkTaskPageToken = typeof WorkTaskPageToken.Type;
+export const WorkTaskReplayCursor = TrimmedNonEmptyString.check(Schema.isMaxLength(2_000)).pipe(
+  Schema.brand("WorkTaskReplayCursor"),
+);
+export type WorkTaskReplayCursor = typeof WorkTaskReplayCursor.Type;
+const pageLimit = PositiveInt.check(Schema.isLessThanOrEqualTo(100));
+const pageInput = {
+  limit: Schema.optional(pageLimit),
+  pageToken: Schema.optional(WorkTaskPageToken),
+};
+const snapshot = { sequence: NonNegativeInt, nextPageToken: Schema.optional(WorkTaskPageToken) };
+const shortText = TrimmedNonEmptyString.check(Schema.isMaxLength(2_000));
+
+export const WorkTaskSummary = Schema.Struct({
+  taskId: WorkTaskId,
+  projectId: Schema.optional(ProjectId),
+  title,
+  definitionRevision: PositiveInt,
+  lifecycleRevision: PositiveInt,
+  desiredMode: Schema.Literals(["not_started", "active", "paused", "closed"]),
+  execution: Schema.Struct({
+    state: Schema.Literals(["not_started", "idle", "queued", "running", "waiting"]),
+    managerThreadId: Schema.optional(ThreadId),
+    managerGeneration: Schema.optional(PositiveInt),
+  }),
+  attention: Schema.Union([
+    Schema.Struct({ state: Schema.Literal("none") }),
+    Schema.Struct({ state: Schema.Literal("needed"), reason: shortText }),
+  ]),
+  completion: Schema.Literals(["incomplete", "ready_for_review", "validating", "done"]),
+});
+export type WorkTaskSummary = typeof WorkTaskSummary.Type;
+
+export const WorkTaskListInput = Schema.Struct({
+  ...pageInput,
+  projectId: Schema.optional(ProjectId),
+});
+export type WorkTaskListInput = typeof WorkTaskListInput.Type;
+export const WorkTaskListResult = Schema.Struct({
+  ...snapshot,
+  tasks: Schema.Array(WorkTaskSummary).check(Schema.isMaxLength(100)),
+});
+export type WorkTaskListResult = typeof WorkTaskListResult.Type;
+export const WorkTaskDetailInput = Schema.Struct({ taskId: WorkTaskId });
+export type WorkTaskDetailInput = typeof WorkTaskDetailInput.Type;
+export const WorkTaskDetailResult = Schema.Struct({
+  sequence: NonNegativeInt,
+  summary: WorkTaskSummary,
+  definition: WorkTaskDraftDefinition,
+  actionPolicyRevision: PositiveInt,
+});
+export type WorkTaskDetailResult = typeof WorkTaskDetailResult.Type;
+
+export const WorkTaskThreadLink = Schema.Struct({
+  threadId: ThreadId,
+  role: Schema.Literals(["manager", "contributor"]),
+});
+export type WorkTaskThreadLink = typeof WorkTaskThreadLink.Type;
+export const WorkTaskThreadLinksInput = Schema.Struct({ taskId: WorkTaskId, ...pageInput });
+export type WorkTaskThreadLinksInput = typeof WorkTaskThreadLinksInput.Type;
+export const WorkTaskThreadLinksResult = Schema.Struct({
+  ...snapshot,
+  links: Schema.Array(WorkTaskThreadLink).check(Schema.isMaxLength(100)),
+});
+export type WorkTaskThreadLinksResult = typeof WorkTaskThreadLinksResult.Type;
+
+export const WorkTaskResultReference = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("run"), threadId: ThreadId, runId: RunId }),
+  Schema.Struct({ type: Schema.Literal("artifact"), uri: shortText, hash: shortText }),
+  Schema.Struct({
+    type: Schema.Literal("source_revision"),
+    repository: shortText,
+    revision: shortText,
+  }),
+]);
+export type WorkTaskResultReference = typeof WorkTaskResultReference.Type;
+export const WorkTaskContribution = Schema.Struct({
+  id: shortText,
+  threadId: ThreadId,
+  sequence: NonNegativeInt,
+  summary: shortText,
+  results: Schema.Array(WorkTaskResultReference).check(Schema.isMaxLength(32)),
+});
+export type WorkTaskContribution = typeof WorkTaskContribution.Type;
+export const WorkTaskHistoryInput = Schema.Struct({ taskId: WorkTaskId, ...pageInput });
+export type WorkTaskHistoryInput = typeof WorkTaskHistoryInput.Type;
+export const WorkTaskHistoryResult = Schema.Struct({
+  ...snapshot,
+  contributions: Schema.Array(WorkTaskContribution).check(Schema.isMaxLength(100)),
+});
+export type WorkTaskHistoryResult = typeof WorkTaskHistoryResult.Type;
+
+// Callers must be authorized for task metadata before reverse memberships are returned.
+export const WorkTaskMembershipsInput = Schema.Struct({ threadId: ThreadId, ...pageInput });
+export type WorkTaskMembershipsInput = typeof WorkTaskMembershipsInput.Type;
+export const WorkTaskMembershipsResult = Schema.Struct({
+  ...snapshot,
+  tasks: Schema.Array(WorkTaskSummary).check(Schema.isMaxLength(100)),
+});
+export type WorkTaskMembershipsResult = typeof WorkTaskMembershipsResult.Type;
+
+export const WorkTaskInvalidation = Schema.Struct({
+  taskId: WorkTaskId,
+  revision: PositiveInt,
+  sequence: NonNegativeInt,
+  change: Schema.Literals([
+    "definition",
+    "lifecycle",
+    "execution",
+    "membership",
+    "contribution",
+    "completion",
+    "deleted",
+  ]),
+});
+export type WorkTaskInvalidation = typeof WorkTaskInvalidation.Type;
+export const WorkTaskSubscribeInput = Schema.Struct({
+  cursor: Schema.optional(WorkTaskReplayCursor),
+});
+export type WorkTaskSubscribeInput = typeof WorkTaskSubscribeInput.Type;
+export const WorkTaskSubscriptionEvent = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("invalidation"),
+    invalidation: WorkTaskInvalidation,
+    cursor: WorkTaskReplayCursor,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("resync-required"),
+    reason: Schema.Literals(["cursor-expired", "buffer-overflow", "replay-unavailable"]),
+    sequence: NonNegativeInt,
+  }),
+]);
+export type WorkTaskSubscriptionEvent = typeof WorkTaskSubscriptionEvent.Type;
