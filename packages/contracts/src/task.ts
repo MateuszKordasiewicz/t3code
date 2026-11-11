@@ -11,6 +11,7 @@ import {
   ThreadId,
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
+import { ModelSelection } from "./modelSelection.ts";
 
 export const WorkTaskId = TrimmedNonEmptyString.pipe(Schema.brand("WorkTaskId"));
 export type WorkTaskId = typeof WorkTaskId.Type;
@@ -201,6 +202,112 @@ export type WorkTaskUnlinkThreadInput = typeof WorkTaskUnlinkThreadInput.Type;
 export const WorkTaskUnlinkThreadResult = Schema.Struct(committed);
 export type WorkTaskUnlinkThreadResult = typeof WorkTaskUnlinkThreadResult.Type;
 
+// Kept structurally aligned with thread launch without importing orchestration into task contracts.
+export const WorkTaskWorkspaceSelection = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("root"), branch: Schema.optional(TrimmedNonEmptyString) }),
+  Schema.Struct({
+    type: Schema.Literal("existing_worktree"),
+    worktreePath: TrimmedNonEmptyString,
+    branch: Schema.optional(TrimmedNonEmptyString),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("worktree"),
+    baseRef: TrimmedNonEmptyString,
+    branch: Schema.optional(TrimmedNonEmptyString),
+    startFromOrigin: Schema.optional(Schema.Boolean),
+  }),
+]);
+export type WorkTaskWorkspaceSelection = typeof WorkTaskWorkspaceSelection.Type;
+export const WorkTaskLaunchSelection = Schema.Struct({
+  projectId: ProjectId,
+  modelSelection: ModelSelection,
+  workspace: WorkTaskWorkspaceSelection,
+});
+export type WorkTaskLaunchSelection = typeof WorkTaskLaunchSelection.Type;
+
+export const WorkTaskCompletionPolicy = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("manual") }),
+  Schema.Struct({ type: Schema.Literal("automatic"), validator: WorkTaskLaunchSelection }),
+]);
+export type WorkTaskCompletionPolicy = typeof WorkTaskCompletionPolicy.Type;
+export const WorkTaskCompletionPolicyOverride = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("inherit") }),
+  Schema.Struct({ type: Schema.Literal("configured"), policy: WorkTaskCompletionPolicy }),
+]);
+export type WorkTaskCompletionPolicyOverride = typeof WorkTaskCompletionPolicyOverride.Type;
+
+const lifecycleGuards = {
+  expectedLifecycleRevision: PositiveInt,
+  expectedManagerGeneration: Schema.NullOr(PositiveInt),
+};
+const executionGuards = {
+  ...definitionGuards,
+  ...lifecycleGuards,
+  expectedCompletionPolicyRevision: PositiveInt,
+};
+const lifecycleResult = { ...committed, completionPolicyRevision: PositiveInt };
+
+export const WorkTaskConfigureInput = Schema.Struct({
+  ...taskCommand,
+  ...lifecycleGuards,
+  expectedCompletionPolicyRevision: PositiveInt,
+  allowanceOverride: Schema.NullOr(PositiveInt),
+  completionPolicy: WorkTaskCompletionPolicyOverride,
+});
+export type WorkTaskConfigureInput = typeof WorkTaskConfigureInput.Type;
+export const WorkTaskConfigureResult = Schema.Struct(lifecycleResult);
+export type WorkTaskConfigureResult = typeof WorkTaskConfigureResult.Type;
+export const WorkTaskTopUpAllowanceInput = Schema.Struct({
+  ...taskCommand,
+  ...lifecycleGuards,
+  newAllowanceCap: PositiveInt,
+});
+export type WorkTaskTopUpAllowanceInput = typeof WorkTaskTopUpAllowanceInput.Type;
+export const WorkTaskTopUpAllowanceResult = Schema.Struct(lifecycleResult);
+export type WorkTaskTopUpAllowanceResult = typeof WorkTaskTopUpAllowanceResult.Type;
+
+export const WorkTaskStartInput = Schema.Struct({
+  ...taskCommand,
+  ...executionGuards,
+  manager: WorkTaskLaunchSelection,
+});
+export type WorkTaskStartInput = typeof WorkTaskStartInput.Type;
+export const WorkTaskStartResult = Schema.Struct(lifecycleResult);
+export type WorkTaskStartResult = typeof WorkTaskStartResult.Type;
+export const WorkTaskReplaceManagerInput = Schema.Struct({
+  ...taskCommand,
+  ...executionGuards,
+  manager: WorkTaskLaunchSelection,
+});
+export type WorkTaskReplaceManagerInput = typeof WorkTaskReplaceManagerInput.Type;
+export const WorkTaskReplaceManagerResult = Schema.Struct(lifecycleResult);
+export type WorkTaskReplaceManagerResult = typeof WorkTaskReplaceManagerResult.Type;
+
+export const WorkTaskPauseInput = Schema.Struct({ ...taskCommand, ...lifecycleGuards });
+export type WorkTaskPauseInput = typeof WorkTaskPauseInput.Type;
+export const WorkTaskPauseResult = Schema.Struct(lifecycleResult);
+export type WorkTaskPauseResult = typeof WorkTaskPauseResult.Type;
+export const WorkTaskResumeInput = Schema.Struct({ ...taskCommand, ...executionGuards });
+export type WorkTaskResumeInput = typeof WorkTaskResumeInput.Type;
+export const WorkTaskResumeResult = Schema.Struct(lifecycleResult);
+export type WorkTaskResumeResult = typeof WorkTaskResumeResult.Type;
+export const WorkTaskReopenInput = Schema.Struct({ ...taskCommand, ...executionGuards });
+export type WorkTaskReopenInput = typeof WorkTaskReopenInput.Type;
+export const WorkTaskReopenResult = Schema.Struct(lifecycleResult);
+export type WorkTaskReopenResult = typeof WorkTaskReopenResult.Type;
+export const WorkTaskArchiveInput = Schema.Struct({ ...taskCommand, ...lifecycleGuards });
+export type WorkTaskArchiveInput = typeof WorkTaskArchiveInput.Type;
+export const WorkTaskArchiveResult = Schema.Struct(lifecycleResult);
+export type WorkTaskArchiveResult = typeof WorkTaskArchiveResult.Type;
+export const WorkTaskUnarchiveInput = Schema.Struct({ ...taskCommand, ...lifecycleGuards });
+export type WorkTaskUnarchiveInput = typeof WorkTaskUnarchiveInput.Type;
+export const WorkTaskUnarchiveResult = Schema.Struct(lifecycleResult);
+export type WorkTaskUnarchiveResult = typeof WorkTaskUnarchiveResult.Type;
+export const WorkTaskCompleteManuallyInput = Schema.Struct({ ...taskCommand, ...executionGuards });
+export type WorkTaskCompleteManuallyInput = typeof WorkTaskCompleteManuallyInput.Type;
+export const WorkTaskCompleteManuallyResult = Schema.Struct(lifecycleResult);
+export type WorkTaskCompleteManuallyResult = typeof WorkTaskCompleteManuallyResult.Type;
+
 // Tokens are opaque and must be bound to the environment and query by the service.
 export const WorkTaskPageToken = TrimmedNonEmptyString.check(Schema.isMaxLength(2_000)).pipe(
   Schema.brand("WorkTaskPageToken"),
@@ -225,6 +332,7 @@ export const WorkTaskSummary = Schema.Struct({
   definitionRevision: PositiveInt,
   lifecycleRevision: PositiveInt,
   desiredMode: Schema.Literals(["not_started", "active", "paused", "closed"]),
+  archived: Schema.Boolean,
   execution: Schema.Struct({
     state: Schema.Literals(["not_started", "idle", "queued", "running", "waiting"]),
     managerThreadId: Schema.optional(ThreadId),
@@ -255,6 +363,12 @@ export const WorkTaskDetailResult = Schema.Struct({
   summary: WorkTaskSummary,
   definition: WorkTaskDraftDefinition,
   actionPolicyRevision: PositiveInt,
+  completionPolicyRevision: PositiveInt,
+  allowanceOverride: Schema.NullOr(PositiveInt),
+  completionPolicy: WorkTaskCompletionPolicyOverride,
+  resolvedCompletionPolicy: Schema.optional(WorkTaskCompletionPolicy),
+  resolvedAllowance: Schema.optional(PositiveInt),
+  consumedAllowance: NonNegativeInt,
 });
 export type WorkTaskDetailResult = typeof WorkTaskDetailResult.Type;
 

@@ -36,6 +36,7 @@ const decodeDetailInput = Schema.decodeUnknownSync(task.WorkTaskDetailInput);
 const decodeThreadLink = Schema.decodeUnknownSync(task.WorkTaskThreadLink);
 const decodeProposalResult = Schema.decodeUnknownSync(WorkTaskProposeDefinitionResult);
 const decodeAdoptDefinition = Schema.decodeUnknownSync(WorkTaskAdoptDefinitionInput);
+const decodeResume = Schema.decodeUnknownSync(task.WorkTaskResumeInput);
 
 describe("work task definitions", () => {
   it("allows incomplete drafts but requires executable accepted definitions", () => {
@@ -248,6 +249,7 @@ describe("bounded task reads", () => {
     definitionRevision: 1,
     lifecycleRevision: 1,
     desiredMode: "active",
+    archived: false,
     execution: { state: "waiting" },
     attention: { state: "none" },
     completion: "incomplete",
@@ -304,7 +306,17 @@ describe("bounded task reads", () => {
       expect(() => decode({ sequence: 0, [key]: [], nextPageToken: "x".repeat(2_001) })).toThrow();
     }
     const detail = Schema.decodeUnknownSync(task.WorkTaskDetailResult);
-    const decoded = detail({ sequence: 1, summary, definition, actionPolicyRevision: 2 });
+    const detailState = {
+      sequence: 1,
+      summary,
+      definition,
+      actionPolicyRevision: 2,
+      completionPolicyRevision: 3,
+      allowanceOverride: null,
+      completionPolicy: { type: "inherit" },
+      consumedAllowance: 0,
+    };
+    const decoded = detail(detailState);
     expect(decoded.actionPolicyRevision).toBe(2);
     expect(
       decodeAdoptDefinition({
@@ -317,9 +329,9 @@ describe("bounded task reads", () => {
       }),
     ).toBeDefined();
     for (const actionPolicyRevision of [undefined, 0]) {
-      expect(() => detail({ sequence: 1, summary, definition, actionPolicyRevision })).toThrow();
+      expect(() => detail({ ...detailState, actionPolicyRevision })).toThrow();
     }
-    expect(() => detail({ summary, definition, actionPolicyRevision: 2 })).toThrow();
+    expect(() => detail({ ...detailState, sequence: undefined })).toThrow();
     expect(() => decodeDetailInput({})).toThrow();
   });
 
@@ -329,6 +341,7 @@ describe("bounded task reads", () => {
       decode({
         ...summary,
         desiredMode: "paused",
+        archived: false,
         execution: { state: "running" },
         attention: { state: "needed", reason: "x".repeat(2_000) },
         completion: "ready_for_review",
@@ -411,5 +424,154 @@ describe("bounded task reads", () => {
     const subscribe = Schema.decodeUnknownSync(task.WorkTaskSubscribeInput);
     expect(subscribe({})).toEqual({});
     expect(() => subscribe({ cursor: "x".repeat(2_001) })).toThrow();
+  });
+});
+
+describe("task configuration and lifecycle", () => {
+  const guards = {
+    taskId: "task",
+    commandId: "command",
+    expectedDefinitionRevision: 1,
+    expectedLifecycleRevision: 2,
+    expectedActionPolicyRevision: 3,
+    expectedCompletionPolicyRevision: 4,
+    expectedManagerGeneration: null,
+  };
+  const selection = {
+    projectId: "project",
+    modelSelection: { instanceId: "codex", model: "model" },
+    workspace: { type: "root" },
+  };
+
+  it("requires finite positive whole allowance and explicit completion configuration", () => {
+    const decode = Schema.decodeUnknownSync(task.WorkTaskConfigureInput);
+    const config = { ...guards, allowanceOverride: 5, completionPolicy: { type: "inherit" } };
+    expect(decode(config).allowanceOverride).toBe(5);
+    expect(
+      decode({
+        ...config,
+        allowanceOverride: null,
+        completionPolicy: {
+          type: "configured",
+          policy: { type: "manual" },
+        },
+      }).allowanceOverride,
+    ).toBeNull();
+    expect(
+      decode({
+        ...config,
+        completionPolicy: {
+          type: "configured",
+          policy: { type: "automatic", validator: selection },
+        },
+      }),
+    ).toBeDefined();
+    for (const allowanceOverride of [0, -1, 1.5, Infinity, NaN]) {
+      expect(() => decode({ ...config, allowanceOverride })).toThrow();
+    }
+    for (const completionPolicy of [
+      { type: "automatic" },
+      { type: "configured", policy: { type: "automatic" } },
+      { type: "configured", policy: { type: "other" } },
+    ])
+      expect(() => decode({ ...config, completionPolicy })).toThrow();
+    const topUp = Schema.decodeUnknownSync(task.WorkTaskTopUpAllowanceInput);
+    expect(topUp({ ...guards, newAllowanceCap: 2, consumedAllowance: 1, actor: "user" })).toEqual({
+      taskId: "task",
+      commandId: "command",
+      expectedLifecycleRevision: 2,
+      expectedManagerGeneration: null,
+      newAllowanceCap: 2,
+    });
+    for (const allowance of [0, -1, 1.5, Infinity, NaN]) {
+      expect(() => topUp({ ...guards, newAllowanceCap: allowance })).toThrow();
+    }
+  });
+
+  it("requires explicit project, provider, model and workspace for manager and validator", () => {
+    const start = Schema.decodeUnknownSync(task.WorkTaskStartInput);
+    const replace = Schema.decodeUnknownSync(task.WorkTaskReplaceManagerInput);
+    const policy = Schema.decodeUnknownSync(task.WorkTaskCompletionPolicy);
+    for (const manager of [
+      { ...selection, projectId: undefined },
+      { ...selection, modelSelection: { model: "model" } },
+      { ...selection, modelSelection: { instanceId: "codex" } },
+      { ...selection, workspace: undefined },
+      { ...selection, workspace: { type: "worktree" } },
+    ]) {
+      expect(() => start({ ...guards, manager })).toThrow();
+      expect(() => replace({ ...guards, manager })).toThrow();
+      expect(() => policy({ type: "automatic", validator: manager })).toThrow();
+    }
+    expect(start({ ...guards, manager: selection })).toBeDefined();
+    expect(replace({ ...guards, manager: selection })).toBeDefined();
+    expect(policy({ type: "automatic", validator: selection })).toBeDefined();
+  });
+
+  it("requires recoverable guards on lifecycle and reverse actions, without payload authority", () => {
+    for (const schema of [
+      task.WorkTaskPauseInput,
+      task.WorkTaskArchiveInput,
+      task.WorkTaskUnarchiveInput,
+    ]) {
+      const decode = Schema.decodeUnknownSync(schema);
+      const decoded = decode({ ...guards, caller: { type: "user" } });
+      expect(decoded).not.toHaveProperty("caller");
+      for (const key of ["expectedLifecycleRevision", "expectedManagerGeneration"]) {
+        expect(() => decode({ ...guards, [key]: undefined })).toThrow();
+      }
+    }
+    for (const schema of [
+      task.WorkTaskResumeInput,
+      task.WorkTaskReopenInput,
+      task.WorkTaskCompleteManuallyInput,
+    ]) {
+      const decode = Schema.decodeUnknownSync(schema);
+      expect(decode(guards)).toEqual(guards);
+      for (const key of [
+        "expectedDefinitionRevision",
+        "expectedLifecycleRevision",
+        "expectedActionPolicyRevision",
+        "expectedCompletionPolicyRevision",
+        "expectedManagerGeneration",
+      ]) {
+        expect(() => decode({ ...guards, [key]: undefined })).toThrow();
+      }
+    }
+    const detail = Schema.decodeUnknownSync(task.WorkTaskDetailResult);
+    const snapshot = {
+      sequence: 1,
+      summary: {
+        taskId: "task",
+        title: "Task",
+        definitionRevision: 1,
+        lifecycleRevision: 2,
+        desiredMode: "paused",
+        archived: false,
+        execution: { state: "idle", managerGeneration: 5 },
+        attention: { state: "none" },
+        completion: "incomplete",
+      },
+      definition,
+      actionPolicyRevision: 3,
+      completionPolicyRevision: 4,
+      allowanceOverride: null,
+      completionPolicy: { type: "inherit" },
+      consumedAllowance: 2,
+      resolvedAllowance: 5,
+    };
+    const read = detail(snapshot);
+    expect(
+      decodeResume({
+        taskId: read.summary.taskId,
+        commandId: "resume",
+        expectedDefinitionRevision: read.summary.definitionRevision,
+        expectedLifecycleRevision: read.summary.lifecycleRevision,
+        expectedActionPolicyRevision: read.actionPolicyRevision,
+        expectedCompletionPolicyRevision: read.completionPolicyRevision,
+        expectedManagerGeneration: read.summary.execution.managerGeneration ?? null,
+      }),
+    ).toBeDefined();
+    expect(() => detail({ ...snapshot, completionPolicyRevision: undefined })).toThrow();
   });
 });
