@@ -36,6 +36,7 @@ const run = Schema.decodeSync(WorkflowRunV1)({
   access: { origins: [] },
 });
 const opId = Schema.decodeSync(WorkflowOperationV1.fields.id)("op-1");
+const otherRunId = Schema.decodeSync(WorkflowRunV1.fields.id)("other");
 const pending = {
   id: opId,
   fingerprint: hash,
@@ -166,8 +167,256 @@ const finalFacts: Partial<Input["facts"]> = {
   },
 };
 
+const newHash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const amendment: Extract<Input["command"], { kind: "approveAmendment" }> = {
+  ...base.command,
+  kind: "approveAmendment",
+  proposal: {
+    proposalHash: "proposal-1",
+    previousSpecHash: hash,
+    newSpecRef: { ...run.spec.ref, sha256: newHash },
+    newPlanBinding: run.spec.plan,
+    limits: {
+      maxAttempts: 4,
+      maxRepairRounds: 1,
+      maxActiveWriters: 1,
+      deadline: "2026-12-01T00:00:00Z",
+    },
+    affectedEvidence: ["evidence-1"],
+  },
+  actor: { kind: "human", id: "reviewer" },
+  approvedProposalHash: "proposal-1",
+};
+const approval: NonNullable<Input["facts"]["amendmentApproval"]> = {
+  actor: { kind: "human", id: "reviewer" },
+  approvedProposalHash: "proposal-1",
+  runId: run.id,
+  recordVersion: 5,
+  previousSpecHash: hash,
+  newSpecHash: newHash,
+};
+const amend = (
+  command = amendment,
+  facts: Partial<Input["facts"]> = {},
+  changes: Partial<Input["run"]> = {},
+): Input =>
+  progress(
+    command,
+    { implementerId: "implementer", amendmentApproval: approval, ...facts },
+    changes,
+  );
+
 describe("WorkflowRunPolicy", () => {
+  it("uses only the explicitly added allowance", () => {
+    const exhaustedRun = { ...run, allowance: { ...run.allowance, attemptsConsumed: 3 } };
+    expect(WorkflowRunPolicy.decide(progress(admit, {}, exhaustedRun))).toEqual({
+      kind: "rejected",
+      reason: "exhausted",
+    });
+    const decision = WorkflowRunPolicy.decide(amend(amendment, {}, exhaustedRun));
+    expect(decision.kind).toBe("accepted");
+    if (decision.kind !== "accepted") return;
+    const next = WorkflowRunPolicy.decide({
+      ...progress({
+        ...admit,
+        expectedVersion: 6,
+        expectedGeneration: 3,
+        expectedSpecHash: newHash,
+      }),
+      run: decision.run,
+    });
+    expect(next).toMatchObject({
+      kind: "accepted",
+      run: { allowance: { maxAttempts: 4, attemptsConsumed: 4, deadline: "2026-12-01T00:00:00Z" } },
+      actions: [reserve],
+    });
+    if (next.kind !== "accepted") return;
+    expect(
+      WorkflowRunPolicy.decide({
+        ...progress({
+          ...admit,
+          commandId: "next",
+          expectedVersion: 7,
+          expectedGeneration: 3,
+          expectedSpecHash: newHash,
+        }),
+        run: next.run,
+      }),
+    ).toEqual({ kind: "rejected", reason: "exhausted" });
+  });
   it.each([
+    [
+      "approved increase preserves consumption",
+      amend(amendment, {}, { allowance: { ...run.allowance, attemptsConsumed: 3 } }),
+      {
+        kind: "accepted",
+        run: {
+          recordVersion: 6,
+          controlGeneration: 3,
+          amendmentSequence: 1,
+          priorSpecHash: hash,
+          spec: {
+            ref: { kind: "configuration", id: "spec-1", sha256: newHash },
+            plan: run.spec.plan,
+          },
+          allowance: {
+            maxAttempts: 4,
+            maxRepairRounds: 1,
+            maxActiveWriters: 1,
+            attemptsConsumed: 3,
+            repairRoundsConsumed: 0,
+            deadline: "2026-12-01T00:00:00Z",
+          },
+        },
+        actions: [
+          { kind: "invalidate_evidence", scope: "selected", evidenceIds: ["evidence-1"] },
+          { kind: "hold_unstarted" },
+        ],
+      },
+    ],
+    [
+      "unknown impact invalidates all",
+      amend({ ...amendment, proposal: { ...amendment.proposal, affectedEvidence: "unknown" } }),
+      {
+        kind: "accepted",
+        actions: [
+          { kind: "invalidate_evidence", scope: "all", evidenceIds: [] },
+          { kind: "hold_unstarted" },
+        ],
+      },
+    ],
+    [
+      "missing approval",
+      { ...progress(amendment), facts: { ...base.facts, implementerId: "implementer" } },
+      rejected("unauthorized"),
+    ],
+    [
+      "missing implementer",
+      { ...progress(amendment), facts: { ...base.facts, amendmentApproval: approval } },
+      rejected("unauthorized"),
+    ],
+    [
+      "agent approval",
+      amend({ ...amendment, actor: { kind: "agent", id: "reviewer" } }),
+      rejected("unauthorized"),
+    ],
+    [
+      "system approval",
+      amend({ ...amendment, actor: { kind: "system", id: "reviewer" } }),
+      rejected("unauthorized"),
+    ],
+    [
+      "forged human",
+      amend(amendment, {
+        amendmentApproval: { ...approval, actor: { kind: "agent", id: "reviewer" } },
+      }),
+      rejected("unauthorized"),
+    ],
+    [
+      "implementer approval",
+      amend(amendment, { implementerId: "reviewer" }),
+      rejected("unauthorized"),
+    ],
+    [
+      "different approval hash",
+      amend({ ...amendment, approvedProposalHash: "other" }),
+      rejected("unauthorized"),
+    ],
+    [
+      "approval wrong version",
+      amend(amendment, { amendmentApproval: { ...approval, recordVersion: 4 } }),
+      rejected("unauthorized"),
+    ],
+    [
+      "approval wrong run",
+      amend(amendment, {
+        amendmentApproval: {
+          ...approval,
+          runId: otherRunId,
+        },
+      }),
+      rejected("unauthorized"),
+    ],
+    [
+      "approval wrong new spec",
+      amend(amendment, { amendmentApproval: { ...approval, newSpecHash: hash } }),
+      rejected("unauthorized"),
+    ],
+    [
+      "previous spec mismatch",
+      amend({ ...amendment, proposal: { ...amendment.proposal, previousSpecHash: newHash } }),
+      rejected("invalid_amendment"),
+    ],
+    [
+      "amendment at deadline",
+      amend(amendment, { now: "2026-12-01T00:00:00Z" }),
+      rejected("deadline"),
+    ],
+    ["amendment unknown custody", amend(amendment, { custody: "unknown" }), rejected("custody")],
+    ["amendment active custody", amend(amendment, { custody: "active" }), rejected("custody")],
+    ["amendment writer", amend(amendment, { activeWriterCount: 1 }), rejected("custody")],
+    [
+      "deadline cannot change",
+      amend({
+        ...amendment,
+        proposal: {
+          ...amendment.proposal,
+          limits: { ...amendment.proposal.limits, deadline: "2026-12-02T00:00:00Z" },
+        },
+      }),
+      rejected("invalid_amendment"),
+    ],
+    [
+      "limit below consumed",
+      amend(
+        {
+          ...amendment,
+          proposal: {
+            ...amendment.proposal,
+            limits: { ...amendment.proposal.limits, maxAttempts: 2 },
+          },
+        },
+        {},
+        { allowance: { ...run.allowance, attemptsConsumed: 3 } },
+      ),
+      rejected("invalid_amendment"),
+    ],
+    [
+      "repair below consumed",
+      amend(
+        {
+          ...amendment,
+          proposal: {
+            ...amendment.proposal,
+            limits: { ...amendment.proposal.limits, maxRepairRounds: 0 },
+          },
+        },
+        {},
+        { allowance: { ...run.allowance, repairRoundsConsumed: 1 } },
+      ),
+      rejected("invalid_amendment"),
+    ],
+    [
+      "invalid limit",
+      amend({
+        ...amendment,
+        proposal: {
+          ...amendment.proposal,
+          limits: { ...amendment.proposal.limits, maxAttempts: Infinity },
+        },
+      }),
+      rejected("invalid_amendment"),
+    ],
+    ["amendment stopped", amend(amendment, {}, { status: "stopped" }), rejected("invalid_state")],
+    ["amendment stale", amend({ ...amendment, expectedVersion: 4 }), rejected("stale")],
+    [
+      "amendment replay",
+      amend(
+        { ...amendment, expectedVersion: 4 },
+        { commandReceipt: { commandId: "cmd-1", fingerprint: hash, receiptId: "receipt-1" } },
+      ),
+      { kind: "replay", receiptId: "receipt-1" },
+    ],
     ["version fence", input({ expectedVersion: 4 }), rejected("stale")],
     ["generation fence", input({ expectedGeneration: 1 }), rejected("stale")],
     ["spec fence", input({ expectedSpecHash: "other" }), rejected("stale")],

@@ -42,6 +42,22 @@ type Command = CommonCommand &
       }
     | { readonly kind: "advance"; readonly binding: Binding; readonly finalCombined: boolean }
     | { readonly kind: "complete" }
+    | {
+        readonly kind: "approveAmendment";
+        readonly proposal: {
+          readonly proposalHash: string;
+          readonly previousSpecHash: string;
+          readonly newSpecRef: WorkflowRunV1["spec"]["ref"];
+          readonly newPlanBinding: WorkflowRunV1["spec"]["plan"];
+          readonly limits: Pick<
+            WorkflowRunV1["allowance"],
+            "maxAttempts" | "maxRepairRounds" | "maxActiveWriters" | "deadline"
+          >;
+          readonly affectedEvidence: readonly string[] | "unknown";
+        };
+        readonly actor: { readonly kind: "human" | "agent" | "system"; readonly id: string };
+        readonly approvedProposalHash: string;
+      }
   );
 
 type HeldOperation = Pick<WorkflowOperationV1, "id" | "fingerprint" | "status"> & {
@@ -87,6 +103,15 @@ type Facts = {
   readonly requiredCiPassed?: boolean;
   readonly publishedHead?: string;
   readonly ciHead?: string;
+  readonly amendmentApproval?: {
+    readonly actor: { readonly kind: "human" | "agent" | "system"; readonly id: string };
+    readonly approvedProposalHash: string;
+    readonly runId: WorkflowRunV1["id"];
+    readonly recordVersion: number;
+    readonly previousSpecHash: string;
+    readonly newSpecHash: string;
+  };
+  readonly implementerId?: string;
   readonly custody: "none" | "active" | "unknown";
   readonly activeWriterCount: number;
   readonly heldOperations: readonly HeldOperation[];
@@ -97,6 +122,11 @@ type Facts = {
 };
 
 type Action =
+  | {
+      readonly kind: "invalidate_evidence";
+      readonly scope: "all" | "selected";
+      readonly evidenceIds: readonly string[];
+    }
   | { readonly kind: "hold_unstarted" }
   | { readonly kind: "cancel_owned" }
   | {
@@ -196,6 +226,68 @@ const decide = ({
     a.policyHash === b.policyHash;
   const terminal = run.status === "stopped" || run.status === "completed";
   switch (command.kind) {
+    case "approveAmendment": {
+      if (run.status !== "active" && run.status !== "paused" && run.status !== "needs_attention")
+        return reject("invalid_state");
+      const approval = facts.amendmentApproval;
+      if (
+        !facts.authority ||
+        !facts.implementerId ||
+        !approval ||
+        command.actor.kind !== "human" ||
+        !command.actor.id ||
+        command.actor.id === facts.implementerId ||
+        approval.actor.kind !== "human" ||
+        approval.actor.id !== command.actor.id ||
+        approval.runId !== run.id ||
+        approval.recordVersion !== run.recordVersion ||
+        approval.approvedProposalHash !== command.proposal.proposalHash ||
+        command.approvedProposalHash !== command.proposal.proposalHash ||
+        approval.previousSpecHash !== run.spec.ref.sha256 ||
+        approval.newSpecHash !== command.proposal.newSpecRef.sha256
+      )
+        return reject("unauthorized");
+      if (!isWorkflowTimestampAfter(run.allowance.deadline, facts.now)) return reject("deadline");
+      if (facts.custody !== "none" || facts.activeWriterCount !== 0) return reject("custody");
+      const { proposal } = command;
+      const { limits } = proposal;
+      if (
+        proposal.previousSpecHash !== run.spec.ref.sha256 ||
+        !Number.isSafeInteger(limits.maxAttempts) ||
+        limits.maxAttempts <= 0 ||
+        limits.maxAttempts < run.allowance.attemptsConsumed ||
+        !Number.isSafeInteger(limits.maxRepairRounds) ||
+        limits.maxRepairRounds < 0 ||
+        limits.maxRepairRounds < run.allowance.repairRoundsConsumed ||
+        limits.maxRepairRounds > limits.maxAttempts ||
+        limits.maxActiveWriters !== 1 ||
+        limits.deadline !== run.allowance.deadline ||
+        !Number.isSafeInteger(run.amendmentSequence + 1) ||
+        !Number.isSafeInteger(run.controlGeneration + 1)
+      )
+        return reject("invalid_amendment");
+      return {
+        kind: "accepted",
+        run: {
+          ...run,
+          recordVersion: run.recordVersion + 1,
+          controlGeneration: run.controlGeneration + 1,
+          amendmentSequence: run.amendmentSequence + 1,
+          priorSpecHash: run.spec.ref.sha256,
+          spec: { ref: proposal.newSpecRef, plan: proposal.newPlanBinding },
+          allowance: { ...run.allowance, ...limits },
+        },
+        actions: [
+          {
+            kind: "invalidate_evidence",
+            scope: proposal.affectedEvidence === "unknown" ? "all" : "selected",
+            evidenceIds:
+              proposal.affectedEvidence === "unknown" ? [] : [...proposal.affectedEvidence],
+          },
+          { kind: "hold_unstarted" },
+        ],
+      };
+    }
     case "admitAttempt": {
       if (run.status !== "active") return reject("invalid_state");
       if (!facts.authority) return reject("unauthorized");
