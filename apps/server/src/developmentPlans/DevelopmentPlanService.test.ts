@@ -17,12 +17,9 @@ import * as Schema from "effect/Schema";
 import * as WorkflowStore from "../workflowRuns/WorkflowRunStore.ts";
 import * as Observation from "./PlanningPassObservation.ts";
 import { WorkflowCanonicalHash } from "../workflowRuns/WorkflowCanonicalHash.ts";
-import evidenceMigration from "../persistence/Migrations/083_PlanningEvidence.ts";
+import { runMigrations } from "../persistence/Migrations.ts";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
-import migration from "../persistence/Migrations/081_WorkflowRuns.ts";
-import planMigration from "../persistence/Migrations/082_DevelopmentPlans.ts";
-import intentMigration from "../persistence/Migrations/084_WorkflowNativeLaunchIntents.ts";
 import { DevelopmentPlanHash } from "./DevelopmentPlanHash.ts";
 import * as Store from "./DevelopmentPlanStore.ts";
 import * as Service from "./DevelopmentPlanService.ts";
@@ -143,10 +140,7 @@ const deniedLayer = Service.layer.pipe(
 const setup = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   yield* sql`PRAGMA foreign_keys = ON`;
-  yield* migration;
-  yield* planMigration;
-  yield* intentMigration;
-  yield* evidenceMigration;
+  yield* runMigrations();
 });
 const withDatabase = <A, E, R>(f: (filename: string) => Effect.Effect<A, E, R>) =>
   Effect.scoped(
