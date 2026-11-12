@@ -749,7 +749,7 @@ const reviewInvalidated = Schema.Struct({
     "authorization_changed",
   ]),
   reason: shortText,
-}).check(reviewBindingMatches);
+}).check(Schema.makeFilter((event) => event.taskId === event.binding.taskId));
 const reviewCancelled = Schema.Struct({
   ...reviewEventBase,
   type: Schema.Literal("task.action-review-cancelled"),

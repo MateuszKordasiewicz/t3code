@@ -160,7 +160,11 @@ describe("staged task events", () => {
       ]) {
         expect(() => decode({ ...event, binding: { ...binding, [field]: undefined } })).toThrow();
       }
-      for (const field of ["taskId", "definitionRevision", "actionPolicyRevision"]) {
+      const matchingFields =
+        event === invalidated
+          ? ["taskId"]
+          : ["taskId", "definitionRevision", "actionPolicyRevision"];
+      for (const field of matchingFields) {
         expect(() =>
           decode({ ...event, binding: { ...binding, [field]: field === "taskId" ? "other" : 99 } }),
         ).toThrow();
@@ -170,6 +174,15 @@ describe("staged task events", () => {
         persisted({ event, context: { ...context, occurredAt: "2026-11-12T00:00:00Z" } }),
       ).toThrow();
       expect(() => decode({ ...event, attribution: { type: "user", subject: "human" } })).toThrow();
+    }
+    for (const revisions of [
+      { actionPolicyRevision: 5 },
+      { definitionRevision: 2 },
+      { definitionRevision: 2, actionPolicyRevision: 5 },
+    ]) {
+      const event = { ...invalidated, ...revisions };
+      expect(decode(event)).toMatchObject({ binding });
+      expect(persisted({ event, context })).toMatchObject({ event: { binding } });
     }
     for (const cause of ["stop", "pause", "timeout", "dismissal"])
       expect(() => decode({ ...invalidated, cause })).toThrow();
