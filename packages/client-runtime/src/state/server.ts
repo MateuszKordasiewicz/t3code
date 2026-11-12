@@ -1557,6 +1557,74 @@ export function createServerEnvironmentAtoms<R, E>(
       label: "environment-data:server:signal-process",
       tag: WS_METHODS.serverSignalProcess,
     }),
+    createDevelopmentPlan: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:development-plan:create",
+      tag: WS_METHODS.developmentPlansCreate,
+    }),
+    importDevelopmentPlan: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:development-plan:import",
+      tag: WS_METHODS.developmentPlansImport,
+    }),
+    exportDevelopmentPlan: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:development-plan:export",
+      tag: WS_METHODS.developmentPlansExport,
+    }),
+    getDevelopmentPlan: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:development-plan:get",
+      tag: WS_METHODS.developmentPlansGet,
+    }),
+    getDevelopmentPlanObject: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:development-plan:get-object",
+      tag: WS_METHODS.developmentPlansGetObject,
+    }),
+    listDevelopmentPlans: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:development-plan:list",
+      tag: WS_METHODS.developmentPlansList,
+    }),
+    updateDevelopmentPlanDraft: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:development-plan:update-draft",
+      tag: WS_METHODS.developmentPlansUpdateDraft,
+    }),
+    linkDevelopmentPlanThread: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:development-plan:link-thread",
+      tag: WS_METHODS.developmentPlansLinkThread,
+    }),
+    unlinkDevelopmentPlanThread: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:development-plan:unlink-thread",
+      tag: WS_METHODS.developmentPlansUnlinkThread,
+    }),
+    validateDevelopmentPlanCoverage: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:development-plan:validate-coverage",
+      tag: WS_METHODS.developmentPlansValidateCoverage,
+    }),
+    beginPlanning: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:development-plan:begin-planning",
+      tag: WS_METHODS.developmentPlansBeginPlanning,
+    }),
+    getPlanning: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:development-plan:get-planning",
+      tag: WS_METHODS.developmentPlansGetPlanning,
+    }),
+    pausePlanning: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:development-plan:pause-planning",
+      tag: WS_METHODS.developmentPlansPausePlanning,
+    }),
+    resumePlanning: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:development-plan:resume-planning",
+      tag: WS_METHODS.developmentPlansResumePlanning,
+    }),
+    stopPlanning: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:development-plan:stop-planning",
+      tag: WS_METHODS.developmentPlansStopPlanning,
+    }),
+    beginPlanningPass: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:development-plan:begin-pass",
+      tag: WS_METHODS.developmentPlansBeginPass,
+    }),
+    recordPlanningDisposition: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:development-plan:record-disposition",
+      tag: WS_METHODS.developmentPlansRecordDisposition,
+    }),
     upsertScheduledTask: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:scheduled-task:upsert",
       tag: WS_METHODS.scheduledTasksUpsert,

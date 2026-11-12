@@ -18,6 +18,8 @@ import {
   AuthSourceControlWriteScope,
   ThreadId,
   EnvironmentId,
+  EnvironmentAuthorizationError,
+  ProjectId,
   ORCHESTRATION_V2_WS_METHODS,
   ScheduledTaskId,
   WS_METHODS,
@@ -35,6 +37,7 @@ import { createCommandPermissions } from "./commandPermissions.ts";
 import { createEnvironmentRpcCommand } from "./runtime.ts";
 import { AVAILABLE_CONNECTION_STATE, BearerConnectionTarget } from "../connection/model.ts";
 import { createPeerLinkEnvironmentAtoms } from "./peerLinks.ts";
+import { createServerEnvironmentAtoms } from "./server.ts";
 
 vi.mock("./session.ts", () => ({
   createEnvironmentSessionAtoms: () => ({ sessionStateAtom: sessions }),
@@ -204,23 +207,96 @@ describe("command permissions", () => {
     ),
   );
 
-  it.effect.each([WS_METHODS.scheduledTasksDelete, ORCHESTRATION_V2_WS_METHODS.stopWorkflow])(
-    "uses the target grant for both availability and execution of %s",
-    (method) =>
-      Effect.scoped(
-        Effect.gen(function* () {
-          const registry = yield* setup;
-          const permissions = createCommandPermissions(runtime, method);
-          registry.set(sessions(env), AsyncResult.success(grant(true)));
-          expect(registry.get(permissions.permissionAtom(env))).toBe(true);
-          expect(permissions.permissionAtom(env)).toBe(permissions.permissionAtom(env));
-          yield* permissions.authorize(registry, env);
-          registry.set(sessions(other), AsyncResult.success(grant(false)));
-          expect(registry.get(permissions.permissionAtom(other))).toBe(false);
-          const denied = yield* permissions.authorize(registry, other).pipe(Effect.flip);
-          expect(denied._tag).toBe("EnvironmentAuthorizationError");
-        }),
-      ),
+  it.effect.each([
+    WS_METHODS.scheduledTasksDelete,
+    ORCHESTRATION_V2_WS_METHODS.stopWorkflow,
+    WS_METHODS.developmentPlansLinkThread,
+  ])("uses the target grant for both availability and execution of %s", (method) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const registry = yield* setup;
+        const permissions = createCommandPermissions(runtime, method);
+        registry.set(sessions(env), AsyncResult.success(grant(true)));
+        expect(registry.get(permissions.permissionAtom(env))).toBe(true);
+        expect(permissions.permissionAtom(env)).toBe(permissions.permissionAtom(env));
+        yield* permissions.authorize(registry, env);
+        registry.set(sessions(other), AsyncResult.success(grant(false)));
+        expect(registry.get(permissions.permissionAtom(other))).toBe(false);
+        const denied = yield* permissions.authorize(registry, other).pipe(Effect.flip);
+        expect(denied._tag).toBe("EnvironmentAuthorizationError");
+      }),
+    ),
+  );
+  it.effect("checks plan mutations at their destination and preserves server read denial", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const registry = yield* setup;
+        registry.mount(sessions(other));
+        registry.set(sessions(env), AsyncResult.success(grant(true)));
+        registry.set(sessions(other), AsyncResult.success(grant(false)));
+        const readDenied = new EnvironmentAuthorizationError({
+          message: "Read permission required",
+          requiredScope: AuthOrchestrationReadScope,
+        });
+        const writes: EnvironmentId[] = [];
+        const supervisorFor = (id: EnvironmentId) =>
+          Effect.gen(function* () {
+            const client = {
+              [WS_METHODS.developmentPlansLinkThread]: () =>
+                Effect.sync(() => {
+                  writes.push(id);
+                  return { kind: "applied" as const, plan: {} };
+                }),
+              [WS_METHODS.developmentPlansGet]: () => Effect.fail(readDenied),
+            };
+            return {
+              target: { environmentId: id, label: id },
+              session: yield* SubscriptionRef.make(
+                Option.some({ client } as unknown as RpcSession),
+              ),
+            } as unknown as EnvironmentSupervisor["Service"];
+          });
+        const first = yield* supervisorFor(env);
+        const second = yield* supervisorFor(other);
+        const planRuntime = Atom.runtime(
+          Layer.succeed(EnvironmentRegistry, {
+            run: (id, effect) =>
+              Effect.provideService(effect, EnvironmentSupervisor, id === env ? first : second),
+          } as EnvironmentRegistry["Service"]),
+        );
+        const server = createServerEnvironmentAtoms(
+          planRuntime as Parameters<typeof createServerEnvironmentAtoms>[0],
+          { initialConfigValueAtom: () => Atom.make(null) },
+        );
+        const input = {
+          projectId: ProjectId.make("project"),
+          planId: "plan",
+          threadId: "thread",
+          expectedVersion: 1,
+          commandId: "command",
+        };
+        const mutate = (environmentId: EnvironmentId) =>
+          Effect.promise(() =>
+            server.linkDevelopmentPlanThread.run(registry, { environmentId, input }),
+          );
+        expect(registry.get(server.linkDevelopmentPlanThread.permissionAtom(env))).toBe(true);
+        expect(registry.get(server.linkDevelopmentPlanThread.permissionAtom(other))).toBe(false);
+        expect((yield* mutate(other))._tag).toBe("Failure");
+        expect((yield* mutate(env))._tag).toBe("Success");
+        registry.set(sessions(env), AsyncResult.success(grant(false)));
+        expect(registry.get(server.linkDevelopmentPlanThread.permissionAtom(env))).toBe(false);
+        expect((yield* mutate(env))._tag).toBe("Failure");
+        expect(writes).toEqual([env]);
+        const read = yield* Effect.promise(() =>
+          server.getDevelopmentPlan.run(registry, {
+            environmentId: env,
+            input: { projectId: input.projectId, planId: input.planId },
+          }),
+        );
+        expect(read._tag).toBe("Failure");
+        if (read._tag === "Failure") expect(Cause.squash(read.cause)).toEqual(readDenied);
+      }),
+    ),
   );
   it.effect("waits for an initial grant", () =>
     Effect.scoped(
