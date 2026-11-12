@@ -295,7 +295,7 @@ const decodeSessionShape = Schema.decodeUnknownEffect(PlanningSessionV1);
 const sessionFail = (reason: PlanningSessionError["reason"]) =>
   new PlanningSessionError({ reason });
 export const isWorkflowUint = (value: number) => Number.isSafeInteger(value) && value >= 0;
-const timestampAfter = (a: string, b: string) => {
+export const isWorkflowTimestampAfter = (a: string, b: string) => {
   const seconds = a.slice(0, 19).localeCompare(b.slice(0, 19));
   if (seconds !== 0) return seconds > 0;
   const fractionA = a.slice(19, -1).replace(/^\./, "").replace(/0+$/, "");
@@ -322,7 +322,7 @@ export const decodePlanningSessionV1 = Effect.fn("PlanningSessionV1.decode")(fun
     limits.maxPasses === 0 ||
     !isWorkflowTimestamp(limits.deadline) ||
     !isWorkflowTimestamp(session.createdAt) ||
-    timestampAfter(session.createdAt, limits.deadline) ||
+    isWorkflowTimestampAfter(session.createdAt, limits.deadline) ||
     session.allowedRoles.length === 0 ||
     session.allowedProviders.length === 0 ||
     hasWorkflowDuplicates(session.allowedRoles) ||

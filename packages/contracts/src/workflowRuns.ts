@@ -6,6 +6,7 @@ import {
   DevelopmentPlanDocumentV1,
   hasWorkflowDuplicates,
   isWorkflowTimestamp,
+  isWorkflowTimestampAfter,
   isWorkflowUint,
   PlanningPassV1,
   PlanningSessionV1,
@@ -341,10 +342,6 @@ export class WorkflowRunError extends Schema.TaggedError<WorkflowRunError>()("Wo
 }) {}
 const runFail = (reason: WorkflowRunError["reason"]) => new WorkflowRunError({ reason });
 const decodeRunShape = Schema.decodeUnknownEffect(WorkflowRunV1);
-const timestampKey = (timestamp: string) => {
-  const [seconds, fraction = ""] = timestamp.slice(0, -1).split(".");
-  return `${seconds}.${fraction.replace(/0+$/, "")}`;
-};
 
 export const decodeWorkflowRunV1 = Effect.fn("WorkflowRunV1.decode")(function* (input: unknown) {
   const run = yield* decodeRunShape(input, { onExcessProperty: "error" }).pipe(
@@ -362,7 +359,7 @@ export const decodeWorkflowRunV1 = Effect.fn("WorkflowRunV1.decode")(function* (
     !isWorkflowUint(allowance.repairRoundsConsumed) ||
     !isWorkflowTimestamp(run.createdAt) ||
     !isWorkflowTimestamp(allowance.deadline) ||
-    timestampKey(allowance.deadline) < timestampKey(run.createdAt) ||
+    isWorkflowTimestampAfter(run.createdAt, allowance.deadline) ||
     hasWorkflowDuplicates(
       run.access.origins.map((o) => JSON.stringify([o.environmentId, o.projectId, o.threadId])),
     )
