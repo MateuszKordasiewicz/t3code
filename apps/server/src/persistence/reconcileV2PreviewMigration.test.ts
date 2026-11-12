@@ -64,6 +64,7 @@ describe("V2 preview upgrade", () => {
         [82, "WorkTaskManagerCustody"],
         [83, "WorkTaskValidation"],
         [84, "WorkTaskActionReviews"],
+        [85, "WorkTaskCurrentState"],
       ]);
       assert.deepStrictEqual(yield* runMigrations(), []);
       assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_legacy_imports`, imports);
@@ -171,6 +172,7 @@ describe("V2 preview upgrade", () => {
         [82, "WorkTaskManagerCustody"],
         [83, "WorkTaskValidation"],
         [84, "WorkTaskActionReviews"],
+        [85, "WorkTaskCurrentState"],
       ]);
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
