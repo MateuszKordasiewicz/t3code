@@ -115,6 +115,11 @@ type Facts = {
   readonly custody: "none" | "active" | "unknown";
   readonly activeWriterCount: number;
   readonly heldOperations: readonly HeldOperation[];
+  readonly heldNativeIntents?: readonly {
+    readonly kind: "native_intent";
+    readonly intentId: string;
+    readonly fingerprint: string;
+  }[];
   readonly capabilitiesCurrent: boolean;
   readonly compatibilityCurrent: boolean;
   readonly fingerprintCurrent: boolean;
@@ -138,6 +143,11 @@ type Action =
       readonly repair: boolean;
     }
   | { readonly kind: "accept_item" | "accept_final"; readonly binding: Binding }
+  | {
+      readonly kind: "rearm_native_intent";
+      readonly intentId: string;
+      readonly fingerprint: string;
+    }
   | {
       readonly kind: "rearm";
       readonly operationId: WorkflowOperationV1["id"];
@@ -445,7 +455,12 @@ const decide = ({
         return reject("invalid_state");
       if (!facts.authority) return reject("unauthorized");
       if (!isWorkflowTimestampAfter(run.allowance.deadline, facts.now)) return reject("deadline");
-      if (run.allowance.attemptsConsumed >= run.allowance.maxAttempts) return reject("exhausted");
+      if (
+        run.allowance.attemptsConsumed > run.allowance.maxAttempts ||
+        (run.allowance.attemptsConsumed === run.allowance.maxAttempts &&
+          !facts.heldNativeIntents?.length)
+      )
+        return reject("exhausted");
       if (
         facts.custody !== "none" ||
         facts.activeWriterCount !== 0 ||
@@ -465,13 +480,20 @@ const decide = ({
         !facts.originGrantCurrent
       )
         return reject("freshness");
-      return accept(
-        "active",
-        run.controlGeneration + 1,
-        facts.heldOperations
+      return accept("active", run.controlGeneration + 1, [
+        ...facts.heldOperations
           .filter((op) => op.status === "pending" && op.provablyUnstarted)
-          .map((op) => ({ kind: "rearm", operationId: op.id, fingerprint: op.fingerprint })),
-      );
+          .map((op) => ({
+            kind: "rearm" as const,
+            operationId: op.id,
+            fingerprint: op.fingerprint,
+          })),
+        ...(facts.heldNativeIntents ?? []).map((intent) => ({
+          kind: "rearm_native_intent" as const,
+          intentId: intent.intentId,
+          fingerprint: intent.fingerprint,
+        })),
+      ]);
   }
 };
 

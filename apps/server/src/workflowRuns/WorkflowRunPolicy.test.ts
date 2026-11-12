@@ -578,6 +578,30 @@ describe("WorkflowRunPolicy", () => {
       accepted("active", 3, [{ kind: "rearm", operationId: "op-1", fingerprint: hash }]),
     ],
     [
+      "resume charged native intent at final slot",
+      input(
+        { kind: "resume" },
+        {
+          run: {
+            status: "paused",
+            allowance: { ...run.allowance, attemptsConsumed: run.allowance.maxAttempts },
+          },
+          facts: {
+            heldNativeIntents: [{ kind: "native_intent", intentId: "intent", fingerprint: hash }],
+          },
+        },
+      ),
+      {
+        kind: "accepted",
+        run: {
+          status: "active",
+          controlGeneration: 3,
+          allowance: { ...run.allowance, attemptsConsumed: run.allowance.maxAttempts },
+        },
+        actions: [{ kind: "rearm_native_intent", intentId: "intent", fingerprint: hash }],
+      },
+    ],
+    [
       "resume unknown",
       input(
         { kind: "resume" },
