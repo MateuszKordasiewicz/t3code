@@ -5,9 +5,18 @@ import * as NodePath from "node:path";
 import * as NodeSqlite from "node:sqlite";
 
 import { assert, it } from "@effect/vitest";
-import { PlanningSessionV1, WorkflowOperationV1, WorkflowRunV1 } from "@t3tools/contracts";
+import {
+  PlanningPassV1,
+  PlanningSessionV1,
+  WorkflowOperationV1,
+  WorkflowRunV1,
+  upgradeDevelopmentPlanDocumentV1,
+} from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Digest from "effect/crypto/Digest";
+import * as Ref from "effect/Ref";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
@@ -15,6 +24,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import migration from "../persistence/Migrations/081_WorkflowRuns.ts";
 import planMigration from "../persistence/Migrations/082_DevelopmentPlans.ts";
+import { DevelopmentPlanHash } from "../developmentPlans/DevelopmentPlanHash.ts";
 import * as Store from "./WorkflowRunStore.ts";
 import { WorkflowCanonicalHash } from "./WorkflowCanonicalHash.ts";
 import { WorkflowRunPolicy } from "./WorkflowRunPolicy.ts";
@@ -1449,4 +1459,213 @@ it.effect("planning receipts survive database reopen and corruption is rejected"
       );
     }),
   ),
+);
+
+const seedAdmission = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`PRAGMA foreign_keys = ON`;
+  yield* migration;
+  yield* planMigration;
+  const example = {
+    schemaVersion: 1,
+    planId: "plan",
+    revisionId: "revision",
+    environmentId: "environment",
+    projectId: "project",
+    title: "Example",
+    brief: "Outcome",
+    linkedThreadIds: [],
+    sources: [
+      {
+        id: "source",
+        kind: "thread_message",
+        environmentId: "environment",
+        projectId: "project",
+        threadId: "thread",
+        messageId: "message",
+        capturedAt: "2026-11-01T00:00:00Z",
+        attribution: "user",
+        bytesBase64: "WA==",
+        byteLength: 1,
+        sha256: "4b68ab3847feda7d6c62c1fbcbeebfa35eab7351ed5e78f4ddadea5df64b8015",
+      },
+    ],
+    sourceStatements: [
+      { id: "statement", sourceId: "source", startByte: 0, endByte: 1, text: "X" },
+    ],
+    requirements: [],
+  };
+  const { native } = yield* upgradeDevelopmentPlanDocumentV1({
+    bytes: new TextEncoder().encode(json(example)),
+    hashSourcePacket: DevelopmentPlanHash.sourcePacket,
+  });
+  const sourcePacketHash = DevelopmentPlanHash.sourcePacket(native.sourcePacket);
+  const revisionHash = DevelopmentPlanHash.revision(native.revision);
+  yield* sql`INSERT INTO workflow_plan_identities VALUES ('plan')`;
+  yield* sql`INSERT INTO development_plans VALUES ('plan', 'environment', 'project', 'Plan', NULL, 0, '2026-11-01T00:00:00Z')`;
+  yield* sql`INSERT INTO development_plan_source_packets VALUES ('plan', ${sourcePacketHash}, ${json(native.sourcePacket)})`;
+  yield* sql`INSERT INTO workflow_revision_identities VALUES ('plan', 'revision', ${revisionHash}, ${sourcePacketHash})`;
+  yield* sql`INSERT INTO development_plan_revisions VALUES ('plan', 'revision', ${revisionHash}, ${sourcePacketHash}, ${json(native.revision)}, '2026-11-01T00:00:00Z')`;
+  yield* sql`UPDATE development_plans SET current_revision_id = 'revision' WHERE plan_id = 'plan'`;
+  return {
+    planId: session.planId,
+    revisionId: "revision",
+    revisionSchemaVersion: 1 as const,
+    revisionHash,
+    sourcePacketHash,
+  };
+});
+const decodePassFixture = Schema.decodeSync(PlanningPassV1);
+const decodeOperationFixture = Schema.decodeSync(WorkflowOperationV1);
+const admissionInput = (
+  binding: Awaited<Effect.Success<typeof seedAdmission>>,
+  id: string,
+  owner = session,
+) => {
+  const pass = decodePassFixture({
+    schemaVersion: 1,
+    id: `pass-${id}`,
+    planningSessionId: owner.id,
+    role: "author",
+    provider: { providerInstanceId: "provider", model: "model" },
+    binding,
+    operationId: `operation-${id}`,
+    inputManifest: {
+      sources: [{ kind: "source", id: "source", sha256: binding.sourcePacketHash }],
+      references: [],
+      additionalContext: [],
+      access: { origins: [] },
+    },
+    status: "pending",
+    native: { threadId: `thread-${id}`, runId: `run-${id}` },
+    access: { origins: [] },
+  });
+  const operation = decodeOperationFixture({
+    schemaVersion: 1,
+    id: pass.operationId,
+    owner: { kind: "planning_session", planningSessionId: owner.id },
+    kind: "planning_pass",
+    parameters: {
+      kind: "planning_pass",
+      passId: pass.id,
+      binding,
+      role: pass.role,
+      provider: pass.provider,
+      limits: owner.limits,
+      inputManifestHash: WorkflowCanonicalHash.tagged(
+        "t3.planning-input-manifest.v1",
+        pass.inputManifest,
+      ),
+    },
+    fingerprint: hash,
+    origin: owner.origin,
+    destination: context.destination,
+    controlGeneration: owner.controlGeneration,
+    status: "pending",
+    access: { origins: [] },
+  });
+  return {
+    sessionId: owner.id,
+    expectedVersion: 0,
+    pass,
+    operation: { ...operation, fingerprint: WorkflowCanonicalHash.operation(operation) },
+    now: facts.now,
+    context,
+    command: { commandId: `command-${id}`, receiptId: `receipt-${id}` },
+  };
+};
+
+it.effect(
+  "competing independent admissions charge the last pass once and replay after reopening",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const directory = yield* Effect.acquireRelease(
+          Effect.sync(() => NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "planning-admit-"))),
+          (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
+        );
+        const filename = NodePath.join(directory, "test.sqlite");
+        const fileLayer = () =>
+          Store.layer.pipe(Layer.provideMerge(NodeSqliteClient.layer({ filename })));
+        const limited = { ...session, limits: { ...session.limits, maxPasses: 1 } };
+        const binding = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+            const store = yield* Store.WorkflowRunStore;
+            yield* begin(store, limited);
+            return binding;
+          }).pipe(Effect.provide(fileLayer())),
+        );
+        const barrier = yield* Deferred.make<void>();
+        const arrivals = yield* Ref.make(0);
+        const attempt = (id: string) =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const store = yield* Store.WorkflowRunStore;
+              const snapshot = yield* store.getPlanning({ sessionId: limited.id });
+              assert.strictEqual(snapshot.consumed.passes, 0);
+              const count = yield* Ref.updateAndGet(arrivals, (value) => value + 1);
+              if (count === 2) yield* Deferred.succeed(barrier, undefined);
+              yield* Deferred.await(barrier);
+              const input = admissionInput(binding, id, limited);
+              return { input, result: yield* Effect.result(store.admitPlanningPass(input)) };
+            }).pipe(Effect.provide(fileLayer())),
+          );
+        const results = yield* Effect.all([attempt("one"), attempt("two")], { concurrency: 2 });
+        const winner = results.find((item) => item.result._tag === "Success");
+        const loser = results.find((item) => item.result._tag === "Failure");
+        assert.isDefined(winner);
+        assert.isDefined(loser);
+        if (
+          !winner ||
+          winner.result._tag !== "Success" ||
+          !loser ||
+          loser.result._tag !== "Failure"
+        )
+          return;
+        assert.include(["conflict", "limit"], loser.result.failure.reason);
+        const won = winner.result.success;
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* Store.WorkflowRunStore;
+            const sql = yield* SqlClient.SqlClient;
+            assert.deepStrictEqual(yield* store.admitPlanningPass(winner.input), {
+              ...won,
+              kind: "replay",
+            });
+            assert.strictEqual(
+              (yield* store.getPlanning({ sessionId: limited.id })).consumed.passes,
+              1,
+            );
+            assert.deepStrictEqual(yield* sql`SELECT id FROM workflow_operations`, [
+              { id: winner.input.operation.id },
+            ]);
+            assert.deepStrictEqual(yield* sql`SELECT id FROM workflow_planning_passes`, [
+              { id: winner.input.pass.id },
+            ]);
+            assert.deepStrictEqual(
+              yield* sql`SELECT operation_id FROM workflow_command_receipts WHERE operation_id IS NOT NULL`,
+              [{ operation_id: winner.input.operation.id }],
+            );
+            const claim = yield* store.claim({
+              operationId: winner.input.operation.id,
+              expectedOwnerVersion: 1,
+              expectedGeneration: 0,
+              bootId: "boot",
+              workerId: "worker",
+              now: facts.now,
+              trustedEligibility: true,
+            });
+            assert.strictEqual(claim.kind, "claimed");
+            const rows = yield* sql<{
+              record_json: string;
+            }>`SELECT record_json FROM workflow_planning_passes`;
+            assert.strictEqual(
+              (parse(rows[0]!.record_json) as { status: string }).status,
+              "claimed",
+            );
+          }).pipe(Effect.provide(fileLayer())),
+        );
+      }),
+    ),
 );

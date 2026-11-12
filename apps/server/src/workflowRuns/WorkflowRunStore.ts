@@ -1,5 +1,7 @@
 import {
   PlanningSessionV1,
+  PlanningPassV1,
+  decodeDevelopmentPlanRevisionV1,
   decodePlanningSessionV1,
   decodePlanningPassV1,
   isWorkflowTimestamp,
@@ -7,9 +9,10 @@ import {
   decodeWorkflowOperationV1,
   decodeWorkflowRoleResultV1,
   decodeWorkflowRunV1,
-  type WorkflowOperationV1,
+  WorkflowOperationV1,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as Digest from "effect/crypto/Digest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
@@ -85,6 +88,14 @@ export class PlanningControlError extends Schema.TaggedError<PlanningControlErro
   }
 }
 type S = PlanningSessionV1;
+type P = PlanningPassV1;
+const decodeAdmission = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    session: PlanningSessionV1,
+    pass: PlanningPassV1,
+    operation: WorkflowOperationV1,
+  }),
+);
 type PlanningContext = {
   readonly actor: S["origin"];
   readonly destination: {
@@ -108,6 +119,10 @@ const isPlanningContext = Schema.is(
 const isPlanningCommand = Schema.is(
   Schema.Struct({ commandId: Schema.String, receiptId: Schema.String }),
 );
+
+// A competing writer on another connection surfaces as a lock timeout; that is a retryable conflict.
+const isWriteContention = (error: unknown): boolean =>
+  (error as { reason?: { _tag?: unknown } } | undefined)?.reason?._tag === "LockTimeoutError";
 
 const make = Effect.fn("WorkflowRunStore.make")(function* (
   beforePublish: Effect.Effect<void> = Effect.void,
@@ -158,7 +173,11 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     sql
       .withTransaction(work)
       .pipe(
-        Effect.mapError((error) => (isPlanningError(error) ? error : planningError("storage"))),
+        Effect.mapError((error) =>
+          isPlanningError(error)
+            ? error
+            : planningError(isWriteContention(error) ? "conflict" : "storage"),
+        ),
       );
   const readSession = Effect.fn("WorkflowRunStore.readPlanningSession")(function* (id: S["id"]) {
     const rows = yield* sql<{
@@ -304,6 +323,188 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
         }>`INSERT INTO workflow_planning_sessions (id, plan_id, predecessor_id, status, record_version, control_generation, record_json) VALUES (${value.id}, ${value.planId}, ${value.predecessorSessionId ?? null}, ${value.status}, ${value.recordVersion}, ${value.controlGeneration}, ${encode(value)}) ON CONFLICT DO NOTHING RETURNING id`;
         if (inserted.length !== 1) return yield* planningError("conflict");
         return yield* savePlanningReceipt(input.command, hash, value);
+      }),
+    );
+    if (result.kind === "applied") yield* notify;
+    return result;
+  });
+  const admitPlanningPass = Effect.fn("WorkflowRunStore.admitPlanningPass")(function* (input: {
+    readonly sessionId: S["id"];
+    readonly expectedVersion: number;
+    readonly pass: P;
+    readonly operation: WorkflowOperationV1;
+    readonly now: string;
+    readonly context: PlanningContext;
+    readonly command: PlanningCommand;
+  }) {
+    if (
+      !input.sessionId ||
+      !Number.isSafeInteger(input.expectedVersion) ||
+      input.expectedVersion < 0 ||
+      !validCommand(input.command) ||
+      !isPlanningContext(input.context) ||
+      !isWorkflowTimestamp(input.now)
+    )
+      return yield* planningError("invalid");
+    const pass = yield* decodePlanningPassV1(input.pass).pipe(
+      Effect.mapError(() => planningError("invalid")),
+    );
+    const operation = yield* decodeWorkflowOperationV1(input.operation).pipe(
+      Effect.mapError(() => planningError("invalid")),
+    );
+    const params = operation.parameters;
+    const hashes = yield* Effect.try({
+      try: () => ({
+        operation: WorkflowCanonicalHash.operation(operation),
+        manifest: WorkflowCanonicalHash.tagged("t3.planning-input-manifest.v1", pass.inputManifest),
+        binding: WorkflowCanonicalHash.tagged("binding", pass.binding),
+        provider: WorkflowCanonicalHash.tagged("provider", pass.provider),
+      }),
+      catch: () => planningError("invalid"),
+    });
+    if (
+      pass.status !== "pending" ||
+      pass.report ||
+      !pass.native ||
+      pass.native.terminalMessageId ||
+      operation.status !== "pending" ||
+      operation.owner.kind !== "planning_session" ||
+      params.kind !== "planning_pass" ||
+      operation.kind !== "planning_pass" ||
+      operation.owner.planningSessionId !== input.sessionId ||
+      pass.planningSessionId !== input.sessionId ||
+      pass.operationId !== operation.id ||
+      params.passId !== pass.id ||
+      params.role !== pass.role ||
+      hashes.operation !== operation.fingerprint ||
+      hashes.manifest !== params.inputManifestHash ||
+      hashes.binding !== WorkflowCanonicalHash.tagged("binding", params.binding) ||
+      hashes.provider !== WorkflowCanonicalHash.tagged("provider", params.provider) ||
+      operation.origin.kind !== input.context.actor.kind ||
+      operation.origin.id !== input.context.actor.id ||
+      operation.destination.environmentId !== input.context.destination.environmentId ||
+      operation.destination.projectId !== input.context.destination.projectId
+    )
+      return yield* planningError("integrity");
+    const hash = yield* fingerprint(input.context, "admitPlanningPass", {
+      sessionId: input.sessionId,
+      expectedVersion: input.expectedVersion,
+      pass,
+      operation,
+    });
+    const result = yield* planningTransaction(
+      Effect.gen(function* () {
+        const receipts = yield* sql<{
+          planning_session_id: string | null;
+          fingerprint: string;
+          receipt_id: string;
+          result_json: string;
+        }>`SELECT planning_session_id, fingerprint, receipt_id, result_json FROM workflow_command_receipts WHERE command_id = ${input.command.commandId}`;
+        const prior = receipts[0];
+        if (prior) {
+          if (prior.planning_session_id !== input.sessionId || prior.fingerprint !== hash)
+            return yield* planningError("conflict");
+          const raw = yield* Effect.try({
+            try: () => parse(prior.result_json),
+            catch: () => planningError("integrity"),
+          });
+          const value = yield* decodeAdmission(raw).pipe(
+            Effect.mapError(() => planningError("integrity")),
+          );
+          return { kind: "replay" as const, receiptId: prior.receipt_id, value };
+        }
+        const current = yield* readSession(input.sessionId);
+        if (!sameContext(current, input.context)) return yield* planningError("unauthorized");
+        if (current.recordVersion !== input.expectedVersion)
+          return yield* new PlanningControlError({
+            reason: "conflict",
+            currentVersion: current.recordVersion,
+          });
+        if (current.status !== "active") return yield* planningError("ineligible");
+        if (!isWorkflowTimestampAfter(current.limits.deadline, input.now))
+          return yield* planningError("deadline");
+        if (
+          pass.binding.planId !== current.planId ||
+          operation.controlGeneration !== current.controlGeneration ||
+          WorkflowCanonicalHash.tagged("limits", params.limits) !==
+            WorkflowCanonicalHash.tagged("limits", current.limits)
+        )
+          return yield* planningError("integrity");
+        if (
+          !current.allowedRoles.includes(pass.role) ||
+          !current.allowedProviders.some(
+            (p) =>
+              p.providerInstanceId === pass.provider.providerInstanceId &&
+              p.model === pass.provider.model,
+          )
+        )
+          return yield* planningError("ineligible");
+        if (
+          current.consumed.passes >= current.limits.maxPasses ||
+          (pass.role === "repair" &&
+            current.consumed.repairRounds >= current.limits.maxRepairRounds)
+        )
+          return yield* planningError("limit");
+        if (pass.role === "author" || pass.role === "repair") {
+          const writers =
+            yield* sql`SELECT p.id FROM workflow_planning_passes p JOIN workflow_operations o ON o.id = p.operation_id WHERE p.plan_id = ${current.planId} AND o.status IN ('pending','claimed','unknown') AND json_extract(p.record_json, '$.role') IN ('author','repair')`;
+          if (writers.length) return yield* planningError("custody");
+        }
+        const b = pass.binding;
+        const rows = yield* sql<{
+          revision_json: string;
+          packet_json: string;
+          created_at: string;
+        }>`SELECT r.revision_json, p.packet_json, r.created_at FROM development_plan_revisions r JOIN development_plan_source_packets p ON p.plan_id = r.plan_id AND p.source_packet_hash = r.source_packet_hash JOIN workflow_revision_identities i ON i.plan_id = r.plan_id AND i.revision_id = r.revision_id AND i.revision_hash = r.revision_hash AND i.source_packet_hash = r.source_packet_hash WHERE r.plan_id = ${b.planId} AND r.revision_id = ${b.revisionId} AND r.revision_hash = ${b.revisionHash} AND r.source_packet_hash = ${b.sourcePacketHash}`;
+        const row = rows[0];
+        if (!row) return yield* planningError("integrity");
+        const content = yield* Effect.try({
+          try: () => ({ revision: parse(row.revision_json), sourcePacket: parse(row.packet_json) }),
+          catch: () => planningError("integrity"),
+        });
+        const envelope = yield* decodeDevelopmentPlanRevisionV1({
+          planId: b.planId,
+          revisionId: b.revisionId,
+          revisionHash: b.revisionHash,
+          sourcePacketHash: b.sourcePacketHash,
+          ...content,
+          createdAt: row.created_at,
+        }).pipe(
+          Effect.provide(Digest.layerWebCrypto),
+          Effect.mapError(() => planningError("integrity")),
+        );
+        const actual = yield* Effect.try({
+          try: () => ({
+            revision: DevelopmentPlanHash.revision(envelope.revision),
+            source: DevelopmentPlanHash.sourcePacket(envelope.sourcePacket),
+          }),
+          catch: () => planningError("integrity"),
+        });
+        if (actual.revision !== b.revisionHash || actual.source !== b.sourcePacketHash)
+          return yield* planningError("integrity");
+        const updated = {
+          ...current,
+          recordVersion: current.recordVersion + 1,
+          consumed: {
+            passes: current.consumed.passes + 1,
+            repairRounds: current.consumed.repairRounds + (pass.role === "repair" ? 1 : 0),
+          },
+        };
+        const changed =
+          yield* sql`UPDATE workflow_planning_sessions SET record_version = ${updated.recordVersion}, record_json = ${encode(updated)} WHERE id = ${current.id} AND record_version = ${current.recordVersion} RETURNING id`;
+        if (changed.length !== 1) return yield* planningError("conflict");
+        const inserted =
+          yield* sql`INSERT INTO workflow_operations (id, planning_session_id, kind, fingerprint, status, held, cancel_requested, generation, record_json) VALUES (${operation.id}, ${current.id}, 'planning_pass', ${operation.fingerprint}, 'pending', 0, 0, ${operation.controlGeneration}, ${encode(operation)}) ON CONFLICT DO NOTHING RETURNING id`;
+        if (inserted.length !== 1) return yield* planningError("conflict");
+        const native = pass.native!;
+        const insertedPass =
+          yield* sql`INSERT INTO workflow_planning_passes VALUES (${pass.id}, ${current.id}, ${b.planId}, ${b.revisionId}, ${b.revisionHash}, ${b.sourcePacketHash}, ${operation.id}, ${native.threadId}, ${native.runId}, ${encode(pass)}) ON CONFLICT DO NOTHING RETURNING id`;
+        if (insertedPass.length !== 1) return yield* planningError("conflict");
+        const value = { session: updated, pass, operation };
+        const saved =
+          yield* sql`INSERT INTO workflow_command_receipts (command_id, planning_session_id, fingerprint, receipt_id, operation_id, result_json) VALUES (${input.command.commandId}, ${current.id}, ${hash}, ${input.command.receiptId}, ${operation.id}, ${encode(value)}) ON CONFLICT DO NOTHING RETURNING receipt_id`;
+        if (saved.length !== 1) return yield* planningError("conflict");
+        return { kind: "applied" as const, receiptId: input.command.receiptId, value };
       }),
     );
     if (result.kind === "applied") yield* notify;
@@ -941,6 +1142,54 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
           return { kind: "stale" as const };
         if (row.status !== "pending" || row.held !== 0 || owner.status !== "active")
           return { kind: "denied" as const };
+        let planningPass: P | undefined;
+        if (operation.owner.kind === "planning_session") {
+          const session = yield* readSession(operation.owner.planningSessionId).pipe(
+            Effect.mapError(integrity),
+          );
+          if (
+            !isWorkflowTimestamp(input.now) ||
+            !isWorkflowTimestampAfter(session.limits.deadline, input.now)
+          )
+            return { kind: "denied" as const };
+          const passes = yield* sql<{
+            id: string;
+            planning_session_id: string;
+            plan_id: string;
+            revision_id: string;
+            revision_hash: string;
+            source_packet_hash: string;
+            operation_id: string;
+            native_thread_id: string | null;
+            native_run_id: string | null;
+            record_json: string;
+          }>`SELECT * FROM workflow_planning_passes WHERE operation_id = ${operation.id}`;
+          const p = passes[0];
+          if (!p || operation.parameters.kind !== "planning_pass") return yield* integrity();
+          const raw = yield* Effect.try({ try: () => parse(p.record_json), catch: integrity });
+          const pass = yield* decodePlanningPassV1(raw).pipe(Effect.mapError(integrity));
+          if (
+            pass.id !== p.id ||
+            pass.planningSessionId !== p.planning_session_id ||
+            pass.planningSessionId !== session.id ||
+            pass.operationId !== operation.id ||
+            p.operation_id !== operation.id ||
+            pass.binding.planId !== p.plan_id ||
+            pass.binding.revisionId !== p.revision_id ||
+            pass.binding.revisionHash !== p.revision_hash ||
+            pass.binding.sourcePacketHash !== p.source_packet_hash ||
+            !pass.native ||
+            pass.native.terminalMessageId ||
+            pass.native.threadId !== p.native_thread_id ||
+            pass.native.runId !== p.native_run_id ||
+            pass.status !== "pending" ||
+            operation.parameters.passId !== pass.id ||
+            WorkflowCanonicalHash.tagged("binding", operation.parameters.binding) !==
+              WorkflowCanonicalHash.tagged("binding", pass.binding)
+          )
+            return yield* integrity();
+          planningPass = pass;
+        }
         const claimed = yield* decodeWorkflowOperationV1({
           ...operation,
           status: "claimed",
@@ -955,6 +1204,11 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
           id: string;
         }>`UPDATE workflow_operations SET status = 'claimed', generation = ${input.expectedGeneration}, record_json = ${encode(claimed)} WHERE id = ${input.operationId} AND status = 'pending' AND held = 0 AND generation = ${input.expectedGeneration} RETURNING id`;
         if (updated.length !== 1) return { kind: "stale" as const };
+        if (planningPass) {
+          const changed =
+            yield* sql`UPDATE workflow_planning_passes SET record_json = ${encode({ ...planningPass, status: "claimed" })} WHERE id = ${planningPass.id} AND operation_id = ${operation.id} RETURNING id`;
+          if (changed.length !== 1) return yield* integrity();
+        }
         return { kind: "claimed" as const, operation: claimed };
       }),
     );
@@ -1137,6 +1391,7 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
   return {
     createRun,
     beginPlanning,
+    admitPlanningPass,
     getPlanning,
     controlPlanning,
     recordRoleResult,
