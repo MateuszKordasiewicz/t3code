@@ -8,6 +8,7 @@ import {
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import { WorkflowCanonicalHash } from "./WorkflowCanonicalHash.ts";
@@ -55,7 +56,14 @@ const isStoreError = Schema.is(WorkflowRunStoreError);
 const integrity = () => new WorkflowRunStoreError({ reason: "integrity" });
 const stale = () => new WorkflowRunStoreError({ reason: "stale" });
 
-const make = Effect.gen(function* () {
+const make = Effect.fn("WorkflowRunStore.make")(function* (
+  beforePublish: Effect.Effect<void> = Effect.void,
+) {
+  const changes = yield* Effect.acquireRelease(PubSub.sliding<void>(1), PubSub.shutdown);
+  const notify = beforePublish.pipe(
+    Effect.andThen(PubSub.publish(changes, undefined)),
+    Effect.asVoid,
+  );
   const sql = yield* SqlClient.SqlClient;
   const inTransaction = <A, E, R>(work: Effect.Effect<A, E, R>) =>
     sql
@@ -96,7 +104,9 @@ const make = Effect.gen(function* () {
       if (inserted.length !== 1) return yield* integrity();
       return run;
     });
-    return yield* inTransaction(work);
+    const result = yield* inTransaction(work);
+    yield* notify;
+    return result;
   });
   const createPlanningSession = Effect.fn("WorkflowRunStore.createPlanningSession")(function* (
     record: unknown,
@@ -118,7 +128,9 @@ const make = Effect.gen(function* () {
       if (inserted.length !== 1) return yield* integrity();
       return session;
     });
-    return yield* inTransaction(work);
+    const result = yield* inTransaction(work);
+    yield* notify;
+    return result;
   });
   const recordRoleResult = Effect.fn("WorkflowRunStore.recordRoleResult")(function* (input: {
     readonly runId: string;
@@ -133,7 +145,7 @@ const make = Effect.gen(function* () {
       result.workflowRunId !== input.runId
     )
       return yield* integrity();
-    return yield* inTransaction(
+    const recorded = yield* inTransaction(
       Effect.gen(function* () {
         const rows = yield* sql<{
           record_json: string;
@@ -167,6 +179,8 @@ const make = Effect.gen(function* () {
         return result;
       }),
     );
+    yield* notify;
+    return recorded;
   });
   const commitTransition = Effect.fn("WorkflowRunStore.commitTransition")(function* (input: {
     readonly runId: string;
@@ -517,13 +531,122 @@ const make = Effect.gen(function* () {
       yield* sql`INSERT INTO workflow_command_receipts (command_id, workflow_run_id, fingerprint, receipt_id, operation_id, result_json) VALUES (${command.commandId}, ${run.id}, ${fingerprint}, ${input.receiptId}, ${operation?.id ?? null}, ${encode(result)})`;
       return result;
     });
-    return yield* inTransaction(work);
+    const result = yield* inTransaction(work);
+    if (result.kind === "accepted") yield* notify;
+    return result;
   });
-  return { createRun, createPlanningSession, recordRoleResult, commitTransition };
+  const subscribeChanges = PubSub.subscribe(changes);
+  const listPending = Effect.fn("WorkflowRunStore.listPending")(
+    function* () {
+      const rows = yield* sql<{
+        record_json: string;
+      }>`SELECT record_json FROM workflow_operations WHERE status = 'pending' AND held = 0 ORDER BY id`;
+      return yield* Effect.forEach(rows, (row) =>
+        Effect.try({ try: () => parse(row.record_json), catch: integrity }).pipe(
+          Effect.flatMap(decodeWorkflowOperationV1),
+          Effect.mapError(integrity),
+        ),
+      );
+    },
+    Effect.mapError((error) =>
+      isStoreError(error) ? error : new WorkflowRunStoreError({ reason: "persistence" }),
+    ),
+  );
+  const claim = Effect.fn("WorkflowRunStore.claim")(function* (input: {
+    readonly operationId: string;
+    readonly expectedOwnerVersion: number;
+    readonly expectedGeneration: number;
+    readonly bootId: string;
+    readonly workerId: string;
+    readonly now: string;
+    readonly trustedEligibility?: boolean;
+  }) {
+    if (input.trustedEligibility !== true) return { kind: "denied" as const };
+    const result = yield* inTransaction(
+      Effect.gen(function* () {
+        const rows = yield* sql<{
+          record_json: string;
+          status: string;
+          held: number;
+          generation: number;
+          workflow_run_id: string | null;
+          planning_session_id: string | null;
+        }>`SELECT record_json, status, held, generation, workflow_run_id, planning_session_id FROM workflow_operations WHERE id = ${input.operationId}`;
+        const row = rows[0];
+        if (!row) return { kind: "denied" as const };
+        const operation = yield* Effect.try({
+          try: () => parse(row.record_json),
+          catch: integrity,
+        }).pipe(Effect.flatMap(decodeWorkflowOperationV1), Effect.mapError(integrity));
+        if (
+          operation.id !== input.operationId ||
+          operation.status !== row.status ||
+          operation.controlGeneration !== row.generation ||
+          (operation.owner.kind === "workflow_run"
+            ? operation.owner.workflowRunId !== row.workflow_run_id ||
+              row.planning_session_id !== null
+            : operation.owner.planningSessionId !== row.planning_session_id ||
+              row.workflow_run_id !== null)
+        )
+          return yield* integrity();
+        const owners =
+          operation.owner.kind === "workflow_run"
+            ? yield* sql<{
+                record_version: number;
+                control_generation: number;
+                status: string;
+              }>`SELECT record_version, control_generation, status FROM workflow_runs WHERE id = ${operation.owner.workflowRunId}`
+            : yield* sql<{
+                record_version: number;
+                control_generation: number;
+                status: string;
+              }>`SELECT record_version, control_generation, status FROM workflow_planning_sessions WHERE id = ${operation.owner.planningSessionId}`;
+        const owner = owners[0];
+        if (!owner) return yield* integrity();
+        if (
+          owner.record_version !== input.expectedOwnerVersion ||
+          owner.control_generation !== input.expectedGeneration ||
+          row.generation !== input.expectedGeneration ||
+          row.status === "claimed"
+        )
+          return { kind: "stale" as const };
+        if (row.status !== "pending" || row.held !== 0 || owner.status !== "active")
+          return { kind: "denied" as const };
+        const claimed = yield* decodeWorkflowOperationV1({
+          ...operation,
+          status: "claimed",
+          claim: {
+            bootId: input.bootId,
+            workerId: input.workerId,
+            generation: input.expectedGeneration,
+            claimedAt: input.now,
+          },
+        }).pipe(Effect.mapError(integrity));
+        const updated = yield* sql<{
+          id: string;
+        }>`UPDATE workflow_operations SET status = 'claimed', generation = ${input.expectedGeneration}, record_json = ${encode(claimed)} WHERE id = ${input.operationId} AND status = 'pending' AND held = 0 AND generation = ${input.expectedGeneration} RETURNING id`;
+        if (updated.length !== 1) return { kind: "stale" as const };
+        return { kind: "claimed" as const, operation: claimed };
+      }),
+    );
+    if (result.kind === "claimed") yield* notify;
+    return result;
+  });
+  return {
+    createRun,
+    createPlanningSession,
+    recordRoleResult,
+    commitTransition,
+    subscribeChanges,
+    listPending,
+    claim,
+  };
 });
 
 export class WorkflowRunStore extends Context.Service<
   WorkflowRunStore,
-  Effect.Success<typeof make>
+  Effect.Success<ReturnType<typeof make>>
 >()("t3/workflowRuns/WorkflowRunStore") {}
-export const layer = Layer.effect(WorkflowRunStore, make);
+export const layer = Layer.effect(WorkflowRunStore, make());
+export const layerWithPublishFault = (fault: Effect.Effect<void>) =>
+  Layer.effect(WorkflowRunStore, make(fault));

@@ -1,9 +1,16 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+import * as NodeSqlite from "node:sqlite";
+
 import { assert, it } from "@effect/vitest";
 import { PlanningSessionV1, WorkflowOperationV1, WorkflowRunV1 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import migration from "../persistence/Migrations/081_WorkflowRuns.ts";
@@ -908,4 +915,193 @@ it.effect(
       yield* sql`UPDATE workflow_operations SET record_json = json_set(record_json, '$.parameters.headCommit', 'head') WHERE id = 'ci'`;
       assert.deepStrictEqual(yield* complete(), { kind: "accepted", receiptId: "completed" });
     }).pipe(Effect.provide(layer)),
+);
+
+it.effect("publishes only committed transitions", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      yield* setupAdmission;
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      const subscription = yield* store.subscribeChanges;
+      const op = operationFor("notify-op", "notify-attempt");
+      const input = {
+        runId: run.id,
+        command: admission(op, "notify-attempt"),
+        externalFacts: admissionFacts,
+        operation: op,
+        receiptId: "notify-receipt",
+      };
+      yield* sql`CREATE TRIGGER fail_receipt BEFORE INSERT ON workflow_command_receipts BEGIN SELECT RAISE(ABORT, 'fault'); END`;
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(store.commitTransition(input))));
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+      assert.strictEqual((yield* sql`SELECT * FROM workflow_operations`).length, 0);
+      assert.strictEqual((yield* sql`SELECT * FROM workflow_attempts`).length, 0);
+      assert.strictEqual((yield* sql`SELECT * FROM workflow_command_receipts`).length, 0);
+      assert.deepStrictEqual(yield* sql`SELECT record_version FROM workflow_runs`, [
+        { record_version: 0 },
+      ]);
+      yield* sql`DROP TRIGGER fail_receipt`;
+      yield* store.commitTransition(input);
+      yield* PubSub.take(subscription);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+      yield* store.commitTransition(input);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+const independentRows = (filename: string) => {
+  const db = new NodeSqlite.DatabaseSync(filename);
+  try {
+    db.exec("PRAGMA foreign_keys = ON");
+    return {
+      run: db.prepare("SELECT record_json FROM workflow_runs WHERE id = 'run'").get(),
+      operation: db
+        .prepare("SELECT fingerprint, record_json FROM workflow_operations WHERE id = 'lost-op'")
+        .get(),
+      receipt: db
+        .prepare(
+          "SELECT fingerprint, operation_id FROM workflow_command_receipts WHERE receipt_id = 'lost-receipt'",
+        )
+        .get(),
+      attempts: db.prepare("SELECT id, operation_id FROM workflow_attempts").all(),
+    };
+  } finally {
+    db.close();
+  }
+};
+
+it.effect("recovers durable pending work after a post-commit notification fault", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const directory = yield* Effect.acquireRelease(
+        Effect.sync(() => NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "workflow-store-"))),
+        (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
+      );
+      const filename = NodePath.join(directory, "test.sqlite");
+      const faultLayer = Store.layerWithPublishFault(Effect.die("notification fault")).pipe(
+        Layer.provideMerge(NodeSqliteClient.layer({ filename })),
+      );
+      yield* Effect.gen(function* () {
+        yield* setupAdmission;
+        const store = yield* Store.WorkflowRunStore;
+        const subscription = yield* store.subscribeChanges;
+        const op = operationFor("lost-op", "lost-attempt");
+        const input = {
+          runId: run.id,
+          command: admission(op, "lost-attempt"),
+          externalFacts: admissionFacts,
+          operation: op,
+          receiptId: "lost-receipt",
+        };
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(store.commitTransition(input))));
+        assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+        const rows = yield* Effect.sync(() => independentRows(filename));
+        assert.strictEqual(
+          (parse(String(rows.run?.record_json)) as typeof run).allowance.attemptsConsumed,
+          1,
+        );
+        assert.strictEqual(rows.operation?.fingerprint, op.fingerprint);
+        assert.deepStrictEqual(parse(String(rows.operation?.record_json)), op);
+        assert.strictEqual(
+          rows.receipt?.fingerprint,
+          WorkflowCanonicalHash.command(run.id, input.command),
+        );
+        assert.strictEqual(rows.receipt?.operation_id, op.id);
+        assert.strictEqual(rows.attempts.length, 1);
+        assert.deepStrictEqual(yield* store.listPending(), [op]);
+      }).pipe(Effect.provide(faultLayer));
+    }),
+  ),
+);
+
+it.effect.each(["eligible", "held", "non-pending", "untrusted", "stale-owner"] as const)(
+  "claim: %s",
+  (scenario) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* setupAdmission;
+        const sql = yield* SqlClient.SqlClient;
+        const store = yield* Store.WorkflowRunStore;
+        const op = operationFor("claim-op", "claim-attempt");
+        yield* store.commitTransition({
+          runId: run.id,
+          command: admission(op, "claim-attempt"),
+          externalFacts: admissionFacts,
+          operation: op,
+          receiptId: "claim-receipt",
+        });
+        if (scenario === "held")
+          yield* sql`UPDATE workflow_operations SET held = 1 WHERE id = ${op.id}`;
+        if (scenario === "non-pending") {
+          const cancelled = {
+            ...op,
+            status: "cancelled",
+            outcome: { kind: "cancelled", summary: "cancelled", evidence: [] },
+          };
+          yield* sql`UPDATE workflow_operations SET status = 'cancelled', record_json = ${json(cancelled)} WHERE id = ${op.id}`;
+        }
+        const before = yield* sql`SELECT * FROM workflow_operations`;
+        const input = {
+          operationId: op.id,
+          expectedOwnerVersion: scenario === "stale-owner" ? 0 : 1,
+          expectedGeneration: 0,
+          bootId: "boot",
+          workerId: "worker",
+          now: "2026-11-12T00:00:00Z",
+          ...(scenario === "untrusted" ? {} : { trustedEligibility: true }),
+        };
+        const result = yield* store.claim(input);
+        assert.strictEqual(
+          result.kind,
+          scenario === "eligible" ? "claimed" : scenario === "stale-owner" ? "stale" : "denied",
+        );
+        if (scenario === "eligible") {
+          assert.strictEqual((yield* store.claim(input)).kind, "stale");
+          assert.deepStrictEqual(yield* store.listPending(), []);
+        } else assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_operations`, before);
+      }),
+    ).pipe(Effect.provide(layer)),
+);
+
+it.effect("claim loses to a committed pause of its owner", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      yield* setupAdmission;
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      const op = operationFor("claim-op", "claim-attempt");
+      yield* store.commitTransition({
+        runId: run.id,
+        command: admission(op, "claim-attempt"),
+        externalFacts: admissionFacts,
+        operation: op,
+        receiptId: "claim-receipt",
+      });
+      yield* store.commitTransition({
+        runId: run.id,
+        command: { ...command, commandId: "pause", expectedVersion: 1, expectedGeneration: 0 },
+        externalFacts: facts,
+        receiptId: "pause",
+      });
+      const before = yield* sql`SELECT * FROM workflow_operations`;
+      const claim = {
+        operationId: op.id,
+        bootId: "boot",
+        workerId: "worker",
+        now: "2026-11-12T00:00:00Z",
+        trustedEligibility: true,
+      };
+      assert.strictEqual(
+        (yield* store.claim({ ...claim, expectedOwnerVersion: 1, expectedGeneration: 0 })).kind,
+        "stale",
+      );
+      assert.strictEqual(
+        (yield* store.claim({ ...claim, expectedOwnerVersion: 2, expectedGeneration: 1 })).kind,
+        "stale",
+      );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_operations`, before);
+    }),
+  ).pipe(Effect.provide(layer)),
 );
