@@ -66,11 +66,16 @@ const base: Input = {
   },
 };
 const input = (
-  command: Partial<Input["command"]> = {},
+  command: Partial<
+    Extract<
+      Input["command"],
+      { kind: "pause" | "stop" | "deadline" | "custodySettled" | "resume" | "observeUnknown" }
+    >
+  > = {},
   changes: { run?: Partial<Input["run"]>; facts?: Partial<Input["facts"]> } = {},
 ): Input => ({
   run: { ...run, ...changes.run },
-  command: { ...base.command, ...command },
+  command: { ...base.command, ...command } as Input["command"],
   facts: { ...base.facts, ...changes.facts },
 });
 const accepted = (status: WorkflowRunV1["status"], generation: number, actions: unknown[]) => ({
@@ -85,6 +90,81 @@ const accepted = (status: WorkflowRunV1["status"], generation: number, actions: 
   actions,
 });
 const rejected = (reason: string) => ({ kind: "rejected", reason });
+
+const binding = {
+  specHash: hash,
+  itemId: "item-1",
+  attemptId: "attempt-1",
+  candidateHash: hash,
+  configurationHash: hash,
+  policyHash: hash,
+};
+const progressFacts: Partial<Input["facts"]> = {
+  orderedItemIds: ["item-1", "item-2"],
+  acceptedItemIds: [],
+  predecessorAccepted: true,
+  knownAttemptIds: [],
+  knownOperationIds: [],
+  currentAttemptState: "none",
+  currentBinding: binding,
+  acceptance: {
+    binding,
+    verdict: "accepted",
+    evidenceAvailable: true,
+    independent: true,
+    finalCombined: false,
+  },
+  finalAccepted: false,
+  publicationSettled: true,
+  requiredCiPassed: true,
+  publishedHead: "head",
+  ciHead: "head",
+};
+const admit: Input["command"] = {
+  ...base.command,
+  kind: "admitAttempt",
+  operationId: opId,
+  operationFingerprint: hash,
+  attemptId: "attempt-1",
+  itemId: "item-1",
+  repair: false,
+};
+const advance: Input["command"] = {
+  ...base.command,
+  kind: "advance",
+  binding,
+  finalCombined: false,
+};
+const complete: Input["command"] = { ...base.command, kind: "complete" };
+const progress = (
+  command: Input["command"],
+  facts: Partial<Input["facts"]> = {},
+  changes: Partial<Input["run"]> = {},
+): Input => ({
+  run: { ...run, ...changes },
+  command,
+  facts: { ...base.facts, ...progressFacts, ...facts },
+});
+const reserve = {
+  kind: "reserve_attempt",
+  operationId: opId,
+  fingerprint: hash,
+  attemptId: "attempt-1",
+  itemId: "item-1",
+  repair: false,
+};
+const finalBinding = { ...binding, itemId: "combined" };
+const finalFacts: Partial<Input["facts"]> = {
+  acceptedItemIds: ["item-1", "item-2"],
+  currentBinding: finalBinding,
+  acceptance: {
+    binding: finalBinding,
+    verdict: "accepted",
+    evidenceAvailable: true,
+    independent: true,
+    finalCombined: true,
+  },
+};
 
 describe("WorkflowRunPolicy", () => {
   it.each([
@@ -333,6 +413,185 @@ describe("WorkflowRunPolicy", () => {
       "resume unauthorized",
       input({ kind: "resume" }, { run: { status: "paused" }, facts: { authority: false } }),
       rejected("unauthorized"),
+    ],
+    [
+      "admit attempt",
+      progress(admit),
+      {
+        kind: "accepted",
+        run: { recordVersion: 6, allowance: { ...run.allowance, attemptsConsumed: 2 } },
+        actions: [reserve],
+      },
+    ],
+    [
+      "admit repair",
+      progress(
+        { ...admit, repair: true },
+        { currentAttemptState: "settled_failed", currentAttemptItemId: "item-1" },
+      ),
+      {
+        kind: "accepted",
+        run: {
+          recordVersion: 6,
+          allowance: { ...run.allowance, attemptsConsumed: 2, repairRoundsConsumed: 1 },
+        },
+        actions: [{ ...reserve, repair: true }],
+      },
+    ],
+    [
+      "operation replay before stale",
+      progress(
+        { ...admit, expectedVersion: 4 },
+        { operationReceipt: { operationId: opId, fingerprint: hash, receiptId: "receipt-op" } },
+      ),
+      { kind: "replay", receiptId: "receipt-op" },
+    ],
+    [
+      "operation conflict",
+      progress(admit, {
+        operationReceipt: { operationId: opId, fingerprint: "other", receiptId: "receipt-op" },
+      }),
+      rejected("integrity"),
+    ],
+    ["admission paused", progress(admit, {}, { status: "paused" }), rejected("invalid_state")],
+    ["admission unauthorized", progress(admit, { authority: false }), rejected("unauthorized")],
+    [
+      "admission at deadline",
+      progress(admit, { now: "2026-12-01T00:00:00Z" }),
+      rejected("deadline"),
+    ],
+    [
+      "admission exhausted",
+      progress(admit, {}, { allowance: { ...run.allowance, attemptsConsumed: 3 } }),
+      rejected("exhausted"),
+    ],
+    [
+      "repair exhausted",
+      progress(
+        { ...admit, repair: true },
+        {},
+        { allowance: { ...run.allowance, repairRoundsConsumed: 1 } },
+      ),
+      rejected("exhausted"),
+    ],
+    ["admission unknown custody", progress(admit, { custody: "unknown" }), rejected("custody")],
+    ["admission writer", progress(admit, { activeWriterCount: 1 }), rejected("custody")],
+    [
+      "admission stale compatibility",
+      progress(admit, { compatibilityCurrent: false }),
+      rejected("freshness"),
+    ],
+    [
+      "admission revoked grant",
+      progress(admit, { originGrantCurrent: false }),
+      rejected("freshness"),
+    ],
+    [
+      "admission predecessor",
+      progress(admit, { predecessorAccepted: false }),
+      rejected("ordering"),
+    ],
+    ["admission order", progress({ ...admit, itemId: "item-2" }), rejected("ordering")],
+    [
+      "duplicate attempt",
+      progress(admit, { knownAttemptIds: ["attempt-1"] }),
+      rejected("integrity"),
+    ],
+    [
+      "duplicate operation without receipt",
+      progress(admit, { knownOperationIds: [opId] }),
+      rejected("integrity"),
+    ],
+    ["repair requires settled attempt", progress({ ...admit, repair: true }), rejected("ordering")],
+    [
+      "accept item",
+      progress(advance),
+      {
+        kind: "accepted",
+        run: { recordVersion: 6, allowance: run.allowance },
+        actions: [{ kind: "accept_item", binding }],
+      },
+    ],
+    [
+      "missing acceptance",
+      {
+        ...progress(advance),
+        facts: { ...base.facts, orderedItemIds: ["item-1"], acceptedItemIds: [] },
+      },
+      rejected("evidence"),
+    ],
+    [
+      "stale binding",
+      progress(advance, { currentBinding: { ...binding, candidateHash: "stale" } }),
+      rejected("evidence"),
+    ],
+    [
+      "unavailable evidence",
+      progress(advance, { acceptance: { ...progressFacts.acceptance!, evidenceAvailable: false } }),
+      rejected("evidence"),
+    ],
+    [
+      "inconclusive evidence",
+      progress(advance, { acceptance: { ...progressFacts.acceptance!, verdict: "inconclusive" } }),
+      rejected("evidence"),
+    ],
+    [
+      "dependent evaluation",
+      progress(advance, { acceptance: { ...progressFacts.acceptance!, independent: false } }),
+      rejected("evidence"),
+    ],
+    ["duplicate item", progress(advance, { acceptedItemIds: ["item-1"] }), rejected("ordering")],
+    ["final before all items", progress({ ...advance, finalCombined: true }), rejected("ordering")],
+    [
+      "accept final",
+      progress({ ...advance, binding: finalBinding, finalCombined: true }, finalFacts),
+      { kind: "accepted", actions: [{ kind: "accept_final", binding: finalBinding }] },
+    ],
+    [
+      "missing final acceptance state",
+      {
+        ...progress({ ...advance, binding: finalBinding, finalCombined: true }, finalFacts),
+        facts: { ...base.facts, ...finalFacts, orderedItemIds: ["item-1", "item-2"] },
+      },
+      rejected("evidence"),
+    ],
+    [
+      "duplicate final",
+      progress(
+        { ...advance, binding: finalBinding, finalCombined: true },
+        { ...finalFacts, finalAccepted: true },
+      ),
+      rejected("invalid_state"),
+    ],
+    [
+      "complete",
+      progress(complete, { finalAccepted: true }),
+      {
+        kind: "accepted",
+        run: { status: "completed", recordVersion: 6, allowance: run.allowance },
+        actions: [],
+      },
+    ],
+    ["complete missing final", progress(complete), rejected("evidence")],
+    [
+      "complete unsettled publication",
+      progress(complete, { finalAccepted: true, publicationSettled: false }),
+      rejected("evidence"),
+    ],
+    [
+      "complete mismatched ci",
+      progress(complete, { finalAccepted: true, ciHead: "other" }),
+      rejected("evidence"),
+    ],
+    [
+      "complete active custody",
+      progress(complete, { finalAccepted: true, custody: "active" }),
+      rejected("custody"),
+    ],
+    [
+      "duplicate completion",
+      progress(complete, { finalAccepted: true }, { status: "completed" }),
+      rejected("invalid_state"),
     ],
   ])("%s", (_name, value, expected) => {
     const before = structuredClone(value);
