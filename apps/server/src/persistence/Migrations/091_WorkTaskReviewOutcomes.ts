@@ -359,15 +359,27 @@ export default Effect.gen(function* () {
     BEGIN SELECT RAISE(ABORT, 'duplicate review status'); END`;
   yield* sql`CREATE INDEX work_task_review_status_page_idx ON work_task_review_status(task_id, state, sequence DESC, review_id DESC)`;
   yield* sql`CREATE INDEX work_task_reviews_history_idx ON work_task_action_reviews(task_id, created_sequence DESC, review_id DESC)`;
+  yield* sql`CREATE TABLE work_task_review_rowids (
+    source TEXT NOT NULL, row_id INTEGER NOT NULL, PRIMARY KEY (source, row_id)
+  ) WITHOUT ROWID`;
   for (const table of [
     "work_task_action_reviews",
     "work_task_action_review_decisions",
     "work_task_action_review_releases",
   ]) {
-    yield* sql.unsafe(`CREATE TRIGGER ${table}_rowid_guard BEFORE INSERT ON ${table}
-      WHEN EXISTS (SELECT 1 FROM ${table} WHERE rowid = NEW.rowid)
-      BEGIN SELECT RAISE(ABORT, 'immutable review rowid'); END`);
+    yield* sql.unsafe(`INSERT INTO work_task_review_rowids SELECT '${table}',rowid FROM ${table}`);
+    yield* sql.unsafe(`CREATE TRIGGER ${table}_rowid_guard AFTER INSERT ON ${table}
+      BEGIN INSERT INTO work_task_review_rowids VALUES ('${table}', NEW.rowid); END`);
   }
+  // AFTER INSERT sees the allocated rowid; BEFORE INSERT uses -1 for implicit allocation.
+  yield* sql`CREATE TRIGGER work_task_review_rowids_unique BEFORE INSERT ON work_task_review_rowids
+    WHEN EXISTS (SELECT 1 FROM work_task_review_rowids WHERE source = NEW.source AND row_id = NEW.row_id)
+    BEGIN SELECT RAISE(ABORT, 'immutable review rowid'); END`;
+  yield* sql`CREATE TRIGGER work_task_review_rowids_no_update BEFORE UPDATE ON work_task_review_rowids
+    BEGIN SELECT RAISE(ABORT, 'immutable rowid reservation'); END`;
+  yield* sql`CREATE TRIGGER work_task_review_rowids_no_delete BEFORE DELETE ON work_task_review_rowids
+    BEGIN SELECT RAISE(ABORT, 'immutable rowid reservation'); END`;
+  yield* sql`CREATE INDEX work_task_review_outcomes_review_idx ON work_task_review_outcomes(review_id, sequence DESC)`;
   for (const table of ["work_task_review_events", "work_task_review_outcomes"]) {
     yield* sql.unsafe(`CREATE TRIGGER ${table}_context_nonblank BEFORE INSERT ON ${table}
       WHEN length(CAST(trim(NEW.event_id, ${whitespace}) AS BLOB)) = 0

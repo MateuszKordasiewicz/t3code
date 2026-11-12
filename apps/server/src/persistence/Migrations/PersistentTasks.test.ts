@@ -45,6 +45,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
         "work_task_results",
         "work_task_review_events",
         "work_task_review_outcomes",
+        "work_task_review_rowids",
         "work_task_review_status",
         "work_task_thread_links",
         "work_task_validation_attempts",
@@ -1925,11 +1926,11 @@ it.effect("preserves review evidence on upgrade and binds append-only outcomes a
     yield* sql`INSERT INTO work_task_projections VALUES ('a', NULL, 1, 1, 1, 1, '{}', 't', 't')`;
     yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('a', 1, 1, '{}', '{}', 'def', 't')`;
     yield* sql`INSERT INTO work_task_manager_bindings VALUES ('a', 1, 'manager', 't', NULL)`;
-    yield* sql`INSERT INTO work_task_action_reviews VALUES
-      ('review', 'a', 1, 1, 'manager', 'session', 'run', 'command', 'request', 'rule', 1, 1,
+    yield* sql`INSERT INTO work_task_action_reviews (rowid,review_id,task_id,revision,manager_generation,manager_thread_id,provider_session_id,run_id,command_id,runtime_request_id,rule_id,definition_revision,action_policy_revision,action,label,target,preview_json,fingerprint,created_sequence,created_at) VALUES
+      (-1,'review', 'a', 1, 1, 'manager', 'session', 'run', 'command', 'request', 'rule', 1, 1,
        'send', 'label', 'target', '{"content":"payload","artifacts":[]}', 'fingerprint', 1, '2026-11-12T00:00:00Z')`;
-    yield* sql`INSERT INTO work_task_action_review_decisions VALUES ('review', 'a', 1, 1, 'fingerprint', 1, 'reject', 'human', 'session', 'feedback', 2, 't')`;
-    yield* sql`INSERT INTO work_task_action_review_releases VALUES ('review', 'a', 1, 1, 'fingerprint', 1, 'continuation', 't')`;
+    yield* sql`INSERT INTO work_task_action_review_decisions (rowid,review_id,task_id,review_revision,action_policy_revision,fingerprint,manager_generation,decision,human_subject,human_session_id,feedback,resolved_sequence,resolved_at) VALUES (-1,'review', 'a', 1, 1, 'fingerprint', 1, 'reject', 'human', 'session', 'feedback', 2, 't')`;
+    yield* sql`INSERT INTO work_task_action_review_releases (rowid,review_id,task_id,review_revision,action_policy_revision,fingerprint,manager_generation,continuation_id,created_at) VALUES (-1,'review', 'a', 1, 1, 'fingerprint', 1, 'continuation', 't')`;
     const reviews = yield* sql`SELECT * FROM work_task_action_reviews`;
     const decisions = yield* sql`SELECT * FROM work_task_action_review_decisions`;
     const releases = yield* sql`SELECT * FROM work_task_action_review_releases`;
@@ -2511,6 +2512,28 @@ it.effect("preserves review evidence on upgrade and binds append-only outcomes a
         sql`INSERT INTO work_task_review_events VALUES (${reviewId},'a',${reviewId},${50 + index},${base.occurredAt},${command},${JSON.stringify(badPreview)})`,
       );
     }
+    const latestPlan = yield* sql<{ detail: string }>`EXPLAIN QUERY PLAN SELECT max(seq) FROM (
+      SELECT created_sequence AS seq FROM work_task_action_reviews WHERE review_id = 'review'
+      UNION ALL SELECT resolved_sequence FROM work_task_action_review_decisions WHERE review_id = 'review'
+      UNION ALL SELECT sequence FROM work_task_review_outcomes WHERE review_id = 'review' AND json_extract(event_json,'$.type') IN ('task.action-review-invalidated','task.action-review-cancelled'))`;
+    assert.isTrue(
+      latestPlan.some((row) =>
+        row.detail.includes(
+          "SEARCH work_task_review_outcomes USING INDEX work_task_review_outcomes_review_idx",
+        ),
+      ),
+    );
+    assert.isFalse(latestPlan.some((row) => row.detail.includes("SCAN work_task_review_outcomes")));
+    const terminalPlan = yield* sql<{
+      detail: string;
+    }>`EXPLAIN QUERY PLAN SELECT 1 FROM work_task_review_outcomes WHERE review_id = 'review' AND sequence = 14 AND json_extract(event_json,'$.type') = 'task.action-review-invalidated'`;
+    assert.isTrue(
+      terminalPlan.some((row) =>
+        row.detail.includes(
+          "SEARCH work_task_review_outcomes USING INDEX work_task_review_outcomes_review_idx",
+        ),
+      ),
+    );
     const statusPlan = yield* sql<{
       readonly detail: string;
     }>`EXPLAIN QUERY PLAN SELECT * FROM work_task_review_status WHERE task_id = 'a' AND state = 'cancelled' ORDER BY sequence DESC, review_id DESC LIMIT 10`;
