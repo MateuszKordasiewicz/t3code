@@ -150,9 +150,10 @@ const preflight = (input: unknown): Reason | undefined => {
     })
   );
 };
-const duplicate = (values: readonly string[]) => new Set(values).size !== values.length;
+export const hasWorkflowDuplicates = (values: readonly string[]) =>
+  new Set(values).size !== values.length;
 const decodeShape = Schema.decodeUnknownEffect(DevelopmentPlanDocumentV1);
-const validTimestamp = (value: string) => {
+export const isWorkflowTimestamp = (value: string) => {
   const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/.exec(value);
   if (!match) return false;
   const [, year, month, day, hour, minute, second] = match;
@@ -180,18 +181,18 @@ export const decodeDevelopmentPlanDocumentV1 = Effect.fn("DevelopmentPlanDocumen
       Effect.mapError(() => fail("malformed field")),
     );
     if (
-      duplicate(document.linkedThreadIds) ||
-      duplicate(document.sources.map((x) => x.id)) ||
-      duplicate(document.sourceStatements.map((x) => x.id)) ||
-      duplicate(document.requirements.map((x) => x.id)) ||
-      duplicate(document.requirements.flatMap((x) => x.criteria.map((c) => c.id))) ||
-      document.requirements.some((x) => duplicate(x.sourceStatementIds))
+      hasWorkflowDuplicates(document.linkedThreadIds) ||
+      hasWorkflowDuplicates(document.sources.map((x) => x.id)) ||
+      hasWorkflowDuplicates(document.sourceStatements.map((x) => x.id)) ||
+      hasWorkflowDuplicates(document.requirements.map((x) => x.id)) ||
+      hasWorkflowDuplicates(document.requirements.flatMap((x) => x.criteria.map((c) => c.id))) ||
+      document.requirements.some((x) => hasWorkflowDuplicates(x.sourceStatementIds))
     )
       return yield* fail("ambiguous identity");
     const sourceBytes = new Map<string, Uint8Array>();
     for (const source of document.sources) {
       if (
-        !validTimestamp(source.capturedAt) ||
+        !isWorkflowTimestamp(source.capturedAt) ||
         !Number.isSafeInteger(source.byteLength) ||
         source.byteLength < 0 ||
         !/^[0-9a-f]{64}$/.test(source.sha256)
@@ -246,7 +247,10 @@ const SessionOrigin = Schema.Struct({
   projectId: ProjectId,
   threadId: Schema.optionalKey(ThreadId),
 });
-const SessionProvider = Schema.Struct({ providerInstanceId: ProviderInstanceId, model: NonEmpty });
+export const WorkflowProvider = Schema.Struct({
+  providerInstanceId: ProviderInstanceId,
+  model: NonEmpty,
+});
 
 export const PlanningSessionV1 = Schema.Struct({
   schemaVersion: Schema.Literal(1),
@@ -259,7 +263,7 @@ export const PlanningSessionV1 = Schema.Struct({
   request: NonEmpty,
   mode: Schema.Literal("ordinary"),
   allowedRoles: Schema.Array(Schema.Literals(["author", "review", "repair", "readback"])),
-  allowedProviders: Schema.Array(SessionProvider),
+  allowedProviders: Schema.Array(WorkflowProvider),
   limits: Schema.Struct({
     maxPasses: Schema.Number,
     maxRepairRounds: Schema.Number,
@@ -290,7 +294,7 @@ export class PlanningSessionError extends Schema.TaggedError<PlanningSessionErro
 const decodeSessionShape = Schema.decodeUnknownEffect(PlanningSessionV1);
 const sessionFail = (reason: PlanningSessionError["reason"]) =>
   new PlanningSessionError({ reason });
-const isUint = (value: number) => Number.isSafeInteger(value) && value >= 0;
+export const isWorkflowUint = (value: number) => Number.isSafeInteger(value) && value >= 0;
 const timestampAfter = (a: string, b: string) => {
   const seconds = a.slice(0, 19).localeCompare(b.slice(0, 19));
   if (seconds !== 0) return seconds > 0;
@@ -314,20 +318,20 @@ export const decodePlanningSessionV1 = Effect.fn("PlanningSessionV1.decode")(fun
       consumed.repairRounds,
       session.controlGeneration,
       session.recordVersion,
-    ].every(isUint) ||
+    ].every(isWorkflowUint) ||
     limits.maxPasses === 0 ||
-    !validTimestamp(limits.deadline) ||
-    !validTimestamp(session.createdAt) ||
+    !isWorkflowTimestamp(limits.deadline) ||
+    !isWorkflowTimestamp(session.createdAt) ||
     timestampAfter(session.createdAt, limits.deadline) ||
     session.allowedRoles.length === 0 ||
     session.allowedProviders.length === 0 ||
-    duplicate(session.allowedRoles) ||
-    duplicate(
+    hasWorkflowDuplicates(session.allowedRoles) ||
+    hasWorkflowDuplicates(
       session.allowedProviders.map((provider) =>
         JSON.stringify([provider.providerInstanceId, provider.model]),
       ),
     ) ||
-    duplicate(
+    hasWorkflowDuplicates(
       session.access.origins.map((origin) =>
         JSON.stringify([origin.environmentId, origin.projectId, origin.threadId]),
       ),
@@ -349,10 +353,10 @@ const OperationId = NonEmpty.pipe(Schema.brand("OperationId"));
 const NativeRunId = NonEmpty.pipe(Schema.brand("NativeRunId"));
 const ReferenceId = NonEmpty.pipe(Schema.brand("ReferenceId"));
 const InventoryId = NonEmpty.pipe(Schema.brand("InventoryId"));
-const RequirementId = NonEmpty.pipe(Schema.brand("RequirementId"));
+export const RequirementId = NonEmpty.pipe(Schema.brand("RequirementId"));
 const FindingId = NonEmpty.pipe(Schema.brand("FindingId"));
 const ObjectId = NonEmpty.pipe(Schema.brand("ObjectId"));
-const Hash = NonEmpty.check(Schema.isPattern(/^[0-9a-f]{64}$/));
+export const Sha256Hex = NonEmpty.check(Schema.isPattern(/^[0-9a-f]{64}$/));
 const Reference = Schema.Struct({
   kind: Schema.Literals([
     "source",
@@ -367,14 +371,14 @@ const Reference = Schema.Struct({
     "native_message",
   ]),
   id: ReferenceId,
-  sha256: Hash,
+  sha256: Sha256Hex,
 });
-const Access = Schema.Struct({ origins: Schema.Array(SessionOrigin) });
+export const WorkflowAccess = Schema.Struct({ origins: Schema.Array(SessionOrigin) });
 const InputManifest = Schema.Struct({
   sources: Schema.Array(Reference),
   references: Schema.Array(Reference),
   additionalContext: Schema.Array(Reference),
-  access: Access,
+  access: WorkflowAccess,
 });
 const Inventory = Schema.Struct({
   id: InventoryId,
@@ -414,8 +418,8 @@ const Report = Schema.Union([
     kind: Schema.Literal("review"),
     verdict: Schema.Literals(["pass", "changes_requested", "inconclusive"]),
     assessment: Schema.Struct({
-      sourcePacketHash: Hash,
-      revisionHash: Hash,
+      sourcePacketHash: Sha256Hex,
+      revisionHash: Sha256Hex,
       inventory: Schema.Array(Inventory),
     }),
     findings: Schema.Array(Finding),
@@ -435,13 +439,13 @@ export const PlanningPassV1 = Schema.Struct({
   id: PlanningPassId,
   planningSessionId: SessionId,
   role: Schema.Literals(["author", "review", "repair", "readback"]),
-  provider: SessionProvider,
+  provider: WorkflowProvider,
   binding: Schema.Struct({
     planId: PlanId,
     revisionId: RevisionId,
     revisionSchemaVersion: Schema.Literal(1),
-    revisionHash: Hash,
-    sourcePacketHash: Hash,
+    revisionHash: Sha256Hex,
+    sourcePacketHash: Sha256Hex,
   }),
   operationId: OperationId,
   inputManifest: InputManifest,
@@ -454,7 +458,7 @@ export const PlanningPassV1 = Schema.Struct({
     }),
   ),
   report: Schema.optionalKey(Report),
-  access: Access,
+  access: WorkflowAccess,
 });
 export type PlanningPassV1 = typeof PlanningPassV1.Type;
 
@@ -472,9 +476,11 @@ export class PlanningPassError extends Schema.TaggedError<PlanningPassError>()(
 const passFail = (reason: PlanningPassError["reason"]) => new PlanningPassError({ reason });
 const decodePassShape = Schema.decodeUnknownEffect(PlanningPassV1);
 const duplicateReferences = (values: readonly (typeof Reference.Type)[]) =>
-  duplicate(values.map((value) => JSON.stringify([value.kind, value.id, value.sha256])));
-const duplicateOrigins = (access: typeof Access.Type) =>
-  duplicate(
+  hasWorkflowDuplicates(
+    values.map((value) => JSON.stringify([value.kind, value.id, value.sha256])),
+  );
+const duplicateOrigins = (access: typeof WorkflowAccess.Type) =>
+  hasWorkflowDuplicates(
     access.origins.map((origin) =>
       JSON.stringify([origin.environmentId, origin.projectId, origin.threadId]),
     ),
@@ -505,26 +511,29 @@ export const decodePlanningPassV1 = Effect.fn("PlanningPassV1.decode")(function*
   if (
     (report.kind === "author" && duplicateReferences(report.outputs)) ||
     (report.kind === "repair" &&
-      (duplicate(report.dispositions.map((d) => JSON.stringify([d.reportId, d.findingId]))) ||
+      (hasWorkflowDuplicates(
+        report.dispositions.map((d) => JSON.stringify([d.reportId, d.findingId])),
+      ) ||
         report.dispositions.some(
           (d) =>
-            duplicate(d.affectedObjectIds) ||
+            hasWorkflowDuplicates(d.affectedObjectIds) ||
             (d.decision === "defer" ? !d.deferTrigger : d.deferTrigger !== undefined),
         ))) ||
     (report.kind === "readback" && invalidManifest(report.actualInputs)) ||
     (report.kind === "review" &&
-      (duplicate(report.assessment.inventory.map((item) => item.id)) ||
-        duplicate(report.findings.map((finding) => finding.id)) ||
+      (hasWorkflowDuplicates(report.assessment.inventory.map((item) => item.id)) ||
+        hasWorkflowDuplicates(report.findings.map((finding) => finding.id)) ||
         report.assessment.inventory.some(
           (item) =>
             item.sourceRefs.length === 0 ||
             duplicateReferences(item.sourceRefs) ||
-            duplicate(item.requirementIds) ||
+            hasWorkflowDuplicates(item.requirementIds) ||
             (item.disposition === "mapped" && item.requirementIds.length === 0),
         ) ||
         report.findings.some(
           (finding) =>
-            duplicate(finding.affectedObjectIds) || duplicateReferences(finding.evidence),
+            hasWorkflowDuplicates(finding.affectedObjectIds) ||
+            duplicateReferences(finding.evidence),
         )))
   )
     return yield* passFail("malformed report");
