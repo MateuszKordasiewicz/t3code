@@ -164,6 +164,78 @@ describe("staged task events", () => {
     ).toThrow();
   });
 
+  it("records distinct manager binding and retirement identities for custody replay", () => {
+    const persisted = Schema.decodeUnknownSync(task.WorkTaskPersistedEvent);
+    const context = { sequence: 8, eventId: "event", occurredAt: base.occurredAt, commandId: null };
+    const bound = {
+      ...base,
+      type: "task.manager-bound",
+      managerThreadId: "manager",
+      managerGeneration: 1,
+    };
+    const retired = { ...bound, type: "task.manager-retired", lifecycleRevision: 9 };
+    const replacement = {
+      ...bound,
+      managerThreadId: "replacement",
+      managerGeneration: 2,
+      definitionRevision: 7,
+    };
+    for (const event of [bound, retired, replacement]) {
+      expect(decode(event)).toEqual(event);
+      expect(persisted({ event, context })).toEqual({ event, context });
+      for (const field of [
+        "id",
+        "taskId",
+        "occurredAt",
+        "attribution",
+        "managerThreadId",
+        "managerGeneration",
+        "definitionRevision",
+        "lifecycleRevision",
+        "completionPolicyRevision",
+        "actionPolicyRevision",
+      ])
+        expect(() => decode({ ...event, [field]: undefined })).toThrow();
+      for (const managerGeneration of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, Infinity])
+        expect(() => decode({ ...event, managerGeneration })).toThrow();
+      for (const field of ["id", "taskId", "managerThreadId"])
+        for (const value of [" ", "x".repeat(2_001)])
+          expect(() => decode({ ...event, [field]: value })).toThrow();
+      expect(() => decode({ ...event, occurredAt: "2026-02-30T00:00:00Z" })).toThrow();
+      expect(() => decode({ ...event, attribution: { type: "user", subject: "human" } })).toThrow();
+      expect(() => persisted({ event, context: { ...context, eventId: "other" } })).toThrow();
+      expect(() =>
+        persisted({ event, context: { ...context, occurredAt: "2026-11-12T00:00:00Z" } }),
+      ).toThrow();
+    }
+    expect(decode({ ...bound, managerGeneration: Number.MAX_SAFE_INTEGER })).toBeDefined();
+    expect(() => decode({ ...bound, type: "task.manager-changed" })).toThrow();
+    expect(() => decode({ ...retired, managerThreadId: undefined })).toThrow();
+  });
+
+  it("provides typed manager binding replay conflicts with concrete identities", () => {
+    const decodeConflict = Schema.decodeUnknownSync(task.WorkTaskManagerBindingReplayConflict);
+    const conflict = {
+      _tag: "WorkTaskManagerBindingReplayConflict",
+      code: "binding_identity_conflict",
+      taskId: "task",
+      managerThreadId: "manager",
+      managerGeneration: 1,
+    };
+    for (const code of [
+      "binding_identity_conflict",
+      "thread_already_bound",
+      "current_binding_conflict",
+      "binding_not_found",
+      "binding_already_retired",
+    ])
+      expect(decodeConflict({ ...conflict, code }).code).toBe(code);
+    expect(() => decodeConflict({ ...conflict, code: "other" })).toThrow();
+    for (const field of ["taskId", "managerThreadId", "managerGeneration"])
+      expect(() => decodeConflict({ ...conflict, [field]: undefined })).toThrow();
+    expect(() => decodeConflict({ ...conflict, managerGeneration: 0 })).toThrow();
+  });
+
   it("records terminal review evidence and purpose-bound continuations in persisted context", () => {
     const binding = {
       taskId: "task",
