@@ -1,4 +1,5 @@
 import {
+  decodePlanningSessionV1,
   decodeWorkflowOperationV1,
   decodeWorkflowRunV1,
   type WorkflowOperationV1,
@@ -27,6 +28,69 @@ const stale = () => new WorkflowRunStoreError({ reason: "stale" });
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const inTransaction = <A, E, R>(work: Effect.Effect<A, E, R>) =>
+    sql
+      .withTransaction(work)
+      .pipe(
+        Effect.mapError((error) =>
+          isStoreError(error) ? error : new WorkflowRunStoreError({ reason: "persistence" }),
+        ),
+      );
+  const createRun = Effect.fn("WorkflowRunStore.createRun")(function* (record: unknown) {
+    const run = yield* decodeWorkflowRunV1(record).pipe(Effect.mapError(integrity));
+    if (
+      run.status !== "active" ||
+      run.recordVersion !== 0 ||
+      run.controlGeneration !== 0 ||
+      run.amendmentSequence !== 0 ||
+      run.priorSpecHash !== undefined ||
+      run.allowance.attemptsConsumed !== 0 ||
+      run.allowance.repairRoundsConsumed !== 0
+    )
+      return yield* integrity();
+    const work = Effect.gen(function* () {
+      const plan = run.spec.plan;
+      yield* sql`INSERT OR IGNORE INTO workflow_plan_identities (plan_id) VALUES (${plan.planId})`;
+      yield* sql`INSERT OR IGNORE INTO workflow_revision_identities (plan_id, revision_id, revision_hash, source_packet_hash) VALUES (${plan.planId}, ${plan.revisionId}, ${plan.revisionHash}, ${plan.sourcePacketHash})`;
+      const revisions = yield* sql<{
+        revision_hash: string;
+        source_packet_hash: string;
+      }>`SELECT revision_hash, source_packet_hash FROM workflow_revision_identities WHERE plan_id = ${plan.planId} AND revision_id = ${plan.revisionId}`;
+      if (
+        revisions[0]?.revision_hash !== plan.revisionHash ||
+        revisions[0]?.source_packet_hash !== plan.sourcePacketHash
+      )
+        return yield* integrity();
+      const inserted = yield* sql<{
+        id: string;
+      }>`INSERT INTO workflow_runs (id, plan_id, revision_id, revision_hash, source_packet_hash, spec_hash, status, record_version, control_generation, record_json) VALUES (${run.id}, ${plan.planId}, ${plan.revisionId}, ${plan.revisionHash}, ${plan.sourcePacketHash}, ${run.spec.ref.sha256}, ${run.status}, ${run.recordVersion}, ${run.controlGeneration}, ${encode(run)}) ON CONFLICT DO NOTHING RETURNING id`;
+      if (inserted.length !== 1) return yield* integrity();
+      return run;
+    });
+    return yield* inTransaction(work);
+  });
+  const createPlanningSession = Effect.fn("WorkflowRunStore.createPlanningSession")(function* (
+    record: unknown,
+  ) {
+    const session = yield* decodePlanningSessionV1(record).pipe(Effect.mapError(integrity));
+    if (
+      session.status !== "active" ||
+      session.recordVersion !== 0 ||
+      session.controlGeneration !== 0 ||
+      session.consumed.passes !== 0 ||
+      session.consumed.repairRounds !== 0
+    )
+      return yield* integrity();
+    const work = Effect.gen(function* () {
+      yield* sql`INSERT OR IGNORE INTO workflow_plan_identities (plan_id) VALUES (${session.planId})`;
+      const inserted = yield* sql<{
+        id: string;
+      }>`INSERT INTO workflow_planning_sessions (id, plan_id, predecessor_id, status, record_version, control_generation, record_json) VALUES (${session.id}, ${session.planId}, ${session.predecessorSessionId ?? null}, ${session.status}, ${session.recordVersion}, ${session.controlGeneration}, ${encode(session)}) ON CONFLICT DO NOTHING RETURNING id`;
+      if (inserted.length !== 1) return yield* integrity();
+      return session;
+    });
+    return yield* inTransaction(work);
+  });
   const commitTransition = Effect.fn("WorkflowRunStore.commitTransition")(function* (input: {
     readonly runId: string;
     readonly command: Command;
@@ -190,15 +254,9 @@ const make = Effect.gen(function* () {
       yield* sql`INSERT INTO workflow_command_receipts (command_id, workflow_run_id, fingerprint, receipt_id, operation_id, result_json) VALUES (${command.commandId}, ${run.id}, ${fingerprint}, ${input.receiptId}, ${operation?.id ?? null}, ${encode(result)})`;
       return result;
     });
-    return yield* sql
-      .withTransaction(work)
-      .pipe(
-        Effect.mapError((error) =>
-          isStoreError(error) ? error : new WorkflowRunStoreError({ reason: "persistence" }),
-        ),
-      );
+    return yield* inTransaction(work);
   });
-  return { commitTransition };
+  return { createRun, createPlanningSession, commitTransition };
 });
 
 export class WorkflowRunStore extends Context.Service<

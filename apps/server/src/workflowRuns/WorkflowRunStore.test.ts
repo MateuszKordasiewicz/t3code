@@ -1,5 +1,5 @@
 import { assert, it } from "@effect/vitest";
-import { WorkflowRunV1 } from "@t3tools/contracts";
+import { PlanningSessionV1, WorkflowRunV1 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -42,6 +42,25 @@ const run = Schema.decodeSync(WorkflowRunV1)({
   createdAt: "2026-11-01T00:00:00Z",
   access: { origins: [] },
 });
+const session = Schema.decodeSync(PlanningSessionV1)({
+  schemaVersion: 1,
+  id: "session",
+  environmentId: "environment",
+  projectId: "project",
+  planId: "plan",
+  origin: { kind: "human", id: "human" },
+  request: "Plan the work",
+  mode: "ordinary",
+  allowedRoles: ["author"],
+  allowedProviders: [{ providerInstanceId: "provider", model: "model" }],
+  limits: { maxPasses: 2, maxRepairRounds: 1, deadline: "2026-12-01T00:00:00Z" },
+  consumed: { passes: 0, repairRounds: 0 },
+  controlGeneration: 0,
+  recordVersion: 0,
+  status: "active",
+  createdAt: "2026-11-01T00:00:00Z",
+  access: { origins: [] },
+});
 type Input = Parameters<typeof WorkflowRunPolicy.decide>[0];
 const facts: Input["facts"] = {
   now: "2026-11-12T00:00:00Z",
@@ -74,6 +93,148 @@ const setup = Effect.gen(function* () {
   yield* sql`INSERT INTO workflow_revision_identities VALUES ('plan', 'revision', ${hash}, ${hash})`;
   yield* sql`INSERT INTO workflow_runs VALUES ('run', 'plan', 'revision', ${hash}, ${hash}, ${hash}, 'active', 0, 0, ${json(run)})`;
 });
+
+it.effect("creates runs and planning sessions with their identities", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`PRAGMA foreign_keys = ON`;
+    yield* migration;
+    const store = yield* Store.WorkflowRunStore;
+    assert.deepStrictEqual(yield* store.createRun(run), run);
+    assert.deepStrictEqual(yield* store.createPlanningSession(session), session);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_plan_identities`, [
+      { plan_id: "plan" },
+    ]);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_revision_identities`, [
+      { plan_id: "plan", revision_id: "revision", revision_hash: hash, source_packet_hash: hash },
+    ]);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_runs`, [
+      {
+        id: run.id,
+        plan_id: run.spec.plan.planId,
+        revision_id: run.spec.plan.revisionId,
+        revision_hash: hash,
+        source_packet_hash: hash,
+        spec_hash: hash,
+        status: run.status,
+        record_version: 0,
+        control_generation: 0,
+        record_json: json(run),
+      },
+    ]);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_planning_sessions`, [
+      {
+        id: session.id,
+        plan_id: session.planId,
+        predecessor_id: null,
+        status: session.status,
+        record_version: 0,
+        control_generation: 0,
+        record_json: json(session),
+      },
+    ]);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  ["run status", "run", { ...run, status: "paused" }],
+  ["run version", "run", { ...run, recordVersion: 1 }],
+  ["run generation", "run", { ...run, controlGeneration: 1 }],
+  ["run amendment", "run", { ...run, amendmentSequence: 1, priorSpecHash: hash }],
+  ["run prior hash", "run", { ...run, priorSpecHash: hash }],
+  ["run attempts", "run", { ...run, allowance: { ...run.allowance, attemptsConsumed: 1 } }],
+  [
+    "run repairs",
+    "run",
+    { ...run, allowance: { ...run.allowance, attemptsConsumed: 1, repairRoundsConsumed: 1 } },
+  ],
+  ["session status", "session", { ...session, status: "paused" }],
+  ["session version", "session", { ...session, recordVersion: 1 }],
+  ["session generation", "session", { ...session, controlGeneration: 1 }],
+  ["session passes", "session", { ...session, consumed: { passes: 1, repairRounds: 0 } }],
+  ["session repairs", "session", { ...session, consumed: { passes: 1, repairRounds: 1 } }],
+  ["invalid run", "run", {}],
+  ["invalid session", "session", {}],
+] as const)("rejects %s without writes", ([_name, kind, record]) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`PRAGMA foreign_keys = ON`;
+    yield* migration;
+    const store = yield* Store.WorkflowRunStore;
+    const error = yield* kind === "run"
+      ? Effect.flip(store.createRun(record))
+      : Effect.flip(store.createPlanningSession(record));
+    assert.strictEqual(error.reason, "integrity");
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_plan_identities`).length, 0);
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_revision_identities`).length, 0);
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_runs`).length, 0);
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_planning_sessions`).length, 0);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("rejects conflicting revision hashes and duplicate run IDs atomically", () =>
+  Effect.gen(function* () {
+    yield* setup;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    for (const record of [
+      {
+        ...run,
+        id: "other",
+        spec: { ...run.spec, plan: { ...run.spec.plan, revisionHash: nextHash } },
+      },
+      {
+        ...run,
+        id: "other",
+        spec: { ...run.spec, plan: { ...run.spec.plan, sourcePacketHash: nextHash } },
+      },
+      { ...run, spec: { ...run.spec, plan: { ...run.spec.plan, planId: "new-plan" } } },
+    ]) {
+      assert.strictEqual((yield* Effect.flip(store.createRun(record))).reason, "integrity");
+    }
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_plan_identities`, [
+      { plan_id: "plan" },
+    ]);
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_revision_identities`).length, 1);
+    assert.deepStrictEqual(yield* sql`SELECT record_json FROM workflow_runs`, [
+      { record_json: json(run) },
+    ]);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect(
+  "rejects an unsettled or duplicate session and permits a successor to a stopped session",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`PRAGMA foreign_keys = ON`;
+      yield* migration;
+      const store = yield* Store.WorkflowRunStore;
+      yield* store.createPlanningSession(session);
+      assert.strictEqual(
+        (yield* Effect.flip(store.createPlanningSession({ ...session, id: "other" }))).reason,
+        "integrity",
+      );
+      assert.strictEqual(
+        (yield* Effect.flip(store.createPlanningSession({ ...session, planId: "new-plan" })))
+          .reason,
+        "integrity",
+      );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_plan_identities`, [
+        { plan_id: "plan" },
+      ]);
+      yield* sql`UPDATE workflow_planning_sessions SET status = 'stopped' WHERE id = ${session.id}`;
+      const successor = { ...session, id: "other", predecessorSessionId: session.id };
+      assert.deepStrictEqual<unknown>(yield* store.createPlanningSession(successor), successor);
+      assert.deepStrictEqual(
+        yield* sql`SELECT id, predecessor_id, status FROM workflow_planning_sessions ORDER BY id`,
+        [
+          { id: "other", predecessor_id: "session", status: "active" },
+          { id: "session", predecessor_id: null, status: "stopped" },
+        ],
+      );
+    }).pipe(Effect.provide(layer)),
+);
 
 it.effect("replays identical commands and rejects changed identities and stale versions", () =>
   Effect.gen(function* () {
