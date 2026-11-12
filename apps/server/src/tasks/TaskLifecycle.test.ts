@@ -1,5 +1,6 @@
 import { WorkTaskPersistedEvent } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
+import * as HashMap from "effect/HashMap";
 import { describe, expect, it } from "vite-plus/test";
 import { FoundationReplayConflict, reduceTaskFoundation } from "./TaskLifecycle.ts";
 
@@ -151,14 +152,17 @@ describe("foundation task replay", () => {
     expect(replay(events)).toEqual(state);
     expect(reduceTaskFoundation(state, events[3]!)).toBe(state);
     expect(state.created.event.projectId).toBe("project");
-    expect(state.acceptedDefinitions[0]).toEqual(events[1]);
+    expect(Array.from(state.acceptedDefinitions)[0]).toEqual(events[1]);
     expect(state.configuration).toEqual(events[2]);
     expect(state.execution).toEqual(events[3]);
-    expect(state.links[0]).toEqual({ linked: events[4], unlinked: events[14] });
-    expect(state.waits).toEqual([events[8]]);
-    expect(state.results).toEqual([events[6]]);
-    expect(state.continuations).toEqual([events[7]]);
-    expect(state.claims).toEqual([events[9]]);
+    expect(Array.from(HashMap.values(state.links))[0]).toEqual({
+      linked: events[4],
+      unlinked: events[14],
+    });
+    expect(Array.from(HashMap.values(state.waits))).toEqual([events[8]]);
+    expect(Array.from(state.results)).toEqual([events[6]]);
+    expect(Array.from(state.continuations)).toEqual([events[7]]);
+    expect(Array.from(state.claims)).toEqual([events[9]]);
     expect(state.completion).toEqual(events[11]);
     expect(state.archive).toEqual(events[13]);
     expect(state.revisions).toEqual({
@@ -194,14 +198,14 @@ describe("foundation task replay", () => {
       }),
     ];
     const before = replay(events.slice(0, 4));
-    expect(before.acceptedDefinitions).toEqual([events[1]]);
+    expect(Array.from(before.acceptedDefinitions)).toEqual([events[1]]);
     expect(before.definition).toEqual(events[2]);
     expect(before.revisions.lifecycleRevision).toBe(1);
     const after = reduceTaskFoundation(before, events[4]!);
-    expect(after.acceptedDefinitions).toEqual([events[1], events[4]]);
+    expect(Array.from(after.acceptedDefinitions)).toEqual([events[1], events[4]]);
     expect(after.definition).toEqual(events[4]);
-    expect(after.results).toEqual(before.results);
-    expect(after.acceptedDefinitions[0]!.event.definition).toEqual(definition);
+    expect(Array.from(after.results)).toEqual(Array.from(before.results));
+    expect(Array.from(after.acceptedDefinitions)[0]!.event.definition).toEqual(definition);
     expect(after.configuration).toBeUndefined();
     expect(after.execution).toBeUndefined();
   });
@@ -219,8 +223,8 @@ describe("foundation task replay", () => {
       first,
       recorded(6, { type: "task.thread-unlinked", threadId: "shared" }),
     );
-    expect(unlinked.links[0]!.unlinked).toBeDefined();
-    expect(second.links[0]!.unlinked).toBeUndefined();
+    expect(Array.from(HashMap.values(unlinked.links))[0]!.unlinked).toBeDefined();
+    expect(Array.from(HashMap.values(second.links))[0]!.unlinked).toBeUndefined();
     const otherFamily = recorded(7, { type: "task.manager-bound", ...identity });
     expect(() => reduceTaskFoundation(first, otherFamily)).toThrow(
       expect.objectContaining({ code: "unsupported" }),
@@ -285,19 +289,26 @@ describe("foundation task replay", () => {
     });
     expect(reduceTaskFoundation(state, manual).completion).toEqual(manual);
     const claimed = reduceTaskFoundation(
-      state,
-      recorded(2, { type: "task.completion-submitted", ...claim, summary: "claim", evidence }),
+      replay([
+        created,
+        recorded(2, {
+          type: "task.definition-accepted",
+          attribution: { type: "user", subject: "human", sessionId: "session" },
+          definition,
+        }),
+      ]),
+      recorded(3, { type: "task.completion-submitted", ...claim, summary: "claim", evidence }),
     );
     expect(() =>
       reduceTaskFoundation(
         claimed,
-        recorded(3, { type: "task.completion-submitted", ...claim, summary: "other", evidence }),
+        recorded(4, { type: "task.completion-submitted", ...claim, summary: "other", evidence }),
       ),
     ).toThrow(expect.objectContaining({ code: "claim" }));
     expect(() =>
       reduceTaskFoundation(
         claimed,
-        recorded(3, {
+        recorded(4, {
           type: "task.completed",
           ...claim,
           attribution: {
@@ -313,14 +324,215 @@ describe("foundation task replay", () => {
     expect(() =>
       reduceTaskFoundation(
         claimed,
-        recorded(3, { type: "task.completed", ...claim, evidenceId: "other" }),
+        recorded(4, { type: "task.completed", ...claim, evidenceId: "other" }),
       ),
     ).toThrow(expect.objectContaining({ code: "completion" }));
     expect(() =>
       reduceTaskFoundation(
         claimed,
-        recorded(3, { type: "task.completed", ...claim, claimId: "other" }),
+        recorded(4, { type: "task.completed", ...claim, claimId: "other" }),
       ),
     ).toThrow(expect.objectContaining({ code: "completion" }));
+  });
+  it("rejects contradictory foundation bindings without implementing custody eligibility", () => {
+    const created = recorded(1, { type: "task.created", definition });
+    const accepted = recorded(2, {
+      type: "task.definition-accepted",
+      attribution: { type: "user", subject: "human", sessionId: "session" },
+      definition,
+    });
+    const state = replay([created, accepted]);
+    const claimed = reduceTaskFoundation(
+      state,
+      recorded(3, { type: "task.completion-submitted", ...claim, summary: "claim", evidence }),
+    );
+    expect(() =>
+      reduceTaskFoundation(
+        claimed,
+        recorded(4, {
+          type: "task.completed",
+          ...claim,
+          attribution: {
+            type: "agent",
+            threadId: "manager",
+            providerSessionId: "ps",
+            runId: "run",
+          },
+        }),
+      ),
+    ).toThrow(expect.objectContaining({ code: "completion" }));
+    expect(() =>
+      reduceTaskFoundation(
+        replay([created]),
+        recorded(2, { type: "task.completion-submitted", ...claim, summary: "claim", evidence }),
+      ),
+    ).toThrow(expect.objectContaining({ code: "claim" }));
+    const draft = { ...definition, revision: 2, objective: "Draft" };
+    const edited = reduceTaskFoundation(
+      state,
+      recorded(3, { type: "task.definition-updated", definitionRevision: 2, definition: draft }),
+    );
+    expect(() =>
+      reduceTaskFoundation(
+        edited,
+        recorded(4, {
+          type: "task.completion-submitted",
+          definitionRevision: 2,
+          ...claim,
+          summary: "claim",
+          evidence,
+        }),
+      ),
+    ).toThrow(expect.objectContaining({ code: "claim" }));
+    const adoption = recorded(4, {
+      type: "task.definition-accepted",
+      definitionRevision: 2,
+      definition: draft,
+      attribution: { type: "user", subject: "human", sessionId: "session" },
+    });
+    expect(() =>
+      reduceTaskFoundation(edited, {
+        ...adoption,
+        context: { ...adoption.context, commandId: accepted.context.commandId },
+      }),
+    ).toThrow(expect.objectContaining({ code: "command" }));
+    const configured = reduceTaskFoundation(
+      state,
+      recorded(3, {
+        type: "task.configuration-updated",
+        allowanceOverride: null,
+        completionPolicy: { type: "configured", policy: { type: "manual" } },
+      }),
+    );
+    expect(() =>
+      reduceTaskFoundation(
+        configured,
+        recorded(4, {
+          type: "task.configuration-updated",
+          allowanceOverride: null,
+          completionPolicy: { type: "inherit" },
+        }),
+      ),
+    ).toThrow(expect.objectContaining({ code: "policy" }));
+    expect(
+      reduceTaskFoundation(
+        configured,
+        recorded(4, {
+          type: "task.configuration-updated",
+          lifecycleRevision: 2,
+          allowanceOverride: 5,
+          completionPolicy: { type: "configured", policy: { type: "manual" } },
+        }),
+      ).configuration?.event.allowanceOverride,
+    ).toBe(5);
+    const execution = {
+      type: "task.execution-updated",
+      desiredMode: "active",
+      previousManagerGeneration: null,
+      manager: identity,
+      reason: "start",
+    };
+    const started = reduceTaskFoundation(state, recorded(3, execution));
+    expect(() =>
+      reduceTaskFoundation(
+        started,
+        recorded(4, { ...execution, manager: { ...identity, managerThreadId: "other" } }),
+      ),
+    ).toThrow(expect.objectContaining({ code: "manager" }));
+    const replaced = reduceTaskFoundation(
+      started,
+      recorded(4, {
+        ...execution,
+        previousManagerGeneration: 1,
+        manager: { managerThreadId: "other", managerGeneration: 2 },
+      }),
+    );
+    expect(() =>
+      reduceTaskFoundation(replaced, recorded(5, { ...execution, previousManagerGeneration: 2 })),
+    ).toThrow(expect.objectContaining({ code: "manager" }));
+    const wait = {
+      type: "task.wait-updated",
+      ...identity,
+      waitId: "wait",
+      target: { type: "source", sourceId: "a" },
+      state: "registered",
+    };
+    const waiting = reduceTaskFoundation(state, recorded(3, wait));
+    expect(() =>
+      reduceTaskFoundation(
+        waiting,
+        recorded(4, { ...wait, state: "cleared", target: { type: "source", sourceId: "b" } }),
+      ),
+    ).toThrow(expect.objectContaining({ code: "wait" }));
+    const launch = {
+      type: "task.continuation-accepted",
+      ...identity,
+      runId: "run",
+      messageId: "message",
+      effectId: "effect",
+      sourceIds: ["source"],
+      dirtyGeneration: 1,
+    };
+    const continuing = reduceTaskFoundation(state, recorded(3, launch));
+    for (const change of [
+      { messageId: "other", effectId: "other" },
+      { runId: "other", effectId: "other" },
+      { runId: "other", messageId: "other" },
+    ]) {
+      expect(() => reduceTaskFoundation(continuing, recorded(4, { ...launch, ...change }))).toThrow(
+        expect.objectContaining({ code: "continuation" }),
+      );
+    }
+    expect(() =>
+      reduceTaskFoundation(
+        continuing,
+        recorded(4, { ...launch, sourceIds: ["another"], dirtyGeneration: 2 }),
+      ),
+    ).not.toThrow();
+    const companion = recorded(3, {
+      type: "task.configuration-updated",
+      allowanceOverride: null,
+      completionPolicy: { type: "inherit" },
+    });
+    expect(() =>
+      reduceTaskFoundation(state, {
+        ...companion,
+        context: { ...companion.context, commandId: accepted.context.commandId },
+      }),
+    ).not.toThrow();
+  });
+
+  it("appends history without rereading every previous event identity", () => {
+    let reads = 0;
+    let state = replay([recorded(1, { type: "task.created", definition })]);
+    const initial = Object.freeze(state);
+    for (let i = 2; i <= 1001; i++) {
+      const item = recorded(i, {
+        type: "task.result-recorded",
+        sourceId: `source-${i}`,
+        summary: "result",
+        results: evidence,
+      });
+      const event = new Proxy(item.event, {
+        get(target, key, receiver) {
+          if (key === "id") reads++;
+          return Reflect.get(target, key, receiver);
+        },
+      });
+      state = reduceTaskFoundation(state, { ...item, event });
+    }
+    const before = reads;
+    state = reduceTaskFoundation(
+      state,
+      recorded(1002, {
+        type: "task.result-recorded",
+        sourceId: "last",
+        summary: "result",
+        results: evidence,
+      }),
+    );
+    expect(reads - before).toBeLessThan(30);
+    expect(Array.from(state.results)).toHaveLength(1001);
+    expect(Array.from(initial.results)).toEqual([]);
   });
 });
