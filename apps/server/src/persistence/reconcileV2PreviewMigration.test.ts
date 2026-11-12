@@ -66,6 +66,7 @@ describe("V2 preview upgrade", () => {
         [84, "WorkTaskActionReviews"],
         [85, "WorkTaskCurrentState"],
         [86, "WorkTaskWaits"],
+        [87, "WorkTaskResults"],
       ]);
       assert.deepStrictEqual(yield* runMigrations(), []);
       assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_legacy_imports`, imports);
@@ -104,7 +105,8 @@ describe("V2 preview upgrade", () => {
               : {}),
           }),
         });
-        yield* runMigrations();
+        const upgraded = yield* runMigrations();
+        assert.deepInclude(upgraded, [87, "WorkTaskResults"]);
         assert.deepStrictEqual(yield* runMigrations(), []);
         const history = yield* sql<{
           readonly migration_id: number;
@@ -175,6 +177,7 @@ describe("V2 preview upgrade", () => {
         [84, "WorkTaskActionReviews"],
         [85, "WorkTaskCurrentState"],
         [86, "WorkTaskWaits"],
+        [87, "WorkTaskResults"],
       ]);
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );

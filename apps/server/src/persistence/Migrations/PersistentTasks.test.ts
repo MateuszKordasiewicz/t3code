@@ -18,6 +18,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
     assert.deepInclude(migrations, [84, "WorkTaskActionReviews"]);
     assert.deepInclude(migrations, [85, "WorkTaskCurrentState"]);
     assert.deepInclude(migrations, [86, "WorkTaskWaits"]);
+    assert.deepInclude(migrations, [87, "WorkTaskResults"]);
     const tables = yield* sql<{ readonly name: string }>`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'work_task_%' ORDER BY name
     `;
@@ -32,6 +33,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
         "work_task_current_state",
         "work_task_manager_bindings",
         "work_task_projections",
+        "work_task_results",
         "work_task_thread_links",
         "work_task_validation_attempts",
         "work_task_view_fence",
@@ -68,6 +70,7 @@ it.effect("upgrades predecessor rows and events without changing their bytes or 
       [84, "WorkTaskActionReviews"],
       [85, "WorkTaskCurrentState"],
       [86, "WorkTaskWaits"],
+      [87, "WorkTaskResults"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM projection_projects ORDER BY project_id`,
@@ -104,6 +107,7 @@ it.effect("rolls back a failed migration and succeeds on rerun", () =>
       [84, "WorkTaskActionReviews"],
       [85, "WorkTaskCurrentState"],
       [86, "WorkTaskWaits"],
+      [87, "WorkTaskResults"],
     ]);
     assert.deepStrictEqual(yield* runMigrations(), []);
   }).pipe(Effect.provide(db)),
@@ -221,6 +225,7 @@ it.effect(
         [84, "WorkTaskActionReviews"],
         [85, "WorkTaskCurrentState"],
         [86, "WorkTaskWaits"],
+        [87, "WorkTaskResults"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -380,6 +385,7 @@ it.effect("preserves task custody through validation upgrade and rolls back migr
       [84, "WorkTaskActionReviews"],
       [85, "WorkTaskCurrentState"],
       [86, "WorkTaskWaits"],
+      [87, "WorkTaskResults"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -512,6 +518,7 @@ it.effect("upgrades validation data atomically to action reviews and preserves p
       [84, "WorkTaskActionReviews"],
       [85, "WorkTaskCurrentState"],
       [86, "WorkTaskWaits"],
+      [87, "WorkTaskResults"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -720,6 +727,7 @@ it.effect("upgrades existing tasks without inventing state and rolls back migrat
     assert.deepStrictEqual(yield* runMigrations(), [
       [85, "WorkTaskCurrentState"],
       [86, "WorkTaskWaits"],
+      [87, "WorkTaskResults"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -811,7 +819,10 @@ it.effect("upgrades waits atomically while preserving task state and link proven
       [],
     );
     yield* sql`DROP INDEX work_task_thread_links_reverse_page_idx`;
-    assert.deepStrictEqual(yield* runMigrations(), [[86, "WorkTaskWaits"]]);
+    assert.deepStrictEqual(yield* runMigrations(), [
+      [86, "WorkTaskWaits"],
+      [87, "WorkTaskResults"],
+    ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM work_task_thread_links ORDER BY link_event_id`,
       links,
@@ -901,5 +912,128 @@ it.effect("constrains attributable waits and supports bounded membership keysets
     assert.isFalse(
       [...waitPlan, ...linkPlan, ...reversePlan].some((row) => row.detail.includes("TEMP B-TREE")),
     );
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect("upgrades result history atomically without changing predecessor data", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations({ toMigrationInclusive: 86 });
+    yield* sql`INSERT INTO work_task_projections VALUES ('a', 'p', 1, 1, 1, 1, '{}', 't', 't')`;
+    yield* sql`INSERT INTO work_task_current_state (task_id) VALUES ('a')`;
+    yield* sql`INSERT INTO work_task_manager_bindings VALUES ('a', 1, 'manager', 't', NULL)`;
+    yield* sql`INSERT INTO work_task_thread_links VALUES ('l', 'a', 'thread', 't', '{}', 'u', 'later', '{}')`;
+    yield* sql`INSERT INTO work_task_waits VALUES ('a', 'w', 1, '{"type":"source","sourceId":"s"}', 'registered', 2, 't')`;
+    yield* sql`INSERT INTO orchestration_events (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, actor_kind, payload_json, metadata_json) VALUES ('e', 'thread', 'thread', 1, 'thread.created', 't', 'client', '{}', '{}'), ('task-event', 'task', 'a', 1, 'task.created', 't', 'client', '{ \"task\": true }', '{}')`;
+    const state = yield* sql`SELECT * FROM work_task_current_state`;
+    const links = yield* sql`SELECT * FROM work_task_thread_links`;
+    const waits = yield* sql`SELECT * FROM work_task_waits`;
+    const fence = yield* sql`SELECT * FROM work_task_view_fence`;
+    const events = yield* sql`SELECT * FROM orchestration_events`;
+    yield* sql`CREATE INDEX work_task_results_history_idx ON work_task_projections(task_id)`;
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(runMigrations())));
+    assert.deepStrictEqual(
+      yield* sql`SELECT name FROM sqlite_master WHERE name = 'work_task_results'`,
+      [],
+    );
+    assert.deepStrictEqual(
+      yield* sql`SELECT migration_id FROM effect_sql_migrations WHERE migration_id = 87`,
+      [],
+    );
+    yield* sql`DROP INDEX work_task_results_history_idx`;
+    assert.deepStrictEqual(yield* runMigrations(), [[87, "WorkTaskResults"]]);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_current_state`, state);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_thread_links`, links);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_waits`, waits);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_view_fence`, fence);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_events`, events);
+    assert.deepStrictEqual(yield* runMigrations(), []);
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect("enforces result provenance and contract bounds with indexed history", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations();
+    yield* sql`PRAGMA foreign_keys = ON`;
+    yield* sql`INSERT INTO work_task_projections VALUES ('a', 'p', 1, 1, 1, 1, '{}', 't', 't')`;
+    const references = [
+      { type: "run", threadId: "thread", runId: "run" },
+      { type: "artifact", uri: "u", hash: "h" },
+      { type: "source_revision", repository: "r", revision: "v" },
+    ];
+    const attribution = [
+      { type: "server" },
+      { type: "user", sessionId: "session", subject: "user" },
+      { type: "agent", threadId: "thread", providerSessionId: "session", runId: "run" },
+      {
+        type: "manager",
+        threadId: "manager",
+        providerSessionId: "session",
+        runId: "run",
+        generation: 1,
+      },
+    ];
+    for (const [i, caller] of attribution.entries()) {
+      const thread = i === 0 ? null : "thread";
+      yield* sql`INSERT INTO work_task_results VALUES (${`e${i}`}, 'a', ${`s${i}`}, ${thread}, ${JSON.stringify(caller)}, 'summary', ${JSON.stringify(references)}, 5, 't')`;
+    }
+    const batch = Array.from({ length: 32 }, () => ({
+      type: "artifact",
+      uri: "😀".repeat(1000),
+      hash: "x".repeat(2000),
+    }));
+    yield* sql`INSERT INTO work_task_results VALUES ('large', 'a', ${"\0"}, NULL, '{"type":"server"}', ${"😀".repeat(1000)}, ${JSON.stringify(batch)}, 6, 't')`;
+    for (const whitespace of [
+      "\t",
+      "\r\n",
+      "\v\f",
+      "\u00a0",
+      "\u1680",
+      "\u2000\u200a",
+      "\u2028\u2029",
+      "\u202f",
+      "\u205f",
+      "\u3000",
+      "\ufeff",
+    ]) {
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`UPDATE work_task_results SET summary = ${whitespace} WHERE event_id = 'e0'`,
+          ),
+        ),
+      );
+    }
+    yield* sql`UPDATE work_task_results SET results_json = ${JSON.stringify([{ type: "run", threadId: " \0 ", runId: "r" }])}, summary = ${" \0 "} WHERE event_id = 'e0'`;
+    yield* sql`INSERT INTO work_task_results VALUES (${"i".repeat(2001)}, 'a', 's', NULL, '{"type":"server"}', 'ok', '[]', 7, 't')`;
+    const invalid = [
+      sql`INSERT INTO work_task_results VALUES (${"\u3000"}, 'a', 's', NULL, '{"type":"server"}', 'ok', '[]', 1, 't')`,
+      sql`INSERT INTO work_task_results VALUES ('e0', 'a', 's', NULL, '{"type":"server"}', 'ok', '[]', 1, 't')`,
+      sql`INSERT INTO work_task_results VALUES ('missing', 'missing', 's', NULL, '{"type":"server"}', 'ok', '[]', 1, 't')`,
+      sql`INSERT INTO work_task_results VALUES ('bad', 'a', 's', NULL, '{"type":"user","sessionId":"s"}', 'ok', '[]', 1, 't')`,
+      sql`INSERT INTO work_task_results VALUES ('bad', 'a', 's', NULL, '{"type":"manager","threadId":"t","providerSessionId":"s","runId":"r","generation":0}', 'ok', '[]', 1, 't')`,
+      sql`INSERT INTO work_task_results VALUES ('bad', 'a', 's', NULL, '{"type":"server"}', 'ok', '[{"type":"run","threadId":"t"}]', 1, 't')`,
+      sql`INSERT INTO work_task_results VALUES ('bad', 'a', 's', NULL, '{"type":"server"}', 'ok', ${JSON.stringify([...batch, batch[0]])}, 1, 't')`,
+      sql`UPDATE work_task_results SET summary = ${"😀".repeat(1001)} WHERE event_id = 'e0'`,
+      sql`UPDATE work_task_results SET source_id = ${"x\0" + "x".repeat(1999)} WHERE event_id = 'e0'`,
+      sql`UPDATE work_task_results SET results_json = ${JSON.stringify([{ type: "artifact", uri: "u", hash: "\u3000" }])} WHERE event_id = 'e0'`,
+      sql`UPDATE work_task_results SET attribution_json = ${JSON.stringify({ type: "user", sessionId: "s", subject: "\ufeff" })} WHERE event_id = 'e0'`,
+      sql`UPDATE work_task_results SET contributor_thread_id = ${"\t\u00a0"} WHERE event_id = 'e0'`,
+      sql`UPDATE work_task_results SET sequence = -1 WHERE event_id = 'e0'`,
+    ];
+    for (const statement of invalid) assert.isTrue(Exit.isFailure(yield* Effect.exit(statement)));
+    const rows = yield* sql<{
+      event_id: string;
+    }>`SELECT event_id FROM work_task_results WHERE task_id = 'a' AND (sequence, event_id) < (6, 'large') ORDER BY sequence DESC, event_id DESC LIMIT 50`;
+    assert.deepStrictEqual(
+      rows.map((row) => row.event_id),
+      ["e3", "e2", "e1", "e0"],
+    );
+    const plan = yield* sql<{
+      detail: string;
+    }>`EXPLAIN QUERY PLAN SELECT event_id FROM work_task_results WHERE task_id = 'a' AND (sequence, event_id) < (6, 'large') ORDER BY sequence DESC, event_id DESC LIMIT 50`;
+    assert.isTrue(plan.some((row) => row.detail.includes("work_task_results_history_idx")));
+    assert.isFalse(plan.some((row) => row.detail.includes("TEMP B-TREE")));
   }).pipe(Effect.provide(db)),
 );
