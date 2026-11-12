@@ -849,7 +849,93 @@ const managerBindingEventBase = {
   managerGeneration: PositiveInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER)),
 };
 
+const allowanceCount = NonNegativeInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER));
+const allowancePositive = PositiveInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER));
+const configuredAllowance = Schema.Struct({
+  type: Schema.Literal("configured"),
+  cap: allowancePositive,
+  consumed: allowanceCount,
+}).check(Schema.makeFilter((state) => state.consumed <= state.cap));
+export const WorkTaskAllowanceState = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("unconfigured"), consumed: allowanceCount }),
+  configuredAllowance,
+]);
+export type WorkTaskAllowanceState = typeof WorkTaskAllowanceState.Type;
+
+export class WorkTaskAllowanceReplayConflict extends Schema.TaggedError<WorkTaskAllowanceReplayConflict>()(
+  "WorkTaskAllowanceReplayConflict",
+  {
+    code: Schema.Literals([
+      "prior_state_mismatch",
+      "allowance_not_configured",
+      "cap_below_consumed",
+      "allowance_exhausted",
+      "unit_identity_conflict",
+      "command_identity_conflict",
+    ]),
+    taskId: WorkTaskId.check(Schema.isMaxLength(2_000)),
+    commandId: CommandId.check(Schema.isMaxLength(2_000)),
+  },
+) {}
+
+const allowanceEventBase = {
+  ...eventBase,
+  id: EventId.check(Schema.isMaxLength(2_000)),
+  taskId: WorkTaskId.check(Schema.isMaxLength(2_000)),
+  occurredAt: persistedTime,
+  commandId: CommandId.check(Schema.isMaxLength(2_000)),
+};
+const allowanceConfiguration = Schema.Struct({
+  ...allowanceEventBase,
+  type: Schema.Literal("task.allowance-configured"),
+  attribution: Schema.Union([
+    Schema.Struct({
+      type: Schema.Literal("user"),
+      subject: shortText,
+      sessionId: humanDecision.sessionId,
+    }),
+    Schema.Struct({ type: Schema.Literal("server") }),
+  ]),
+  previous: WorkTaskAllowanceState,
+  resulting: configuredAllowance,
+}).check(Schema.makeFilter((event) => event.previous.consumed === event.resulting.consumed));
+const allowanceTopUp = Schema.Struct({
+  ...allowanceEventBase,
+  type: Schema.Literal("task.allowance-topped-up"),
+  attribution: Schema.Struct({
+    type: Schema.Literal("user"),
+    subject: shortText,
+    sessionId: humanDecision.sessionId,
+  }),
+  previous: configuredAllowance,
+  resulting: configuredAllowance,
+}).check(
+  Schema.makeFilter(
+    (event) =>
+      event.previous.consumed === event.resulting.consumed &&
+      event.resulting.cap > event.previous.cap,
+  ),
+);
+const allowanceDebit = Schema.Struct({
+  ...allowanceEventBase,
+  type: Schema.Literal("task.allowance-debited"),
+  attribution: Schema.Struct({ type: Schema.Literal("server") }),
+  previous: configuredAllowance,
+  resulting: configuredAllowance,
+  allowanceUnit: allowancePositive,
+}).check(
+  Schema.makeFilter(
+    (event) =>
+      event.resulting.cap === event.previous.cap &&
+      event.resulting.consumed === event.previous.consumed + 1 &&
+      event.allowanceUnit === event.resulting.consumed,
+  ),
+);
+
 const WorkTaskNonReviewRequestedEvent = Schema.Union([
+  allowanceConfiguration,
+  allowanceTopUp,
+  allowanceDebit,
   Schema.Struct({ ...managerBindingEventBase, type: Schema.Literal("task.manager-bound") }),
   Schema.Struct({ ...managerBindingEventBase, type: Schema.Literal("task.manager-retired") }),
   reviewInvalidated,
@@ -1014,6 +1100,12 @@ const persistedEvent = Schema.Union([
 export const WorkTaskPersistedEvent = persistedEvent.check(
   Schema.makeFilter(({ event, context }) => {
     if (event.id !== context.eventId || event.occurredAt !== context.occurredAt) return false;
+    if (
+      event.type === "task.allowance-configured" ||
+      event.type === "task.allowance-topped-up" ||
+      event.type === "task.allowance-debited"
+    )
+      return context.commandId === event.commandId;
     if (event.type === "task.definition-accepted")
       return context.commandId !== null && context.commandId.length <= 2_000;
     if (event.type === "task.action-review-cancelled")
