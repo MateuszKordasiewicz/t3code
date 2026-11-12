@@ -154,7 +154,7 @@ const reserve = {
   itemId: "item-1",
   repair: false,
 };
-const finalBinding = { ...binding, itemId: "combined" };
+const { itemId: _itemId, attemptId: _attemptId, ...finalBinding } = binding;
 const finalFacts: Partial<Input["facts"]> = {
   acceptedItemIds: ["item-1", "item-2"],
   currentBinding: finalBinding,
@@ -795,6 +795,23 @@ describe("WorkflowRunPolicy", () => {
       "accept final",
       progress({ ...advance, binding: finalBinding, finalCombined: true }, finalFacts),
       { kind: "accepted", actions: [{ kind: "accept_final", binding: finalBinding }] },
+    ],
+    [
+      "final binding naming an item",
+      progress(
+        { ...advance, binding, finalCombined: true },
+        {
+          ...finalFacts,
+          currentBinding: binding,
+          acceptance: { ...finalFacts.acceptance!, binding },
+        },
+      ),
+      rejected("evidence"),
+    ],
+    [
+      "item binding without an attempt",
+      progress({ ...advance, binding: { ...finalBinding, itemId: "item-1" } }),
+      rejected("evidence"),
     ],
     [
       "missing final acceptance state",

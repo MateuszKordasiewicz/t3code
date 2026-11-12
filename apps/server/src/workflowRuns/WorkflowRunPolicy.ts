@@ -14,8 +14,8 @@ type CommonCommand = {
 
 type Binding = {
   readonly specHash: string;
-  readonly itemId: string;
-  readonly attemptId: string;
+  readonly itemId?: string;
+  readonly attemptId?: string;
   readonly candidateHash: string;
   readonly configurationHash: string;
   readonly policyHash: string;
@@ -372,6 +372,9 @@ const decide = ({
         !facts.currentBinding ||
         !evidence ||
         (command.finalCombined && facts.finalAccepted !== false) ||
+        (command.finalCombined
+          ? command.binding.itemId !== undefined || command.binding.attemptId !== undefined
+          : command.binding.itemId === undefined || command.binding.attemptId === undefined) ||
         command.binding.specHash !== run.spec.ref.sha256 ||
         !sameBinding(command.binding, facts.currentBinding) ||
         !sameBinding(command.binding, evidence.binding) ||

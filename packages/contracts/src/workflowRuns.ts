@@ -568,10 +568,15 @@ export const decodeWorkflowOperationV1 = Effect.fn("WorkflowOperationV1.decode")
       return yield* operationFail("invalid record");
   } else {
     const context = parameters.context;
+    const finalReview =
+      parameters.kind === "stage_launch" &&
+      parameters.stage !== "implementation" &&
+      context.itemId === undefined &&
+      context.attemptId === undefined;
     if (
       (parameters.kind === "stage_launch" || parameters.kind === "check") &&
-      (context.itemId === undefined ||
-        context.attemptId === undefined ||
+      ((!finalReview && (context.itemId === undefined || context.attemptId === undefined)) ||
+        (context.itemId === undefined) !== (context.attemptId === undefined) ||
         context.candidateHash === undefined ||
         context.configurationHash === undefined)
     )

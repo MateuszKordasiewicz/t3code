@@ -630,6 +630,32 @@ const operationCases: { name: string; input: unknown; reason?: string }[] = [
     input: { ...operationExample(), status: "unknown" },
     reason: "invalid journal state",
   },
+  ...(
+    [
+      ["final combined review launch", "code_review", {}, undefined],
+      ["implementation launch without item", "implementation", {}, "invalid record"],
+      [
+        "review launch with item but no attempt",
+        "code_review",
+        { itemId: "item-1" },
+        "invalid record",
+      ],
+    ] as const
+  ).map(([name, stage, ids, reason]) => {
+    const { itemId: _itemId, attemptId: _attemptId, ...combined } = context;
+    return {
+      name,
+      input: workflowOperation({
+        kind: "stage_launch",
+        context: { ...combined, ...ids },
+        stage,
+        provider,
+        nativeThreadId: "thread-1",
+        nativeRunId: "run-1",
+      }),
+      ...(reason ? { reason } : {}),
+    };
+  }),
   {
     name: "invalid hash format",
     input: { ...operationExample(), fingerprint: "A".repeat(64) },
