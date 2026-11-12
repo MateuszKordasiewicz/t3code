@@ -11,6 +11,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import migration from "../persistence/Migrations/081_WorkflowRuns.ts";
 import planMigration from "../persistence/Migrations/082_DevelopmentPlans.ts";
+import intentMigration from "../persistence/Migrations/084_WorkflowNativeLaunchIntents.ts";
 import * as Store from "./WorkflowRunStore.ts";
 import * as Recovery from "./WorkflowRunRecovery.ts";
 import { WorkflowCanonicalHash } from "./WorkflowCanonicalHash.ts";
@@ -109,6 +110,7 @@ const seed = Effect.gen(function* () {
   yield* sql`PRAGMA foreign_keys = ON`;
   yield* migration;
   yield* planMigration;
+  yield* intentMigration;
   yield* seedPlan;
   const store = yield* Store.WorkflowRunStore;
   yield* store.createRun(run);

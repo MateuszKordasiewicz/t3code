@@ -24,6 +24,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import migration from "../persistence/Migrations/081_WorkflowRuns.ts";
 import planMigration from "../persistence/Migrations/082_DevelopmentPlans.ts";
+import intentMigration from "../persistence/Migrations/084_WorkflowNativeLaunchIntents.ts";
 import evidenceMigration from "../persistence/Migrations/083_PlanningEvidence.ts";
 import { DevelopmentPlanHash } from "../developmentPlans/DevelopmentPlanHash.ts";
 import * as Store from "./WorkflowRunStore.ts";
@@ -142,6 +143,7 @@ const setup = Effect.gen(function* () {
   yield* sql`PRAGMA foreign_keys = ON`;
   yield* migration;
   yield* planMigration;
+  yield* intentMigration;
   yield* seedPlan();
   yield* sql`INSERT INTO workflow_runs VALUES ('run', 'plan', 'revision', ${hash}, ${hash}, ${hash}, 'active', 0, 0, ${json(run)})`;
 });
@@ -152,6 +154,7 @@ it.effect("creates runs and planning sessions with existing plan payloads", () =
     yield* sql`PRAGMA foreign_keys = ON`;
     yield* migration;
     yield* planMigration;
+    yield* intentMigration;
     yield* seedPlan();
     const store = yield* Store.WorkflowRunStore;
     assert.deepStrictEqual(yield* store.createRun(run), run);
@@ -207,6 +210,7 @@ it.effect("preserves an admitted run's plan binding after reopening", () =>
           yield* sql`PRAGMA foreign_keys = ON`;
           yield* migration;
           yield* planMigration;
+          yield* intentMigration;
           yield* seedPlan();
           const store = yield* Store.WorkflowRunStore;
           yield* store.createRun(run);
@@ -257,6 +261,7 @@ it.effect.each([
     yield* sql`PRAGMA foreign_keys = ON`;
     yield* migration;
     yield* planMigration;
+    yield* intentMigration;
     const store = yield* Store.WorkflowRunStore;
     const error = yield* kind === "run"
       ? Effect.flip(store.createRun(record))
@@ -288,6 +293,7 @@ it.effect.each([
     yield* sql`PRAGMA foreign_keys = ON`;
     yield* migration;
     yield* planMigration;
+    yield* intentMigration;
     if (fixture !== "none") yield* seedPlan(fixture);
     const identities = yield* sql`SELECT * FROM workflow_plan_identities`;
     const revisions = yield* sql`SELECT * FROM workflow_revision_identities`;
@@ -307,6 +313,7 @@ it.effect("rejects a planning session without a current payload without writes o
     yield* sql`PRAGMA foreign_keys = ON`;
     yield* migration;
     yield* planMigration;
+    yield* intentMigration;
     yield* seedPlan("plan");
     const store = yield* Store.WorkflowRunStore;
     const subscription = yield* store.subscribeChanges;
@@ -357,6 +364,7 @@ it.effect(
       yield* sql`PRAGMA foreign_keys = ON`;
       yield* migration;
       yield* planMigration;
+      yield* intentMigration;
       yield* seedPlan();
       const store = yield* Store.WorkflowRunStore;
       yield* begin(store, session);
@@ -585,6 +593,435 @@ const setupAdmission = Effect.gen(function* () {
   const updated = { ...run, access: { origins: [{ ...destination, threadId: "thread" }] } };
   yield* sql`UPDATE workflow_runs SET record_json = ${json(updated)} WHERE id = ${run.id}`;
 });
+
+const reservation = (operation: WorkflowOperationV1, attemptId: string) => {
+  if (operation.parameters.kind !== "stage_launch") throw new Error("expected stage launch");
+  const {
+    fingerprint: _fingerprint,
+    controlGeneration: _generation,
+    status: _status,
+    ...rest
+  } = operation;
+  const { nativeRunId: _nativeRunId, ...parameters } = operation.parameters;
+  const {
+    fingerprint: _commandHash,
+    operationFingerprint: _operationHash,
+    ...command
+  } = admission(operation, attemptId);
+  return {
+    intentId: `intent-${attemptId}`,
+    runId: run.id,
+    operationId: operation.id,
+    attemptId,
+    itemId: "item",
+    repair: false,
+    environmentId: destination.environmentId,
+    projectId: destination.projectId,
+    launchCommandId: `launch-${attemptId}`,
+    threadId: parameters.nativeThreadId,
+    messageId: `message-${attemptId}`,
+    receiptId: `receipt-${attemptId}`,
+    generation: 0,
+    draft: {
+      version: 1 as const,
+      kind: "stage_launch" as const,
+      operation: { ...rest, parameters },
+      admission: { command },
+    },
+    externalFacts: admissionFacts,
+  };
+};
+
+it.effect("reserves once, replays after expiry and prevents legacy admission", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const operation = operationFor("reservation-op", "reservation-attempt");
+    const input = reservation(operation, "reservation-attempt");
+    const first = yield* store.reserveWorkflowNativeIntent(input);
+    assert.strictEqual(first.kind, "reserved");
+    if (first.kind !== "reserved") return;
+    assert.strictEqual(
+      first.fingerprint,
+      WorkflowCanonicalHash.tagged("t3.workflow-native-launch-intent.v1", {
+        intentId: input.intentId,
+        workflowRunId: input.runId,
+        planningSessionId: null,
+        operationId: input.operationId,
+        attemptId: input.attemptId,
+        passId: null,
+        itemId: input.itemId,
+        chargeAttempt: 1,
+        repair: input.repair,
+        role: "implementation",
+        environmentId: input.environmentId,
+        projectId: input.projectId,
+        launchCommandId: input.launchCommandId,
+        threadId: input.threadId,
+        messageId: input.messageId,
+        draft: input.draft,
+      }),
+    );
+    for (const changed of [
+      { ...input, receiptId: "changed" },
+      { ...input, intentId: "changed" },
+      { ...input, messageId: "changed" },
+      {
+        ...input,
+        draft: {
+          ...input.draft,
+          admission: { command: { ...input.draft.admission.command, expectedVersion: 1 } },
+        },
+      },
+    ])
+      assert.strictEqual(
+        (yield* Effect.flip(store.reserveWorkflowNativeIntent(changed))).reason,
+        "integrity",
+      );
+    const rowsBefore = yield* sql<{ record_json: string }>`SELECT record_json FROM workflow_runs`;
+    const changedRun = {
+      ...(parse(rowsBefore[0]!.record_json) as typeof run),
+      status: "paused",
+      recordVersion: 2,
+      controlGeneration: 1,
+    };
+    yield* sql`UPDATE workflow_runs SET status = 'paused', record_version = 2, control_generation = 1, record_json = ${json(changedRun)} WHERE id = ${run.id}`;
+    const replay = yield* store.reserveWorkflowNativeIntent({
+      ...input,
+      externalFacts: { ...admissionFacts, now: "2030-01-01T00:00:00Z" },
+    });
+    assert.deepStrictEqual(replay, { ...first, kind: "replay" });
+    const legacy = yield* store.commitTransition({
+      runId: run.id,
+      command: admission(operation, "reservation-attempt"),
+      operation,
+      receiptId: "legacy",
+      externalFacts: admissionFacts,
+    });
+    assert.deepStrictEqual(legacy, { kind: "rejected", reason: "custody" });
+    const rows = yield* sql<{ record_json: string }>`SELECT record_json FROM workflow_runs`;
+    assert.strictEqual((parse(rows[0]!.record_json) as typeof run).allowance.attemptsConsumed, 1);
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_operations`).length, 0);
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_attempts`).length, 0);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  "unknown field",
+  "native run",
+  "wrong context",
+  "bad time",
+  "deadline",
+  "stale",
+  "authority",
+  "freshness",
+  "ordering",
+] as const)("reservation rejects %s without writes", (scenario) =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const original = reservation(operationFor("op", "attempt"), "attempt");
+    const draft =
+      scenario === "unknown field"
+        ? { ...original.draft, extra: true }
+        : scenario === "native run"
+          ? {
+              ...original.draft,
+              operation: {
+                ...original.draft.operation,
+                parameters: { ...original.draft.operation.parameters, nativeRunId: "fake" },
+              },
+            }
+          : scenario === "wrong context"
+            ? {
+                ...original.draft,
+                operation: {
+                  ...original.draft.operation,
+                  parameters: {
+                    ...original.draft.operation.parameters,
+                    context: { ...original.draft.operation.parameters.context, itemId: "wrong" },
+                  },
+                },
+              }
+            : original.draft;
+    const input = {
+      ...original,
+      draft,
+      externalFacts: {
+        ...original.externalFacts,
+        ...(scenario === "deadline" ? { now: run.allowance.deadline } : {}),
+        ...(scenario === "bad time" ? { now: "invalid" } : {}),
+        ...(scenario === "authority" ? { authority: false } : {}),
+        ...(scenario === "freshness" ? { originGrantCurrent: false } : {}),
+        ...(scenario === "ordering" ? { orderedItemIds: ["other"] } : {}),
+      },
+      ...(scenario === "stale" ? { generation: 1 } : {}),
+    };
+    const before = yield* sql`SELECT * FROM workflow_runs`;
+    const result = yield* Effect.result(
+      store.reserveWorkflowNativeIntent(input as typeof original),
+    );
+    if (
+      scenario === "unknown field" ||
+      scenario === "native run" ||
+      scenario === "wrong context" ||
+      scenario === "bad time"
+    ) {
+      assert.strictEqual(result._tag, "Failure");
+      if (result._tag === "Failure") assert.strictEqual(result.failure.reason, "integrity");
+    } else {
+      assert.strictEqual(result._tag, "Success");
+      if (result._tag === "Success")
+        assert.deepStrictEqual(result.success, {
+          kind: "rejected",
+          reason: scenario === "authority" ? "unauthorized" : scenario,
+        });
+    }
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_runs`, before);
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_native_launch_intents`).length, 0);
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_native_intent_receipts`).length, 0);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("rolls back reservation when receipt insertion fails", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const before = yield* sql`SELECT * FROM workflow_runs`;
+    yield* sql`CREATE TRIGGER reject_intent_receipt BEFORE INSERT ON workflow_native_intent_receipts BEGIN SELECT RAISE(ABORT, 'failure'); END`;
+    assert.isTrue(
+      Exit.isFailure(
+        yield* Effect.exit(
+          store.reserveWorkflowNativeIntent(reservation(operationFor("op", "attempt"), "attempt")),
+        ),
+      ),
+    );
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_runs`, before);
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_native_launch_intents`).length, 0);
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_native_intent_receipts`).length, 0);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["intent", "legacy"] as const)(
+  "rejects a %s attempt reused by another run on a distinct thread",
+  (source) =>
+    Effect.gen(function* () {
+      yield* setupAdmission;
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      const first = reservation(operationFor("first-op", "attempt"), "attempt");
+      if (source === "intent") {
+        assert.strictEqual((yield* store.reserveWorkflowNativeIntent(first)).kind, "reserved");
+      } else {
+        assert.strictEqual(
+          (yield* store.commitTransition({
+            runId: run.id,
+            command: admission(operationFor("first-op", "attempt"), "attempt"),
+            operation: operationFor("first-op", "attempt"),
+            externalFacts: admissionFacts,
+            receiptId: "legacy-receipt",
+          })).kind,
+          "accepted",
+        );
+      }
+      const secondRun = {
+        ...run,
+        id: "other-run",
+        access: { origins: [{ ...destination, threadId: "other-thread" }] },
+      };
+      yield* sql`INSERT INTO workflow_runs VALUES ('other-run', 'plan', 'revision', ${hash}, ${hash}, ${hash}, 'active', 0, 0, ${json(secondRun)})`;
+      const op = operationFor("other-op", "attempt");
+      if (op.parameters.kind !== "stage_launch") return;
+      const secondOp = decodeOperation({
+        ...op,
+        owner: { kind: "workflow_run", workflowRunId: "other-run" },
+        parameters: { ...op.parameters, nativeThreadId: "other-thread" },
+      });
+      const second = {
+        ...reservation(secondOp, "attempt"),
+        runId: "other-run",
+        intentId: "other-intent",
+        receiptId: "other-receipt",
+        launchCommandId: "other-launch",
+        threadId: "other-thread",
+        messageId: "other-message",
+        draft: {
+          ...reservation(secondOp, "attempt").draft,
+          admission: {
+            command: {
+              ...reservation(secondOp, "attempt").draft.admission.command,
+              commandId: "other-command",
+            },
+          },
+        },
+      };
+      const before = yield* sql`SELECT * FROM workflow_runs ORDER BY id`;
+      assert.strictEqual(
+        (yield* Effect.flip(store.reserveWorkflowNativeIntent(second))).reason,
+        "integrity",
+      );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_runs ORDER BY id`, before);
+      assert.strictEqual(
+        (yield* sql`SELECT * FROM workflow_native_launch_intents`).length,
+        source === "intent" ? 1 : 0,
+      );
+      assert.strictEqual(
+        (yield* sql`SELECT * FROM workflow_native_intent_receipts`).length,
+        source === "intent" ? 1 : 0,
+      );
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  ["reservation", "settled"],
+  ["legacy", "settled"],
+  ["reservation", "pending"],
+  ["legacy", "pending"],
+  ["reservation", "unknown"],
+  ["legacy", "unknown"],
+] as const)("checks next-item state and global custody through %s", ([path, priorStatus]) =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const previous = operationFor("previous-operation", "previous-attempt");
+    assert.strictEqual(
+      (yield* store.commitTransition({
+        runId: run.id,
+        command: admission(previous, "previous-attempt"),
+        operation: previous,
+        externalFacts: admissionFacts,
+        receiptId: "previous-receipt",
+      })).kind,
+      "accepted",
+    );
+    const settled = {
+      ...previous,
+      status: priorStatus,
+      ...(priorStatus === "pending"
+        ? {}
+        : {
+            outcome: {
+              kind: priorStatus === "settled" ? "succeeded" : "unknown",
+              summary: "observed",
+              evidence: [],
+            },
+          }),
+    };
+    yield* sql`UPDATE workflow_operations SET status = ${priorStatus}, record_json = ${json(settled)} WHERE id = ${previous.id}`;
+    yield* sql`INSERT INTO workflow_acceptances VALUES (${run.id}, 'item:item', '{}', 0)`;
+    const nextBase = operationFor("next-operation", "next-attempt");
+    if (nextBase.parameters.kind !== "stage_launch") throw new Error("expected stage launch");
+    const next = decodeOperation({
+      ...nextBase,
+      parameters: {
+        ...nextBase.parameters,
+        context: { ...nextBase.parameters.context, itemId: "next" },
+      },
+    });
+    const operation = { ...next, fingerprint: WorkflowCanonicalHash.operation(next) };
+    const command = {
+      ...admission(operation, "next-attempt"),
+      expectedVersion: 1,
+      itemId: "next",
+    };
+    const externalFacts = { ...admissionFacts, orderedItemIds: ["item", "next"] };
+    const input = reservation(operation, "next-attempt");
+    const {
+      fingerprint: _commandHash,
+      operationFingerprint: _operationHash,
+      ...retainedCommand
+    } = command;
+    const result =
+      path === "legacy"
+        ? yield* store.commitTransition({
+            runId: run.id,
+            command,
+            operation,
+            externalFacts,
+            receiptId: "next-receipt",
+          })
+        : yield* store.reserveWorkflowNativeIntent({
+            ...input,
+            itemId: "next",
+            externalFacts,
+            draft: { ...input.draft, admission: { command: retainedCommand } },
+          });
+    if (priorStatus === "settled") {
+      assert.strictEqual(result.kind, path === "legacy" ? "accepted" : "reserved");
+    } else {
+      assert.deepStrictEqual(result, { kind: "rejected", reason: "custody" });
+    }
+    const rows = yield* sql<{
+      record_json: string;
+    }>`SELECT record_json FROM workflow_runs WHERE id = ${run.id}`;
+    assert.strictEqual(
+      (parse(rows[0]!.record_json) as typeof run).allowance.attemptsConsumed,
+      priorStatus === "settled" ? 2 : 1,
+    );
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("independent connections contend for the last workflow attempt", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const directory = yield* Effect.acquireRelease(
+        Effect.sync(() => NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "workflow-reserve-"))),
+        (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
+      );
+      const filename = NodePath.join(directory, "test.sqlite");
+      const fileLayer = () =>
+        Store.layer.pipe(Layer.provideMerge(NodeSqliteClient.layer({ filename })));
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* setupAdmission;
+          const sql = yield* SqlClient.SqlClient;
+          const limited = {
+            ...run,
+            access: { origins: [{ ...destination, threadId: "thread" }] },
+            allowance: { ...run.allowance, maxAttempts: 1 },
+          };
+          yield* sql`UPDATE workflow_runs SET record_json = ${json(limited)} WHERE id = ${run.id}`;
+        }).pipe(Effect.provide(fileLayer())),
+      );
+      const barrier = yield* Deferred.make<void>();
+      const arrivals = yield* Ref.make(0);
+      const attempt = (id: string) =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* Store.WorkflowRunStore;
+            const count = yield* Ref.updateAndGet(arrivals, (value) => value + 1);
+            if (count === 2) yield* Deferred.succeed(barrier, undefined);
+            yield* Deferred.await(barrier);
+            return yield* Effect.result(
+              store.reserveWorkflowNativeIntent(reservation(operationFor(`op-${id}`, id), id)),
+            );
+          }).pipe(Effect.provide(fileLayer())),
+        );
+      const results = yield* Effect.all([attempt("one"), attempt("two")], { concurrency: 2 });
+      assert.strictEqual(
+        results.filter((result) => result._tag === "Success" && result.success.kind === "reserved")
+          .length,
+        1,
+      );
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          const rows = yield* sql<{ record_json: string }>`SELECT record_json FROM workflow_runs`;
+          assert.strictEqual(
+            (parse(rows[0]!.record_json) as typeof run).allowance.attemptsConsumed,
+            1,
+          );
+          assert.strictEqual((yield* sql`SELECT * FROM workflow_native_launch_intents`).length, 1);
+          assert.strictEqual((yield* sql`SELECT * FROM workflow_native_intent_receipts`).length, 1);
+        }).pipe(Effect.provide(fileLayer())),
+      );
+    }),
+  ),
+);
 
 it.effect("admits, replays, blocks a concurrent attempt, and permits a repair after failure", () =>
   Effect.gen(function* () {
@@ -1431,6 +1868,7 @@ it.effect("planning receipts survive database reopen and corruption is rejected"
           yield* sql`PRAGMA foreign_keys = ON`;
           yield* migration;
           yield* planMigration;
+          yield* intentMigration;
           yield* seedPlan();
           const store = yield* Store.WorkflowRunStore;
           yield* store.beginPlanning(input);
@@ -1468,6 +1906,7 @@ const seedAdmission = Effect.gen(function* () {
   yield* sql`PRAGMA foreign_keys = ON`;
   yield* migration;
   yield* planMigration;
+  yield* intentMigration;
   const example = {
     schemaVersion: 1,
     planId: "plan",
@@ -1582,6 +2021,23 @@ const admissionInput = (
     command: { commandId: `command-${id}`, receiptId: `receipt-${id}` },
   };
 };
+
+it.effect("planning admission fails closed for an outstanding intent", () =>
+  Effect.gen(function* () {
+    const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    yield* begin(store, session);
+    const input = admissionInput(binding, "reserved");
+    yield* sql`INSERT INTO workflow_native_launch_intents (intent_id, planning_session_id, operation_id, pass_id, charge_attempt, repair, role, environment_id, project_id, launch_command_id, thread_id, message_id, fingerprint, draft_json, generation, state) VALUES ('planning-intent', ${session.id}, ${input.operation.id}, ${input.pass.id}, 0, 0, 'author', 'environment', 'project', 'launch', 'thread', 'message', ${hash}, '{}', 0, 'reserved')`;
+    yield* sql`INSERT INTO workflow_native_intent_receipts VALUES (${input.command.commandId}, 'reserved-receipt', 'planning-intent', ${hash}, '{}')`;
+    const before = yield* sql`SELECT * FROM workflow_planning_sessions`;
+    assert.strictEqual((yield* Effect.flip(store.admitPlanningPass(input))).reason, "custody");
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_planning_sessions`, before);
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_planning_passes`).length, 0);
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_operations`).length, 0);
+  }).pipe(Effect.provide(layer)),
+);
 
 it.effect.each([
   ["bad timestamp", "invalid"],

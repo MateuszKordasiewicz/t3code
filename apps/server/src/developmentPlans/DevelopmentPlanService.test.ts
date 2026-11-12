@@ -22,6 +22,7 @@ import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
 import migration from "../persistence/Migrations/081_WorkflowRuns.ts";
 import planMigration from "../persistence/Migrations/082_DevelopmentPlans.ts";
+import intentMigration from "../persistence/Migrations/084_WorkflowNativeLaunchIntents.ts";
 import { DevelopmentPlanHash } from "./DevelopmentPlanHash.ts";
 import * as Store from "./DevelopmentPlanStore.ts";
 import * as Service from "./DevelopmentPlanService.ts";
@@ -144,6 +145,7 @@ const setup = Effect.gen(function* () {
   yield* sql`PRAGMA foreign_keys = ON`;
   yield* migration;
   yield* planMigration;
+  yield* intentMigration;
   yield* evidenceMigration;
 });
 const withDatabase = <A, E, R>(f: (filename: string) => Effect.Effect<A, E, R>) =>

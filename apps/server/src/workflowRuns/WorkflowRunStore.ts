@@ -54,6 +54,33 @@ const contextBinding = (operation: WorkflowOperationV1): Binding | undefined => 
       : {}),
   };
 };
+const attemptFacts = <
+  A extends {
+    readonly item_id: string;
+    readonly status: WorkflowOperationV1["status"];
+    readonly outcome: string | null;
+  },
+>(
+  attempts: readonly A[],
+  targetItemId: string | undefined,
+) => {
+  const latest =
+    targetItemId === undefined
+      ? attempts.at(-1)
+      : attempts.findLast((attempt) => attempt.item_id === targetItemId);
+  const state: NonNullable<Facts["currentAttemptState"]> = attempts.some(
+    (attempt) => attempt.status === "unknown",
+  )
+    ? "unknown"
+    : attempts.some((attempt) => attempt.status === "pending" || attempt.status === "claimed")
+      ? "active"
+      : !latest
+        ? "none"
+        : latest.status === "settled" && latest.outcome === "succeeded"
+          ? "settled_succeeded"
+          : "settled_failed";
+  return { latest, state };
+};
 const encode = (value: unknown) => JSON.stringify(value);
 const parse = (value: string): unknown => JSON.parse(value);
 
@@ -408,6 +435,24 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     });
     const result = yield* planningTransaction(
       Effect.gen(function* () {
+        const outstanding = yield* sql<{
+          planning_session_id: string | null;
+          operation_id: string;
+          pass_id: string | null;
+          command_id: string | null;
+        }>`SELECT i.planning_session_id, i.operation_id, i.pass_id, r.command_id FROM workflow_native_launch_intents i LEFT JOIN workflow_native_intent_receipts r ON r.intent_id = i.intent_id WHERE i.state IN ('reserved','dispatching','unknown') AND (i.planning_session_id = ${input.sessionId} OR i.operation_id = ${operation.id} OR i.pass_id = ${pass.id} OR r.command_id = ${input.command.commandId})`;
+        if (
+          outstanding.some(
+            (i) =>
+              i.planning_session_id !== input.sessionId ||
+              (i.command_id === input.command.commandId &&
+                (i.operation_id !== operation.id || i.pass_id !== pass.id)) ||
+              (i.operation_id === operation.id && i.pass_id !== pass.id) ||
+              (i.pass_id === pass.id && i.operation_id !== operation.id),
+          )
+        )
+          return yield* planningError("integrity");
+        if (outstanding.length) return yield* planningError("custody");
         const receipts = yield* sql<{
           planning_session_id: string | null;
           fingerprint: string;
@@ -1086,6 +1131,414 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     yield* notify;
     return recorded;
   });
+  const reserveWorkflowNativeIntent = Effect.fn("WorkflowRunStore.reserveWorkflowNativeIntent")(
+    function* (input: {
+      readonly intentId: string;
+      readonly runId: string;
+      readonly operationId: WorkflowOperationV1["id"];
+      readonly attemptId: string;
+      readonly itemId: string;
+      readonly repair: boolean;
+      readonly environmentId: string;
+      readonly projectId: string;
+      readonly launchCommandId: string;
+      readonly threadId: string;
+      readonly messageId: string;
+      readonly receiptId: string;
+      readonly generation: number;
+      readonly draft: {
+        readonly version: 1;
+        readonly kind: "stage_launch";
+        readonly operation: Omit<
+          WorkflowOperationV1,
+          | "fingerprint"
+          | "controlGeneration"
+          | "status"
+          | "claim"
+          | "outcome"
+          | "nextDueAt"
+          | "parameters"
+        > & {
+          readonly parameters: Omit<
+            Extract<WorkflowOperationV1["parameters"], { kind: "stage_launch" }>,
+            "nativeRunId"
+          >;
+        };
+        readonly admission: {
+          readonly command: Omit<
+            Extract<Command, { kind: "admitAttempt" }>,
+            "fingerprint" | "operationFingerprint"
+          >;
+        };
+      };
+      readonly externalFacts: Facts;
+    }) {
+      const work = Effect.gen(function* () {
+        const { draft } = input;
+        const valid = yield* Effect.try({
+          try: () => {
+            WorkflowCanonicalHash.assertCanonical(draft);
+            const command = draft.admission.command;
+            return (
+              [
+                input.intentId,
+                input.runId,
+                input.operationId,
+                input.attemptId,
+                input.itemId,
+                input.environmentId,
+                input.projectId,
+                input.launchCommandId,
+                input.threadId,
+                input.messageId,
+                input.receiptId,
+                command.commandId,
+              ].every((id) => typeof id === "string" && id.length > 0) &&
+              Number.isSafeInteger(input.generation) &&
+              input.generation >= 0 &&
+              typeof input.repair === "boolean" &&
+              Object.keys(draft).sort().join() === "admission,kind,operation,version" &&
+              draft.version === 1 &&
+              draft.kind === "stage_launch" &&
+              Object.keys(draft.admission).join() === "command" &&
+              Object.keys(command).sort().join() ===
+                "attemptId,commandId,expectedGeneration,expectedSpecHash,expectedVersion,itemId,kind,operationId,repair" &&
+              Number.isSafeInteger(command.expectedVersion) &&
+              command.expectedVersion >= 0 &&
+              Number.isSafeInteger(command.expectedGeneration) &&
+              command.expectedGeneration >= 0 &&
+              command.kind === "admitAttempt" &&
+              command.operationId === input.operationId &&
+              command.attemptId === input.attemptId &&
+              command.itemId === input.itemId &&
+              command.repair === input.repair &&
+              command.commandId !== input.launchCommandId &&
+              command.commandId !== `${input.launchCommandId}:initial-message`
+            );
+          },
+          catch: integrity,
+        });
+        if (!valid) return yield* integrity();
+        const supplemented = {
+          ...draft.operation,
+          parameters: { ...draft.operation.parameters, nativeRunId: "reservation-validation-only" },
+          fingerprint: "0".repeat(64),
+          controlGeneration: input.generation,
+          status: "pending",
+        };
+        const operation = yield* decodeWorkflowOperationV1(supplemented).pipe(
+          Effect.mapError(integrity),
+        );
+        if (operation.kind !== "stage_launch" || operation.parameters.kind !== "stage_launch")
+          return yield* integrity();
+        const {
+          fingerprint: _fingerprint,
+          controlGeneration: _controlGeneration,
+          status: _status,
+          claim: _claim,
+          outcome: _outcome,
+          nextDueAt: _nextDueAt,
+          ...operationBase
+        } = operation;
+        const { nativeRunId: _nativeRunId, ...parameters } = operation.parameters;
+        const canonical = yield* Effect.try({
+          try: () =>
+            WorkflowCanonicalHash.tagged("compare", { ...operationBase, parameters }) ===
+            WorkflowCanonicalHash.tagged("compare", draft.operation),
+          catch: integrity,
+        });
+        if (
+          !canonical ||
+          operation.parameters.stage !== "implementation" ||
+          operation.id !== input.operationId ||
+          operation.owner.kind !== "workflow_run" ||
+          operation.owner.workflowRunId !== input.runId ||
+          operation.destination.environmentId !== input.environmentId ||
+          operation.destination.projectId !== input.projectId ||
+          operation.parameters.nativeThreadId !== input.threadId ||
+          operation.parameters.context.itemId !== input.itemId ||
+          operation.parameters.context.attemptId !== input.attemptId ||
+          operation.parameters.context.specHash !== draft.admission.command.expectedSpecHash
+        )
+          return yield* integrity();
+        const fingerprint = yield* Effect.try({
+          try: () =>
+            WorkflowCanonicalHash.tagged("t3.workflow-native-launch-intent.v1", {
+              intentId: input.intentId,
+              workflowRunId: input.runId,
+              planningSessionId: null,
+              operationId: input.operationId,
+              attemptId: input.attemptId,
+              passId: null,
+              itemId: input.itemId,
+              chargeAttempt: 1,
+              repair: input.repair,
+              role: "implementation",
+              environmentId: input.environmentId,
+              projectId: input.projectId,
+              launchCommandId: input.launchCommandId,
+              threadId: input.threadId,
+              messageId: input.messageId,
+              draft,
+            }),
+          catch: integrity,
+        });
+        const receipts = yield* sql<{
+          command_id: string;
+          receipt_id: string;
+          intent_id: string;
+          fingerprint: string;
+          result_json: string;
+        }>`SELECT * FROM workflow_native_intent_receipts WHERE command_id = ${draft.admission.command.commandId} OR receipt_id = ${input.receiptId} OR intent_id = ${input.intentId}`;
+        const intents = yield* sql<{
+          intent_id: string;
+          workflow_run_id: string | null;
+          planning_session_id: string | null;
+          operation_id: string;
+          attempt_id: string | null;
+          pass_id: string | null;
+          item_id: string | null;
+          charge_attempt: number;
+          repair: number;
+          role: string;
+          environment_id: string;
+          project_id: string;
+          launch_command_id: string;
+          thread_id: string;
+          message_id: string;
+          fingerprint: string;
+          draft_json: string;
+        }>`SELECT * FROM workflow_native_launch_intents WHERE intent_id = ${input.intentId}`;
+        if (receipts.length || intents.length) {
+          const receipt = receipts[0];
+          const intent = intents[0];
+          if (
+            receipts.length !== 1 ||
+            intents.length !== 1 ||
+            !receipt ||
+            !intent ||
+            receipt.command_id !== draft.admission.command.commandId ||
+            receipt.receipt_id !== input.receiptId ||
+            receipt.intent_id !== input.intentId ||
+            receipt.fingerprint !== fingerprint ||
+            intent.workflow_run_id !== input.runId ||
+            intent.planning_session_id !== null ||
+            intent.operation_id !== input.operationId ||
+            intent.attempt_id !== input.attemptId ||
+            intent.pass_id !== null ||
+            intent.item_id !== input.itemId ||
+            intent.charge_attempt !== 1 ||
+            intent.repair !== (input.repair ? 1 : 0) ||
+            intent.role !== "implementation" ||
+            intent.environment_id !== input.environmentId ||
+            intent.project_id !== input.projectId ||
+            intent.launch_command_id !== input.launchCommandId ||
+            intent.thread_id !== input.threadId ||
+            intent.message_id !== input.messageId ||
+            intent.fingerprint !== fingerprint ||
+            (yield* Effect.try({
+              try: () =>
+                WorkflowCanonicalHash.tagged("compare", parse(intent.draft_json)) ===
+                  WorkflowCanonicalHash.tagged("compare", draft) &&
+                WorkflowCanonicalHash.tagged("compare", parse(receipt.result_json)) ===
+                  WorkflowCanonicalHash.tagged("compare", {
+                    intentId: input.intentId,
+                    fingerprint,
+                  }),
+              catch: integrity,
+            })) === false
+          )
+            return yield* integrity();
+          return {
+            kind: "replay" as const,
+            receiptId: receipt.receipt_id,
+            intentId: input.intentId,
+            fingerprint,
+          };
+        }
+        const collisions =
+          yield* sql`SELECT 1 FROM workflow_command_receipts WHERE command_id IN (${draft.admission.command.commandId}, ${input.launchCommandId}, ${input.launchCommandId + ":initial-message"}) OR receipt_id = ${input.receiptId} OR operation_id = ${input.operationId} UNION ALL SELECT 1 FROM workflow_operations WHERE id = ${input.operationId} UNION ALL SELECT 1 FROM workflow_attempts WHERE id = ${input.attemptId} UNION ALL SELECT 1 FROM workflow_native_launch_intents WHERE operation_id = ${input.operationId} OR (charge_attempt = 1 AND attempt_id = ${input.attemptId}) OR launch_command_id IN (${input.launchCommandId}, ${draft.admission.command.commandId}, ${input.launchCommandId + ":initial-message"}) OR launch_command_id || ':initial-message' IN (${input.launchCommandId}, ${draft.admission.command.commandId}) OR (thread_id = ${input.threadId} AND message_id = ${input.messageId}) UNION ALL SELECT 1 FROM workflow_native_intent_receipts WHERE command_id IN (${input.launchCommandId}, ${input.launchCommandId + ":initial-message"})`;
+        if (collisions.length) return yield* integrity();
+        const foreignIntents =
+          yield* sql`SELECT 1 FROM workflow_native_launch_intents WHERE thread_id = ${input.threadId} AND state <> 'cancelled' AND (workflow_run_id IS NULL OR workflow_run_id <> ${input.runId})`;
+        if (foreignIntents.length) return { kind: "rejected" as const, reason: "custody" as const };
+        const nativeOperations = yield* sql<{
+          id: string;
+          kind: string;
+          workflow_run_id: string | null;
+          planning_session_id: string | null;
+          record_json: string;
+        }>`SELECT id, kind, workflow_run_id, planning_session_id, record_json FROM workflow_operations WHERE json_extract(record_json, '$.parameters.nativeThreadId') = ${input.threadId}`;
+        for (const row of nativeOperations) {
+          const op = yield* Effect.try({
+            try: () => parse(row.record_json),
+            catch: integrity,
+          }).pipe(Effect.flatMap(decodeWorkflowOperationV1), Effect.mapError(integrity));
+          if (
+            row.workflow_run_id !== input.runId ||
+            row.planning_session_id !== null ||
+            op.id !== row.id ||
+            op.kind !== row.kind ||
+            (op.parameters.kind !== "stage_launch" && op.parameters.kind !== "supervision") ||
+            op.owner.kind !== "workflow_run" ||
+            op.owner.workflowRunId !== row.workflow_run_id
+          )
+            return { kind: "rejected" as const, reason: "custody" as const };
+        }
+        const passes =
+          yield* sql`SELECT 1 FROM workflow_planning_passes WHERE native_thread_id = ${input.threadId}`;
+        if (passes.length) return { kind: "rejected" as const, reason: "custody" as const };
+        const rows = yield* sql<{
+          record_json: string;
+          record_version: number;
+          control_generation: number;
+          spec_hash: string;
+          status: string;
+        }>`SELECT record_json, record_version, control_generation, spec_hash, status FROM workflow_runs WHERE id = ${input.runId}`;
+        const row = rows[0];
+        if (!row) return yield* integrity();
+        const run = yield* Effect.try({ try: () => parse(row.record_json), catch: integrity }).pipe(
+          Effect.flatMap(decodeWorkflowRunV1),
+          Effect.mapError(integrity),
+        );
+        if (
+          run.id !== input.runId ||
+          run.recordVersion !== row.record_version ||
+          run.controlGeneration !== row.control_generation ||
+          run.spec.ref.sha256 !== row.spec_hash ||
+          run.status !== row.status ||
+          WorkflowCanonicalHash.tagged("compare", run.origin) !==
+            WorkflowCanonicalHash.tagged("compare", operation.origin) ||
+          !run.access.origins.some(
+            (origin) =>
+              origin.environmentId === input.environmentId && origin.projectId === input.projectId,
+          )
+        )
+          return yield* integrity();
+        if (input.generation !== run.controlGeneration)
+          return { kind: "rejected" as const, reason: "stale" as const };
+        const operations = yield* sql<{
+          id: WorkflowOperationV1["id"];
+          status: WorkflowOperationV1["status"];
+          kind: string;
+          stage: string | null;
+        }>`SELECT id, status, kind, json_extract(record_json, '$.parameters.stage') AS stage FROM workflow_operations WHERE workflow_run_id = ${input.runId} ORDER BY rowid`;
+        const attempts = yield* sql<{
+          id: string;
+          item_id: string;
+          status: WorkflowOperationV1["status"];
+          outcome: string | null;
+        }>`SELECT a.id, a.item_id, o.status, json_extract(o.record_json, '$.outcome.kind') AS outcome FROM workflow_attempts a JOIN workflow_operations o ON o.id = a.operation_id AND o.workflow_run_id = a.workflow_run_id WHERE a.workflow_run_id = ${input.runId} ORDER BY a.rowid`;
+        const activeIntents = yield* sql<{
+          operation_id: WorkflowOperationV1["id"];
+          attempt_id: string | null;
+          state: string;
+          role: string;
+        }>`SELECT operation_id, attempt_id, state, role FROM workflow_native_launch_intents WHERE workflow_run_id = ${input.runId} AND state IN ('reserved','dispatching','unknown')`;
+        const acceptances = yield* sql<{
+          acceptance_key: string;
+        }>`SELECT acceptance_key FROM workflow_acceptances WHERE workflow_run_id = ${input.runId} AND invalidated = 0 ORDER BY rowid`;
+        const acceptedItemIds = acceptances
+          .filter((a) => a.acceptance_key.startsWith("item:"))
+          .map((a) => a.acceptance_key.slice(5));
+        const { latest, state: currentAttemptState } = attemptFacts(attempts, input.itemId);
+        if (
+          latest?.status === "settled" &&
+          latest.outcome !== "succeeded" &&
+          latest.outcome !== "failed"
+        )
+          return yield* integrity();
+        if (!isWorkflowTimestamp(input.externalFacts.now)) return yield* integrity();
+        const ordered = input.externalFacts.orderedItemIds;
+        if (
+          ordered !== undefined &&
+          (!Array.isArray(ordered) || ordered.some((id) => typeof id !== "string" || !id))
+        )
+          return yield* integrity();
+        const index = ordered?.indexOf(input.itemId);
+        const facts: Facts = {
+          now: input.externalFacts.now,
+          authority: input.externalFacts.authority === true,
+          capabilitiesCurrent: input.externalFacts.capabilitiesCurrent === true,
+          compatibilityCurrent: input.externalFacts.compatibilityCurrent === true,
+          fingerprintCurrent: input.externalFacts.fingerprintCurrent === true,
+          originGrantCurrent: input.externalFacts.originGrantCurrent === true,
+          heldOperations: [],
+          ...(ordered ? { orderedItemIds: ordered } : {}),
+          custody:
+            activeIntents.some((i) => i.state === "unknown") ||
+            operations.some((o) => o.status === "unknown")
+              ? "unknown"
+              : activeIntents.length || operations.some((o) => o.status === "claimed")
+                ? "active"
+                : "none",
+          activeWriterCount:
+            activeIntents.filter((i) => i.role === "implementation").length +
+            operations.filter(
+              (o) =>
+                o.status === "claimed" && o.kind === "stage_launch" && o.stage === "implementation",
+            ).length,
+          knownAttemptIds: [
+            ...attempts.map((a) => a.id),
+            ...activeIntents.flatMap((i) => (i.attempt_id ? [i.attempt_id] : [])),
+          ],
+          knownOperationIds: [
+            ...operations.map((o) => o.id),
+            ...activeIntents.map((i) => i.operation_id),
+          ],
+          currentAttemptState: activeIntents.some((i) => i.state === "unknown")
+            ? "unknown"
+            : activeIntents.length
+              ? "active"
+              : currentAttemptState,
+          ...(latest ? { currentAttemptItemId: latest.item_id } : {}),
+          acceptedItemIds,
+          predecessorAccepted:
+            index !== undefined &&
+            index >= 0 &&
+            acceptedItemIds.length === index &&
+            acceptedItemIds.every((id, i) => id === ordered?.[i]),
+        };
+        const baseCommand = { ...draft.admission.command, operationFingerprint: fingerprint };
+        const command = {
+          ...baseCommand,
+          fingerprint: WorkflowCanonicalHash.command(run.id, baseCommand),
+        };
+        const decision = WorkflowRunPolicy.decide({ run, command, facts });
+        if (decision.kind !== "accepted")
+          return decision.kind === "replay" ? yield* integrity() : decision;
+        const action = decision.actions[0];
+        if (
+          decision.actions.length !== 1 ||
+          action?.kind !== "reserve_attempt" ||
+          action.operationId !== input.operationId ||
+          action.fingerprint !== fingerprint ||
+          action.attemptId !== input.attemptId ||
+          action.itemId !== input.itemId ||
+          action.repair !== input.repair
+        )
+          return yield* integrity();
+        const updated =
+          yield* sql`UPDATE workflow_runs SET status = ${decision.run.status}, record_version = ${decision.run.recordVersion}, control_generation = ${decision.run.controlGeneration}, spec_hash = ${decision.run.spec.ref.sha256}, record_json = ${encode(decision.run)} WHERE id = ${run.id} AND record_version = ${run.recordVersion} AND control_generation = ${run.controlGeneration} AND spec_hash = ${run.spec.ref.sha256} RETURNING id`;
+        if (updated.length !== 1) return yield* stale();
+        const inserted =
+          yield* sql`INSERT INTO workflow_native_launch_intents (intent_id, workflow_run_id, operation_id, attempt_id, item_id, charge_attempt, repair, role, environment_id, project_id, launch_command_id, thread_id, message_id, fingerprint, draft_json, generation, state, held) VALUES (${input.intentId}, ${input.runId}, ${input.operationId}, ${input.attemptId}, ${input.itemId}, 1, ${input.repair ? 1 : 0}, 'implementation', ${input.environmentId}, ${input.projectId}, ${input.launchCommandId}, ${input.threadId}, ${input.messageId}, ${fingerprint}, ${encode(draft)}, ${input.generation}, 'reserved', 0) RETURNING intent_id`;
+        if (inserted.length !== 1) return yield* integrity();
+        const receipt =
+          yield* sql`INSERT INTO workflow_native_intent_receipts (command_id, receipt_id, intent_id, fingerprint, result_json) VALUES (${command.commandId}, ${input.receiptId}, ${input.intentId}, ${fingerprint}, ${encode({ intentId: input.intentId, fingerprint })}) RETURNING receipt_id`;
+        if (receipt.length !== 1) return yield* integrity();
+        return {
+          kind: "reserved" as const,
+          receiptId: input.receiptId,
+          intentId: input.intentId,
+          fingerprint,
+        };
+      });
+      const result = yield* inTransaction(work);
+      if (result.kind === "reserved") yield* notify;
+      return result;
+    },
+  );
   const commitTransition = Effect.fn("WorkflowRunStore.commitTransition")(function* (input: {
     readonly runId: string;
     readonly command: Command;
@@ -1099,6 +1552,30 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
         try: () => WorkflowCanonicalHash.command(input.runId, input.command),
         catch: integrity,
       });
+      if (input.command.kind === "admitAttempt") {
+        const admissionCommand = input.command;
+        const conflicts = yield* sql<{
+          workflow_run_id: string | null;
+          operation_id: string;
+          attempt_id: string | null;
+          command_id: string | null;
+        }>`SELECT i.workflow_run_id, i.operation_id, i.attempt_id, r.command_id FROM workflow_native_launch_intents i LEFT JOIN workflow_native_intent_receipts r ON r.intent_id = i.intent_id WHERE i.state IN ('reserved','dispatching','unknown') AND (i.workflow_run_id = ${input.runId} OR i.operation_id = ${admissionCommand.operationId} OR i.attempt_id = ${admissionCommand.attemptId} OR r.command_id = ${admissionCommand.commandId})`;
+        if (
+          conflicts.some(
+            (i) =>
+              i.workflow_run_id !== input.runId ||
+              (i.command_id === admissionCommand.commandId &&
+                (i.operation_id !== admissionCommand.operationId ||
+                  i.attempt_id !== admissionCommand.attemptId)) ||
+              (i.operation_id === admissionCommand.operationId &&
+                i.attempt_id !== admissionCommand.attemptId) ||
+              (i.attempt_id === admissionCommand.attemptId &&
+                i.operation_id !== admissionCommand.operationId),
+          )
+        )
+          return yield* integrity();
+        if (conflicts.length) return { kind: "rejected" as const, reason: "custody" as const };
+      }
       const receipts = yield* sql<{
         workflow_run_id: string | null;
         fingerprint: string;
@@ -1159,22 +1636,16 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
       const acceptedItemIds = acceptances
         .filter((a) => a.acceptance_key.startsWith("item:"))
         .map((a) => a.acceptance_key.slice(5));
-      const latest = attempts.at(-1);
+      const { latest, state: currentAttemptState } = attemptFacts(
+        attempts,
+        command.kind === "admitAttempt" ? command.itemId : undefined,
+      );
       if (
         latest?.status === "settled" &&
         latest.outcome !== "succeeded" &&
         latest.outcome !== "failed"
       )
         return yield* integrity();
-      const currentAttemptState: NonNullable<Facts["currentAttemptState"]> = !latest
-        ? "none"
-        : latest.status === "unknown"
-          ? "unknown"
-          : latest.status === "pending" || latest.status === "claimed"
-            ? "active"
-            : latest.status === "settled" && latest.outcome === "succeeded"
-              ? "settled_succeeded"
-              : "settled_failed";
       const operationReceipts =
         command.kind === "admitAttempt"
           ? yield* sql<{
@@ -1796,6 +2267,7 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     controlPlanning,
     recordRoleResult,
     commitTransition,
+    reserveWorkflowNativeIntent,
     subscribeChanges,
     listPending,
     claim,
