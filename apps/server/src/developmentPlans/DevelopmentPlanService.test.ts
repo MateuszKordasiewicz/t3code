@@ -95,7 +95,11 @@ const key = (origin: {
 const layer = (
   filename: string,
   grants: Ref.Ref<Set<string>>,
-  ports = Layer.merge(Service.emptyPassReaderLayer, Service.denyAttestationLayer),
+  ports: Layer.Layer<
+    Service.DevelopmentPlanPassReader | Service.DevelopmentPlanReviewAttestation,
+    never,
+    SqlClient.SqlClient
+  > = Layer.merge(Service.emptyPassReaderLayer, Service.denyAttestationLayer),
 ) => {
   const auth = Layer.succeed(Service.DevelopmentPlanAuthorization, {
     check: ({ origins, destination }) =>
@@ -1086,6 +1090,208 @@ describe("DevelopmentPlanService", () => {
           "unauthorized",
         );
       }).pipe(Effect.provide(layer(":memory:", grants)));
+    }),
+  );
+  it.effect("attests persisted reviews and fails closed on missing or altered evidence", () =>
+    Effect.gen(function* () {
+      const cases = [
+        "positive",
+        "stale hash",
+        "failed verdict",
+        "not fresh",
+        "sources not delivered",
+        "forbidden context",
+        "unqualified profile",
+        "manifest mismatch",
+        "blocking finding",
+        "unresolved disposition",
+        "non-review",
+        "ambiguous reviews",
+        "malformed",
+        "no review",
+      ] as const;
+      for (const scenario of cases) {
+        const grants = yield* Ref.make(allGrants());
+        yield* Effect.gen(function* () {
+          yield* setup;
+          const service = yield* Service.DevelopmentPlanService;
+          const workflow = yield* WorkflowStore.WorkflowRunStore;
+          const reader = yield* Service.DevelopmentPlanPassReader;
+          const sql = yield* SqlClient.SqlClient;
+          const base = yield* fixture;
+          const revision = {
+            ...base.revision,
+            workItems: [
+              {
+                id: "work",
+                explanation: "Explanation",
+                sourceStatementIds: ["statement"],
+                access: base.revision.access,
+                title: "Work",
+                state: "active" as const,
+                requirementIds: [base.revision.requirements[0]!.id],
+                criterionIds: ["criterion"],
+                dependencyIds: [],
+                fileChanges: [],
+                verification: [
+                  { id: "verification", description: "Check", criterionIds: ["criterion"] },
+                ],
+              },
+            ],
+          };
+          const value = { ...base, revision };
+          yield* service.create(value, context);
+          const lookup = {
+            planId: value.planId,
+            revisionId: value.revisionId,
+            revisionHash: DevelopmentPlanHash.revision(revision),
+            sourcePacketHash: DevelopmentPlanHash.sourcePacket(value.packet),
+          };
+          if (scenario === "no review") {
+            expect(yield* reader.findReview(lookup), scenario).toBeUndefined();
+            expect(
+              (yield* service.validateCoverage({ planId: "plan" }, context)).reviewReady,
+              scenario,
+            ).toBe(false);
+            return;
+          }
+          yield* service.beginPlanning(
+            { session: planningSession, command: planningCommand("begin") },
+            planningContext,
+          );
+          const entry = makePass(value, "review", scenario === "non-review" ? "author" : "review");
+          yield* service.beginPass(
+            {
+              sessionId: planningSession.id,
+              expectedVersion: 0,
+              ...entry,
+              command: planningCommand("pass"),
+            },
+            planningContext,
+          );
+          yield* workflow.claim({
+            operationId: entry.pass.operationId,
+            expectedOwnerVersion: 1,
+            expectedGeneration: 0,
+            bootId: "boot",
+            workerId: "worker",
+            now: timestamp,
+            trustedEligibility: true,
+          });
+          const native = entry.pass.native;
+          if (!native) throw new Error("missing native");
+          const reviewReport: NonNullable<PlanningPassV1["report"]> =
+            scenario === "non-review"
+              ? { kind: "author", summary: "Done", outputs: [] }
+              : {
+                  kind: "review",
+                  verdict: scenario === "failed verdict" ? "changes_requested" : "pass",
+                  assessment: {
+                    revisionHash: lookup.revisionHash,
+                    sourcePacketHash: lookup.sourcePacketHash,
+                    inventory: [],
+                  },
+                  findings:
+                    scenario === "blocking finding" || scenario === "unresolved disposition"
+                      ? [
+                          {
+                            id: findingId,
+                            severity: scenario === "blocking finding" ? "blocking" : "nonblocking",
+                            description: "Problem",
+                            affectedObjectIds: [objectId],
+                            evidence: [],
+                            proposedRemedy: "Fix",
+                          },
+                        ]
+                      : [],
+                };
+          const terminal = Layer.succeed(Observation.PlanningPassObservation, {
+            observe: () =>
+              Effect.succeed({
+                kind: "terminal" as const,
+                operationId: entry.pass.operationId,
+                passId: entry.pass.id,
+                native: { ...native, terminalMessageId: terminalId },
+                outcome: "succeeded" as const,
+                actualInputManifest: entry.pass.inputManifest,
+                inputManifestHash: WorkflowCanonicalHash.tagged(
+                  "t3.planning-input-manifest.v1",
+                  entry.pass.inputManifest,
+                ),
+                freshConversation: scenario !== "not fresh",
+                sourcePacketDelivered: scenario !== "sources not delivered",
+                forbiddenContextDelivered: scenario === "forbidden context",
+                restrictedProfileQualified: scenario !== "unqualified profile",
+              }),
+          });
+          yield* Effect.gen(function* () {
+            const current = yield* Service.DevelopmentPlanService;
+            yield* current.settlePass({
+              sessionId: planningSession.id,
+              passId: entry.pass.id,
+              operationId: entry.pass.operationId,
+              expectedVersion: 1,
+              native,
+              report: reviewReport,
+            });
+          }).pipe(Effect.provide(Layer.fresh(Service.layer).pipe(Layer.provide(terminal))));
+          if (scenario === "stale hash")
+            yield* service.updateDraft(
+              {
+                planId: value.planId,
+                expectedVersion: 0,
+                revisionId: "revision-2",
+                revision: { ...value.revision, brief: "Changed after review" },
+                packet: value.packet,
+                commandId: "stale-update",
+              },
+              context,
+            );
+          if (scenario === "manifest mismatch")
+            yield* sql`UPDATE workflow_planning_observations SET manifest_hash = ${"0".repeat(64)}`;
+          if (scenario === "malformed")
+            yield* sql`UPDATE workflow_planning_passes SET record_json = '{}'`;
+          if (scenario === "unresolved disposition") {
+            const disposition = {
+              reportId: entry.pass.id,
+              findingId,
+              decision: "defer",
+              rationale: "Later",
+              affectedObjectIds: [objectId],
+            };
+            yield* sql`INSERT INTO workflow_planning_dispositions (review_pass_id, finding_id, repair_pass_id, disposition_json) VALUES (${entry.pass.id}, ${findingId}, ${entry.pass.id}, ${json(disposition)})`;
+          }
+          if (scenario === "ambiguous reviews") {
+            const other = makePass(value, "other", "review");
+            yield* service.beginPass(
+              {
+                sessionId: planningSession.id,
+                expectedVersion: 2,
+                ...other,
+                command: planningCommand("other"),
+              },
+              planningContext,
+            );
+            yield* sql`UPDATE workflow_planning_passes SET native_thread_id = ${native.threadId}, record_json = json_set(record_json, '$.native.threadId', ${native.threadId}) WHERE id = ${other.pass.id}`;
+          }
+          if (scenario === "malformed" || scenario === "non-review")
+            expect(yield* reader.findReview(lookup), scenario).toBeUndefined();
+          expect(
+            (yield* service.validateCoverage({ planId: "plan" }, context)).reviewReady,
+            scenario,
+          ).toBe(scenario === "positive");
+        }).pipe(
+          Effect.provide(
+            layer(
+              ":memory:",
+              grants,
+              Layer.merge(Service.persistedPassReaderLayer, Service.localAttestationLayer).pipe(
+                Layer.provide(Digest.layerWebCrypto),
+              ),
+            ),
+          ),
+        );
+      }
     }),
   );
 });
