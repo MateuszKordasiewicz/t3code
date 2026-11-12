@@ -1232,7 +1232,7 @@ it.effect(
 );
 
 it.effect(
-  "binds validation identity to matching attempts and claims and indexes state history",
+  "binds validation identity to matching attempts and claims and indexes stored state keys",
   () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
@@ -1248,8 +1248,8 @@ it.effect(
       ('c3', 'b', 'claim', 'e', 'mb', 1, 1, 1, 0, '{"type":"server"}', 's', '[{"type":"run","threadId":"t","runId":"r"}]', 1, 't')`;
       yield* sql`INSERT INTO work_task_validation_attempts VALUES
       ('v1', 'a', 1, 1, 1, 'e', 'w', '{}', NULL, 'reserved', NULL, '1', NULL, NULL),
-      ('v2', 'a', 1, 1, 1, 'e', 'w', '{}', NULL, 'reserved', NULL, '2', NULL, NULL),
-      ('v3', 'a', 2, 2, 2, 'other-e', 'w', '{}', NULL, 'reserved', NULL, '2', NULL, NULL),
+      ('v2', 'a', 1, 1, 1, 'e', 'w', '{}', NULL, 'reserved', NULL, '2026-11-11T00:00:00Z', NULL, NULL),
+      ('v3', 'a', 2, 2, 2, 'other-e', 'w', '{}', NULL, 'reserved', NULL, '2026-11-11T00:00:00.1Z', NULL, NULL),
       ('vb', 'b', 1, 1, 1, 'e', 'w', '{}', NULL, 'reserved', NULL, '2', NULL, NULL)`;
       yield* sql`DELETE FROM work_task_allowances WHERE task_id = 'b'`;
       assert.isTrue(
@@ -1262,6 +1262,13 @@ it.effect(
       yield* sql`INSERT INTO work_task_allowances VALUES ('b', 5, 0)`;
       yield* sql`INSERT INTO work_task_validation_identity VALUES ('v1', 'a', 'claim', 1), ('v3', 'a', 'other', 9007199254740991), ('vb', 'b', 'claim', 1)`;
       const invalid = [
+        sql`INSERT OR REPLACE INTO work_task_validation_attempts VALUES ('v1', 'a', 2, 1, 1, 'changed', 'w', '{}', NULL, 'reserved', NULL, '1', NULL, NULL)`,
+        sql`INSERT OR REPLACE INTO work_task_claims VALUES ('c1', 'a', 'claim', 'changed', 'm1', 1, 2, 1, 0, '{"type":"server"}', 's', '[{"type":"run","threadId":"t","runId":"r"}]', 1, 't')`,
+        sql`INSERT OR REPLACE INTO work_task_claims VALUES ('new-event', 'a', 'claim', 'changed', 'm1', 1, 2, 1, 0, '{"type":"server"}', 's', '[{"type":"run","threadId":"t","runId":"r"}]', 1, 't')`,
+        sql`INSERT OR REPLACE INTO work_task_claims VALUES ('new-event', 'a', 'new-claim', 'e', 'm1', 1, 1, 1, 0, '{"type":"server"}', 's', '[{"type":"run","threadId":"t","runId":"r"}]', 1, 't')`,
+        sql`INSERT OR REPLACE INTO work_task_manager_bindings VALUES ('a', 1, 'changed', 't', 't')`,
+        sql`INSERT OR REPLACE INTO work_task_manager_bindings VALUES ('b', 2, 'm1', 't', 't')`,
+        sql`INSERT OR REPLACE INTO work_task_manager_bindings VALUES ('a', 3, 'new-current', 't', NULL)`,
         sql`INSERT INTO work_task_validation_identity VALUES (NULL, 'a', 'claim', 2)`,
         sql`INSERT INTO work_task_validation_identity VALUES ('v2', NULL, 'claim', 2)`,
         sql`INSERT INTO work_task_validation_identity VALUES ('v2', 'a', NULL, 2)`,
@@ -1321,16 +1328,17 @@ it.effect(
       yield* sql`UPDATE work_task_validation_attempts SET state = 'started', started_at = 't', run_id = 'r' WHERE attempt_id = 'v1'`;
       yield* sql`UPDATE work_task_claims SET summary = 'updated' WHERE event_id = 'c1'`;
       yield* sql`INSERT INTO work_task_validation_identity VALUES ('v2', 'a', 'claim', 2)`;
+      // Raw timestamp keys support lexical lookup, not chronological history.
       const rows = yield* sql<{
         attempt_id: string;
-      }>`SELECT attempt_id FROM work_task_validation_attempts WHERE task_id = 'a' AND state = 'reserved' AND (created_at, attempt_id) < ('3', 'z') ORDER BY created_at DESC, attempt_id DESC LIMIT 50`;
+      }>`SELECT attempt_id FROM work_task_validation_attempts WHERE task_id = 'a' AND state = 'reserved' AND (created_at, attempt_id) < ('2026-11-12T00:00:00Z', 'z') ORDER BY created_at DESC, attempt_id DESC LIMIT 50`;
       assert.deepStrictEqual(
         rows.map((row) => row.attempt_id),
-        ["v3", "v2"],
+        ["v2", "v3"],
       );
       const plan = yield* sql<{
         detail: string;
-      }>`EXPLAIN QUERY PLAN SELECT attempt_id FROM work_task_validation_attempts WHERE task_id = 'a' AND state = 'reserved' AND (created_at, attempt_id) < ('3', 'z') ORDER BY created_at DESC, attempt_id DESC LIMIT 50`;
+      }>`EXPLAIN QUERY PLAN SELECT attempt_id FROM work_task_validation_attempts WHERE task_id = 'a' AND state = 'reserved' AND (created_at, attempt_id) < ('2026-11-12T00:00:00Z', 'z') ORDER BY created_at DESC, attempt_id DESC LIMIT 50`;
       assert.isTrue(
         plan.some((row) => row.detail.includes("work_task_validation_state_history_idx")),
       );
