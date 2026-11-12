@@ -1261,7 +1261,18 @@ it.effect(
       );
       yield* sql`INSERT INTO work_task_allowances VALUES ('b', 5, 0)`;
       yield* sql`INSERT INTO work_task_validation_identity VALUES ('v1', 'a', 'claim', 1), ('v3', 'a', 'other', 9007199254740991), ('vb', 'b', 'claim', 1)`;
+      yield* sql`INSERT INTO work_task_manager_bindings VALUES ('a', 3, 'm3', 't', 't'), ('a', 4, 'm4', 't', 't')`;
+      yield* sql`INSERT INTO work_task_claims VALUES ('free-event', 'a', 'free-claim', 'free-evidence', 'm3', 3, 2, 2, 0, '{"type":"server"}', 's', '[{"type":"run","threadId":"t","runId":"r"}]', 3, 't')`;
+      yield* sql`INSERT INTO work_task_validation_attempts VALUES ('free-attempt', 'a', 2, 3, 2, 'free-evidence', 'w', '{}', 'free-run', 'started', NULL, 't', 't', NULL)`;
       const invalid = [
+        sql`UPDATE OR REPLACE work_task_validation_attempts SET attempt_id = 'v1' WHERE attempt_id = 'free-attempt'`,
+        sql`UPDATE OR REPLACE work_task_claims SET claim_id = 'claim' WHERE event_id = 'free-event'`,
+        sql`UPDATE OR REPLACE work_task_claims SET event_id = 'c1', claim_id = 'claim' WHERE event_id = 'free-event'`,
+        sql`UPDATE OR REPLACE work_task_claims SET event_id = 'c1' WHERE event_id = 'free-event'`,
+        sql`UPDATE OR REPLACE work_task_claims SET evidence_id = 'e' WHERE event_id = 'free-event'`,
+        sql`UPDATE OR REPLACE work_task_manager_bindings SET generation = 1 WHERE task_id = 'a' AND generation = 4`,
+        sql`UPDATE OR REPLACE work_task_manager_bindings SET thread_id = 'm1' WHERE task_id = 'a' AND generation = 4`,
+        sql`UPDATE OR REPLACE work_task_manager_bindings SET retired_at = NULL WHERE task_id = 'a' AND generation = 4`,
         sql`INSERT OR REPLACE INTO work_task_validation_attempts VALUES ('v1', 'a', 2, 1, 1, 'changed', 'w', '{}', NULL, 'reserved', NULL, '1', NULL, NULL)`,
         sql`INSERT OR REPLACE INTO work_task_claims VALUES ('c1', 'a', 'claim', 'changed', 'm1', 1, 2, 1, 0, '{"type":"server"}', 's', '[{"type":"run","threadId":"t","runId":"r"}]', 1, 't')`,
         sql`INSERT OR REPLACE INTO work_task_claims VALUES ('new-event', 'a', 'claim', 'changed', 'm1', 1, 2, 1, 0, '{"type":"server"}', 's', '[{"type":"run","threadId":"t","runId":"r"}]', 1, 't')`,

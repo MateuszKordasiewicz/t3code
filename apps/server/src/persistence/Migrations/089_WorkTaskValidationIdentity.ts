@@ -49,27 +49,41 @@ export default Effect.gen(function* () {
   }
   yield* sql`
     CREATE TRIGGER work_task_validation_identity_attempt_update BEFORE UPDATE ON work_task_validation_attempts
-    WHEN EXISTS (SELECT 1 FROM work_task_validation_identity i WHERE i.attempt_id = OLD.attempt_id)
+    WHEN (EXISTS (SELECT 1 FROM work_task_validation_identity i WHERE i.attempt_id = OLD.attempt_id)
       AND (NEW.attempt_id IS NOT OLD.attempt_id OR NEW.task_id IS NOT OLD.task_id
         OR NEW.definition_revision IS NOT OLD.definition_revision OR NEW.manager_generation IS NOT OLD.manager_generation
         OR NEW.completion_policy_revision IS NOT OLD.completion_policy_revision OR NEW.evidence_id IS NOT OLD.evidence_id
-        OR NEW.work_watermark IS NOT OLD.work_watermark)
+        OR NEW.work_watermark IS NOT OLD.work_watermark))
+      OR EXISTS (SELECT 1 FROM work_task_validation_identity i
+        JOIN work_task_validation_attempts a ON a.attempt_id = i.attempt_id
+        WHERE a.attempt_id IS NOT OLD.attempt_id
+          AND (a.attempt_id = NEW.attempt_id OR (a.run_id IS NOT NULL AND a.run_id = NEW.run_id)))
     BEGIN SELECT RAISE(ABORT, 'validation identity in use'); END
   `;
   yield* sql`
     CREATE TRIGGER work_task_validation_identity_claim_update BEFORE UPDATE ON work_task_claims
-    WHEN EXISTS (SELECT 1 FROM work_task_validation_identity i WHERE i.task_id = OLD.task_id AND i.claim_id = OLD.claim_id)
+    WHEN (EXISTS (SELECT 1 FROM work_task_validation_identity i WHERE i.task_id = OLD.task_id AND i.claim_id = OLD.claim_id)
       AND (NEW.task_id IS NOT OLD.task_id OR NEW.claim_id IS NOT OLD.claim_id OR NEW.evidence_id IS NOT OLD.evidence_id
         OR NEW.definition_revision IS NOT OLD.definition_revision OR NEW.manager_generation IS NOT OLD.manager_generation
-        OR NEW.completion_policy_revision IS NOT OLD.completion_policy_revision)
+        OR NEW.completion_policy_revision IS NOT OLD.completion_policy_revision))
+      OR EXISTS (SELECT 1 FROM work_task_validation_identity i
+        JOIN work_task_claims c ON c.task_id = i.task_id AND c.claim_id = i.claim_id
+        WHERE c.event_id IS NOT OLD.event_id AND (c.event_id = NEW.event_id
+          OR (c.task_id = NEW.task_id AND (c.claim_id = NEW.claim_id OR c.evidence_id = NEW.evidence_id))))
     BEGIN SELECT RAISE(ABORT, 'validation claim in use'); END
   `;
   yield* sql`
     CREATE TRIGGER work_task_validation_identity_manager_update BEFORE UPDATE ON work_task_manager_bindings
-    WHEN EXISTS (SELECT 1 FROM work_task_validation_identity i
+    WHEN (EXISTS (SELECT 1 FROM work_task_validation_identity i
       JOIN work_task_claims c ON c.task_id = i.task_id AND c.claim_id = i.claim_id
       WHERE c.task_id = OLD.task_id AND c.manager_generation = OLD.generation)
-      AND (NEW.task_id IS NOT OLD.task_id OR NEW.generation IS NOT OLD.generation OR NEW.thread_id IS NOT OLD.thread_id)
+      AND (NEW.task_id IS NOT OLD.task_id OR NEW.generation IS NOT OLD.generation OR NEW.thread_id IS NOT OLD.thread_id))
+      OR EXISTS (SELECT 1 FROM work_task_validation_identity i
+        JOIN work_task_claims c ON c.task_id = i.task_id AND c.claim_id = i.claim_id
+        JOIN work_task_manager_bindings m ON m.task_id = c.task_id AND m.generation = c.manager_generation
+        WHERE (m.task_id IS NOT OLD.task_id OR m.generation IS NOT OLD.generation)
+          AND ((m.task_id = NEW.task_id AND m.generation = NEW.generation) OR m.thread_id = NEW.thread_id
+            OR (m.task_id = NEW.task_id AND m.retired_at IS NULL AND NEW.retired_at IS NULL)))
     BEGIN SELECT RAISE(ABORT, 'validation manager in use'); END
   `;
   // REPLACE can remove referenced parents without running their UPDATE triggers.
