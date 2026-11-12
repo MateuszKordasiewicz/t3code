@@ -360,6 +360,7 @@ const decide = ({
         return reject("invalid_state");
       if (!facts.authority) return reject("unauthorized");
       if (!isWorkflowTimestampAfter(run.allowance.deadline, facts.now)) return reject("deadline");
+      if (facts.custody !== "none") return reject("custody");
       if (
         !validPrefix ||
         (command.finalCombined

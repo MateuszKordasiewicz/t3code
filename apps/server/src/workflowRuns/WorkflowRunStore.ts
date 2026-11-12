@@ -810,12 +810,6 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     });
     const result = yield* planningTransaction(
       Effect.gen(function* () {
-        const outstanding =
-          yield* sql`SELECT 1 FROM workflow_native_launch_intents i LEFT JOIN workflow_native_intent_receipts r ON r.intent_id = i.intent_id WHERE i.state IN ('reserved','dispatching','unknown') AND (i.operation_id = ${operation.id} OR i.pass_id = ${pass.id} OR r.command_id = ${input.command.commandId} OR r.receipt_id = ${input.command.receiptId} OR i.launch_command_id IN (${input.command.commandId}, ${input.command.commandId + ":initial-message"}))`;
-        if (outstanding.length) return yield* planningError("conflict");
-        const foreignThread =
-          yield* sql`SELECT 1 FROM workflow_native_launch_intents WHERE thread_id = ${pass.native!.threadId} AND state <> 'cancelled' AND (planning_session_id IS NULL OR planning_session_id <> ${input.sessionId})`;
-        if (foreignThread.length) return yield* planningError("custody");
         const receipts = yield* sql<{
           planning_session_id: string | null;
           fingerprint: string;
@@ -835,6 +829,12 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
           );
           return { kind: "replay" as const, receiptId: prior.receipt_id, value };
         }
+        const outstanding =
+          yield* sql`SELECT 1 FROM workflow_native_launch_intents i LEFT JOIN workflow_native_intent_receipts r ON r.intent_id = i.intent_id WHERE (i.operation_id = ${operation.id} OR i.pass_id = ${pass.id} OR r.command_id = ${input.command.commandId} OR r.receipt_id = ${input.command.receiptId} OR i.launch_command_id IN (${input.command.commandId}, ${input.command.commandId + ":initial-message"}))`;
+        if (outstanding.length) return yield* planningError("conflict");
+        const foreignThread =
+          yield* sql`SELECT 1 FROM workflow_native_launch_intents WHERE thread_id = ${pass.native!.threadId} AND state <> 'cancelled' AND (planning_session_id IS NULL OR planning_session_id <> ${input.sessionId})`;
+        if (foreignThread.length) return yield* planningError("custody");
         const current = yield* readSession(input.sessionId);
         if (!sameContext(current, input.context)) return yield* planningError("unauthorized");
         if (current.recordVersion !== input.expectedVersion)
@@ -1158,7 +1158,7 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
           ...(operation.nextDueAt ? { nextDueAt: operation.nextDueAt } : {}),
         }).pipe(Effect.mapError(() => planningError("integrity")));
         const remaining =
-          yield* sql`SELECT id FROM workflow_operations WHERE planning_session_id = ${session.id} AND id != ${operation.id} AND status IN ('claimed','unknown')`;
+          yield* sql`SELECT id FROM workflow_operations WHERE planning_session_id = ${session.id} AND id != ${operation.id} AND status IN ('claimed','unknown') UNION ALL SELECT intent_id AS id FROM workflow_native_launch_intents WHERE planning_session_id = ${session.id} AND state IN ('dispatching','unknown')`;
         const status =
           remaining.length === 0 && session.status === "pausing"
             ? "paused"
@@ -1368,8 +1368,15 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
             return { row, operation };
           }),
         );
-        const claimed = operations.some(({ operation }) => operation.status === "claimed");
-        const unknown = operations.some(({ operation }) => operation.status === "unknown");
+        const nativeCustody = yield* sql<{
+          state: string;
+        }>`SELECT state FROM workflow_native_launch_intents WHERE planning_session_id = ${value.id} AND state IN ('dispatching','unknown')`;
+        const claimed =
+          operations.some(({ operation }) => operation.status === "claimed") ||
+          nativeCustody.some((intent) => intent.state === "dispatching");
+        const unknown =
+          operations.some(({ operation }) => operation.status === "unknown") ||
+          nativeCustody.some((intent) => intent.state === "unknown");
         let status: S["status"];
         if (input.action === "pause") {
           if (value.status !== "active") return yield* planningError("ineligible");
@@ -1918,6 +1925,30 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
         try: () => WorkflowCanonicalHash.command(input.runId, input.command),
         catch: integrity,
       });
+      const receipts = yield* sql<{
+        workflow_run_id: string | null;
+        fingerprint: string;
+        receipt_id: string;
+        result_json: string;
+      }>`SELECT workflow_run_id, fingerprint, receipt_id, result_json FROM workflow_command_receipts WHERE command_id = ${input.command.commandId}`;
+      const prior = receipts[0];
+      if (prior) {
+        if (prior.workflow_run_id !== input.runId || prior.fingerprint !== fingerprint)
+          return yield* integrity();
+        return { kind: "replay" as const, receiptId: prior.receipt_id };
+      }
+      if (input.command.kind === "admitAttempt") {
+        const operationReceipts = yield* sql<{
+          fingerprint: string;
+          receipt_id: string;
+        }>`SELECT o.fingerprint, r.receipt_id FROM workflow_command_receipts r JOIN workflow_operations o ON o.id = r.operation_id WHERE r.workflow_run_id = ${input.runId} AND r.operation_id = ${input.command.operationId} LIMIT 1`;
+        const operationReceipt = operationReceipts[0];
+        if (operationReceipt) {
+          return operationReceipt.fingerprint === input.command.operationFingerprint
+            ? { kind: "replay" as const, receiptId: operationReceipt.receipt_id }
+            : { kind: "rejected" as const, reason: "integrity" as const };
+        }
+      }
       if (input.command.kind === "admitAttempt") {
         const admissionCommand = input.command;
         const conflicts = yield* sql<{
@@ -1925,7 +1956,7 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
           operation_id: string;
           attempt_id: string | null;
           command_id: string | null;
-        }>`SELECT i.workflow_run_id, i.operation_id, i.attempt_id, r.command_id FROM workflow_native_launch_intents i LEFT JOIN workflow_native_intent_receipts r ON r.intent_id = i.intent_id WHERE i.state IN ('reserved','dispatching','unknown') AND (i.workflow_run_id = ${input.runId} OR i.operation_id = ${admissionCommand.operationId} OR i.attempt_id = ${admissionCommand.attemptId} OR r.command_id = ${admissionCommand.commandId})`;
+        }>`SELECT i.workflow_run_id, i.operation_id, i.attempt_id, r.command_id FROM workflow_native_launch_intents i LEFT JOIN workflow_native_intent_receipts r ON r.intent_id = i.intent_id WHERE ((i.workflow_run_id = ${input.runId} AND i.state IN ('reserved','dispatching','unknown')) OR i.operation_id = ${admissionCommand.operationId} OR i.attempt_id = ${admissionCommand.attemptId} OR r.command_id = ${admissionCommand.commandId} OR r.receipt_id = ${input.receiptId} OR i.launch_command_id IN (${admissionCommand.commandId}, ${admissionCommand.commandId + ":initial-message"}))`;
         if (
           conflicts.some(
             (i) =>
@@ -1941,18 +1972,6 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
         )
           return yield* integrity();
         if (conflicts.length) return { kind: "rejected" as const, reason: "custody" as const };
-      }
-      const receipts = yield* sql<{
-        workflow_run_id: string | null;
-        fingerprint: string;
-        receipt_id: string;
-        result_json: string;
-      }>`SELECT workflow_run_id, fingerprint, receipt_id, result_json FROM workflow_command_receipts WHERE command_id = ${input.command.commandId}`;
-      const prior = receipts[0];
-      if (prior) {
-        if (prior.workflow_run_id !== input.runId || prior.fingerprint !== fingerprint)
-          return yield* integrity();
-        return { kind: "replay" as const, receiptId: prior.receipt_id };
       }
       const rows = yield* sql<{
         record_json: string;
@@ -2137,13 +2156,19 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
           : undefined;
       const ciHead =
         ci?.raw.parameters.kind === "ci_observation" ? ci.raw.parameters.headCommit : undefined;
+      const nativeCustody = yield* sql<{
+        state: string;
+      }>`SELECT state FROM workflow_native_launch_intents WHERE workflow_run_id = ${run.id} AND state IN ('dispatching','unknown')`;
       const facts: Facts = {
         ...externalFacts,
-        custody: operations.some((o) => o.status === "unknown")
-          ? "unknown"
-          : operations.some((o) => o.status === "claimed")
-            ? "active"
-            : "none",
+        custody:
+          operations.some((o) => o.status === "unknown") ||
+          nativeCustody.some((intent) => intent.state === "unknown")
+            ? "unknown"
+            : operations.some((o) => o.status === "claimed") ||
+                nativeCustody.some((intent) => intent.state === "dispatching")
+              ? "active"
+              : "none",
         activeWriterCount: operations.filter(
           (o) =>
             o.status === "claimed" && o.kind === "stage_launch" && o.stage === "implementation",

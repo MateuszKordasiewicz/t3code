@@ -761,6 +761,8 @@ describe("WorkflowRunPolicy", () => {
         actions: [{ kind: "accept_item", binding }],
       },
     ],
+    ["advance active custody", progress(advance, { custody: "active" }), rejected("custody")],
+    ["advance unknown custody", progress(advance, { custody: "unknown" }), rejected("custody")],
     [
       "missing acceptance",
       {

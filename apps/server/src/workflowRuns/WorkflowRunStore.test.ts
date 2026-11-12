@@ -632,6 +632,62 @@ const reservation = (operation: WorkflowOperationV1, attemptId: string) => {
   };
 };
 
+it.effect.each(["dispatching", "unknown"] as const)(
+  "workflow pause retains native %s custody",
+  (state) =>
+    Effect.gen(function* () {
+      yield* setupAdmission;
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      const input = reservation(operationFor("native-op", "native-attempt"), "native-attempt");
+      yield* store.reserveWorkflowNativeIntent(input);
+      yield* sql`UPDATE workflow_native_launch_intents SET state = ${state}, boot_id = 'boot', worker_id = 'worker' WHERE intent_id = ${input.intentId}`;
+      const paused = yield* store.commitTransition({
+        runId: run.id,
+        command: { ...command, commandId: "pause-native", expectedVersion: 1 },
+        externalFacts: facts,
+        receiptId: "pause-native",
+      });
+      assert.strictEqual(paused.kind, "accepted");
+      const rows = yield* sql<{ status: string }>`SELECT status FROM workflow_runs`;
+      assert.strictEqual(rows[0]!.status, state === "unknown" ? "needs_attention" : "pausing");
+      assert.deepStrictEqual(yield* sql`SELECT state, held FROM workflow_native_launch_intents`, [
+        { state, held: 0 },
+      ]);
+      const stopped = yield* store.commitTransition({
+        runId: run.id,
+        command: {
+          ...command,
+          kind: "stop",
+          commandId: "stop-native",
+          expectedVersion: 2,
+          expectedGeneration: 1,
+        },
+        externalFacts: facts,
+        receiptId: "stop-native",
+      });
+      assert.strictEqual(stopped.kind, "accepted");
+      assert.deepStrictEqual(yield* sql`SELECT status FROM workflow_runs`, [
+        { status: "stopping" },
+      ]);
+      assert.deepStrictEqual(
+        yield* store.commitTransition({
+          runId: run.id,
+          command: {
+            ...command,
+            kind: "custodySettled",
+            commandId: "settle-native",
+            expectedVersion: 3,
+            expectedGeneration: 2,
+          },
+          externalFacts: { ...facts, now: "2099-01-01T00:00:00Z" },
+          receiptId: "settle-native",
+        }),
+        { kind: "rejected", reason: "custody" },
+      );
+    }).pipe(Effect.provide(layer)),
+);
+
 it.effect("reserves once, replays after expiry and prevents legacy admission", () =>
   Effect.gen(function* () {
     yield* setupAdmission;
@@ -704,6 +760,58 @@ it.effect("reserves once, replays after expiry and prevents legacy admission", (
     assert.strictEqual((parse(rows[0]!.record_json) as typeof run).allowance.attemptsConsumed, 1);
     assert.strictEqual((yield* sql`SELECT * FROM workflow_operations`).length, 0);
     assert.strictEqual((yield* sql`SELECT * FROM workflow_attempts`).length, 0);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("finalized workflow intent preserves exact V1 receipt replay", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const operation = operationFor("finalized-op", "finalized-attempt");
+    const input = {
+      runId: run.id,
+      command: admission(operation, "finalized-attempt"),
+      operation,
+      receiptId: "finalized-receipt",
+      externalFacts: admissionFacts,
+    };
+    assert.strictEqual((yield* store.commitTransition(input)).kind, "accepted");
+    yield* sql`INSERT INTO workflow_native_launch_intents (intent_id, workflow_run_id, operation_id, attempt_id, item_id, charge_attempt, repair, role, environment_id, project_id, launch_command_id, thread_id, message_id, fingerprint, draft_json, generation, state, native_run_id, finalized_operation_id) VALUES ('finalized-intent', ${run.id}, ${operation.id}, 'finalized-attempt', 'item', 1, 0, 'implementation', ${destination.environmentId}, ${destination.projectId}, 'finalized-launch', 'thread', 'finalized-message', ${hash}, '{}', 0, 'finalized', 'finalized-op', ${operation.id})`;
+    const before = yield* sql`SELECT * FROM workflow_runs`;
+    assert.deepStrictEqual(yield* store.commitTransition(input), {
+      kind: "replay",
+      receiptId: input.receiptId,
+    });
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_runs`, before);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("a cancelled native attempt identity cannot be charged by legacy admission", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const operation = operationFor("cancelled-op", "cancelled-attempt");
+    const input = reservation(operation, "cancelled-attempt");
+    yield* store.reserveWorkflowNativeIntent(input);
+    yield* sql`UPDATE workflow_native_launch_intents SET state = 'cancelled' WHERE intent_id = ${input.intentId}`;
+    const before = yield* sql`SELECT record_json FROM workflow_runs`;
+    const result = yield* Effect.result(
+      store.commitTransition({
+        runId: run.id,
+        command: {
+          ...admission(operation, "cancelled-attempt"),
+          commandId: "legacy-after-cancel",
+          expectedVersion: 1,
+        },
+        operation,
+        receiptId: "legacy-after-cancel",
+        externalFacts: admissionFacts,
+      }),
+    );
+    assert.isFalse(result._tag === "Success" && result.success.kind === "accepted");
+    assert.deepStrictEqual(yield* sql`SELECT record_json FROM workflow_runs`, before);
   }).pipe(Effect.provide(layer)),
 );
 
@@ -2063,6 +2171,41 @@ const planningReservation = (admission: ReturnType<typeof admissionInput>) => {
   };
 };
 
+it.effect.each(["dispatching", "unknown"] as const)(
+  "planning pause retains native %s custody",
+  (state) =>
+    Effect.gen(function* () {
+      const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      yield* begin(store, session);
+      const input = planningReservation(admissionInput(binding, "native-custody"));
+      yield* store.reservePlanningNativeIntent(input);
+      yield* sql`UPDATE workflow_native_launch_intents SET state = ${state}, boot_id = 'boot', worker_id = 'worker' WHERE intent_id = ${input.intentId}`;
+      const paused = yield* store.controlPlanning({
+        sessionId: session.id,
+        action: "pause",
+        expectedVersion: 1,
+        now: facts.now,
+        context,
+        command: { commandId: "pause-custody", receiptId: "pause-custody" },
+      });
+      assert.strictEqual(paused.value.status, state === "unknown" ? "needs_attention" : "pausing");
+      assert.deepStrictEqual(yield* sql`SELECT state, held FROM workflow_native_launch_intents`, [
+        { state, held: 0 },
+      ]);
+      const stopped = yield* store.controlPlanning({
+        sessionId: session.id,
+        action: "stop",
+        expectedVersion: 2,
+        now: "2099-01-01T00:00:00Z",
+        context,
+        command: { commandId: "stop-custody", receiptId: "stop-custody" },
+      });
+      assert.strictEqual(stopped.value.status, "stopping");
+    }).pipe(Effect.provide(layer)),
+);
+
 it.effect("planning reservation charges once and replays after its deadline", () =>
   Effect.gen(function* () {
     const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
@@ -2118,6 +2261,44 @@ it.effect("planning reservation charges once and replays after its deadline", ()
       (yield* Effect.flip(store.reservePlanningNativeIntent(forged))).reason,
       "integrity",
     );
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("finalized planning intent preserves exact V1 receipt replay", () =>
+  Effect.gen(function* () {
+    const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    yield* begin(store, session);
+    const input = admissionInput(binding, "finalized-replay");
+    const first = yield* store.admitPlanningPass(input);
+    yield* sql`INSERT INTO workflow_native_launch_intents (intent_id, planning_session_id, operation_id, pass_id, charge_attempt, repair, role, environment_id, project_id, launch_command_id, thread_id, message_id, fingerprint, draft_json, generation, state, native_run_id, finalized_operation_id) VALUES ('finalized-intent', ${session.id}, ${input.operation.id}, ${input.pass.id}, 0, 0, 'author', ${session.environmentId}, ${session.projectId}, 'finalized-launch', ${input.pass.native!.threadId}, 'finalized-message', ${hash}, '{}', 0, 'finalized', ${input.pass.native!.runId}, ${input.operation.id})`;
+    const before = yield* sql`SELECT * FROM workflow_planning_sessions`;
+    assert.deepStrictEqual(yield* store.admitPlanningPass(input), { ...first, kind: "replay" });
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_planning_sessions`, before);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("a cancelled planning intent identity cannot be charged by legacy admission", () =>
+  Effect.gen(function* () {
+    const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    yield* begin(store, session);
+    const admission = admissionInput(binding, "cancelled-intent");
+    const input = planningReservation(admission);
+    yield* store.reservePlanningNativeIntent(input);
+    yield* sql`UPDATE workflow_native_launch_intents SET state = 'cancelled' WHERE intent_id = ${input.intentId}`;
+    const before = yield* sql`SELECT record_json FROM workflow_planning_sessions`;
+    const result = yield* Effect.result(
+      store.admitPlanningPass({
+        ...admission,
+        expectedVersion: 1,
+        command: { commandId: "legacy-after-cancel", receiptId: "legacy-after-cancel" },
+      }),
+    );
+    assert.strictEqual(result._tag, "Failure");
+    assert.deepStrictEqual(yield* sql`SELECT record_json FROM workflow_planning_sessions`, before);
   }).pipe(Effect.provide(layer)),
 );
 
@@ -3313,72 +3494,98 @@ it.effect.each([
 );
 
 it.effect.each([
-  ["active", "active", true],
-  ["pausing", "paused", true],
-  ["stopping", "stopped", false],
-  ["stopped", "stopped", false],
-  ["needs_attention", "needs_attention", false],
-] as const)("planning settlement preserves %s history", ([initial, expected, eligible]) =>
-  Effect.gen(function* () {
-    const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
-    yield* evidenceMigration;
-    const store = yield* Store.WorkflowRunStore;
-    const sql = yield* SqlClient.SqlClient;
-    yield* begin(store, session);
-    const admission = admissionInput(binding, "late");
-    yield* store.admitPlanningPass(admission);
-    yield* store.claim({
-      operationId: admission.operation.id,
-      expectedOwnerVersion: 1,
-      expectedGeneration: 0,
-      bootId: "boot",
-      workerId: "worker",
-      now: facts.now,
-      trustedEligibility: true,
-    });
-    const current = yield* store.getPlanning({ sessionId: session.id });
-    yield* sql`UPDATE workflow_planning_sessions SET status = ${initial}, record_json = ${json({ ...current, status: initial })} WHERE id = ${session.id}`;
-    const native = admission.pass.native;
-    if (!native) throw new Error("missing native");
-    const result = yield* store.settlePlanningPass({
-      sessionId: session.id,
-      passId: admission.pass.id,
-      operationId: admission.operation.id,
-      expectedVersion: 1,
-      observation: {
-        kind: "terminal",
+  ["active", "active", true, "none"],
+  ["pausing", "paused", true, "none"],
+  ["stopping", "stopped", false, "none"],
+  ["stopped", "stopped", false, "none"],
+  ["needs_attention", "needs_attention", false, "none"],
+  ["pausing", "pausing", true, "dispatching"],
+  ["pausing", "pausing", true, "unknown"],
+  ["stopping", "stopping", false, "dispatching"],
+  ["stopping", "stopping", false, "unknown"],
+] as const)(
+  "planning settlement preserves %s history",
+  ([initial, expected, eligible, intentState]) =>
+    Effect.gen(function* () {
+      const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+      yield* evidenceMigration;
+      const store = yield* Store.WorkflowRunStore;
+      const sql = yield* SqlClient.SqlClient;
+      const owner = { ...session, allowedRoles: ["author", "review"] as const };
+      yield* begin(store, owner);
+      const admission = admissionInput(binding, "late", owner);
+      yield* store.admitPlanningPass(admission);
+      if (intentState !== "none") {
+        const review = admissionInput(binding, "remaining", owner);
+        if (review.operation.parameters.kind !== "planning_pass")
+          throw new Error("expected planning pass");
+        const nativeInput = planningReservation({
+          ...review,
+          expectedVersion: 1,
+          pass: { ...review.pass, role: "review" },
+          operation: {
+            ...review.operation,
+            parameters: { ...review.operation.parameters, role: "review" },
+          },
+        });
+        yield* store.reservePlanningNativeIntent(nativeInput);
+        yield* sql`UPDATE workflow_native_launch_intents SET state = ${intentState}, boot_id = 'boot', worker_id = 'worker' WHERE intent_id = ${nativeInput.intentId}`;
+      }
+      yield* store.claim({
         operationId: admission.operation.id,
+        expectedOwnerVersion: intentState === "none" ? 1 : 2,
+        expectedGeneration: 0,
+        bootId: "boot",
+        workerId: "worker",
+        now: facts.now,
+        trustedEligibility: true,
+      });
+      const current = yield* store.getPlanning({ sessionId: session.id });
+      yield* sql`UPDATE workflow_planning_sessions SET status = ${initial}, record_json = ${json({ ...current, status: initial })} WHERE id = ${session.id}`;
+      const native = admission.pass.native;
+      if (!native) throw new Error("missing native");
+      const result = yield* store.settlePlanningPass({
+        sessionId: session.id,
         passId: admission.pass.id,
-        native: {
-          threadId: native.threadId,
-          runId: native.runId,
-          terminalMessageId: decodeTerminalId("terminal"),
+        operationId: admission.operation.id,
+        expectedVersion: current.recordVersion,
+        observation: {
+          kind: "terminal",
+          operationId: admission.operation.id,
+          passId: admission.pass.id,
+          native: {
+            threadId: native.threadId,
+            runId: native.runId,
+            terminalMessageId: decodeTerminalId("terminal"),
+          },
+          outcome: "succeeded",
+          actualInputManifest: admission.pass.inputManifest,
+          inputManifestHash: WorkflowCanonicalHash.tagged(
+            "t3.planning-input-manifest.v1",
+            admission.pass.inputManifest,
+          ),
+          freshConversation: true,
+          sourcePacketDelivered: true,
+          forbiddenContextDelivered: false,
+          restrictedProfileQualified: false,
         },
-        outcome: "succeeded",
-        actualInputManifest: admission.pass.inputManifest,
-        inputManifestHash: WorkflowCanonicalHash.tagged(
-          "t3.planning-input-manifest.v1",
-          admission.pass.inputManifest,
-        ),
-        freshConversation: true,
-        sourcePacketDelivered: true,
-        forbiddenContextDelivered: false,
-        restrictedProfileQualified: false,
-      },
-      report: { kind: "author", summary: "done", outputs: [] },
-    });
-    assert.strictEqual(result.value.session.status, expected);
-    assert.deepStrictEqual(result.value.session.consumed, { passes: 1, repairRounds: 0 });
-    const rows = yield* sql<{
-      observation_json: string;
-    }>`SELECT observation_json FROM workflow_planning_observations`;
-    const row = rows[0];
-    if (!row) throw new Error("missing observation");
-    assert.strictEqual(
-      (parse(row.observation_json) as { eligibleForReadiness: boolean }).eligibleForReadiness,
-      eligible,
-    );
-  }).pipe(Effect.provide(layer)),
+        report: { kind: "author", summary: "done", outputs: [] },
+      });
+      assert.strictEqual(result.value.session.status, expected);
+      assert.deepStrictEqual(result.value.session.consumed, {
+        passes: intentState === "none" ? 1 : 2,
+        repairRounds: 0,
+      });
+      const rows = yield* sql<{
+        observation_json: string;
+      }>`SELECT observation_json FROM workflow_planning_observations`;
+      const row = rows[0];
+      if (!row) throw new Error("missing observation");
+      assert.strictEqual(
+        (parse(row.observation_json) as { eligibleForReadiness: boolean }).eligibleForReadiness,
+        eligible,
+      );
+    }).pipe(Effect.provide(layer)),
 );
 
 it.effect("planning recovery preserves unknown custody and rejects independent settlement", () =>
