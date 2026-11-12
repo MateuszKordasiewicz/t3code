@@ -1,11 +1,17 @@
 // @effect-diagnostics deterministicKeys:off -- The authorization port key is fixed by the integration contract.
-import type { DevelopmentPlanRevisionV1, RevisionEnvelope } from "@t3tools/contracts";
+import type {
+  DevelopmentPlanRevisionV1,
+  PlanningPassV1,
+  RevisionEnvelope,
+} from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Store from "./DevelopmentPlanStore.ts";
+import { DevelopmentPlanCoverage } from "./DevelopmentPlanCoverage.ts";
+import { DevelopmentPlanHash } from "./DevelopmentPlanHash.ts";
 
 export class DevelopmentPlanServiceError extends Schema.TaggedError<DevelopmentPlanServiceError>()(
   "DevelopmentPlanServiceError",
@@ -49,6 +55,35 @@ export const denyAllLayer = Layer.succeed(DevelopmentPlanAuthorization, {
   ),
 });
 
+export class DevelopmentPlanPassReader extends Context.Service<
+  DevelopmentPlanPassReader,
+  {
+    readonly findReview: (input: {
+      readonly planId: string;
+      readonly revisionId: string;
+      readonly revisionHash: string;
+      readonly sourcePacketHash: string;
+    }) => Effect.Effect<PlanningPassV1 | undefined>;
+  }
+>()("t3/developmentPlans/DevelopmentPlanPassReader") {}
+export const emptyPassReaderLayer = Layer.succeed(DevelopmentPlanPassReader, {
+  findReview: Effect.fn("DevelopmentPlanPassReader.findReview")(() => Effect.undefined),
+});
+
+export class DevelopmentPlanReviewAttestation extends Context.Service<
+  DevelopmentPlanReviewAttestation,
+  {
+    readonly attest: (input: {
+      readonly passId: string;
+      readonly revisionHash: string;
+      readonly sourcePacketHash: string;
+    }) => Effect.Effect<boolean>;
+  }
+>()("t3/developmentPlans/DevelopmentPlanReviewAttestation") {}
+export const denyAttestationLayer = Layer.succeed(DevelopmentPlanReviewAttestation, {
+  attest: Effect.fn("DevelopmentPlanReviewAttestation.attest")(() => Effect.succeed(false)),
+});
+
 type StoreService = Store.DevelopmentPlanStore["Service"];
 type Create = Omit<
   Parameters<StoreService["create"]>[0],
@@ -86,6 +121,8 @@ const mapStore = (error: Store.DevelopmentPlanStoreError) =>
 const make = Effect.gen(function* () {
   const store = yield* Store.DevelopmentPlanStore;
   const authorization = yield* DevelopmentPlanAuthorization;
+  const passReader = yield* DevelopmentPlanPassReader;
+  const attestation = yield* DevelopmentPlanReviewAttestation;
   const check = (context: RequestContext, operation: Operation, origins: readonly Origin[]) =>
     authorization.check({ ...context, operation, origins });
   const precheck = (context: RequestContext, operation: Operation) =>
@@ -113,6 +150,38 @@ const make = Effect.gen(function* () {
       originsOf(result.revision, result.sourcePacket, context.destination),
     );
     return result;
+  });
+  const validateCoverage = Effect.fn("DevelopmentPlanService.validateCoverage")(function* (
+    input: Parameters<StoreService["get"]>[0],
+    context: RequestContext,
+  ) {
+    yield* precheck(context, "read");
+    const result = yield* store.get(input).pipe(Effect.mapError(mapStore));
+    yield* check(
+      context,
+      "read",
+      originsOf(result.revision, result.sourcePacket, context.destination),
+    );
+    const review = yield* passReader.findReview({
+      planId: input.planId,
+      revisionId: result.revisionId,
+      revisionHash: DevelopmentPlanHash.revision(result.revision),
+      sourcePacketHash: DevelopmentPlanHash.sourcePacket(result.sourcePacket),
+    });
+    const coverage = DevelopmentPlanCoverage.validate({
+      revision: result.revision,
+      sourcePacket: result.sourcePacket,
+      ...(review === undefined ? {} : { review }),
+    });
+    const reviewReady =
+      review && coverage.structuralBlockers.length === 0 && coverage.reviewBlockers.length === 0
+        ? yield* attestation.attest({
+            passId: review.id,
+            revisionHash: coverage.revisionHash,
+            sourcePacketHash: coverage.sourcePacketHash,
+          })
+        : false;
+    return { revisionId: result.revisionId, coverage, reviewReady };
   });
   const getObject = Effect.fn("DevelopmentPlanService.getObject")(function* (
     input: Parameters<StoreService["getObject"]>[0],
@@ -204,7 +273,7 @@ const make = Effect.gen(function* () {
     );
     return yield* store.unlinkThread(input, context).pipe(Effect.mapError(mapStore));
   });
-  return { create, get, getObject, list, updateDraft, linkThread, unlinkThread };
+  return { create, get, getObject, list, updateDraft, linkThread, unlinkThread, validateCoverage };
 });
 export class DevelopmentPlanService extends Context.Service<
   DevelopmentPlanService,

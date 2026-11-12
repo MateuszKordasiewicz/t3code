@@ -3,7 +3,11 @@ import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { describe, expect, it } from "@effect/vitest";
-import { upgradeDevelopmentPlanDocumentV1 } from "@t3tools/contracts";
+import {
+  decodePlanningPassV1,
+  upgradeDevelopmentPlanDocumentV1,
+  type PlanningPassV1,
+} from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Digest from "effect/crypto/Digest";
 import * as Effect from "effect/Effect";
@@ -81,7 +85,11 @@ const key = (origin: {
   readonly projectId: string;
   readonly threadId?: string;
 }) => `${origin.environmentId}|${origin.projectId}|${origin.threadId ?? ""}`;
-const layer = (filename: string, grants: Ref.Ref<Set<string>>) => {
+const layer = (
+  filename: string,
+  grants: Ref.Ref<Set<string>>,
+  ports = Layer.merge(Service.emptyPassReaderLayer, Service.denyAttestationLayer),
+) => {
   const auth = Layer.succeed(Service.DevelopmentPlanAuthorization, {
     check: ({ origins }) =>
       Ref.get(grants).pipe(
@@ -93,12 +101,19 @@ const layer = (filename: string, grants: Ref.Ref<Set<string>>) => {
       ),
   });
   return Service.layer.pipe(
-    Layer.provideMerge(Layer.merge(Store.layer, auth)),
+    Layer.provideMerge(Layer.mergeAll(Store.layer, auth, ports)),
     Layer.provideMerge(Layer.merge(NodeSqliteClient.layer({ filename }), Digest.layerWebCrypto)),
   );
 };
 const deniedLayer = Service.layer.pipe(
-  Layer.provideMerge(Layer.merge(Store.layer, Service.denyAllLayer)),
+  Layer.provideMerge(
+    Layer.mergeAll(
+      Store.layer,
+      Service.denyAllLayer,
+      Service.emptyPassReaderLayer,
+      Service.denyAttestationLayer,
+    ),
+  ),
   Layer.provideMerge(
     Layer.merge(NodeSqliteClient.layer({ filename: ":memory:" }), Digest.layerWebCrypto),
   ),
@@ -197,6 +212,7 @@ describe("DevelopmentPlanService", () => {
           const calls = [
             service.create(input, context),
             service.get({ planId: "missing" }, context),
+            service.validateCoverage({ planId: "missing" }, context),
             service.getObject(object, context),
             service.list({ projectId: "project", limit: 10 }, context),
             service.updateDraft({ ...input, expectedVersion: 0 }, context),
@@ -223,6 +239,172 @@ describe("DevelopmentPlanService", () => {
           ).toBe("unauthorized");
         }).pipe(Effect.provide(layer(":memory:", grants)));
       }),
+  );
+  it.effect("validates exact revision coverage and requires attestation", () =>
+    Effect.gen(function* () {
+      const grants = yield* Ref.make(allGrants());
+      const reviews = yield* Ref.make(new Map<string, PlanningPassV1>());
+      const attestations = yield* Ref.make<string[]>([]);
+      const reviewKey = (input: {
+        planId: string;
+        revisionId: string;
+        revisionHash: string;
+        sourcePacketHash: string;
+      }) => [input.planId, input.revisionId, input.revisionHash, input.sourcePacketHash].join("|");
+      const reader = Layer.succeed(Service.DevelopmentPlanPassReader, {
+        findReview: (input) =>
+          Ref.get(reviews).pipe(Effect.map((map) => map.get(reviewKey(input)))),
+      });
+      const attester = Layer.succeed(Service.DevelopmentPlanReviewAttestation, {
+        attest: (input) =>
+          Ref.update(attestations, (calls) => [
+            ...calls,
+            [input.passId, input.revisionHash, input.sourcePacketHash].join("|"),
+          ]).pipe(Effect.as(true)),
+      });
+      const ports = Layer.merge(reader, attester);
+      yield* Effect.gen(function* () {
+        yield* setup;
+        const service = yield* Service.DevelopmentPlanService;
+        const input = yield* fixture;
+        const revision = {
+          ...input.revision,
+          workItems: [
+            {
+              id: "work",
+              explanation: "Explanation",
+              sourceStatementIds: ["statement"],
+              access: input.revision.access,
+              title: "Work",
+              state: "active" as const,
+              requirementIds: [input.revision.requirements[0]!.id],
+              criterionIds: ["criterion"],
+              dependencyIds: [],
+              fileChanges: [],
+              verification: [
+                { id: "verification", description: "Check", criterionIds: ["criterion"] },
+              ],
+            },
+          ],
+        };
+        yield* service.create({ ...input, revision }, context);
+        const sourcePacketHash = DevelopmentPlanHash.sourcePacket(input.packet);
+        const revisionHash = DevelopmentPlanHash.revision(revision);
+        const reference = { kind: "source", id: "source", sha256: input.packet.sources[0]!.sha256 };
+        const makeReview = (revisionId: string, hash: string, disposition: "missing" | "mapped") =>
+          decodePlanningPassV1({
+            schemaVersion: 1,
+            id: "pass",
+            planningSessionId: "session",
+            role: "review",
+            provider: { providerInstanceId: "codex", model: "model" },
+            binding: {
+              planId: "plan",
+              revisionId,
+              revisionSchemaVersion: 1,
+              revisionHash: hash,
+              sourcePacketHash,
+            },
+            operationId: "op",
+            inputManifest: {
+              sources: [reference],
+              references: [],
+              additionalContext: [],
+              access: input.packet.access,
+            },
+            status: "settled",
+            native: { threadId: "thread", runId: "run", terminalMessageId: "message" },
+            report: {
+              kind: "review",
+              verdict: "pass",
+              assessment: {
+                revisionHash: hash,
+                sourcePacketHash,
+                inventory: [
+                  {
+                    id: "inventory",
+                    text: "Outcome",
+                    sourceRefs: [reference],
+                    requirementIds: ["requirement"],
+                    disposition,
+                  },
+                ],
+              },
+              findings: [],
+            },
+            access: input.packet.access,
+          });
+        const lookup = { planId: "plan", revisionId: "revision", revisionHash, sourcePacketHash };
+        expect(
+          (yield* service.validateCoverage({ planId: "plan" }, context)).coverage.reviewBlockers,
+        ).toEqual([{ code: "review-missing" }]);
+        const missing = yield* makeReview("revision", revisionHash, "missing");
+        yield* Ref.update(reviews, (map) => new Map(map).set(reviewKey(lookup), missing));
+        const omitted = yield* service.validateCoverage(
+          { planId: "plan", revisionId: "revision" },
+          context,
+        );
+        expect(omitted.coverage.structuralBlockers).toEqual([]);
+        expect(omitted.coverage.reviewBlockers).toEqual([
+          { code: "anchored-omission", objectId: "inventory" },
+        ]);
+        expect(omitted.reviewReady).toBe(false);
+        const stale = yield* makeReview("revision", "0".repeat(64), "mapped");
+        yield* Ref.update(reviews, (map) => new Map(map).set(reviewKey(lookup), stale));
+        expect(
+          (yield* service.validateCoverage({ planId: "plan" }, context)).coverage.reviewBlockers,
+        ).toEqual([{ code: "review-stale" }]);
+        const corrected = { ...revision, brief: "Corrected" };
+        yield* service.updateDraft(
+          {
+            ...input,
+            revision: corrected,
+            revisionId: "revision-2",
+            expectedVersion: 0,
+            commandId: "update",
+          },
+          context,
+        );
+        const correctedHash = DevelopmentPlanHash.revision(corrected);
+        const fresh = yield* makeReview("revision-2", correctedHash, "mapped");
+        yield* Ref.update(reviews, (map) =>
+          new Map(map).set(
+            reviewKey({ ...lookup, revisionId: "revision-2", revisionHash: correctedHash }),
+            fresh,
+          ),
+        );
+        const ready = yield* service.validateCoverage({ planId: "plan" }, context);
+        expect(ready).toEqual({
+          revisionId: "revision-2",
+          coverage: {
+            revisionHash: correctedHash,
+            sourcePacketHash,
+            structuralBlockers: [],
+            reviewBlockers: [],
+          },
+          reviewReady: true,
+        });
+        expect(yield* Ref.get(attestations)).toEqual([
+          ["pass", correctedHash, sourcePacketHash].join("|"),
+        ]);
+        yield* Ref.set(grants, new Set(["env|project|"]));
+        expect(
+          (yield* Effect.flip(service.validateCoverage({ planId: "plan" }, context))).reason,
+        ).toBe("unauthorized");
+        yield* Ref.set(grants, allGrants());
+        const denied = yield* Effect.gen(function* () {
+          const serviceWithDeny = yield* Service.DevelopmentPlanService;
+          return yield* serviceWithDeny.validateCoverage({ planId: "plan" }, context);
+        }).pipe(
+          Effect.provide(
+            Layer.fresh(Service.layer).pipe(
+              Layer.provide(Layer.merge(reader, Service.denyAttestationLayer)),
+            ),
+          ),
+        );
+        expect(denied.reviewReady).toBe(false);
+      }).pipe(Effect.provide(layer(":memory:", grants, ports)));
+    }),
   );
   it.effect("filters revoked origins after reopening persisted plans and retains cursors", () =>
     withDatabase((filename) =>
