@@ -27,6 +27,43 @@ const seed = Effect.gen(function* () {
   yield* sql`INSERT INTO workflow_planning_settlements VALUES ('planning-op', ${hash}, '{ "settled": true }')`;
 });
 
+const snapshot = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  return {
+    plans: yield* sql`SELECT * FROM development_plans ORDER BY plan_id`,
+    identities: yield* sql`SELECT * FROM workflow_plan_identities ORDER BY plan_id`,
+    revisions: yield* sql`SELECT * FROM workflow_revision_identities ORDER BY plan_id, revision_id`,
+    runs: yield* sql`SELECT * FROM workflow_runs ORDER BY id`,
+    sessions: yield* sql`SELECT * FROM workflow_planning_sessions ORDER BY id`,
+    operations: yield* sql`SELECT * FROM workflow_operations ORDER BY id`,
+    attempts: yield* sql`SELECT * FROM workflow_attempts ORDER BY id`,
+    passes: yield* sql`SELECT * FROM workflow_planning_passes ORDER BY id`,
+    observations: yield* sql`SELECT * FROM workflow_planning_observations`,
+    settlements: yield* sql`SELECT * FROM workflow_planning_settlements`,
+    receipts: yield* sql`SELECT * FROM workflow_command_receipts ORDER BY command_id`,
+    intents: yield* sql`SELECT * FROM workflow_native_launch_intents ORDER BY intent_id`,
+    intentReceipts: yield* sql`SELECT * FROM workflow_native_intent_receipts ORDER BY command_id`,
+  };
+});
+
+const lookup = (threadId: string) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const rows = yield* sql<{
+      id: string;
+    }>`SELECT id FROM workflow_operations WHERE CASE WHEN json_valid(record_json) THEN json_extract(record_json, '$.parameters.nativeThreadId') END = ${threadId}`;
+    return rows.map((row) => row.id).sort();
+  });
+
+const lookupPlan = (threadId: string) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const rows = yield* sql<{
+      detail: string;
+    }>`EXPLAIN QUERY PLAN SELECT id FROM workflow_operations WHERE CASE WHEN json_valid(record_json) THEN json_extract(record_json, '$.parameters.nativeThreadId') END = ${threadId}`;
+    return rows.map((row) => row.detail);
+  });
+
 const row = (id: string, overrides: Record<string, string | number | null> = {}) => ({
   intent_id: id,
   workflow_run_id: "run",
@@ -73,6 +110,8 @@ it.effect("upgrades seeded 083 without changing legacy rows, replays, and surviv
         (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
       );
       const filename = NodePath.join(dir, "test.sqlite");
+      let preserved: Effect.Success<typeof snapshot>;
+      let existingIndexes: ReadonlyArray<{ name: string; sql: string | null }>;
       yield* Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
         yield* sql`PRAGMA foreign_keys = ON`;
@@ -88,8 +127,10 @@ it.effect("upgrades seeded 083 without changing legacy rows, replays, and surviv
         const settlements = yield* sql`SELECT * FROM workflow_planning_settlements`;
         const receipts = yield* sql`SELECT * FROM workflow_command_receipts`;
         const plans = yield* sql`SELECT * FROM development_plans`;
-        assert.deepStrictEqual(yield* runMigrations(), [[84, "WorkflowNativeLaunchIntents"]]);
-        assert.deepStrictEqual(yield* runMigrations(), []);
+        assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 84 }), [
+          [84, "WorkflowNativeLaunchIntents"],
+        ]);
+        assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 84 }), []);
         assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_runs`, runs);
         assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_planning_sessions`, sessions);
         assert.deepStrictEqual(
@@ -111,11 +152,66 @@ it.effect("upgrades seeded 083 without changing legacy rows, replays, and surviv
         assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_launch_intents`, []);
         yield* sql.unsafe(insert(row("one")));
         yield* sql`INSERT INTO workflow_native_intent_receipts VALUES ('command', 'receipt', 'one', ${hash}, '{ "reserved": true }')`;
+        yield* sql`INSERT INTO workflow_operations VALUES ('native-stage', 'run', NULL, 'stage_launch', ${"b".repeat(64)}, 'pending', 0, 0, 9, NULL, '{ "parameters": { "kind": "stage_launch", "nativeThreadId": "target" } }')`;
+        yield* sql`INSERT INTO workflow_operations VALUES ('native-supervision', 'run', NULL, 'supervision', ${"c".repeat(64)}, 'pending', 0, 0, 9, NULL, '{ "parameters": { "kind": "supervision", "nativeThreadId": "target" } }')`;
+        yield* sql`INSERT INTO workflow_operations VALUES ('native-null', 'run', NULL, 'supervision', ${"d".repeat(64)}, 'pending', 0, 0, 9, NULL, '{ "parameters": { "nativeThreadId": null } }')`;
+        yield* sql`INSERT INTO workflow_operations VALUES ('native-missing', 'run', NULL, 'supervision', ${"e".repeat(64)}, 'pending', 0, 0, 9, NULL, '{ "parameters": {} }')`;
+        preserved = yield* snapshot;
+        existingIndexes = yield* sql<{
+          name: string;
+          sql: string | null;
+        }>`SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name LIKE 'workflow_%' ORDER BY name`;
+        const matches = yield* lookup("target");
+        const missing = yield* lookup("absent");
+        assert.deepStrictEqual(matches, ["native-stage", "native-supervision"]);
+        assert.deepStrictEqual(missing, []);
+        for (const key of ["target", "absent"]) {
+          assert.isTrue(
+            (yield* lookupPlan(key)).some((detail) => detail.includes("SCAN workflow_operations")),
+          );
+        }
+        assert.deepStrictEqual(yield* runMigrations(), [[85, "WorkflowNativeThreadLookup"]]);
+        assert.deepStrictEqual(yield* snapshot, preserved);
+        assert.deepStrictEqual(
+          yield* sql`SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name LIKE 'workflow_%' AND name <> 'workflow_operations_native_thread' ORDER BY name`,
+          existingIndexes,
+        );
+        assert.deepStrictEqual(yield* lookup("target"), matches);
+        assert.deepStrictEqual(yield* lookup("absent"), missing);
+        for (const key of ["target", "absent"]) {
+          assert.isTrue(
+            (yield* lookupPlan(key)).some((detail) =>
+              detail.includes(
+                "SEARCH workflow_operations USING INDEX workflow_operations_native_thread",
+              ),
+            ),
+          );
+        }
+        assert.deepStrictEqual(yield* runMigrations(), []);
+        assert.deepStrictEqual(yield* snapshot, preserved);
+        assert.deepStrictEqual(yield* lookup("target"), matches);
+        assert.deepStrictEqual(yield* lookup("absent"), missing);
       }).pipe(Effect.provide(NodeSqliteClient.layer({ filename })));
       yield* Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
         yield* sql`PRAGMA foreign_keys = ON`;
         assert.deepStrictEqual(yield* runMigrations(), []);
+        assert.deepStrictEqual(yield* snapshot, preserved);
+        assert.deepStrictEqual(
+          yield* sql`SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name LIKE 'workflow_%' AND name <> 'workflow_operations_native_thread' ORDER BY name`,
+          existingIndexes,
+        );
+        assert.deepStrictEqual(yield* lookup("target"), ["native-stage", "native-supervision"]);
+        assert.deepStrictEqual(yield* lookup("absent"), []);
+        for (const key of ["target", "absent"]) {
+          assert.isTrue(
+            (yield* lookupPlan(key)).some((detail) =>
+              detail.includes(
+                "SEARCH workflow_operations USING INDEX workflow_operations_native_thread",
+              ),
+            ),
+          );
+        }
         assert.deepStrictEqual(
           yield* sql`SELECT record_json, record_version, control_generation FROM workflow_runs`,
           [

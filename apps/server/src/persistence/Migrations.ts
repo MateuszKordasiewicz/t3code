@@ -87,6 +87,7 @@ import Migration0081 from "./Migrations/081_WorkflowRuns.ts";
 import Migration0082 from "./Migrations/082_DevelopmentPlans.ts";
 import Migration0083 from "./Migrations/083_PlanningEvidence.ts";
 import Migration0084 from "./Migrations/084_WorkflowNativeLaunchIntents.ts";
+import Migration0085 from "./Migrations/085_WorkflowNativeThreadLookup.ts";
 
 const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
@@ -174,6 +175,7 @@ const migrationEntries = [
   [82, "DevelopmentPlans", Migration0082],
   [83, "PlanningEvidence", Migration0083],
   [84, "WorkflowNativeLaunchIntents", Migration0084],
+  [85, "WorkflowNativeThreadLookup", Migration0085],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
