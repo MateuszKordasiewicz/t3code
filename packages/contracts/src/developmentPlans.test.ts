@@ -4,6 +4,9 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import {
   decodeDevelopmentPlanDocumentV1,
+  decodeDevelopmentPlanDocumentV2,
+  upgradeDevelopmentPlanDocumentV1,
+  DevelopmentPlanDocumentV2,
   decodeDevelopmentPlanRevisionV1,
   RevisionEnvelope,
   decodePlanningSessionV1,
@@ -942,6 +945,116 @@ describe("development plan revision", () => {
         if (result._tag === "Success")
           expect(yield* encodeRevisionEnvelope(result.success)).toEqual(input);
       }
+    }).pipe(Effect.provide(Digest.layerWebCrypto)),
+  );
+});
+
+const documentV2Example = () => {
+  const doc = example();
+  const { revision, sourcePacket } = revisionExample();
+  return { ...doc, schemaVersion: 2, native: { revision, sourcePacket } };
+};
+const changeDocumentV2 = (f: (doc: ReturnType<typeof documentV2Example>) => void) => {
+  const doc = documentV2Example();
+  f(doc);
+  return doc;
+};
+const v2Bytes = new TextEncoder().encode(JSON.stringify(example(), null, 2));
+const v2Hash = "d".repeat(64);
+const documentV2Cases: {
+  name: string;
+  input?: unknown;
+  bytes?: Uint8Array;
+  hash?: string;
+  reason?: string;
+}[] = [
+  { name: "populated native objects and historical receipt", input: documentV2Example() },
+  { name: "upgrade preserves original bytes", bytes: v2Bytes, hash: v2Hash },
+  {
+    name: "unsupported version",
+    input: { ...documentV2Example(), schemaVersion: 3 },
+    reason: "unsupported version",
+  },
+  { name: "unknown root", input: { ...documentV2Example(), extra: true }, reason: "unknown field" },
+  {
+    name: "unknown native",
+    input: changeDocumentV2((d) => Object.assign(d.native, { extra: true })),
+    reason: "unknown field",
+  },
+  {
+    name: "invalid projection",
+    input: changeDocumentV2((d) => {
+      d.requirements[0]!.sourceStatementIds = ["missing"];
+    }),
+    reason: "dangling reference",
+  },
+  {
+    name: "native dependency cycle",
+    input: changeDocumentV2((d) => {
+      d.native.revision.workItems[0]!.dependencyIds = ["item-1"];
+    }),
+    reason: "dependency cycle",
+  },
+  {
+    name: "brief mirror",
+    input: changeDocumentV2((d) => {
+      d.brief = "different";
+    }),
+    reason: "mirror mismatch",
+  },
+  {
+    name: "requirement mirror",
+    input: changeDocumentV2((d) => {
+      d.requirements[0]!.text = "different";
+    }),
+    reason: "mirror mismatch",
+  },
+  {
+    name: "source mirror",
+    input: changeDocumentV2((d) => {
+      d.sources[0]!.attribution = "different";
+    }),
+    reason: "mirror mismatch",
+  },
+  { name: "invalid hash", bytes: v2Bytes, hash: "not hex", reason: "malformed field" },
+  {
+    name: "invalid JSON",
+    bytes: new TextEncoder().encode("{"),
+    hash: v2Hash,
+    reason: "malformed field",
+  },
+  { name: "invalid UTF-8", bytes: new Uint8Array([0xff]), hash: v2Hash, reason: "malformed field" },
+];
+const encodeDocumentV2 = Schema.encodeEffect(DevelopmentPlanDocumentV2);
+describe("development plan document v2", () => {
+  it.effect.each(documentV2Cases)("$name", ({ input, bytes, hash, reason }) =>
+    Effect.gen(function* () {
+      let calls = 0;
+      const result = yield* Effect.result(
+        bytes
+          ? upgradeDevelopmentPlanDocumentV1({
+              bytes,
+              hashSourcePacket: () => {
+                calls++;
+                return hash ?? "";
+              },
+            })
+          : decodeDevelopmentPlanDocumentV2(input),
+      );
+      if (reason) expect(result).toMatchObject({ _tag: "Failure", failure: { reason } });
+      else if (result._tag === "Success") {
+        if (bytes) {
+          const { native, schemaVersion: _schemaVersion, ...fields } = result.success;
+          const { schemaVersion: _v1Version, ...v1Fields } =
+            yield* decodeDevelopmentPlanDocumentV1(example());
+          expect(fields).toEqual(v1Fields);
+          expect(native.revision.sourcePacketHash).toBe(hash);
+          expect(native.revision.legacyDocument?.bytesBase64).toBe(
+            btoa(String.fromCharCode(...bytes)),
+          );
+          expect(calls).toBe(1);
+        } else expect(yield* encodeDocumentV2(result.success)).toEqual(input);
+      } else expect.fail(`Unexpected failure: ${result.failure.reason}`);
     }).pipe(Effect.provide(Digest.layerWebCrypto)),
   );
 });

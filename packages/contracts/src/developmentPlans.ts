@@ -698,6 +698,104 @@ const hasCycle = (items: readonly (typeof WorkItem.Type)[]) => {
   };
   return items.some((item) => visit(item.id));
 };
+const validateRevisionContent = Effect.fn("DevelopmentPlanRevisionV1.validateContent")(function* (
+  r: DevelopmentPlanRevisionV1,
+  p: typeof PlanningSourcePacket.Type,
+  containingHash?: string,
+) {
+  if (r.coverageReceipts.some((receipt) => !isWorkflowTimestamp(receipt.createdAt)))
+    return yield* revisionFail("malformed field");
+  if (
+    containingHash !== undefined &&
+    r.coverageReceipts.some((receipt) => receipt.revisionHash === containingHash)
+  )
+    return yield* revisionFail("self-referential receipt");
+  const families = [
+    p.sources,
+    p.statements,
+    r.requirements,
+    r.decisions,
+    r.questions,
+    r.assumptions,
+    r.approach,
+    r.workItems,
+    r.coverageReceipts,
+    r.requirements.flatMap((x) => x.criteria),
+    r.workItems.flatMap((x) => x.verification),
+  ];
+  const sourceRefs = [
+    ...r.requirements,
+    ...r.requirements.flatMap((x) => x.criteria).filter((x) => x.sourceStatementIds !== undefined),
+    ...r.decisions,
+    ...r.questions,
+    ...r.assumptions,
+    ...r.approach,
+    ...r.workItems,
+  ];
+  if (
+    families.some((family) => hasWorkflowDuplicates(family.map((x) => x.id))) ||
+    sourceRefs.some((x) => hasWorkflowDuplicates(x.sourceStatementIds ?? [])) ||
+    r.decisions.some((d) => hasWorkflowDuplicates(d.alternatives.map((a) => a.id))) ||
+    r.workItems.some((w) =>
+      [
+        w.requirementIds,
+        w.criterionIds,
+        w.dependencyIds,
+        ...w.verification.map((v) => v.criterionIds),
+      ].some(hasWorkflowDuplicates),
+    )
+  )
+    return yield* revisionFail("ambiguous identity");
+  if (
+    r.decisions.some((d) =>
+      d.state === "decided"
+        ? !d.selectedAlternativeId ||
+          !d.reason ||
+          !d.alternatives.some((a) => a.id === d.selectedAlternativeId)
+        : d.selectedAlternativeId !== undefined || d.reason !== undefined,
+    ) ||
+    r.questions.some((q) => (q.state === "resolved" ? !q.resolution : q.resolution !== undefined))
+  )
+    return yield* revisionFail("invalid state");
+  const statements = new Set(p.statements.map((x) => x.id)),
+    sources = new Set(p.sources.map((x) => x.id)),
+    requirements = new Set(r.requirements.map((x) => x.id)),
+    criteria = new Set(r.requirements.flatMap((x) => x.criteria.map((c) => c.id))),
+    work = new Set(r.workItems.map((x) => x.id));
+  if (
+    sourceRefs.some((x) => x.sourceStatementIds?.some((id) => !statements.has(id))) ||
+    r.unmappedMaterial.some((x) => !sources.has(x.sourceId)) ||
+    r.workItems.some(
+      (w) =>
+        w.requirementIds.some((id) => !requirements.has(id)) ||
+        w.criterionIds.some((id) => !criteria.has(id)) ||
+        w.dependencyIds.some((id) => !work.has(id)) ||
+        w.verification.some((v) => v.criterionIds.some((id) => !criteria.has(id))),
+    )
+  )
+    return yield* revisionFail("dangling reference");
+  if (hasCycle(r.workItems)) return yield* revisionFail("dependency cycle");
+  yield* validateSourcePacket(p.sources, p.statements, []).pipe(
+    Effect.mapError((error) => revisionFail(error.reason)),
+  );
+  if (r.legacyDocument)
+    yield* validateSourcePacket(
+      [
+        {
+          ...r.legacyDocument,
+          id: "legacy",
+          kind: "imported_document",
+          environmentId: "legacy",
+          projectId: "legacy",
+          documentId: "legacy",
+          capturedAt: "2000-01-01T00:00:00Z",
+          attribution: "legacy",
+        },
+      ],
+      [],
+      [],
+    ).pipe(Effect.mapError((error) => revisionFail(error.reason)));
+});
 export const decodeDevelopmentPlanRevisionV1 = Effect.fn("DevelopmentPlanRevisionV1.decode")(
   function* (input: unknown) {
     const preflightError = revisionPreflight(input);
@@ -706,103 +804,171 @@ export const decodeDevelopmentPlanRevisionV1 = Effect.fn("DevelopmentPlanRevisio
       Effect.mapError(() => revisionFail("malformed field")),
     );
     const { revision: r, sourcePacket: p } = envelope;
-    if (
-      !isWorkflowTimestamp(envelope.createdAt) ||
-      r.coverageReceipts.some((receipt) => !isWorkflowTimestamp(receipt.createdAt))
-    )
-      return yield* revisionFail("malformed field");
+    if (!isWorkflowTimestamp(envelope.createdAt)) return yield* revisionFail("malformed field");
     if (envelope.planId !== r.planId || envelope.sourcePacketHash !== r.sourcePacketHash)
       return yield* revisionFail("binding mismatch");
-    if (r.coverageReceipts.some((receipt) => receipt.revisionHash === envelope.revisionHash))
-      return yield* revisionFail("self-referential receipt");
-    const families = [
-      p.sources,
-      p.statements,
-      r.requirements,
-      r.decisions,
-      r.questions,
-      r.assumptions,
-      r.approach,
-      r.workItems,
-      r.coverageReceipts,
-      r.requirements.flatMap((x) => x.criteria),
-      r.workItems.flatMap((x) => x.verification),
-    ];
-    const sourceRefs = [
-      ...r.requirements,
-      ...r.requirements
-        .flatMap((x) => x.criteria)
-        .filter((x) => x.sourceStatementIds !== undefined),
-      ...r.decisions,
-      ...r.questions,
-      ...r.assumptions,
-      ...r.approach,
-      ...r.workItems,
-    ];
-    if (
-      families.some((family) => hasWorkflowDuplicates(family.map((x) => x.id))) ||
-      sourceRefs.some((x) => hasWorkflowDuplicates(x.sourceStatementIds ?? [])) ||
-      r.decisions.some((d) => hasWorkflowDuplicates(d.alternatives.map((a) => a.id))) ||
-      r.workItems.some((w) =>
-        [
-          w.requirementIds,
-          w.criterionIds,
-          w.dependencyIds,
-          ...w.verification.map((v) => v.criterionIds),
-        ].some(hasWorkflowDuplicates),
-      )
-    )
-      return yield* revisionFail("ambiguous identity");
-    if (
-      r.decisions.some((d) =>
-        d.state === "decided"
-          ? !d.selectedAlternativeId ||
-            !d.reason ||
-            !d.alternatives.some((a) => a.id === d.selectedAlternativeId)
-          : d.selectedAlternativeId !== undefined || d.reason !== undefined,
-      ) ||
-      r.questions.some((q) => (q.state === "resolved" ? !q.resolution : q.resolution !== undefined))
-    )
-      return yield* revisionFail("invalid state");
-    const statements = new Set(p.statements.map((x) => x.id)),
-      sources = new Set(p.sources.map((x) => x.id)),
-      requirements = new Set(r.requirements.map((x) => x.id)),
-      criteria = new Set(r.requirements.flatMap((x) => x.criteria.map((c) => c.id))),
-      work = new Set(r.workItems.map((x) => x.id));
-    if (
-      sourceRefs.some((x) => x.sourceStatementIds?.some((id) => !statements.has(id))) ||
-      r.unmappedMaterial.some((x) => !sources.has(x.sourceId)) ||
-      r.workItems.some(
-        (w) =>
-          w.requirementIds.some((id) => !requirements.has(id)) ||
-          w.criterionIds.some((id) => !criteria.has(id)) ||
-          w.dependencyIds.some((id) => !work.has(id)) ||
-          w.verification.some((v) => v.criterionIds.some((id) => !criteria.has(id))),
-      )
-    )
-      return yield* revisionFail("dangling reference");
-    if (hasCycle(r.workItems)) return yield* revisionFail("dependency cycle");
-    yield* validateSourcePacket(p.sources, p.statements, []).pipe(
-      Effect.mapError((error) => revisionFail(error.reason)),
-    );
-    if (r.legacyDocument)
-      yield* validateSourcePacket(
-        [
-          {
-            ...r.legacyDocument,
-            id: "legacy",
-            kind: "imported_document",
-            environmentId: "legacy",
-            projectId: "legacy",
-            documentId: "legacy",
-            capturedAt: "2000-01-01T00:00:00Z",
-            attribution: "legacy",
-          },
-        ],
-        [],
-        [],
-      ).pipe(Effect.mapError((error) => revisionFail(error.reason)));
+    yield* validateRevisionContent(r, p, envelope.revisionHash);
     return envelope;
+  },
+);
+
+export const DevelopmentPlanDocumentV2 = Schema.Struct({
+  ...DevelopmentPlanDocumentV1.fields,
+  schemaVersion: Schema.Literal(2),
+  native: Schema.Struct({
+    revision: DevelopmentPlanRevisionV1,
+    sourcePacket: PlanningSourcePacket,
+  }),
+});
+export type DevelopmentPlanDocumentV2 = typeof DevelopmentPlanDocumentV2.Type;
+export class DevelopmentPlanDocumentV2Error extends Schema.TaggedError<DevelopmentPlanDocumentV2Error>()(
+  "DevelopmentPlanDocumentV2Error",
+  {
+    reason: Schema.Literals([
+      "unsupported version",
+      "unknown field",
+      "ambiguous identity",
+      "dangling reference",
+      "invalid byte span",
+      "source identity mismatch",
+      "text differs from original selected bytes",
+      "mixed discriminant shape",
+      "malformed field",
+      "invalid state",
+      "dependency cycle",
+      "binding mismatch",
+      "self-referential receipt",
+      "mirror mismatch",
+    ]),
+  },
+) {}
+const documentV2Fail = (reason: DevelopmentPlanDocumentV2Error["reason"]) =>
+  new DevelopmentPlanDocumentV2Error({ reason });
+const decodeDocumentV2Shape = Schema.decodeUnknownEffect(DevelopmentPlanDocumentV2);
+const decodeSourcePacketShape = Schema.decodeUnknownEffect(PlanningSourcePacket);
+const sameValue = (a: unknown, b: unknown): boolean => {
+  if (a === b) return true;
+  if (Array.isArray(a) && Array.isArray(b))
+    return a.length === b.length && a.every((value, index) => sameValue(value, b[index]));
+  if (!record(a) || !record(b)) return false;
+  const keys = Object.keys(a);
+  return (
+    keys.length === Object.keys(b).length &&
+    keys.every((key) => key in b && sameValue(a[key], b[key]))
+  );
+};
+const parseDocumentBytes = (bytes: Uint8Array): unknown =>
+  JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+
+export const decodeDevelopmentPlanDocumentV2 = Effect.fn("DevelopmentPlanDocumentV2.decode")(
+  function* (input: unknown) {
+    if (record(input) && input.schemaVersion !== 2)
+      return yield* documentV2Fail("unsupported version");
+    if (extra(input, [...Object.keys(DevelopmentPlanDocumentV1.fields), "native"]))
+      return yield* documentV2Fail("unknown field");
+    if (record(input) && extra(input.native, ["revision", "sourcePacket"]))
+      return yield* documentV2Fail("unknown field");
+    const projection = record(input)
+      ? Object.fromEntries(
+          Object.entries(input)
+            .filter(([key]) => key !== "native")
+            .map(([key, value]) => [key, key === "schemaVersion" ? 1 : value]),
+        )
+      : input;
+    const v1 = yield* decodeDevelopmentPlanDocumentV1(projection).pipe(
+      Effect.mapError((error) => documentV2Fail(error.reason)),
+    );
+    const native = record(input) ? input.native : undefined;
+    const preflightError = revisionPreflight(native);
+    if (preflightError) return yield* documentV2Fail(preflightError);
+    const document = yield* decodeDocumentV2Shape(input, { onExcessProperty: "error" }).pipe(
+      Effect.mapError(() => documentV2Fail("malformed field")),
+    );
+    const { revision, sourcePacket } = document.native;
+    yield* validateRevisionContent(revision, sourcePacket).pipe(
+      Effect.mapError((error) => documentV2Fail(error.reason)),
+    );
+    const requirements = revision.requirements.map(
+      ({ id, text, sourceStatementIds, criteria }) => ({
+        id,
+        text,
+        sourceStatementIds,
+        criteria: criteria.map(({ id, text }) => ({ id, text })),
+      }),
+    );
+    if (
+      v1.planId !== revision.planId ||
+      v1.brief !== revision.brief ||
+      !sameValue(v1.sources, sourcePacket.sources) ||
+      !sameValue(v1.sourceStatements, sourcePacket.statements) ||
+      !sameValue(v1.requirements, requirements)
+    )
+      return yield* documentV2Fail("mirror mismatch");
+    return document;
+  },
+);
+
+export const upgradeDevelopmentPlanDocumentV1 = Effect.fn("DevelopmentPlanDocumentV1.upgrade")(
+  function* (input: {
+    bytes: Uint8Array;
+    hashSourcePacket: (packet: typeof PlanningSourcePacket.Type) => string;
+  }) {
+    const parsed = yield* Effect.try({
+      try: () => parseDocumentBytes(input.bytes),
+      catch: () => documentV2Fail("malformed field"),
+    });
+    const v1 = yield* decodeDevelopmentPlanDocumentV1(parsed).pipe(
+      Effect.mapError((error) => documentV2Fail(error.reason)),
+    );
+    const origins: { environmentId: string; projectId: string; threadId?: string }[] = [];
+    for (const source of v1.sources) {
+      const origin = {
+        environmentId: source.environmentId,
+        projectId: source.projectId,
+        ...(source.kind === "thread_message" ? { threadId: source.threadId } : {}),
+      };
+      if (!origins.some((existing) => sameValue(existing, origin))) origins.push(origin);
+    }
+    const sourcePacket = yield* decodeSourcePacketShape({
+      schemaVersion: 1,
+      sources: v1.sources,
+      statements: v1.sourceStatements,
+      selectionLimitations: [],
+      access: { origins },
+    }).pipe(Effect.mapError(() => documentV2Fail("malformed field")));
+    const sourcePacketHash = yield* Effect.try({
+      try: () => input.hashSourcePacket(sourcePacket),
+      catch: () => documentV2Fail("malformed field"),
+    });
+    if (!/^[0-9a-f]{64}$/.test(sourcePacketHash)) return yield* documentV2Fail("malformed field");
+    const hash = yield* Effect.flatMap(Digest.Digest, (digest) =>
+      digest.digest(Digest.sha256, input.bytes),
+    ).pipe(Effect.mapError(() => documentV2Fail("source identity mismatch")));
+    const revision = {
+      schemaVersion: 1,
+      planId: v1.planId,
+      sourcePacketHash,
+      brief: v1.brief,
+      requirements: v1.requirements,
+      decisions: [],
+      questions: [],
+      assumptions: [],
+      approach: [],
+      workItems: [],
+      access: sourcePacket.access,
+      coverageReceipts: [],
+      unmappedMaterial: [],
+      legacyDocument: {
+        bytesBase64: Base64.encode(input.bytes),
+        byteLength: input.bytes.length,
+        sha256: Array.from(hash, (byte) => byte.toString(16).padStart(2, "0")).join(""),
+      },
+    };
+    return yield* decodeDevelopmentPlanDocumentV2({
+      ...v1,
+      schemaVersion: 2,
+      native: { revision, sourcePacket },
+    });
   },
 );
 
