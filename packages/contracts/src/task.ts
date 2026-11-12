@@ -392,6 +392,18 @@ export type WorkTaskThreadLinksResult = typeof WorkTaskThreadLinksResult.Type;
 
 const referenceThreadId = ThreadId.check(Schema.isMaxLength(2_000));
 const referenceRunId = RunId.check(Schema.isMaxLength(2_000));
+const resultAttribution = WorkTaskCallerContext.check(
+  Schema.makeFilter((caller) => {
+    if (caller.type === "server") return true;
+    if (caller.type === "user")
+      return caller.sessionId.length <= 2_000 && caller.subject.length <= 2_000;
+    return (
+      caller.threadId.length <= 2_000 &&
+      caller.providerSessionId.length <= 2_000 &&
+      caller.runId.length <= 2_000
+    );
+  }),
+);
 export const WorkTaskResultReference = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("run"),
@@ -408,7 +420,8 @@ export const WorkTaskResultReference = Schema.Union([
 export type WorkTaskResultReference = typeof WorkTaskResultReference.Type;
 export const WorkTaskContribution = Schema.Struct({
   id: shortText,
-  threadId: ThreadId,
+  threadId: Schema.optional(referenceThreadId),
+  attribution: resultAttribution,
   sequence: NonNegativeInt,
   summary: shortText,
   results: Schema.Array(WorkTaskResultReference).check(Schema.isMaxLength(32)),
@@ -797,6 +810,18 @@ const WorkTaskNonReviewRequestedEvent = Schema.Union([
   }).check(Schema.makeFilter((event) => event.definitionRevision === event.definition.revision)),
   Schema.Struct({
     ...eventBase,
+    id: EventId.check(Schema.isMaxLength(2_000)),
+    taskId: WorkTaskId.check(Schema.isMaxLength(2_000)),
+    type: Schema.Literal("task.definition-accepted"),
+    attribution: Schema.Struct({
+      type: Schema.Literal("user"),
+      subject: shortText,
+      sessionId: humanDecision.sessionId,
+    }),
+    definition: WorkTaskAcceptedDefinition,
+  }).check(Schema.makeFilter((event) => event.definitionRevision === event.definition.revision)),
+  Schema.Struct({
+    ...eventBase,
     type: Schema.Literals(["task.thread-linked", "task.thread-unlinked"]),
     threadId: ThreadId,
   }),
@@ -828,9 +853,11 @@ const WorkTaskNonReviewRequestedEvent = Schema.Union([
   Schema.Struct({
     ...eventBase,
     type: Schema.Literal("task.result-recorded"),
+    attribution: resultAttribution,
     sourceId: shortText,
     summary: shortText,
     results: workTaskReferenceBatch,
+    contributorThreadId: Schema.optional(referenceThreadId),
   }),
   Schema.Struct({
     ...eventBase,
@@ -959,6 +986,8 @@ const persistedEvent = Schema.Union([
 export const WorkTaskPersistedEvent = persistedEvent.check(
   Schema.makeFilter(({ event, context }) => {
     if (event.id !== context.eventId || event.occurredAt !== context.occurredAt) return false;
+    if (event.type === "task.definition-accepted")
+      return context.commandId !== null && context.commandId.length <= 2_000;
     if (event.type === "task.action-review-cancelled")
       return context.commandId === event.source.commandId;
     if (event.type !== "task.action-review-requested") return true;
