@@ -702,7 +702,88 @@ const completionIdentity = {
   observedWorkSequence: NonNegativeInt,
 };
 
+const reviewEventBinding = Schema.Struct({
+  taskId: reviewTaskId,
+  reviewId,
+  reviewRevision: PositiveInt,
+  definitionRevision: PositiveInt,
+  actionPolicyRevision: PositiveInt,
+  payloadIdentity: WorkTaskActionPayloadIdentity,
+  ruleId: WorkTaskActionRuleId.check(Schema.isMaxLength(2_000)),
+  runtimeRequestId: shortText,
+  providerSessionId: ProviderSessionId.check(Schema.isMaxLength(2_000)),
+  managerThreadId: referenceThreadId,
+  managerGeneration: PositiveInt,
+  runId: referenceRunId,
+});
+const reviewEventBase = {
+  ...eventBase,
+  id: EventId.check(Schema.isMaxLength(2_000)),
+  taskId: reviewTaskId,
+  attribution: Schema.Struct({ type: Schema.Literal("server") }),
+  binding: reviewEventBinding,
+};
+const reviewBindingMatches = Schema.makeFilter(
+  (event: {
+    readonly taskId: string;
+    readonly definitionRevision: number;
+    readonly actionPolicyRevision: number;
+    readonly binding: {
+      readonly taskId: string;
+      readonly definitionRevision: number;
+      readonly actionPolicyRevision: number;
+    };
+  }) =>
+    event.taskId === event.binding.taskId &&
+    event.definitionRevision === event.binding.definitionRevision &&
+    event.actionPolicyRevision === event.binding.actionPolicyRevision,
+);
+const reviewInvalidated = Schema.Struct({
+  ...reviewEventBase,
+  type: Schema.Literal("task.action-review-invalidated"),
+  cause: Schema.Literals([
+    "payload_changed",
+    "policy_changed",
+    "generation_changed",
+    "run_changed",
+    "authorization_changed",
+  ]),
+  reason: shortText,
+}).check(Schema.makeFilter((event) => event.taskId === event.binding.taskId));
+const reviewCancelled = Schema.Struct({
+  ...reviewEventBase,
+  type: Schema.Literal("task.action-review-cancelled"),
+  reason: shortText,
+  source: Schema.Struct({
+    type: Schema.Literal("task.archive"),
+    commandId: reviewCommandId,
+    human: Schema.Struct({ subject: shortText, sessionId: humanDecision.sessionId }),
+  }),
+}).check(reviewBindingMatches);
+const reviewReleaseBase = {
+  ...reviewEventBase,
+  type: Schema.Literal("task.action-review-continuation-released"),
+  continuationId: shortText,
+  reason: shortText,
+  decisionEventId: EventId.check(Schema.isMaxLength(2_000)),
+};
+const reviewContinuationReleased = Schema.Union([
+  Schema.Struct({
+    ...reviewReleaseBase,
+    purpose: Schema.Literal("approved_action"),
+    decision: Schema.Literal("approve"),
+  }).check(reviewBindingMatches),
+  Schema.Struct({
+    ...reviewReleaseBase,
+    purpose: Schema.Literal("feedback"),
+    decision: Schema.Literals(["reject", "request_changes"]),
+  }).check(reviewBindingMatches),
+]);
+
 const WorkTaskNonReviewRequestedEvent = Schema.Union([
+  reviewInvalidated,
+  reviewCancelled,
+  reviewContinuationReleased,
   Schema.Struct({
     ...eventBase,
     type: Schema.Literal("task.created"),
@@ -878,6 +959,8 @@ const persistedEvent = Schema.Union([
 export const WorkTaskPersistedEvent = persistedEvent.check(
   Schema.makeFilter(({ event, context }) => {
     if (event.id !== context.eventId || event.occurredAt !== context.occurredAt) return false;
+    if (event.type === "task.action-review-cancelled")
+      return context.commandId === event.source.commandId;
     if (event.type !== "task.action-review-requested") return true;
     return (
       event.taskId === event.review.taskId &&
