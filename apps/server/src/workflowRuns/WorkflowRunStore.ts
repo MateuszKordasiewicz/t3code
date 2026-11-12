@@ -367,6 +367,381 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     if (result.kind === "applied") yield* notify;
     return result;
   });
+  const reservePlanningNativeIntent = Effect.fn("WorkflowRunStore.reservePlanningNativeIntent")(
+    function* (input: {
+      readonly intentId: string;
+      readonly sessionId: S["id"];
+      readonly operationId: WorkflowOperationV1["id"];
+      readonly passId: P["id"];
+      readonly role: P["role"];
+      readonly environmentId: string;
+      readonly projectId: string;
+      readonly launchCommandId: string;
+      readonly threadId: string;
+      readonly messageId: string;
+      readonly generation: number;
+      readonly draft: {
+        readonly version: 1;
+        readonly kind: "planning_pass";
+        readonly operation: Omit<
+          WorkflowOperationV1,
+          "fingerprint" | "controlGeneration" | "status" | "claim" | "outcome" | "nextDueAt"
+        >;
+        readonly pass: Omit<P, "native">;
+        readonly admission: {
+          readonly sessionId: S["id"];
+          readonly expectedVersion: number;
+          readonly context: PlanningContext;
+          readonly command: PlanningCommand;
+        };
+      };
+      readonly now: string;
+    }) {
+      const { draft } = input;
+      const valid = yield* Effect.try({
+        try: () => {
+          WorkflowCanonicalHash.assertCanonical(draft);
+          return (
+            [
+              input.intentId,
+              input.sessionId,
+              input.operationId,
+              input.passId,
+              input.environmentId,
+              input.projectId,
+              input.launchCommandId,
+              input.threadId,
+              input.messageId,
+            ].every((x) => typeof x === "string" && x.length > 0) &&
+            Object.keys(draft).sort().join() === "admission,kind,operation,pass,version" &&
+            draft.version === 1 &&
+            draft.kind === "planning_pass" &&
+            Object.keys(draft.admission).sort().join() ===
+              "command,context,expectedVersion,sessionId" &&
+            Object.keys(draft.admission.command).sort().join() === "commandId,receiptId" &&
+            Object.keys(draft.admission.context).sort().join() === "actor,destination" &&
+            Object.keys(draft.admission.context.destination).sort().join() ===
+              "environmentId,projectId" &&
+            validCommand(draft.admission.command) &&
+            isPlanningContext(draft.admission.context) &&
+            Number.isSafeInteger(draft.admission.expectedVersion) &&
+            draft.admission.expectedVersion >= 0 &&
+            draft.admission.sessionId === input.sessionId &&
+            ![input.launchCommandId, `${input.launchCommandId}:initial-message`].includes(
+              draft.admission.command.commandId,
+            )
+          );
+        },
+        catch: () => planningError("invalid"),
+      });
+      if (!valid) return yield* planningError("invalid");
+      const pass = yield* decodePlanningPassV1({
+        ...draft.pass,
+        native: { threadId: input.threadId, runId: "reservation-validation-only" },
+      }).pipe(Effect.mapError(() => planningError("invalid")));
+      const operation = yield* decodeWorkflowOperationV1({
+        ...draft.operation,
+        fingerprint: "0".repeat(64),
+        controlGeneration: 0,
+        status: "pending",
+      }).pipe(Effect.mapError(() => planningError("invalid")));
+      const { native: _native, ...passBase } = pass;
+      const {
+        fingerprint: _fingerprint,
+        controlGeneration: _generation,
+        status: _status,
+        claim: _claim,
+        outcome: _outcome,
+        nextDueAt: _nextDueAt,
+        ...operationBase
+      } = operation;
+      const same = (a: unknown, b: unknown) =>
+        WorkflowCanonicalHash.tagged("compare", a) === WorkflowCanonicalHash.tagged("compare", b);
+      const params = operation.parameters;
+      const context = draft.admission.context;
+      const consistent = yield* Effect.try({
+        try: () =>
+          same(passBase, draft.pass) &&
+          same(operationBase, draft.operation) &&
+          pass.status === "pending" &&
+          !pass.report &&
+          operation.kind === "planning_pass" &&
+          params.kind === "planning_pass" &&
+          operation.owner.kind === "planning_session" &&
+          operation.owner.planningSessionId === input.sessionId &&
+          pass.planningSessionId === input.sessionId &&
+          pass.id === input.passId &&
+          pass.operationId === input.operationId &&
+          operation.id === input.operationId &&
+          pass.role === input.role &&
+          params.passId === pass.id &&
+          params.role === pass.role &&
+          same(pass.binding, params.binding) &&
+          same(pass.provider, params.provider) &&
+          WorkflowCanonicalHash.tagged("t3.planning-input-manifest.v1", pass.inputManifest) ===
+            params.inputManifestHash &&
+          same(operation.origin, context.actor) &&
+          same(operation.destination, context.destination) &&
+          input.environmentId === context.destination.environmentId &&
+          input.projectId === context.destination.projectId,
+        catch: () => planningError("invalid"),
+      });
+      if (!consistent || params.kind !== "planning_pass") return yield* planningError("integrity");
+      const fingerprint = yield* Effect.try({
+        try: () =>
+          WorkflowCanonicalHash.tagged("t3.workflow-native-launch-intent.v1", {
+            intentId: input.intentId,
+            workflowRunId: null,
+            planningSessionId: input.sessionId,
+            operationId: input.operationId,
+            attemptId: null,
+            passId: input.passId,
+            itemId: null,
+            chargeAttempt: 0,
+            repair: input.role === "repair",
+            role: input.role,
+            environmentId: input.environmentId,
+            projectId: input.projectId,
+            launchCommandId: input.launchCommandId,
+            threadId: input.threadId,
+            messageId: input.messageId,
+            draft,
+          }),
+        catch: () => planningError("invalid"),
+      });
+      const command = draft.admission.command;
+      const result = yield* planningTransaction(
+        Effect.gen(function* () {
+          const receipts = yield* sql<{
+            command_id: string;
+            receipt_id: string;
+            intent_id: string;
+            fingerprint: string;
+            result_json: string;
+            draft_json: string;
+            intent_fingerprint: string;
+          }>`SELECT r.*, i.draft_json, i.fingerprint AS intent_fingerprint FROM workflow_native_intent_receipts r JOIN workflow_native_launch_intents i ON i.intent_id = r.intent_id WHERE r.command_id = ${command.commandId} OR r.receipt_id = ${command.receiptId} OR r.intent_id = ${input.intentId}`;
+          const orphan = yield* sql<{
+            workflow_run_id: string | null;
+            planning_session_id: string | null;
+            operation_id: string;
+            pass_id: string | null;
+            attempt_id: string | null;
+            item_id: string | null;
+            charge_attempt: number;
+            repair: number;
+            role: string;
+            environment_id: string;
+            project_id: string;
+            launch_command_id: string;
+            thread_id: string;
+            message_id: string;
+          }>`SELECT * FROM workflow_native_launch_intents WHERE intent_id = ${input.intentId}`;
+          if (receipts.length || orphan.length) {
+            const r = receipts[0];
+            if (
+              receipts.length !== 1 ||
+              orphan.length !== 1 ||
+              !r ||
+              r.command_id !== command.commandId ||
+              r.receipt_id !== command.receiptId ||
+              r.intent_id !== input.intentId ||
+              r.fingerprint !== fingerprint ||
+              r.intent_fingerprint !== fingerprint
+            )
+              return yield* planningError("conflict");
+            const i = orphan[0]!;
+            if (
+              i.workflow_run_id !== null ||
+              i.planning_session_id !== input.sessionId ||
+              i.operation_id !== input.operationId ||
+              i.pass_id !== input.passId ||
+              i.attempt_id !== null ||
+              i.item_id !== null ||
+              i.charge_attempt !== 0 ||
+              i.repair !== (input.role === "repair" ? 1 : 0) ||
+              i.role !== input.role ||
+              i.environment_id !== input.environmentId ||
+              i.project_id !== input.projectId ||
+              i.launch_command_id !== input.launchCommandId ||
+              i.thread_id !== input.threadId ||
+              i.message_id !== input.messageId
+            )
+              return yield* planningError("integrity");
+            const matches = yield* Effect.try({
+              try: () =>
+                same(parse(r.draft_json), draft) &&
+                same(parse(r.result_json), { intentId: input.intentId, fingerprint }),
+              catch: () => planningError("integrity"),
+            });
+            if (!matches) return yield* planningError("integrity");
+            return {
+              kind: "replay" as const,
+              receiptId: r.receipt_id,
+              intentId: input.intentId,
+              fingerprint,
+            };
+          }
+          const collisions =
+            yield* sql`SELECT 1 FROM workflow_command_receipts WHERE command_id IN (${command.commandId}, ${input.launchCommandId}, ${input.launchCommandId + ":initial-message"}) OR receipt_id = ${command.receiptId} OR operation_id = ${input.operationId} UNION ALL SELECT 1 FROM workflow_operations WHERE id = ${input.operationId} UNION ALL SELECT 1 FROM workflow_planning_passes WHERE id = ${input.passId} OR operation_id = ${input.operationId} UNION ALL SELECT 1 FROM workflow_native_launch_intents WHERE operation_id = ${input.operationId} OR pass_id = ${input.passId} OR launch_command_id IN (${command.commandId}, ${input.launchCommandId}, ${input.launchCommandId + ":initial-message"}) OR launch_command_id || ':initial-message' IN (${command.commandId}, ${input.launchCommandId}) OR (thread_id = ${input.threadId} AND message_id = ${input.messageId}) UNION ALL SELECT 1 FROM workflow_native_intent_receipts WHERE command_id IN (${command.commandId}, ${input.launchCommandId}, ${input.launchCommandId + ":initial-message"}) OR receipt_id = ${command.receiptId}`;
+          if (collisions.length) return yield* planningError("conflict");
+          if (
+            !Number.isSafeInteger(input.generation) ||
+            input.generation < 0 ||
+            !isWorkflowTimestamp(input.now)
+          )
+            return yield* planningError("invalid");
+          const current = yield* readSession(input.sessionId);
+          if (!sameContext(current, context)) return yield* planningError("unauthorized");
+          if (current.recordVersion !== draft.admission.expectedVersion)
+            return yield* new PlanningControlError({
+              reason: "conflict",
+              currentVersion: current.recordVersion,
+            });
+          if (current.status !== "active") return yield* planningError("ineligible");
+          if (!isWorkflowTimestampAfter(current.limits.deadline, input.now))
+            return yield* planningError("deadline");
+          if (
+            input.generation !== current.controlGeneration ||
+            pass.binding.planId !== current.planId ||
+            !same(params.limits, current.limits)
+          )
+            return yield* planningError("integrity");
+          if (
+            !current.allowedRoles.includes(pass.role) ||
+            !current.allowedProviders.some(
+              (p) =>
+                p.providerInstanceId === pass.provider.providerInstanceId &&
+                p.model === pass.provider.model,
+            )
+          )
+            return yield* planningError("ineligible");
+          if (
+            current.consumed.passes >= current.limits.maxPasses ||
+            (pass.role === "repair" &&
+              current.consumed.repairRounds >= current.limits.maxRepairRounds)
+          )
+            return yield* planningError("limit");
+          if (pass.role === "author" || pass.role === "repair") {
+            const writers =
+              yield* sql`SELECT 1 FROM workflow_planning_passes p JOIN workflow_operations o ON o.id = p.operation_id WHERE p.plan_id = ${current.planId} AND o.status IN ('pending','claimed','unknown') AND json_extract(p.record_json, '$.role') IN ('author','repair') UNION ALL SELECT 1 FROM workflow_native_launch_intents i JOIN workflow_planning_sessions s ON s.id = i.planning_session_id WHERE s.plan_id = ${current.planId} AND i.state IN ('reserved','dispatching','unknown') AND i.role IN ('author','repair')`;
+            if (writers.length) return yield* planningError("custody");
+          }
+          const foreign =
+            yield* sql`SELECT 1 FROM workflow_native_launch_intents WHERE thread_id = ${input.threadId} AND state <> 'cancelled' AND (planning_session_id IS NULL OR planning_session_id <> ${input.sessionId}) UNION ALL SELECT 1 FROM workflow_operations WHERE json_extract(record_json, '$.parameters.nativeThreadId') = ${input.threadId} UNION ALL SELECT 1 FROM workflow_planning_passes WHERE native_thread_id = ${input.threadId} AND (planning_session_id <> ${input.sessionId} OR planning_session_id IS NULL)`;
+          if (foreign.length) return yield* planningError("custody");
+          const ownPasses = yield* sql<{
+            record_json: string;
+            id: string;
+            operation_id: string;
+            native_run_id: string | null;
+            operation_json: string | null;
+            operation_owner: string | null;
+            workflow_owner: string | null;
+          }>`SELECT p.record_json, p.id, p.operation_id, p.native_run_id, o.record_json AS operation_json, o.planning_session_id AS operation_owner, o.workflow_run_id AS workflow_owner FROM workflow_planning_passes p LEFT JOIN workflow_operations o ON o.id = p.operation_id WHERE p.native_thread_id = ${input.threadId}`;
+          for (const row of ownPasses) {
+            const existing = yield* Effect.try({
+              try: () => parse(row.record_json),
+              catch: () => planningError("integrity"),
+            }).pipe(
+              Effect.flatMap(decodePlanningPassV1),
+              Effect.mapError(() => planningError("custody")),
+            );
+            if (
+              !row.operation_json ||
+              row.operation_owner !== input.sessionId ||
+              row.workflow_owner !== null
+            )
+              return yield* planningError("custody");
+            const existingOperation = yield* Effect.try({
+              try: () => parse(row.operation_json!),
+              catch: () => planningError("custody"),
+            }).pipe(
+              Effect.flatMap(decodeWorkflowOperationV1),
+              Effect.mapError(() => planningError("custody")),
+            );
+            if (
+              existingOperation.id !== row.operation_id ||
+              existingOperation.kind !== "planning_pass" ||
+              existingOperation.parameters.kind !== "planning_pass" ||
+              existingOperation.parameters.passId !== row.id ||
+              existingOperation.owner.kind !== "planning_session" ||
+              existingOperation.owner.planningSessionId !== input.sessionId ||
+              existing.id !== row.id ||
+              existing.operationId !== row.operation_id ||
+              existing.planningSessionId !== input.sessionId ||
+              existing.native?.threadId !== input.threadId ||
+              existing.native?.runId !== row.native_run_id
+            )
+              return yield* planningError("custody");
+          }
+          const b = pass.binding;
+          const rows = yield* sql<{
+            revision_json: string;
+            packet_json: string;
+            created_at: string;
+          }>`SELECT r.revision_json, p.packet_json, r.created_at FROM development_plan_revisions r JOIN development_plan_source_packets p ON p.plan_id = r.plan_id AND p.source_packet_hash = r.source_packet_hash JOIN workflow_revision_identities i ON i.plan_id = r.plan_id AND i.revision_id = r.revision_id AND i.revision_hash = r.revision_hash AND i.source_packet_hash = r.source_packet_hash WHERE r.plan_id = ${b.planId} AND r.revision_id = ${b.revisionId} AND r.revision_hash = ${b.revisionHash} AND r.source_packet_hash = ${b.sourcePacketHash}`;
+          const row = rows[0];
+          if (!row) return yield* planningError("integrity");
+          const content = yield* Effect.try({
+            try: () => ({
+              revision: parse(row.revision_json),
+              sourcePacket: parse(row.packet_json),
+            }),
+            catch: () => planningError("integrity"),
+          });
+          const envelope = yield* decodeDevelopmentPlanRevisionV1({
+            planId: b.planId,
+            revisionId: b.revisionId,
+            revisionHash: b.revisionHash,
+            sourcePacketHash: b.sourcePacketHash,
+            ...content,
+            createdAt: row.created_at,
+          }).pipe(
+            Effect.provide(Digest.layerWebCrypto),
+            Effect.mapError(() => planningError("integrity")),
+          );
+          const actual = yield* Effect.try({
+            try: () => ({
+              revision: DevelopmentPlanHash.revision(envelope.revision),
+              source: DevelopmentPlanHash.sourcePacket(envelope.sourcePacket),
+            }),
+            catch: () => planningError("integrity"),
+          });
+          if (actual.revision !== b.revisionHash || actual.source !== b.sourcePacketHash)
+            return yield* planningError("integrity");
+          const updated = {
+            ...current,
+            recordVersion: current.recordVersion + 1,
+            consumed: {
+              passes: current.consumed.passes + 1,
+              repairRounds: current.consumed.repairRounds + (pass.role === "repair" ? 1 : 0),
+            },
+          };
+          yield* decodePlanningSessionV1(updated).pipe(
+            Effect.mapError(() => planningError("integrity")),
+          );
+          const changed =
+            yield* sql`UPDATE workflow_planning_sessions SET record_version = ${updated.recordVersion}, record_json = ${encode(updated)} WHERE id = ${current.id} AND record_version = ${current.recordVersion} AND control_generation = ${current.controlGeneration} RETURNING id`;
+          if (changed.length !== 1) return yield* planningError("conflict");
+          const inserted =
+            yield* sql`INSERT INTO workflow_native_launch_intents (intent_id, planning_session_id, operation_id, pass_id, charge_attempt, repair, role, environment_id, project_id, launch_command_id, thread_id, message_id, fingerprint, draft_json, generation, state, held) VALUES (${input.intentId}, ${input.sessionId}, ${input.operationId}, ${input.passId}, 0, ${input.role === "repair" ? 1 : 0}, ${input.role}, ${input.environmentId}, ${input.projectId}, ${input.launchCommandId}, ${input.threadId}, ${input.messageId}, ${fingerprint}, ${encode(draft)}, ${input.generation}, 'reserved', 0) RETURNING intent_id`;
+          if (inserted.length !== 1) return yield* planningError("conflict");
+          const saved =
+            yield* sql`INSERT INTO workflow_native_intent_receipts (command_id, receipt_id, intent_id, fingerprint, result_json) VALUES (${command.commandId}, ${command.receiptId}, ${input.intentId}, ${fingerprint}, ${encode({ intentId: input.intentId, fingerprint })}) RETURNING receipt_id`;
+          if (saved.length !== 1) return yield* planningError("conflict");
+          return {
+            kind: "reserved" as const,
+            receiptId: command.receiptId,
+            intentId: input.intentId,
+            fingerprint,
+          };
+        }),
+      );
+      if (result.kind === "reserved") yield* notify;
+      return result;
+    },
+  );
   const admitPlanningPass = Effect.fn("WorkflowRunStore.admitPlanningPass")(function* (input: {
     readonly sessionId: S["id"];
     readonly expectedVersion: number;
@@ -435,24 +810,12 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     });
     const result = yield* planningTransaction(
       Effect.gen(function* () {
-        const outstanding = yield* sql<{
-          planning_session_id: string | null;
-          operation_id: string;
-          pass_id: string | null;
-          command_id: string | null;
-        }>`SELECT i.planning_session_id, i.operation_id, i.pass_id, r.command_id FROM workflow_native_launch_intents i LEFT JOIN workflow_native_intent_receipts r ON r.intent_id = i.intent_id WHERE i.state IN ('reserved','dispatching','unknown') AND (i.planning_session_id = ${input.sessionId} OR i.operation_id = ${operation.id} OR i.pass_id = ${pass.id} OR r.command_id = ${input.command.commandId})`;
-        if (
-          outstanding.some(
-            (i) =>
-              i.planning_session_id !== input.sessionId ||
-              (i.command_id === input.command.commandId &&
-                (i.operation_id !== operation.id || i.pass_id !== pass.id)) ||
-              (i.operation_id === operation.id && i.pass_id !== pass.id) ||
-              (i.pass_id === pass.id && i.operation_id !== operation.id),
-          )
-        )
-          return yield* planningError("integrity");
-        if (outstanding.length) return yield* planningError("custody");
+        const outstanding =
+          yield* sql`SELECT 1 FROM workflow_native_launch_intents i LEFT JOIN workflow_native_intent_receipts r ON r.intent_id = i.intent_id WHERE i.state IN ('reserved','dispatching','unknown') AND (i.operation_id = ${operation.id} OR i.pass_id = ${pass.id} OR r.command_id = ${input.command.commandId} OR r.receipt_id = ${input.command.receiptId} OR i.launch_command_id IN (${input.command.commandId}, ${input.command.commandId + ":initial-message"}))`;
+        if (outstanding.length) return yield* planningError("conflict");
+        const foreignThread =
+          yield* sql`SELECT 1 FROM workflow_native_launch_intents WHERE thread_id = ${pass.native!.threadId} AND state <> 'cancelled' AND (planning_session_id IS NULL OR planning_session_id <> ${input.sessionId})`;
+        if (foreignThread.length) return yield* planningError("custody");
         const receipts = yield* sql<{
           planning_session_id: string | null;
           fingerprint: string;
@@ -506,7 +869,7 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
           return yield* planningError("limit");
         if (pass.role === "author" || pass.role === "repair") {
           const writers =
-            yield* sql`SELECT p.id FROM workflow_planning_passes p JOIN workflow_operations o ON o.id = p.operation_id WHERE p.plan_id = ${current.planId} AND o.status IN ('pending','claimed','unknown') AND json_extract(p.record_json, '$.role') IN ('author','repair')`;
+            yield* sql`SELECT p.id FROM workflow_planning_passes p JOIN workflow_operations o ON o.id = p.operation_id WHERE p.plan_id = ${current.planId} AND o.status IN ('pending','claimed','unknown') AND json_extract(p.record_json, '$.role') IN ('author','repair') UNION ALL SELECT i.intent_id FROM workflow_native_launch_intents i JOIN workflow_planning_sessions s ON s.id = i.planning_session_id WHERE s.plan_id = ${current.planId} AND i.state IN ('reserved','dispatching','unknown') AND i.role IN ('author','repair')`;
           if (writers.length) return yield* planningError("custody");
         }
         const b = pass.binding;
@@ -549,6 +912,9 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
             repairRounds: current.consumed.repairRounds + (pass.role === "repair" ? 1 : 0),
           },
         };
+        yield* decodePlanningSessionV1(updated).pipe(
+          Effect.mapError(() => planningError("integrity")),
+        );
         const changed =
           yield* sql`UPDATE workflow_planning_sessions SET record_version = ${updated.recordVersion}, record_json = ${encode(updated)} WHERE id = ${current.id} AND record_version = ${current.recordVersion} RETURNING id`;
         if (changed.length !== 1) return yield* planningError("conflict");
@@ -2268,6 +2634,7 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     recordRoleResult,
     commitTransition,
     reserveWorkflowNativeIntent,
+    reservePlanningNativeIntent,
     subscribeChanges,
     listPending,
     claim,
