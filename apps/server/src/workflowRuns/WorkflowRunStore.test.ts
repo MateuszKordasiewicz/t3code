@@ -24,6 +24,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import migration from "../persistence/Migrations/081_WorkflowRuns.ts";
 import planMigration from "../persistence/Migrations/082_DevelopmentPlans.ts";
+import evidenceMigration from "../persistence/Migrations/083_PlanningEvidence.ts";
 import { DevelopmentPlanHash } from "../developmentPlans/DevelopmentPlanHash.ts";
 import * as Store from "./WorkflowRunStore.ts";
 import { WorkflowCanonicalHash } from "./WorkflowCanonicalHash.ts";
@@ -1516,6 +1517,12 @@ const seedAdmission = Effect.gen(function* () {
   };
 });
 const decodePassFixture = Schema.decodeSync(PlanningPassV1);
+const decodeTerminalId = Schema.decodeSync(
+  PlanningPassV1.fields.native.schema.fields.terminalMessageId.schema,
+);
+const decodeThreadId = Schema.decodeSync(PlanningPassV1.fields.native.schema.fields.threadId);
+const decodeNativeRunId = Schema.decodeSync(PlanningPassV1.fields.native.schema.fields.runId);
+const decodePassId = Schema.decodeSync(PlanningPassV1.fields.id);
 const decodeOperationFixture = Schema.decodeSync(WorkflowOperationV1);
 const admissionInput = (
   binding: Awaited<Effect.Success<typeof seedAdmission>>,
@@ -1877,4 +1884,502 @@ it.effect(
         );
       }),
     ),
+);
+
+it.effect.each([
+  ["thread", "integrity"],
+  ["run", "integrity"],
+  ["pass", "integrity"],
+  ["manifest", "integrity"],
+  ["role", "integrity"],
+  ["failed", "ineligible"],
+  ["version", "conflict"],
+] as const)("planning settlement rejects %s without writes", ([scenario, reason]) =>
+  Effect.gen(function* () {
+    const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+    const sql = yield* SqlClient.SqlClient;
+    yield* evidenceMigration;
+    const store = yield* Store.WorkflowRunStore;
+    yield* begin(store, session);
+    const admission = admissionInput(binding, "settle");
+    yield* store.admitPlanningPass(admission);
+    yield* store.claim({
+      operationId: admission.operation.id,
+      expectedOwnerVersion: 1,
+      expectedGeneration: 0,
+      bootId: "boot",
+      workerId: "worker",
+      now: facts.now,
+      trustedEligibility: true,
+    });
+    const native = admission.pass.native;
+    if (!native) throw new Error("missing native");
+    const observation = {
+      kind: "terminal" as const,
+      operationId: admission.operation.id,
+      passId: admission.pass.id,
+      native: {
+        threadId: native.threadId,
+        runId: native.runId,
+        terminalMessageId: decodeTerminalId("terminal"),
+      },
+      outcome: "succeeded" as const,
+      actualInputManifest: admission.pass.inputManifest,
+      inputManifestHash: WorkflowCanonicalHash.tagged(
+        "t3.planning-input-manifest.v1",
+        admission.pass.inputManifest,
+      ),
+      freshConversation: true,
+      sourcePacketDelivered: true,
+      forbiddenContextDelivered: false,
+      restrictedProfileQualified: false,
+    };
+    const input = {
+      sessionId: session.id,
+      passId: admission.pass.id,
+      operationId: admission.operation.id,
+      expectedVersion: scenario === "version" ? 0 : 1,
+      observation: {
+        ...observation,
+        passId: scenario === "pass" ? decodePassId("other") : observation.passId,
+        native: {
+          ...observation.native,
+          threadId: scenario === "thread" ? decodeThreadId("other") : native.threadId,
+          runId: scenario === "run" ? decodeNativeRunId("other") : native.runId,
+        },
+        inputManifestHash: scenario === "manifest" ? hash : observation.inputManifestHash,
+        outcome: scenario === "failed" ? ("failed" as const) : observation.outcome,
+      },
+      report:
+        scenario === "role"
+          ? { kind: "repair" as const, summary: "repair", dispositions: [] }
+          : { kind: "author" as const, summary: "done", outputs: [] },
+    };
+    const snapshot = Effect.gen(function* () {
+      return {
+        sessions: yield* sql`SELECT * FROM workflow_planning_sessions`,
+        passes: yield* sql`SELECT * FROM workflow_planning_passes`,
+        operations: yield* sql`SELECT * FROM workflow_operations`,
+        observations: yield* sql`SELECT * FROM workflow_planning_observations`,
+        settlements: yield* sql`SELECT * FROM workflow_planning_settlements`,
+        dispositions: yield* sql`SELECT * FROM workflow_planning_dispositions`,
+      };
+    });
+    const before = yield* snapshot;
+    assert.strictEqual((yield* Effect.flip(store.settlePlanningPass(input))).reason, reason);
+    assert.deepStrictEqual(yield* snapshot, before);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("planning settlement replays after reopening the file database", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const directory = yield* Effect.acquireRelease(
+        Effect.sync(() => NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "planning-settle-"))),
+        (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
+      );
+      const filename = NodePath.join(directory, "test.sqlite");
+      const fileLayer = () =>
+        Store.layer.pipe(Layer.provideMerge(NodeSqliteClient.layer({ filename })));
+      const first = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+          yield* evidenceMigration;
+          const store = yield* Store.WorkflowRunStore;
+          yield* begin(store, session);
+          const admission = admissionInput(binding, "persist");
+          yield* store.admitPlanningPass(admission);
+          yield* store.claim({
+            operationId: admission.operation.id,
+            expectedOwnerVersion: 1,
+            expectedGeneration: 0,
+            bootId: "boot",
+            workerId: "worker",
+            now: facts.now,
+            trustedEligibility: true,
+          });
+          const native = admission.pass.native;
+          if (!native) throw new Error("missing native");
+          const input = {
+            sessionId: session.id,
+            passId: admission.pass.id,
+            operationId: admission.operation.id,
+            expectedVersion: 1,
+            observation: {
+              kind: "terminal" as const,
+              operationId: admission.operation.id,
+              passId: admission.pass.id,
+              native: {
+                threadId: native.threadId,
+                runId: native.runId,
+                terminalMessageId: decodeTerminalId("terminal"),
+              },
+              outcome: "succeeded" as const,
+              actualInputManifest: admission.pass.inputManifest,
+              inputManifestHash: WorkflowCanonicalHash.tagged(
+                "t3.planning-input-manifest.v1",
+                admission.pass.inputManifest,
+              ),
+              freshConversation: true,
+              sourcePacketDelivered: true,
+              forbiddenContextDelivered: false,
+              restrictedProfileQualified: false,
+            },
+            report: { kind: "author" as const, summary: "done", outputs: [] },
+          };
+          return { input, result: yield* store.settlePlanningPass(input) };
+        }).pipe(Effect.provide(fileLayer())),
+      );
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const store = yield* Store.WorkflowRunStore;
+          const sql = yield* SqlClient.SqlClient;
+          assert.deepStrictEqual(yield* store.settlePlanningPass(first.input), {
+            ...first.result,
+            kind: "replay",
+          });
+          assert.strictEqual(
+            (yield* Effect.flip(
+              store.settlePlanningPass({
+                ...first.input,
+                report: { ...first.input.report, summary: "changed" },
+              }),
+            )).reason,
+            "integrity",
+          );
+          assert.strictEqual((yield* sql`SELECT * FROM workflow_planning_observations`).length, 1);
+          assert.strictEqual((yield* sql`SELECT * FROM workflow_planning_settlements`).length, 1);
+        }).pipe(Effect.provide(fileLayer())),
+      );
+    }),
+  ),
+);
+
+it.effect.each([
+  "accept",
+  "defer",
+  "foreign review",
+  "missing finding",
+  "affected objects",
+  "conflict",
+] as const)("planning repair disposition: %s", (scenario) =>
+  Effect.gen(function* () {
+    const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+    yield* evidenceMigration;
+    const store = yield* Store.WorkflowRunStore;
+    const sql = yield* SqlClient.SqlClient;
+    const owner = { ...session, allowedRoles: ["review", "repair"] as const };
+    yield* begin(store, owner);
+    const admissionFor = (id: string, role: "review" | "repair", expectedVersion: number) => {
+      const base = admissionInput(binding, id, owner);
+      const pass = { ...base.pass, role };
+      if (base.operation.parameters.kind !== "planning_pass") throw new Error("wrong operation");
+      const operation = { ...base.operation, parameters: { ...base.operation.parameters, role } };
+      return {
+        ...base,
+        expectedVersion,
+        pass,
+        operation: { ...operation, fingerprint: WorkflowCanonicalHash.operation(operation) },
+      };
+    };
+    const review = admissionFor("review", "review", 0);
+    yield* store.admitPlanningPass(review);
+    yield* store.claim({
+      operationId: review.operation.id,
+      expectedOwnerVersion: 1,
+      expectedGeneration: 0,
+      bootId: "boot",
+      workerId: "worker",
+      now: facts.now,
+      trustedEligibility: true,
+    });
+    const observationFor = (admission: typeof review) => {
+      const native = admission.pass.native;
+      if (!native) throw new Error("missing native");
+      return {
+        kind: "terminal" as const,
+        operationId: admission.operation.id,
+        passId: admission.pass.id,
+        native: {
+          threadId: native.threadId,
+          runId: native.runId,
+          terminalMessageId: decodeTerminalId("terminal"),
+        },
+        outcome: "succeeded" as const,
+        actualInputManifest: admission.pass.inputManifest,
+        inputManifestHash: WorkflowCanonicalHash.tagged(
+          "t3.planning-input-manifest.v1",
+          admission.pass.inputManifest,
+        ),
+        freshConversation: true,
+        sourcePacketDelivered: true,
+        forbiddenContextDelivered: false,
+        restrictedProfileQualified: false,
+      };
+    };
+    const reviewPass = decodePassFixture({
+      schemaVersion: review.pass.schemaVersion,
+      id: review.pass.id,
+      planningSessionId: review.pass.planningSessionId,
+      role: review.pass.role,
+      provider: review.pass.provider,
+      binding: review.pass.binding,
+      operationId: review.pass.operationId,
+      inputManifest: review.pass.inputManifest,
+      access: review.pass.access,
+      status: "settled",
+      native: observationFor(review).native,
+      report: {
+        kind: "review",
+        verdict: "changes_requested",
+        assessment: {
+          revisionHash: binding.revisionHash,
+          sourcePacketHash: binding.sourcePacketHash,
+          inventory: [],
+        },
+        findings: [
+          {
+            id: "finding",
+            severity: "blocking",
+            description: "Problem",
+            affectedObjectIds: ["object"],
+            evidence: [],
+            proposedRemedy: "Repair",
+          },
+        ],
+      },
+    });
+    if (!reviewPass.report) throw new Error("missing report");
+    yield* store.settlePlanningPass({
+      sessionId: owner.id,
+      passId: review.pass.id,
+      operationId: review.operation.id,
+      expectedVersion: 1,
+      observation: observationFor(review),
+      report: reviewPass.report,
+    });
+    const repair = admissionFor("repair", "repair", 2);
+    yield* store.admitPlanningPass(repair);
+    yield* store.claim({
+      operationId: repair.operation.id,
+      expectedOwnerVersion: 3,
+      expectedGeneration: 0,
+      bootId: "boot",
+      workerId: "worker",
+      now: facts.now,
+      trustedEligibility: true,
+    });
+    const disposition = {
+      reportId: scenario === "foreign review" ? "missing" : review.pass.id,
+      findingId: scenario === "missing finding" ? "missing" : "finding",
+      decision: scenario === "defer" ? ("defer" as const) : ("accept" as const),
+      rationale: "Reason",
+      affectedObjectIds: scenario === "affected objects" ? ["other"] : ["object"],
+      ...(scenario === "defer" ? { deferTrigger: "After review" } : {}),
+    };
+    const repairPass = decodePassFixture({
+      schemaVersion: repair.pass.schemaVersion,
+      id: repair.pass.id,
+      planningSessionId: repair.pass.planningSessionId,
+      role: repair.pass.role,
+      provider: repair.pass.provider,
+      binding: repair.pass.binding,
+      operationId: repair.pass.operationId,
+      inputManifest: repair.pass.inputManifest,
+      access: repair.pass.access,
+      status: "settled",
+      native: observationFor(repair).native,
+      report: { kind: "repair", summary: "Repaired", dispositions: [disposition] },
+    });
+    if (repairPass.report?.kind !== "repair") throw new Error("missing report");
+    const item = repairPass.report.dispositions[0];
+    if (!item) throw new Error("missing disposition");
+    if (scenario === "conflict")
+      yield* sql`INSERT INTO workflow_planning_dispositions VALUES (${review.pass.id}, ${item.findingId}, ${review.pass.id}, ${json({ ...item, rationale: "Different" })})`;
+    const before = {
+      sessions: yield* sql`SELECT * FROM workflow_planning_sessions`,
+      operations: yield* sql`SELECT * FROM workflow_operations`,
+      passes: yield* sql`SELECT * FROM workflow_planning_passes`,
+      observations: yield* sql`SELECT * FROM workflow_planning_observations`,
+      settlements: yield* sql`SELECT * FROM workflow_planning_settlements`,
+      dispositions: yield* sql`SELECT * FROM workflow_planning_dispositions`,
+    };
+    const action = store.settlePlanningPass({
+      sessionId: owner.id,
+      passId: repair.pass.id,
+      operationId: repair.operation.id,
+      expectedVersion: 3,
+      observation: observationFor(repair),
+      report: repairPass.report,
+    });
+    if (scenario === "accept" || scenario === "defer") {
+      const result = yield* action;
+      assert.strictEqual(result.kind, "applied");
+      const rows = yield* sql<{
+        disposition_json: string;
+      }>`SELECT disposition_json FROM workflow_planning_dispositions`;
+      assert.strictEqual(rows.length, 1);
+      const row = rows[0];
+      if (!row) throw new Error("missing disposition");
+      assert.deepStrictEqual(parse(row.disposition_json), item);
+      const input = {
+        sessionId: owner.id,
+        reviewPassId: review.pass.id,
+        findingId: item.findingId,
+        repairPassId: repair.pass.id,
+        disposition: item,
+        expectedVersion: 4,
+        context,
+        command: { commandId: "disposition", receiptId: "disposition-receipt" },
+      };
+      const receipt = yield* store.recordPlanningDisposition(input);
+      assert.deepStrictEqual(yield* store.recordPlanningDisposition(input), {
+        ...receipt,
+        kind: "replay",
+      });
+    } else {
+      assert.strictEqual(
+        (yield* Effect.flip(action)).reason,
+        scenario === "conflict" ? "conflict" : "integrity",
+      );
+      assert.deepStrictEqual(
+        {
+          sessions: yield* sql`SELECT * FROM workflow_planning_sessions`,
+          operations: yield* sql`SELECT * FROM workflow_operations`,
+          passes: yield* sql`SELECT * FROM workflow_planning_passes`,
+          observations: yield* sql`SELECT * FROM workflow_planning_observations`,
+          settlements: yield* sql`SELECT * FROM workflow_planning_settlements`,
+          dispositions: yield* sql`SELECT * FROM workflow_planning_dispositions`,
+        },
+        before,
+      );
+    }
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  ["active", "active", true],
+  ["pausing", "paused", true],
+  ["stopping", "stopped", false],
+  ["stopped", "stopped", false],
+  ["needs_attention", "needs_attention", false],
+] as const)("planning settlement preserves %s history", ([initial, expected, eligible]) =>
+  Effect.gen(function* () {
+    const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+    yield* evidenceMigration;
+    const store = yield* Store.WorkflowRunStore;
+    const sql = yield* SqlClient.SqlClient;
+    yield* begin(store, session);
+    const admission = admissionInput(binding, "late");
+    yield* store.admitPlanningPass(admission);
+    yield* store.claim({
+      operationId: admission.operation.id,
+      expectedOwnerVersion: 1,
+      expectedGeneration: 0,
+      bootId: "boot",
+      workerId: "worker",
+      now: facts.now,
+      trustedEligibility: true,
+    });
+    const current = yield* store.getPlanning({ sessionId: session.id });
+    yield* sql`UPDATE workflow_planning_sessions SET status = ${initial}, record_json = ${json({ ...current, status: initial })} WHERE id = ${session.id}`;
+    const native = admission.pass.native;
+    if (!native) throw new Error("missing native");
+    const result = yield* store.settlePlanningPass({
+      sessionId: session.id,
+      passId: admission.pass.id,
+      operationId: admission.operation.id,
+      expectedVersion: 1,
+      observation: {
+        kind: "terminal",
+        operationId: admission.operation.id,
+        passId: admission.pass.id,
+        native: {
+          threadId: native.threadId,
+          runId: native.runId,
+          terminalMessageId: decodeTerminalId("terminal"),
+        },
+        outcome: "succeeded",
+        actualInputManifest: admission.pass.inputManifest,
+        inputManifestHash: WorkflowCanonicalHash.tagged(
+          "t3.planning-input-manifest.v1",
+          admission.pass.inputManifest,
+        ),
+        freshConversation: true,
+        sourcePacketDelivered: true,
+        forbiddenContextDelivered: false,
+        restrictedProfileQualified: false,
+      },
+      report: { kind: "author", summary: "done", outputs: [] },
+    });
+    assert.strictEqual(result.value.session.status, expected);
+    assert.deepStrictEqual(result.value.session.consumed, { passes: 1, repairRounds: 0 });
+    const rows = yield* sql<{
+      observation_json: string;
+    }>`SELECT observation_json FROM workflow_planning_observations`;
+    const row = rows[0];
+    if (!row) throw new Error("missing observation");
+    assert.strictEqual(
+      (parse(row.observation_json) as { eligibleForReadiness: boolean }).eligibleForReadiness,
+      eligible,
+    );
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("planning recovery preserves unknown custody and rejects independent settlement", () =>
+  Effect.gen(function* () {
+    const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+    const store = yield* Store.WorkflowRunStore;
+    const sql = yield* SqlClient.SqlClient;
+    yield* begin(store, session);
+    const admission = admissionInput(binding, "recover");
+    yield* store.admitPlanningPass(admission);
+    yield* store.claim({
+      operationId: admission.operation.id,
+      expectedOwnerVersion: 1,
+      expectedGeneration: 0,
+      bootId: "boot",
+      workerId: "worker",
+      now: facts.now,
+      trustedEligibility: true,
+    });
+    const snapshot = yield* store.readRecovery(admission.operation.id);
+    if (!snapshot) throw new Error("missing operation");
+    const input = {
+      operationId: admission.operation.id,
+      expectedOwnerVersion: snapshot.owner.recordVersion,
+      expectedGeneration: 0,
+      expectedFingerprint: snapshot.operation.fingerprint,
+      observed: {
+        operation: snapshot.operation,
+        ownerGeneration: snapshot.owner.controlGeneration,
+        native: snapshot.native,
+        kind: "settled" as const,
+        outcome: { kind: "succeeded" as const, summary: "done", evidence: [] },
+      },
+    };
+    const before = yield* sql`SELECT * FROM workflow_operations`;
+    assert.strictEqual(
+      (yield* Effect.flip(store.compareAndApplyRecovery(input))).reason,
+      "integrity",
+    );
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_operations`, before);
+    assert.strictEqual(
+      (yield* store.compareAndApplyRecovery({
+        ...input,
+        observed: { ...input.observed, kind: "unknown" },
+      })).kind,
+      "updated",
+    );
+    const rows = yield* sql<{
+      record_json: string;
+    }>`SELECT record_json FROM workflow_planning_passes`;
+    const row = rows[0];
+    if (!row) throw new Error("missing pass");
+    assert.strictEqual((parse(row.record_json) as { status: string }).status, "unknown");
+    assert.strictEqual(
+      (yield* store.getPlanning({ sessionId: session.id })).status,
+      "needs_attention",
+    );
+  }).pipe(Effect.provide(layer)),
 );
