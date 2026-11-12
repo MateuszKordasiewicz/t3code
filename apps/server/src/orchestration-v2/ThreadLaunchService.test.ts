@@ -25,6 +25,8 @@ import {
   ScheduledTaskId,
   type ServerProvider,
   ThreadId,
+  WorkflowOperationV1,
+  WorkflowRunV1,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
@@ -32,6 +34,7 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -43,6 +46,8 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import * as WorkflowRunStore from "../workflowRuns/WorkflowRunStore.ts";
+import { WorkflowCanonicalHash } from "../workflowRuns/WorkflowCanonicalHash.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
@@ -132,6 +137,10 @@ interface HarnessOptions {
   readonly serverSettings?: Parameters<typeof ServerSettings.layerTest>[0];
   readonly providers?: ReadonlyArray<ServerProvider>;
   readonly git?: Partial<GitWorkflow.GitWorkflowService["Service"]>;
+  readonly beforeCustodyRead?: (count: number) => Effect.Effect<void, never, SqlClient.SqlClient>;
+  readonly beforePreparationSequenceRead?: (
+    threadId: ThreadId,
+  ) => Effect.Effect<void, never, SqlClient.SqlClient>;
 }
 
 function makeHarness(options: HarnessOptions = {}) {
@@ -232,13 +241,55 @@ function makeHarness(options: HarnessOptions = {}) {
         folderForThread: () => Effect.succeedNone,
       }),
   );
+  const realWorkflowStore = WorkflowRunStore.layer.pipe(Layer.provide(layerDatabase));
+  const layerWorkflowStore = Layer.effect(
+    WorkflowRunStore.WorkflowRunStore,
+    Effect.gen(function* () {
+      const store = yield* WorkflowRunStore.WorkflowRunStore;
+      const sql = yield* SqlClient.SqlClient;
+      let reads = 0;
+      return WorkflowRunStore.WorkflowRunStore.of({
+        ...store,
+        readThreadCustody: (input) =>
+          Effect.gen(function* () {
+            reads++;
+            if (options.beforeCustodyRead) {
+              yield* options
+                .beforeCustodyRead(reads)
+                .pipe(Effect.provideService(SqlClient.SqlClient, sql));
+            }
+            return yield* store.readThreadCustody(input);
+          }),
+      });
+    }),
+  ).pipe(Layer.provide(Layer.mergeAll(realWorkflowStore, layerDatabase)));
+  const layerLaunchThreads = Layer.effect(
+    ThreadManagement.ThreadManagementService,
+    Effect.gen(function* () {
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const sql = yield* SqlClient.SqlClient;
+      return ThreadManagement.ThreadManagementService.of({
+        ...threads,
+        getThreadEventSequence: (threadId) =>
+          Effect.gen(function* () {
+            if (options.beforePreparationSequenceRead) {
+              yield* options
+                .beforePreparationSequenceRead(threadId)
+                .pipe(Effect.provideService(SqlClient.SqlClient, sql));
+            }
+            return yield* threads.getThreadEventSequence(threadId);
+          }),
+      });
+    }),
+  ).pipe(Layer.provide(Layer.mergeAll(layerThreadManagement, layerDatabase)));
   const layerLaunch = ThreadLaunch.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
         layerExternalServices,
-        layerThreadManagement,
+        layerLaunchThreads,
         layerReceipts,
         IdAllocator.layer,
+        layerWorkflowStore,
       ),
     ),
   );
@@ -324,6 +375,365 @@ function launchInput(input: {
     creationSource: "web" as const,
   };
 }
+
+const custodyHash = "a".repeat(64);
+const decodeCustodyRun = Schema.decodeEffect(WorkflowRunV1);
+const decodeCustodyOperation = Schema.decodeEffect(WorkflowOperationV1);
+const seedCustody = (threadId: string, malformed = false) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const run = yield* decodeCustodyRun({
+      schemaVersion: 1,
+      id: "custody-run",
+      spec: {
+        ref: { kind: "configuration", id: "spec", sha256: custodyHash },
+        plan: {
+          planId: "custody-plan",
+          revisionId: "revision",
+          revisionSchemaVersion: 1,
+          revisionHash: custodyHash,
+          sourcePacketHash: custodyHash,
+        },
+      },
+      mode: "ordinary",
+      origin: { kind: "human", id: "human" },
+      status: "active",
+      controlGeneration: 0,
+      recordVersion: 0,
+      allowance: {
+        maxAttempts: 2,
+        maxRepairRounds: 1,
+        maxActiveWriters: 1,
+        attemptsConsumed: 0,
+        repairRoundsConsumed: 0,
+        deadline: "2026-12-01T00:00:00Z",
+      },
+      amendmentSequence: 0,
+      createdAt: "2026-11-01T00:00:00Z",
+      access: { origins: [] },
+    });
+    const base = yield* decodeCustodyOperation({
+      schemaVersion: 1,
+      id: "custody-operation",
+      owner: { kind: "workflow_run", workflowRunId: run.id },
+      kind: "stage_launch",
+      parameters: {
+        kind: "stage_launch",
+        stage: "implementation",
+        context: {
+          specHash: custodyHash,
+          policyHash: custodyHash,
+          itemId: "item",
+          attemptId: "attempt",
+          candidateHash: custodyHash,
+          configurationHash: custodyHash,
+        },
+        provider: { providerInstanceId: "provider", model: "model" },
+        nativeThreadId: threadId,
+        nativeRunId: "native-run",
+      },
+      fingerprint: custodyHash,
+      origin: run.origin,
+      destination: { environmentId: "environment", projectId },
+      controlGeneration: 0,
+      status: "pending",
+      access: { origins: [] },
+    });
+    const operation = { ...base, fingerprint: WorkflowCanonicalHash.operation(base) };
+    yield* sql`INSERT INTO workflow_plan_identities VALUES ('custody-plan')`;
+    yield* sql`INSERT INTO workflow_revision_identities VALUES ('custody-plan', 'revision', ${custodyHash}, ${custodyHash})`;
+    yield* sql`INSERT INTO workflow_runs VALUES ('custody-run', 'custody-plan', 'revision', ${custodyHash}, ${custodyHash}, ${custodyHash}, 'active', 0, 0, ${JSON.stringify(run)})`;
+    const record = malformed
+      ? JSON.stringify({ parameters: { nativeThreadId: threadId } })
+      : JSON.stringify(operation);
+    yield* sql`INSERT INTO workflow_operations (id, workflow_run_id, kind, fingerprint, status, generation, record_json) VALUES ('custody-operation', 'custody-run', 'stage_launch', ${operation.fingerprint}, 'pending', 0, ${record})`;
+  }).pipe(Effect.orDie);
+
+const nativeSnapshot = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  return {
+    receipts: yield* sql`SELECT * FROM orchestration_command_receipts ORDER BY command_id`,
+    events: yield* sql`SELECT * FROM orchestration_events ORDER BY sequence`,
+    threads: yield* sql`SELECT * FROM projection_threads ORDER BY thread_id`,
+    outbox: yield* sql`SELECT * FROM orchestration_v2_effect_outbox ORDER BY rowid`,
+  };
+});
+
+it.effect("denies launch when custody storage cannot be read", () => {
+  const harness = makeHarness();
+  return Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    yield* sql`DROP TABLE workflow_native_launch_intents`;
+    const failure = yield* Effect.flip(
+      launches.launch(
+        launchInput({
+          command: "command:custody-read-failure",
+          thread: "thread:custody-read-failure",
+          message: "hello",
+          workspace: { type: "worktree", baseRef: "main" },
+        }),
+      ),
+    );
+    assert.equal(failure._tag, "ThreadLaunchError");
+    assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_command_receipts`, []);
+    assert.equal(harness.createWorktree.mock.calls.length, 0);
+    assert.equal(harness.runSetup.mock.calls.length, 0);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect.each(["owned", "malformed", "read-error"] as const)(
+  "denies all public preparation entrances for %s custody evidence",
+  (evidence) => {
+    const folderForThread = vi.fn(() => Effect.succeedNone);
+    const harness = makeHarness({
+      managedFolders: Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+        namedProjectsRoot: "/projects",
+        isScratchProject: () => Effect.succeed(false),
+        folderForThread,
+      }),
+    });
+    return Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const threadId = ThreadId.make("thread:custody-entrances");
+      yield* threads.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("custody-create"),
+        threadId,
+        projectId,
+        title: "Existing",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "user",
+        creationSource: "web",
+      });
+      yield* threads.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make("custody-message"),
+        threadId,
+        messageId: MessageId.make("custody-message-id"),
+        text: "prepare",
+        attachments: [],
+        modelSelection,
+        dispatchMode: {
+          type: "defer_start",
+          workspaceStrategy: { type: "worktree", baseRef: "main" },
+        },
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const beforeProjection = yield* threads.getThreadProjection(threadId);
+      const runId = beforeProjection.runs[0]!.id;
+      if (evidence === "read-error") yield* sql`DROP TABLE workflow_native_launch_intents`;
+      else yield* seedCustody(threadId, evidence === "malformed");
+      const before = yield* nativeSnapshot;
+      for (const message of [undefined, "new message"]) {
+        const failure = yield* Effect.flip(
+          launches.launch({
+            ...launchInput({
+              command: `custody-launch-${message ?? "empty"}`,
+              thread: threadId,
+              ...(message === undefined ? {} : { message }),
+              workspace: { type: "worktree", baseRef: "main" },
+            }),
+            reuseExistingThread: true,
+          }),
+        );
+        assert.equal(failure._tag, "ThreadLaunchError");
+        if (failure._tag === "ThreadLaunchError") assert.equal(failure.operation, "update-thread");
+      }
+      for (const command of ["custody-new", "custody-create"]) {
+        const failure = yield* Effect.flip(
+          launches.launch(launchInput({ command, thread: threadId })),
+        );
+        assert.equal(failure._tag, "ThreadLaunchError");
+        if (failure._tag === "ThreadLaunchError") assert.equal(failure.operation, "update-thread");
+      }
+      assert.equal(folderForThread.mock.calls.length, 0);
+      const retry = yield* Effect.flip(
+        launches.retryPreparation({
+          commandId: CommandId.make("custody-retry"),
+          threadId,
+          runId,
+        }),
+      );
+      assert.equal(retry._tag, "OrchestratorDispatchError");
+      if (retry._tag === "OrchestratorDispatchError") {
+        assert.equal(retry.commandId, "custody-retry");
+        assert.equal(retry.commandType, "prepared-run.retry");
+      }
+      yield* launches.prepareRun({ commandId: CommandId.make("custody-prepare"), threadId, runId });
+      assert.deepStrictEqual(yield* nativeSnapshot, before);
+      assert.deepStrictEqual(yield* threads.getThreadProjection(threadId), beforeProjection);
+      assert.equal(harness.createWorktree.mock.calls.length, 0);
+      assert.equal(harness.runSetup.mock.calls.length, 0);
+      assert.isNull(yield* (yield* WorktreeSetupTracker.WorktreeSetupTracker).get(threadId));
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+
+it.effect.each(["owned", "malformed", "read-error"] as const)(
+  "retains committed message evidence when %s custody appears before scheduling",
+  (evidence) => {
+    const threadId = ThreadId.make("thread:custody-schedule-race");
+    const harness = makeHarness({
+      beforeCustodyRead: (count) =>
+        count !== 2
+          ? Effect.void
+          : evidence === "read-error"
+            ? Effect.gen(function* () {
+                const sql = yield* SqlClient.SqlClient;
+                yield* sql`DROP TABLE workflow_native_launch_intents`;
+              }).pipe(Effect.orDie)
+            : seedCustody(threadId, evidence === "malformed"),
+    });
+    return Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const sql = yield* SqlClient.SqlClient;
+      const input = launchInput({
+        command: "custody-race",
+        thread: threadId,
+        message: "committed",
+        workspace: { type: "worktree", baseRef: "main" },
+      });
+      const failure = yield* Effect.flip(launches.launch(input));
+      assert.equal(failure._tag, "ThreadLaunchError");
+      const projection = yield* threads.getThreadProjection(threadId);
+      assert.equal(projection.messages[0]?.text, "committed");
+      assert.equal(projection.runs[0]?.status, "preparing");
+      assert.equal(
+        (yield* sql`SELECT * FROM orchestration_command_receipts WHERE command_id = 'custody-race:initial-message'`)
+          .length,
+        1,
+      );
+      assert.isAbove(
+        (yield* sql`SELECT * FROM orchestration_events WHERE command_id = 'custody-race:initial-message'`)
+          .length,
+        0,
+      );
+      assert.equal(harness.createWorktree.mock.calls.length, 0);
+      assert.equal(harness.runSetup.mock.calls.length, 0);
+      assert.isNull(yield* (yield* WorktreeSetupTracker.WorktreeSetupTracker).get(threadId));
+      if (evidence !== "read-error") {
+        yield* sql`DELETE FROM workflow_operations WHERE id = 'custody-operation'`;
+        const replay = yield* launches.launch(input);
+        assert.isTrue(replay.resumed);
+        const settled = yield* preparationSettled(threadId);
+        assert.equal(settled.runs[0]?.status, "starting");
+        assert.equal(harness.createWorktree.mock.calls.length, 1);
+      }
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+
+it.effect.each(["owned", "malformed", "read-error"] as const)(
+  "background preparation refuses %s custody without failure writes and releases its reservation",
+  (evidence) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<Fiber.Fiber<unknown, unknown>>();
+      const resume = yield* Deferred.make<void>();
+      const threadId = ThreadId.make("thread:custody-background");
+      const harness = makeHarness({
+        beforeCustodyRead: (count) =>
+          count !== 3
+            ? Effect.void
+            : Effect.gen(function* () {
+                yield* Deferred.succeed(entered, yield* Effect.fiber);
+                yield* Deferred.await(resume);
+              }),
+      });
+      yield* Effect.gen(function* () {
+        const launches = yield* ThreadLaunch.ThreadLaunchService;
+        const threads = yield* ThreadManagement.ThreadManagementService;
+        const sql = yield* SqlClient.SqlClient;
+        const input = launchInput({
+          command: "custody-background",
+          thread: threadId,
+          message: "committed",
+          workspace: { type: "worktree", baseRef: "main" },
+        });
+        const launched = yield* launches.launch(input);
+        const background = yield* Deferred.await(entered);
+        const before = yield* nativeSnapshot;
+        if (evidence === "read-error") yield* sql`DROP TABLE workflow_native_launch_intents`;
+        else yield* seedCustody(threadId, evidence === "malformed");
+        yield* Deferred.succeed(resume, undefined);
+        yield* Fiber.await(background);
+        assert.deepStrictEqual(yield* nativeSnapshot, before);
+        const projection = yield* threads.getThreadProjection(threadId);
+        assert.equal(projection.messages[0]?.text, "committed");
+        assert.equal(projection.runs[0]?.status, "preparing");
+        assert.equal(launched.projection.messages[0]?.id, projection.messages[0]?.id);
+        assert.equal(harness.createWorktree.mock.calls.length, 0);
+        assert.equal(harness.runSetup.mock.calls.length, 0);
+        assert.isNull(yield* (yield* WorktreeSetupTracker.WorktreeSetupTracker).get(threadId));
+        if (evidence !== "read-error") {
+          yield* sql`DELETE FROM workflow_operations WHERE id = 'custody-operation'`;
+          const replay = yield* launches.launch(input);
+          assert.isTrue(replay.resumed);
+          const settled = yield* preparationSettled(threadId);
+          assert.equal(settled.runs[0]?.status, "starting");
+          assert.equal(harness.createWorktree.mock.calls.length, 1);
+        }
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+
+it.effect.each(["owned", "ordinary"] as const)(
+  "background preflight failure preserves %s thread handling",
+  (ownership) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<Fiber.Fiber<unknown, unknown>>();
+      const resume = yield* Deferred.make<void>();
+      const threadId = ThreadId.make("thread:custody-preflight-failure");
+      const harness = makeHarness({
+        beforePreparationSequenceRead: () =>
+          Effect.gen(function* () {
+            yield* Deferred.succeed(entered, yield* Effect.fiber);
+            yield* Deferred.await(resume);
+            return yield* Effect.die("native preflight lookup failed");
+          }),
+      });
+      yield* Effect.gen(function* () {
+        const launches = yield* ThreadLaunch.ThreadLaunchService;
+        const threads = yield* ThreadManagement.ThreadManagementService;
+        const sql = yield* SqlClient.SqlClient;
+        yield* launches.launch(
+          launchInput({
+            command: "custody-preflight-failure",
+            thread: threadId,
+            message: "committed",
+            workspace: { type: "worktree", baseRef: "main" },
+          }),
+        );
+        const background = yield* Deferred.await(entered);
+        if (ownership === "owned") yield* seedCustody(threadId);
+        const before = yield* nativeSnapshot;
+        yield* Deferred.succeed(resume, undefined);
+        yield* Fiber.await(background);
+        const projection = yield* threads.getThreadProjection(threadId);
+        if (ownership === "owned") {
+          assert.deepStrictEqual(yield* nativeSnapshot, before);
+          assert.equal(projection.runs[0]?.status, "preparing");
+        } else {
+          assert.equal(projection.runs[0]?.status, "failed");
+          assert.equal(
+            (yield* sql`SELECT * FROM orchestration_command_receipts WHERE command_id = 'custody-preflight-failure:fail'`)
+              .length,
+            1,
+          );
+        }
+        assert.equal(harness.createWorktree.mock.calls.length, 0);
+        assert.equal(harness.runSetup.mock.calls.length, 0);
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
 
 it.effect.each(
   (["new", "existing"] as const).flatMap((target) =>

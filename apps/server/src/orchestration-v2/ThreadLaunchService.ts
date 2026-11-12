@@ -29,6 +29,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -48,7 +49,8 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
-import type * as Orchestrator from "./Orchestrator.ts";
+import * as Orchestrator from "./Orchestrator.ts";
+import * as WorkflowRunStore from "../workflowRuns/WorkflowRunStore.ts";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import { randomUuidV4 } from "@t3tools/provider-core/server/randomUuid";
 import { DispatchModeLimit } from "./DispatchModeLimit.ts";
@@ -212,6 +214,7 @@ const make = Effect.gen(function* () {
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const textGeneration = yield* TextGeneration.TextGeneration;
   const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+  const workflowRuns = yield* WorkflowRunStore.WorkflowRunStore;
   const ids = yield* IdAllocator.IdAllocatorV2;
   const threads = yield* ThreadManagement.ThreadManagementService;
   const managedFolders = yield* ManagedProjectFolders.ManagedProjectFolders;
@@ -229,6 +232,14 @@ const make = Effect.gen(function* () {
         ...(threadId === undefined ? {} : { threadId }),
         cause,
       });
+
+  const requireOrdinaryThread = Effect.fn("ThreadLaunchService.requireOrdinaryThread")(function* (
+    threadId: ThreadId,
+  ) {
+    const custody = yield* workflowRuns.readThreadCustody({ threadId });
+    if (custody.kind === "owned")
+      return yield* Effect.fail("Thread has workflow or planning custody.");
+  });
 
   const readReceipt = (input: ThreadLaunchInput, commandId: CommandId) =>
     receipts
@@ -792,42 +803,69 @@ const make = Effect.gen(function* () {
     threadId: ThreadId,
     runId: RunId | null,
   ) {
-    const preparation = Effect.gen(function* () {
-      const prepare = prepareInBackground(input, threadId, runId);
-      if (
-        runId === null ||
-        (input.workspaceStrategy.type !== "worktree" && input.reusedWorktree === undefined)
-      ) {
-        return yield* prepare;
-      }
-      const afterSequence = yield* threads.getThreadEventSequence(threadId);
-      const projection = yield* threads.getThreadRecords(threadId, ["runs"]);
-      if (projection.runs.find((run) => run.id === runId)?.status !== "preparing") return;
-      const interruption = threads
-        .streamStoredEventsFrom({ threadId, afterSequence, eventType: "run.updated" })
-        .pipe(
-          Stream.filter(
-            (stored) =>
-              stored.event.type === "run.updated" &&
-              stored.event.payload.id === runId &&
-              (stored.event.payload.status === "interrupted" ||
-                stored.event.payload.status === "cancelled"),
-          ),
-          Stream.runHead,
-          Effect.flatMap((event) => (Option.isSome(event) ? Effect.interrupt : Effect.never)),
-        );
-      yield* Effect.raceFirst(prepare, interruption);
-    });
-    yield* preparation.pipe(
-      Effect.onError((cause) =>
-        failPreparedRun(
-          input,
-          threadId,
-          runId,
-          Cause.hasInterruptsOnly(cause) ? "Worktree setup cancelled." : Cause.squash(cause),
+    const guardedPreparation = Effect.gen(function* () {
+      const preflight = yield* Effect.gen(function* () {
+        if (
+          runId === null ||
+          (input.workspaceStrategy.type !== "worktree" && input.reusedWorktree === undefined)
+        )
+          return { kind: "ready" as const, interruption: null };
+        const afterSequence = yield* threads.getThreadEventSequence(threadId);
+        const projection = yield* threads.getThreadRecords(threadId, ["runs"]);
+        if (projection.runs.find((run) => run.id === runId)?.status !== "preparing") {
+          return { kind: "skip" as const };
+        }
+        const interruption = threads
+          .streamStoredEventsFrom({ threadId, afterSequence, eventType: "run.updated" })
+          .pipe(
+            Stream.filter(
+              (stored) =>
+                stored.event.type === "run.updated" &&
+                stored.event.payload.id === runId &&
+                (stored.event.payload.status === "interrupted" ||
+                  stored.event.payload.status === "cancelled"),
+            ),
+            Stream.runHead,
+            Effect.flatMap((event) => (Option.isSome(event) ? Effect.interrupt : Effect.never)),
+          );
+        return { kind: "ready" as const, interruption };
+      }).pipe(
+        Effect.onError((cause) =>
+          Effect.gen(function* () {
+            const custody = yield* Effect.result(requireOrdinaryThread(threadId));
+            if (Result.isFailure(custody)) return;
+            yield* failPreparedRun(
+              input,
+              threadId,
+              runId,
+              Cause.hasInterruptsOnly(cause) ? "Worktree setup cancelled." : Cause.squash(cause),
+            );
+          }),
         ),
-      ),
-      Effect.ignoreCause,
+        Effect.exit,
+      );
+      if (Exit.isFailure(preflight)) return;
+      if (preflight.value.kind === "skip") return;
+      const custody = yield* Effect.result(requireOrdinaryThread(threadId));
+      if (Result.isFailure(custody)) return;
+      const prepare = prepareInBackground(input, threadId, runId);
+      yield* (
+        preflight.value.interruption === null
+          ? prepare
+          : Effect.raceFirst(prepare, preflight.value.interruption)
+      ).pipe(
+        Effect.onError((cause) =>
+          failPreparedRun(
+            input,
+            threadId,
+            runId,
+            Cause.hasInterruptsOnly(cause) ? "Worktree setup cancelled." : Cause.squash(cause),
+          ),
+        ),
+        Effect.ignoreCause,
+      );
+    });
+    yield* guardedPreparation.pipe(
       Effect.ensuring(releasePreparation(input.commandId)),
       Effect.forkIn(preparationScope),
     );
@@ -883,6 +921,10 @@ const make = Effect.gen(function* () {
           (yield* ids.allocate
             .thread({ projectId: input.projectId })
             .pipe(Effect.mapError(mapError(input, "create-thread"))));
+
+        yield* requireOrdinaryThread(candidateThreadId).pipe(
+          Effect.mapError(mapError(input, "update-thread", candidateThreadId)),
+        );
 
         if (reusableLaunchReceipt !== undefined) {
           const shell = yield* threads
@@ -1061,6 +1103,9 @@ const make = Effect.gen(function* () {
                       Effect.mapError(mapError(input, "update-thread", threadId)),
                     );
               if (preparationStillRequired) {
+                yield* requireOrdinaryThread(threadId).pipe(
+                  Effect.mapError(mapError(input, "update-thread", threadId)),
+                );
                 yield* schedulePreparation(
                   { ...input, workspaceStrategy: preparationStrategy },
                   threadId,
@@ -1091,6 +1136,8 @@ const make = Effect.gen(function* () {
   const prepareRun: ThreadLaunchService["Service"]["prepareRun"] = Effect.fn(
     "ThreadLaunchService.prepareRun",
   )(function* (input) {
+    const custody = yield* Effect.result(requireOrdinaryThread(input.threadId));
+    if (Result.isFailure(custody)) return;
     const scheduled = yield* Effect.gen(function* () {
       const { thread, runs } = yield* threads.getThreadRecords(input.threadId, ["runs"], {
         runIds: [input.runId],
@@ -1111,6 +1158,16 @@ const make = Effect.gen(function* () {
   const retryPreparation: ThreadLaunchService["Service"]["retryPreparation"] = Effect.fn(
     "ThreadLaunchService.retryPreparation",
   )(function* (input) {
+    yield* requireOrdinaryThread(input.threadId).pipe(
+      Effect.mapError(
+        (cause) =>
+          new Orchestrator.OrchestratorDispatchError({
+            commandId: input.commandId,
+            commandType: "prepared-run.retry",
+            cause,
+          }),
+      ),
+    );
     const dispatched = yield* threads.dispatch({
       type: "prepared-run.retry",
       commandId: input.commandId,
