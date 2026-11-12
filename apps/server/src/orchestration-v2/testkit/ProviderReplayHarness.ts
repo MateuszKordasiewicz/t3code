@@ -22,6 +22,7 @@ import * as ServerConfig from "../../config.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as ManagedPolicy from "../../policy/ManagedPolicy.ts";
+import * as WorkflowRunStore from "../../workflowRuns/WorkflowRunStore.ts";
 import * as ThreadManagementService from "../ThreadManagementService.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as McpSessionRegistryTestkit from "../../mcp/McpSessionRegistry.testkit.ts";
@@ -567,6 +568,7 @@ export function layerWithRegistry<Error>(
               layerEventSinkProvided,
               IdAllocator.layer,
               layerServerSettings,
+              WorkflowRunStore.layer.pipe(Layer.provide(layerDatabase)),
             ),
           ),
         )

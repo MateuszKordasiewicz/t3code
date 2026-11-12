@@ -347,6 +347,7 @@ const layerProviderRuntimeRecoveryProvided = ProviderRuntimeRecoveryService.laye
       layerEventSink,
       IdAllocator.layer,
       ProjectionStore.layer,
+      WorkflowRunStore.layer,
     ),
   ),
 );

@@ -28,6 +28,7 @@ import * as Statement from "effect/sql/Statement";
 import delegatedRecoveryIndexes from "../persistence/Migrations/079_DelegatedRecoveryIndexes.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as WorkflowRunStore from "../workflowRuns/WorkflowRunStore.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -49,6 +50,7 @@ const layerRecoveryTest = ProviderRuntimeRecovery.layer.pipe(
           ProjectionStore.layer,
           EffectOutbox.layer,
           IdAllocator.layer,
+          WorkflowRunStore.layer,
         ).pipe(Layer.provideMerge(SqlitePersistence.layerMemory)),
       ),
     ),
