@@ -820,6 +820,7 @@ export const WorkTaskEvent = Schema.Union([
 export type WorkTaskEvent = typeof WorkTaskEvent.Type;
 
 const persistedTime = IsoDateTime.check(
+  Schema.isMaxLength(2_000),
   Schema.makeFilter(
     (value) => {
       const match =

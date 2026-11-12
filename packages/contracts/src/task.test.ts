@@ -136,6 +136,20 @@ describe("staged task events", () => {
       context: { ...context, occurredAt: preciseTime },
     };
     expect(decodePersisted(precise)).toBeDefined();
+    for (const length of [2_000, 2_001]) {
+      const timestamp = `2026-11-11T00:00:00.${"0".repeat(length - 21)}Z`;
+      const bounded = {
+        event: {
+          ...published.event,
+          occurredAt: timestamp,
+          review: { ...published.event.review, createdAt: timestamp },
+        },
+        context: { ...context, occurredAt: timestamp },
+      };
+      if (length === 2_000) expect(decodePersisted(bounded)).toBeDefined();
+      else expect(() => decodePersisted(bounded)).toThrow();
+    }
+
     expect(() =>
       decodePersisted({
         ...precise,
