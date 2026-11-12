@@ -47,7 +47,9 @@ it.effect("upgrades an 080 database without changing ordinary rows or history", 
     const tasks = yield* sql`SELECT * FROM scheduled_tasks`;
     const history =
       yield* sql`SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id`;
-    assert.deepStrictEqual(yield* runMigrations(), [[81, "WorkflowRuns"]]);
+    assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 81 }), [
+      [81, "WorkflowRuns"],
+    ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM projection_projects`, projects);
     assert.deepStrictEqual(yield* sql`SELECT * FROM projection_threads`, threads);
     assert.deepStrictEqual(yield* sql`SELECT * FROM scheduled_tasks`, tasks);
