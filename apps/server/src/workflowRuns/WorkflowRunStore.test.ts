@@ -2483,3 +2483,42 @@ it.effect("planning recovery preserves unknown custody and rejects independent s
     );
   }).pipe(Effect.provide(layer)),
 );
+
+it.effect("admission replays after pause and resume advance the control generation", () =>
+  Effect.gen(function* () {
+    const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+    const store = yield* Store.WorkflowRunStore;
+    yield* begin(store, session);
+    const admitted = yield* store.admitPlanningPass(admissionInput(binding, "one"));
+    assert.strictEqual(admitted.kind, "applied");
+    const control = {
+      sessionId: session.id,
+      now: facts.now,
+      context,
+    };
+    yield* store.controlPlanning({
+      ...control,
+      action: "pause",
+      expectedVersion: 1,
+      command: { commandId: "pause-after-admit", receiptId: "pause-after-admit" },
+    });
+    yield* store.controlPlanning({
+      ...control,
+      action: "resume",
+      expectedVersion: 2,
+      command: { commandId: "resume-after-admit", receiptId: "resume-after-admit" },
+    });
+    const current = yield* store.getPlanning({ sessionId: session.id });
+    assert.notStrictEqual(current.controlGeneration, session.controlGeneration);
+    const replay = yield* store.admitPlanningPass(admissionInput(binding, "one", current));
+    assert.deepStrictEqual(replay, { ...admitted, kind: "replay" });
+    assert.deepStrictEqual(
+      yield* store.getPlanningPass({ passId: admitted.value.pass.id }),
+      admitted.value.pass,
+    );
+    assert.strictEqual(
+      (yield* Effect.flip(store.getPlanningPass({ passId: "missing" }))).reason,
+      "not-found",
+    );
+  }).pipe(Effect.provide(layer)),
+);

@@ -398,11 +398,13 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
       operation.destination.projectId !== input.context.destination.projectId
     )
       return yield* planningError("integrity");
+    // The operation fingerprint is canonical and excludes the control generation, which a
+    // pause/resume advances; fingerprinting the whole operation would break replay after one.
     const hash = yield* fingerprint(input.context, "admitPlanningPass", {
       sessionId: input.sessionId,
       expectedVersion: input.expectedVersion,
       pass,
-      operation,
+      operationFingerprint: operation.fingerprint,
     });
     const result = yield* planningTransaction(
       Effect.gen(function* () {
@@ -869,6 +871,19 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
       return result;
     },
   );
+  const getPlanningPass = Effect.fn("WorkflowRunStore.getPlanningPass")(function* (input: {
+    readonly passId: P["id"];
+  }) {
+    if (typeof input.passId !== "string" || !input.passId) return yield* planningError("invalid");
+    const exists =
+      yield* sql`SELECT id FROM workflow_planning_passes WHERE id = ${input.passId}`.pipe(
+        Effect.mapError(() => planningError("storage")),
+      );
+    if (!exists.length) return yield* planningError("not-found");
+    return yield* readPass(input.passId).pipe(
+      Effect.mapError((error) => (isPlanningError(error) ? error : planningError("storage"))),
+    );
+  });
   const getPlanning = Effect.fn("WorkflowRunStore.getPlanning")(function* (input: {
     readonly sessionId: S["id"];
   }) {
@@ -1777,6 +1792,7 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     settlePlanningPass,
     recordPlanningDisposition,
     getPlanning,
+    getPlanningPass,
     controlPlanning,
     recordRoleResult,
     commitTransition,
