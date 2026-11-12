@@ -4,6 +4,8 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import {
   decodeDevelopmentPlanDocumentV1,
+  decodeDevelopmentPlanRevisionV1,
+  RevisionEnvelope,
   decodePlanningSessionV1,
   decodePlanningPassV1,
   PlanningPassV1,
@@ -663,5 +665,283 @@ describe("planning pass", () => {
           expect(yield* encodePlanningPass(result.success)).toEqual(input);
       }
     }),
+  );
+});
+
+const revisionExample = () => {
+  const doc = example();
+  const access = { origins: [{ environmentId: "environment-1", projectId: "project-1" }] };
+  const common = {
+    id: "item-1",
+    explanation: "Explanation",
+    sourceStatementIds: ["statement-1"],
+    access,
+  };
+  return {
+    planId: "plan-1",
+    revisionId: "revision-1",
+    revisionHash: "a".repeat(64),
+    sourcePacketHash: "b".repeat(64),
+    createdAt: "2026-11-11T00:00:00Z",
+    sourcePacket: {
+      schemaVersion: 1,
+      sources: doc.sources,
+      statements: doc.sourceStatements,
+      selectionLimitations: [] as string[],
+      access,
+    },
+    revision: {
+      schemaVersion: 1,
+      planId: "plan-1",
+      sourcePacketHash: "b".repeat(64),
+      brief: doc.brief,
+      requirements: doc.requirements,
+      decisions: [
+        {
+          ...common,
+          text: "Decision",
+          state: "decided",
+          alternatives: [{ id: "alt-1", text: "Alternative" }],
+          selectedAlternativeId: "alt-1",
+          reason: "Reason",
+        },
+      ],
+      questions: [
+        {
+          ...common,
+          text: "Question",
+          state: "resolved",
+          executionBlocking: true,
+          resolution: "Resolved",
+        },
+      ],
+      assumptions: [{ ...common, text: "Assumption", state: "confirmed" }],
+      approach: [{ ...common, text: "Approach", state: "active" }],
+      workItems: [
+        {
+          ...common,
+          title: "Work",
+          state: "active",
+          requirementIds: ["requirement-1"],
+          criterionIds: ["criterion-1"],
+          dependencyIds: [] as string[],
+          fileChanges: [{ kind: "rename", fromPath: "a", toPath: "b", intendedChange: "Move" }],
+          verification: [
+            { id: "verification-1", description: "Check", criterionIds: ["criterion-1"] },
+          ],
+        },
+      ],
+      access,
+      briefDetails: { outcome: "Outcome", reason: "Reason", boundaries: ["Boundary"] },
+      coverageReceipts: [
+        {
+          id: "receipt-1",
+          revisionHash: "c".repeat(64),
+          sourcePacketHash: "b".repeat(64),
+          structuralBlockers: [] as string[],
+          createdAt: "2026-11-10T00:00:00Z",
+        },
+      ],
+      unmappedMaterial: [{ sourceId: "source-1", description: "Material" }],
+      legacyDocument: { bytesBase64: "WA==", byteLength: 1, sha256: doc.sources[0]!.sha256 },
+    },
+  };
+};
+const changeRevision = (f: (e: ReturnType<typeof revisionExample>) => void) => {
+  const e = revisionExample();
+  f(e);
+  return e;
+};
+const revisionCases: { name: string; input: unknown; reason?: string }[] = [
+  { name: "full snapshot roundtrip", input: revisionExample() },
+  {
+    name: "minimal draft",
+    input: changeRevision((e) => {
+      const r = e.revision;
+      r.decisions = [];
+      r.questions = [];
+      r.assumptions = [];
+      r.approach = [];
+      r.workItems = [];
+      r.coverageReceipts = [];
+      r.unmappedMaterial = [];
+      Reflect.deleteProperty(r, "briefDetails");
+      Reflect.deleteProperty(r, "legacyDocument");
+    }),
+  },
+  { name: "historical receipt", input: revisionExample() },
+  ...(["revision", "sourcePacket"] as const).map((key) => ({
+    name: `unsupported ${key}`,
+    input: changeRevision((e) => {
+      e[key].schemaVersion = 2;
+    }),
+    reason: "unsupported version",
+  })),
+  ...["root", "revision", "nested"].map((location) => ({
+    name: `unknown ${location}`,
+    input: changeRevision((e) => {
+      Object.assign(
+        location === "root" ? e : location === "revision" ? e.revision : e.revision.decisions[0]!,
+        { extra: true },
+      );
+    }),
+    reason: "unknown field",
+  })),
+  {
+    name: "missing field",
+    input: changeRevision((e) => {
+      Reflect.deleteProperty(e.revision, "brief");
+    }),
+    reason: "malformed field",
+  },
+  {
+    name: "wrong type",
+    input: changeRevision((e) => {
+      Object.assign(e.revision, { brief: 42 });
+    }),
+    reason: "malformed field",
+  },
+  {
+    name: "duplicate family",
+    input: changeRevision((e) => {
+      e.revision.decisions.push(e.revision.decisions[0]!);
+    }),
+    reason: "ambiguous identity",
+  },
+  {
+    name: "duplicate criterion globally",
+    input: changeRevision((e) => {
+      e.revision.requirements.push({ ...e.revision.requirements[0]!, id: "other" });
+    }),
+    reason: "ambiguous identity",
+  },
+  {
+    name: "duplicate reference",
+    input: changeRevision((e) => {
+      e.revision.workItems[0]!.criterionIds.push("criterion-1");
+    }),
+    reason: "ambiguous identity",
+  },
+  ...[
+    "sourceStatementIds",
+    "requirementIds",
+    "criterionIds",
+    "dependencyIds",
+    "verification",
+    "source",
+  ].map((key) => ({
+    name: `dangling ${key}`,
+    input: changeRevision((e) => {
+      const w = e.revision.workItems[0]!;
+      if (key === "source") e.sourcePacket.statements[0]!.sourceId = "missing";
+      else if (key === "verification") w.verification[0]!.criterionIds = ["missing"];
+      else if (key === "sourceStatementIds") w.sourceStatementIds = ["missing"];
+      else if (key === "requirementIds") w.requirementIds = ["missing"];
+      else if (key === "criterionIds") w.criterionIds = ["missing"];
+      else w.dependencyIds = ["missing"];
+    }),
+    reason: "dangling reference",
+  })),
+  {
+    name: "invalid span",
+    input: changeRevision((e) => {
+      e.sourcePacket.statements[0]!.endByte = 2;
+    }),
+    reason: "invalid byte span",
+  },
+  ...["length", "hash", "legacy"].map((key) => ({
+    name: `source identity ${key}`,
+    input: changeRevision((e) => {
+      if (key === "length") e.sourcePacket.sources[0]!.byteLength = 2;
+      else if (key === "hash") e.sourcePacket.sources[0]!.sha256 = "0".repeat(64);
+      else e.revision.legacyDocument.sha256 = "0".repeat(64);
+    }),
+    reason: "source identity mismatch",
+  })),
+  {
+    name: "different text",
+    input: changeRevision((e) => {
+      e.sourcePacket.statements[0]!.text = "Y";
+    }),
+    reason: "text differs from original selected bytes",
+  },
+  {
+    name: "rename with path",
+    input: changeRevision((e) => {
+      Object.assign(e.revision.workItems[0]!.fileChanges[0]!, { path: "x" });
+    }),
+    reason: "mixed discriminant shape",
+  },
+  {
+    name: "create with fromPath",
+    input: changeRevision((e) => {
+      Object.assign(e.revision.workItems[0]!.fileChanges[0]!, { kind: "create", path: "x" });
+    }),
+    reason: "mixed discriminant shape",
+  },
+  ...[
+    "missing selection",
+    "missing reason",
+    "open decision",
+    "unknown alternative",
+    "missing resolution",
+    "open question",
+  ].map((key) => ({
+    name: key,
+    input: changeRevision((e) => {
+      const d = e.revision.decisions[0]!,
+        q = e.revision.questions[0]!;
+      if (key === "missing selection") Reflect.deleteProperty(d, "selectedAlternativeId");
+      else if (key === "missing reason") Reflect.deleteProperty(d, "reason");
+      else if (key === "open decision") d.state = "open";
+      else if (key === "unknown alternative") d.selectedAlternativeId = "missing";
+      else if (key === "missing resolution") Reflect.deleteProperty(q, "resolution");
+      else q.state = "open";
+    }),
+    reason: "invalid state",
+  })),
+  {
+    name: "dependency self cycle",
+    input: changeRevision((e) => {
+      e.revision.workItems[0]!.dependencyIds = ["item-1"];
+    }),
+    reason: "dependency cycle",
+  },
+  {
+    name: "dependency cycle",
+    input: changeRevision((e) => {
+      const w = e.revision.workItems[0]!;
+      w.dependencyIds = ["other"];
+      e.revision.workItems.push({ ...w, id: "other", dependencyIds: ["item-1"], verification: [] });
+    }),
+    reason: "dependency cycle",
+  },
+  ...(["planId", "sourcePacketHash"] as const).map((key) => ({
+    name: `binding ${key}`,
+    input: changeRevision((e) => {
+      e[key] = key === "planId" ? "other" : "c".repeat(64);
+    }),
+    reason: "binding mismatch",
+  })),
+  {
+    name: "self receipt",
+    input: changeRevision((e) => {
+      e.revision.coverageReceipts[0]!.revisionHash = e.revisionHash;
+    }),
+    reason: "self-referential receipt",
+  },
+];
+const encodeRevisionEnvelope = Schema.encodeEffect(RevisionEnvelope);
+describe("development plan revision", () => {
+  it.effect.each(revisionCases)("$name", ({ input, reason }) =>
+    Effect.gen(function* () {
+      const result = yield* Effect.result(decodeDevelopmentPlanRevisionV1(input));
+      if (reason) expect(result).toMatchObject({ _tag: "Failure", failure: { reason } });
+      else {
+        expect(result).toMatchObject({ _tag: "Success", success: input });
+        if (result._tag === "Success")
+          expect(yield* encodeRevisionEnvelope(result.success)).toEqual(input);
+      }
+    }).pipe(Effect.provide(Digest.layerWebCrypto)),
   );
 });
