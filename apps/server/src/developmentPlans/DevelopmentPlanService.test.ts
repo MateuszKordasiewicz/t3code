@@ -6,11 +6,18 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   decodePlanningPassV1,
   upgradeDevelopmentPlanDocumentV1,
-  type PlanningPassV1,
+  PlanningPassV1,
+  PlanningSessionV1,
+  WorkflowOperationV1,
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Digest from "effect/crypto/Digest";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
+import * as WorkflowStore from "../workflowRuns/WorkflowRunStore.ts";
+import * as Observation from "./PlanningPassObservation.ts";
+import { WorkflowCanonicalHash } from "../workflowRuns/WorkflowCanonicalHash.ts";
+import evidenceMigration from "../persistence/Migrations/083_PlanningEvidence.ts";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
 import migration from "../persistence/Migrations/081_WorkflowRuns.ts";
@@ -91,17 +98,25 @@ const layer = (
   ports = Layer.merge(Service.emptyPassReaderLayer, Service.denyAttestationLayer),
 ) => {
   const auth = Layer.succeed(Service.DevelopmentPlanAuthorization, {
-    check: ({ origins }) =>
+    check: ({ origins, destination }) =>
       Ref.get(grants).pipe(
         Effect.flatMap((set) =>
-          origins.every((origin) => set.has(key(origin)))
+          set.has(key(destination)) && origins.every((origin) => set.has(key(origin)))
             ? Effect.void
             : Effect.fail(new Service.DevelopmentPlanServiceError({ reason: "unauthorized" })),
         ),
       ),
   });
   return Service.layer.pipe(
-    Layer.provideMerge(Layer.mergeAll(Store.layer, auth, ports)),
+    Layer.provideMerge(
+      Layer.mergeAll(
+        Store.layer,
+        WorkflowStore.layer,
+        Observation.unknownObservationLayer,
+        auth,
+        ports,
+      ),
+    ),
     Layer.provideMerge(Layer.merge(NodeSqliteClient.layer({ filename }), Digest.layerWebCrypto)),
   );
 };
@@ -109,6 +124,8 @@ const deniedLayer = Service.layer.pipe(
   Layer.provideMerge(
     Layer.mergeAll(
       Store.layer,
+      WorkflowStore.layer,
+      Observation.unknownObservationLayer,
       Service.denyAllLayer,
       Service.emptyPassReaderLayer,
       Service.denyAttestationLayer,
@@ -123,6 +140,7 @@ const setup = Effect.gen(function* () {
   yield* sql`PRAGMA foreign_keys = ON`;
   yield* migration;
   yield* planMigration;
+  yield* evidenceMigration;
 });
 const withDatabase = <A, E, R>(f: (filename: string) => Effect.Effect<A, E, R>) =>
   Effect.scoped(
@@ -143,6 +161,106 @@ const object = {
 };
 const link = { planId: "plan", expectedVersion: 1, threadId: "thread", commandId: "link" };
 
+const decodeSession = Schema.decodeSync(PlanningSessionV1);
+const decodePass = Schema.decodeSync(PlanningPassV1);
+const decodeOperation = Schema.decodeSync(WorkflowOperationV1);
+const planningSession = decodeSession({
+  schemaVersion: 1,
+  id: "session",
+  environmentId: "env",
+  projectId: "project",
+  planId: "plan",
+  origin: context.actor,
+  request: "Plan",
+  mode: "ordinary",
+  allowedRoles: ["author", "review", "repair"],
+  allowedProviders: [{ providerInstanceId: "provider", model: "model" }],
+  limits: { maxPasses: 4, maxRepairRounds: 2, deadline: "2026-12-01T00:00:00Z" },
+  consumed: { passes: 0, repairRounds: 0 },
+  controlGeneration: 0,
+  recordVersion: 0,
+  status: "active",
+  createdAt: timestamp,
+  access: { origins: [] },
+});
+const planningContext = {
+  actor: planningSession.origin,
+  destination: {
+    environmentId: planningSession.environmentId,
+    projectId: planningSession.projectId,
+  },
+};
+const planningCommand = (id: string) => ({ commandId: id, receiptId: `receipt-${id}` });
+const makePass = (
+  value: Effect.Success<typeof fixture>,
+  id: string,
+  role: "author" | "review" | "repair" = "author",
+) => {
+  const binding = {
+    planId: planningSession.planId,
+    revisionId: value.revision.planId === planningSession.planId ? "revision" : "other",
+    revisionSchemaVersion: 1 as const,
+    revisionHash: DevelopmentPlanHash.revision(value.revision),
+    sourcePacketHash: DevelopmentPlanHash.sourcePacket(value.packet),
+  };
+  const pass = decodePass({
+    schemaVersion: 1,
+    id: `pass-${id}`,
+    planningSessionId: planningSession.id,
+    role,
+    provider: { providerInstanceId: "provider", model: "model" },
+    binding,
+    operationId: `operation-${id}`,
+    inputManifest: {
+      sources: [{ kind: "source", id: "source", sha256: binding.sourcePacketHash }],
+      references: [],
+      additionalContext: [],
+      access: { origins: [] },
+    },
+    status: "pending",
+    native: { threadId: `native-${id}`, runId: `run-${id}` },
+    access: { origins: [] },
+  });
+  const operation = decodeOperation({
+    schemaVersion: 1,
+    id: pass.operationId,
+    owner: { kind: "planning_session", planningSessionId: planningSession.id },
+    kind: "planning_pass",
+    parameters: {
+      kind: "planning_pass",
+      passId: pass.id,
+      binding: pass.binding,
+      role,
+      provider: pass.provider,
+      limits: planningSession.limits,
+      inputManifestHash: WorkflowCanonicalHash.tagged(
+        "t3.planning-input-manifest.v1",
+        pass.inputManifest,
+      ),
+    },
+    fingerprint: "0".repeat(64),
+    origin: planningSession.origin,
+    destination: planningContext.destination,
+    controlGeneration: 0,
+    status: "pending",
+    access: pass.access,
+  });
+  return { pass, operation };
+};
+const decodeThread = Schema.decodeSync(PlanningPassV1.fields.native.schema.fields.threadId);
+const decodeFinding = Schema.decodeSync(
+  PlanningPassV1.fields.report.schema.members[1].fields.dispositions.value.fields.findingId,
+);
+const decodeObject = Schema.decodeSync(
+  PlanningPassV1.fields.report.schema.members[1].fields.dispositions.value.fields.affectedObjectIds
+    .value,
+);
+const reviewOrigin = decodeThread("review-origin");
+const findingId = decodeFinding("finding");
+const objectId = decodeObject("object");
+const terminalId = Schema.decodeSync(
+  PlanningPassV1.fields.native.schema.fields.terminalMessageId.schema,
+)("terminal");
 describe("DevelopmentPlanService", () => {
   it.effect("authorizes all operations and preserves receipts and conflicts", () =>
     Effect.gen(function* () {
@@ -649,6 +767,322 @@ describe("DevelopmentPlanService", () => {
         yield* service.create(value, context);
         yield* Ref.set(grants, new Set(["env|project|"]));
         expect((yield* Effect.flip(service.export({ planId: "plan" }, context))).reason).toBe(
+          "unauthorized",
+        );
+      }).pipe(Effect.provide(layer(":memory:", grants)));
+    }),
+  );
+  it.effect("authorizes planning controls and replays across pause and resume", () =>
+    withDatabase((filename) =>
+      Effect.gen(function* () {
+        const grants = yield* Ref.make(allGrants());
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* setup;
+            const service = yield* Service.DevelopmentPlanService;
+            const value = yield* fixture;
+            yield* service.create(value, context);
+            const begin = { session: planningSession, command: planningCommand("begin") };
+            const started = yield* service.beginPlanning(begin, planningContext);
+            expect((yield* service.beginPlanning(begin, planningContext)).kind).toBe("replay");
+            expect(
+              yield* service.getPlanning({ sessionId: planningSession.id }, planningContext),
+            ).toEqual(started.value);
+            const pass = makePass(value, "one");
+            const admission = {
+              sessionId: planningSession.id,
+              expectedVersion: 0,
+              ...pass,
+              command: planningCommand("pass"),
+            };
+            yield* service.beginPass(admission, planningContext);
+            const pause = {
+              sessionId: planningSession.id,
+              expectedVersion: 1,
+              command: planningCommand("pause"),
+            };
+            const paused = yield* service.pausePlanning(pause, planningContext);
+            expect((yield* service.pausePlanning(pause, planningContext)).kind).toBe("replay");
+            const resume = {
+              sessionId: planningSession.id,
+              expectedVersion: paused.value.recordVersion,
+              command: planningCommand("resume"),
+            };
+            const resumed = yield* service.resumePlanning(resume, planningContext);
+            expect((yield* service.resumePlanning(resume, planningContext)).kind).toBe("replay");
+            expect((yield* service.beginPass(admission, planningContext)).kind).toBe("replay");
+            const stop = {
+              sessionId: planningSession.id,
+              expectedVersion: resumed.value.recordVersion,
+              command: planningCommand("stop"),
+            };
+            yield* service.stopPlanning(stop, planningContext);
+            expect((yield* service.stopPlanning(stop, planningContext)).kind).toBe("replay");
+            yield* Ref.set(grants, new Set(["env|project|"]));
+            expect((yield* Effect.flip(service.beginPass(admission, planningContext))).reason).toBe(
+              "unauthorized",
+            );
+          }).pipe(Effect.provide(layer(filename, grants))),
+        );
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            expect(yield* sql`SELECT id FROM workflow_planning_sessions`).toHaveLength(1);
+            expect(yield* sql`SELECT id FROM workflow_planning_passes`).toHaveLength(1);
+          }).pipe(Effect.provide(NodeSqliteClient.layer({ filename }))),
+        );
+      }),
+    ),
+  );
+  it.effect("denies all public planning methods before lookup and writes", () =>
+    Effect.gen(function* () {
+      const grants = yield* Ref.make(allGrants());
+      yield* Effect.gen(function* () {
+        yield* setup;
+        const service = yield* Service.DevelopmentPlanService;
+        const value = yield* fixture;
+        yield* service.create(value, context);
+        yield* Ref.set(grants, new Set());
+        const pass = makePass(value, "denied");
+        const command = planningCommand("denied");
+        const input = { sessionId: planningSession.id, expectedVersion: 0, command };
+        const disposition = {
+          reportId: pass.pass.id,
+          findingId,
+          decision: "accept" as const,
+          rationale: "reason",
+          affectedObjectIds: [],
+        };
+        const actions: ReadonlyArray<Effect.Effect<unknown, { readonly reason: string }>> = [
+          service.beginPlanning({ session: planningSession, command }, planningContext),
+          service.getPlanning({ sessionId: planningSession.id }, planningContext),
+          service.pausePlanning(input, planningContext),
+          service.resumePlanning(input, planningContext),
+          service.stopPlanning(input, planningContext),
+          service.beginPass({ ...input, ...pass }, planningContext),
+          service.recordDisposition(
+            {
+              ...input,
+              reviewPassId: pass.pass.id,
+              repairPassId: pass.pass.id,
+              findingId: "finding",
+              disposition,
+            },
+            planningContext,
+          ),
+        ];
+        for (const action of actions)
+          expect((yield* Effect.flip(Effect.asVoid(action))).reason).toBe("unauthorized");
+        const sql = yield* SqlClient.SqlClient;
+        expect(yield* sql`SELECT * FROM workflow_planning_sessions`).toHaveLength(0);
+        expect(yield* sql`SELECT * FROM workflow_command_receipts`).toHaveLength(0);
+      }).pipe(Effect.provide(layer(":memory:", grants)));
+    }),
+  );
+  it.effect("settles only an observed terminal pass", () =>
+    Effect.gen(function* () {
+      const grants = yield* Ref.make(allGrants());
+      yield* Effect.gen(function* () {
+        yield* setup;
+        const service = yield* Service.DevelopmentPlanService;
+        const workflow = yield* WorkflowStore.WorkflowRunStore;
+        const value = yield* fixture;
+        yield* service.create(value, context);
+        yield* service.beginPlanning(
+          { session: planningSession, command: planningCommand("begin") },
+          planningContext,
+        );
+        const admission = makePass(value, "one");
+        yield* service.beginPass(
+          {
+            sessionId: planningSession.id,
+            expectedVersion: 0,
+            ...admission,
+            command: planningCommand("pass"),
+          },
+          planningContext,
+        );
+        yield* workflow.claim({
+          operationId: admission.pass.operationId,
+          expectedOwnerVersion: 1,
+          expectedGeneration: 0,
+          bootId: "boot",
+          workerId: "worker",
+          now: timestamp,
+          trustedEligibility: true,
+        });
+        const native = admission.pass.native;
+        if (!native) throw new Error("missing native");
+        const input = {
+          sessionId: planningSession.id,
+          passId: admission.pass.id,
+          operationId: admission.pass.operationId,
+          expectedVersion: 1,
+          native,
+          report: { kind: "author" as const, summary: "Done", outputs: [] },
+        };
+        expect((yield* Effect.flip(service.settlePass(input))).reason).toBe("observation-unknown");
+        const sql = yield* SqlClient.SqlClient;
+        expect(yield* sql`SELECT * FROM workflow_planning_observations`).toHaveLength(0);
+        const terminal = Layer.succeed(Observation.PlanningPassObservation, {
+          observe: () =>
+            Effect.succeed({
+              kind: "terminal" as const,
+              operationId: input.operationId,
+              passId: input.passId,
+              native: { ...native, terminalMessageId: terminalId },
+              outcome: "succeeded" as const,
+              actualInputManifest: admission.pass.inputManifest,
+              inputManifestHash: WorkflowCanonicalHash.tagged(
+                "t3.planning-input-manifest.v1",
+                admission.pass.inputManifest,
+              ),
+              freshConversation: true,
+              sourcePacketDelivered: true,
+              forbiddenContextDelivered: false,
+              restrictedProfileQualified: false,
+            }),
+        });
+        const settled = yield* Effect.gen(function* () {
+          const current = yield* Service.DevelopmentPlanService;
+          return yield* current.settlePass(input);
+        }).pipe(Effect.provide(Layer.fresh(Service.layer).pipe(Layer.provide(terminal))));
+        expect(settled.value.pass.status).toBe("settled");
+        expect(yield* sql`SELECT * FROM workflow_planning_observations`).toHaveLength(1);
+      }).pipe(Effect.provide(layer(":memory:", grants)));
+    }),
+  );
+  it.effect("authorizes both pass origins before recording a disposition and replay", () =>
+    Effect.gen(function* () {
+      const grants = yield* Ref.make(new Set([...allGrants(), "env|project|review-origin"]));
+      yield* Effect.gen(function* () {
+        yield* setup;
+        const service = yield* Service.DevelopmentPlanService;
+        const workflow = yield* WorkflowStore.WorkflowRunStore;
+        const value = yield* fixture;
+        yield* service.create(value, context);
+        yield* service.beginPlanning(
+          { session: planningSession, command: planningCommand("begin") },
+          planningContext,
+        );
+        const reviewBase = makePass(value, "review", "review");
+        const review = {
+          ...reviewBase,
+          pass: {
+            ...reviewBase.pass,
+            access: {
+              origins: [
+                {
+                  environmentId: planningSession.environmentId,
+                  projectId: planningSession.projectId,
+                  threadId: reviewOrigin,
+                },
+              ],
+            },
+          },
+        };
+        const admitAndSettle = Effect.fn("test.admitAndSettle")(function* (
+          entry: ReturnType<typeof makePass>,
+          version: number,
+          report: NonNullable<PlanningPassV1["report"]>,
+        ) {
+          yield* service.beginPass(
+            {
+              sessionId: planningSession.id,
+              expectedVersion: version,
+              ...entry,
+              command: planningCommand(entry.pass.id),
+            },
+            planningContext,
+          );
+          yield* workflow.claim({
+            operationId: entry.pass.operationId,
+            expectedOwnerVersion: version + 1,
+            expectedGeneration: 0,
+            bootId: "boot",
+            workerId: "worker",
+            now: timestamp,
+            trustedEligibility: true,
+          });
+          if (!entry.pass.native) throw new Error("missing native");
+          return yield* workflow.settlePlanningPass({
+            sessionId: planningSession.id,
+            passId: entry.pass.id,
+            operationId: entry.pass.operationId,
+            expectedVersion: version + 1,
+            report,
+            observation: {
+              kind: "terminal",
+              operationId: entry.pass.operationId,
+              passId: entry.pass.id,
+              native: { ...entry.pass.native, terminalMessageId: terminalId },
+              outcome: "succeeded",
+              actualInputManifest: entry.pass.inputManifest,
+              inputManifestHash: WorkflowCanonicalHash.tagged(
+                "t3.planning-input-manifest.v1",
+                entry.pass.inputManifest,
+              ),
+              freshConversation: true,
+              sourcePacketDelivered: true,
+              forbiddenContextDelivered: false,
+              restrictedProfileQualified: false,
+            },
+          });
+        });
+        yield* admitAndSettle(review, 0, {
+          kind: "review",
+          verdict: "changes_requested",
+          assessment: {
+            revisionHash: review.pass.binding.revisionHash,
+            sourcePacketHash: review.pass.binding.sourcePacketHash,
+            inventory: [],
+          },
+          findings: [
+            {
+              id: findingId,
+              severity: "blocking",
+              description: "Problem",
+              affectedObjectIds: [objectId],
+              evidence: [],
+              proposedRemedy: "Repair",
+            },
+          ],
+        });
+        const repair = makePass(value, "repair", "repair");
+        const disposition = {
+          reportId: review.pass.id,
+          findingId,
+          decision: "accept" as const,
+          rationale: "Fixed",
+          affectedObjectIds: [objectId],
+        };
+        yield* admitAndSettle(repair, 2, {
+          kind: "repair",
+          summary: "Fixed",
+          dispositions: [disposition],
+        });
+        const input = {
+          sessionId: planningSession.id,
+          reviewPassId: review.pass.id,
+          repairPassId: repair.pass.id,
+          findingId: "finding",
+          disposition,
+          expectedVersion: 4,
+          command: planningCommand("disposition"),
+        };
+        yield* Ref.set(grants, allGrants());
+        expect((yield* Effect.flip(service.recordDisposition(input, planningContext))).reason).toBe(
+          "unauthorized",
+        );
+        const sql = yield* SqlClient.SqlClient;
+        expect(
+          yield* sql`SELECT * FROM workflow_command_receipts WHERE command_id = 'disposition'`,
+        ).toHaveLength(0);
+        yield* Ref.set(grants, new Set([...allGrants(), "env|project|review-origin"]));
+        expect((yield* service.recordDisposition(input, planningContext)).kind).toBe("applied");
+        expect((yield* service.recordDisposition(input, planningContext)).kind).toBe("replay");
+        yield* Ref.set(grants, allGrants());
+        expect((yield* Effect.flip(service.recordDisposition(input, planningContext))).reason).toBe(
           "unauthorized",
         );
       }).pipe(Effect.provide(layer(":memory:", grants)));

@@ -5,6 +5,11 @@ import {
   OrchestrationV2PlanArtifact,
   DevelopmentPlanRevisionV1,
   type PlanningPassV1,
+  type PlanningSessionV1,
+  type WorkflowOperationV1,
+  decodePlanningSessionV1,
+  decodePlanningPassV1,
+  decodeWorkflowOperationV1,
   RevisionEnvelope,
 } from "@t3tools/contracts";
 import * as Digest from "effect/crypto/Digest";
@@ -15,6 +20,9 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Store from "./DevelopmentPlanStore.ts";
+import * as WorkflowStore from "../workflowRuns/WorkflowRunStore.ts";
+import { WorkflowCanonicalHash } from "../workflowRuns/WorkflowCanonicalHash.ts";
+import * as Observation from "./PlanningPassObservation.ts";
 import { DevelopmentPlanCoverage } from "./DevelopmentPlanCoverage.ts";
 import { DevelopmentPlanHash } from "./DevelopmentPlanHash.ts";
 
@@ -145,6 +153,8 @@ const make = Effect.gen(function* () {
   const authorization = yield* DevelopmentPlanAuthorization;
   const passReader = yield* DevelopmentPlanPassReader;
   const attestation = yield* DevelopmentPlanReviewAttestation;
+  const workflows = yield* WorkflowStore.WorkflowRunStore;
+  const observer = yield* Observation.PlanningPassObservation;
   const check = (context: RequestContext, operation: Operation, origins: readonly Origin[]) =>
     authorization.check({ ...context, operation, origins });
   const precheck = (context: RequestContext, operation: Operation) =>
@@ -423,6 +433,208 @@ const make = Effect.gen(function* () {
     );
     return yield* store.unlinkThread(input, context).pipe(Effect.mapError(mapStore));
   });
+  type PlanningContext = {
+    readonly actor: PlanningSessionV1["origin"];
+    readonly destination: {
+      readonly environmentId: PlanningSessionV1["environmentId"];
+      readonly projectId: PlanningSessionV1["projectId"];
+    };
+  };
+  type Command = { readonly commandId: string; readonly receiptId: string };
+  type ControlInput = {
+    readonly sessionId: PlanningSessionV1["id"];
+    readonly expectedVersion: number;
+    readonly command: Command;
+  };
+  const invalidPlanning = () => new WorkflowStore.PlanningControlError({ reason: "invalid" });
+  const authorizePlanning = Effect.fn("DevelopmentPlanService.authorizePlanning")(function* (
+    session: PlanningSessionV1,
+    context: PlanningContext,
+    operation: "read" | "update",
+    passes: readonly PlanningPassV1[] = [],
+  ) {
+    if (
+      session.environmentId !== context.destination.environmentId ||
+      session.projectId !== context.destination.projectId ||
+      session.origin.kind !== context.actor.kind ||
+      session.origin.id !== context.actor.id
+    )
+      return yield* new DevelopmentPlanServiceError({ reason: "unauthorized" });
+    const plan = yield* store.get({ planId: session.planId }).pipe(Effect.mapError(mapStore));
+    const origins = [
+      ...originsOf(plan.revision, plan.sourcePacket, context.destination),
+      ...session.access.origins,
+    ];
+    for (const pass of passes) {
+      const bound = yield* store
+        .get({ planId: pass.binding.planId, revisionId: pass.binding.revisionId })
+        .pipe(Effect.mapError(mapStore));
+      origins.push(
+        ...originsOf(bound.revision, bound.sourcePacket, context.destination),
+        ...pass.access.origins,
+        ...pass.inputManifest.access.origins,
+      );
+    }
+    yield* check(
+      context,
+      operation,
+      origins.filter(
+        (origin, i) =>
+          origins.findIndex(
+            (other) =>
+              other.environmentId === origin.environmentId &&
+              other.projectId === origin.projectId &&
+              other.threadId === origin.threadId,
+          ) === i,
+      ),
+    );
+  });
+  const beginPlanning = Effect.fn("DevelopmentPlanService.beginPlanning")(function* (
+    input: { readonly session: PlanningSessionV1; readonly command: Command },
+    context: PlanningContext,
+  ) {
+    yield* check(context, "update", []);
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const session = yield* decodePlanningSessionV1({
+      schemaVersion: input.session.schemaVersion,
+      id: input.session.id,
+      environmentId: input.session.environmentId,
+      projectId: input.session.projectId,
+      planId: input.session.planId,
+      ...(input.session.predecessorSessionId === undefined
+        ? {}
+        : { predecessorSessionId: input.session.predecessorSessionId }),
+      origin: input.session.origin,
+      request: input.session.request,
+      mode: input.session.mode,
+      allowedRoles: input.session.allowedRoles,
+      allowedProviders: input.session.allowedProviders,
+      limits: input.session.limits,
+      consumed: input.session.consumed,
+      controlGeneration: input.session.controlGeneration,
+      recordVersion: input.session.recordVersion,
+      status: input.session.status,
+      createdAt: now,
+      access: input.session.access,
+    }).pipe(Effect.mapError(invalidPlanning));
+    yield* authorizePlanning(session, context, "update");
+    return yield* workflows.beginPlanning({ session, command: input.command, context, now });
+  });
+  const getPlanning = Effect.fn("DevelopmentPlanService.getPlanning")(function* (
+    input: { readonly sessionId: PlanningSessionV1["id"] },
+    context: PlanningContext,
+  ) {
+    yield* check(context, "read", []);
+    const session = yield* workflows.getPlanning(input);
+    yield* authorizePlanning(session, context, "read");
+    return session;
+  });
+  const control = Effect.fn("DevelopmentPlanService.controlPlanning")(function* (
+    input: ControlInput,
+    context: PlanningContext,
+    action: "pause" | "resume" | "stop",
+  ) {
+    yield* check(context, "update", []);
+    const session = yield* workflows.getPlanning({ sessionId: input.sessionId });
+    yield* authorizePlanning(session, context, "update");
+    const now = DateTime.formatIso(yield* DateTime.now);
+    return yield* workflows.controlPlanning({ ...input, context, action, now });
+  });
+  const pausePlanning = Effect.fn("DevelopmentPlanService.pausePlanning")(
+    (input: ControlInput, context: PlanningContext) => control(input, context, "pause"),
+  );
+  const resumePlanning = Effect.fn("DevelopmentPlanService.resumePlanning")(
+    (input: ControlInput, context: PlanningContext) => control(input, context, "resume"),
+  );
+  const stopPlanning = Effect.fn("DevelopmentPlanService.stopPlanning")(
+    (input: ControlInput, context: PlanningContext) => control(input, context, "stop"),
+  );
+  const beginPass = Effect.fn("DevelopmentPlanService.beginPass")(function* (
+    input: ControlInput & {
+      readonly pass: PlanningPassV1;
+      readonly operation: WorkflowOperationV1;
+    },
+    context: PlanningContext,
+  ) {
+    yield* check(context, "update", []);
+    const session = yield* workflows.getPlanning({ sessionId: input.sessionId });
+    const pass = yield* decodePlanningPassV1(input.pass).pipe(Effect.mapError(invalidPlanning));
+    yield* authorizePlanning(session, context, "update", [pass]);
+    yield* decodeWorkflowOperationV1(input.operation).pipe(Effect.mapError(invalidPlanning));
+    const operation = yield* decodeWorkflowOperationV1({
+      schemaVersion: 1,
+      id: pass.operationId,
+      owner: { kind: "planning_session", planningSessionId: session.id },
+      kind: "planning_pass",
+      parameters: {
+        kind: "planning_pass",
+        passId: pass.id,
+        binding: pass.binding,
+        role: pass.role,
+        provider: pass.provider,
+        limits: session.limits,
+        inputManifestHash: WorkflowCanonicalHash.tagged(
+          "t3.planning-input-manifest.v1",
+          pass.inputManifest,
+        ),
+      },
+      fingerprint: "0".repeat(64),
+      origin: session.origin,
+      destination: context.destination,
+      controlGeneration: session.controlGeneration,
+      status: "pending",
+      access: pass.access,
+    }).pipe(Effect.mapError(invalidPlanning));
+    const now = DateTime.formatIso(yield* DateTime.now);
+    return yield* workflows.admitPlanningPass({
+      sessionId: input.sessionId,
+      expectedVersion: input.expectedVersion,
+      pass,
+      operation: { ...operation, fingerprint: WorkflowCanonicalHash.operation(operation) },
+      context,
+      command: input.command,
+      now,
+    });
+  });
+  const settlePass = Effect.fn("DevelopmentPlanService.settlePass")(function* (input: {
+    readonly sessionId: PlanningSessionV1["id"];
+    readonly passId: PlanningPassV1["id"];
+    readonly operationId: PlanningPassV1["operationId"];
+    readonly expectedVersion: number;
+    readonly native: NonNullable<PlanningPassV1["native"]>;
+    readonly report: NonNullable<PlanningPassV1["report"]>;
+  }) {
+    const observation = yield* observer.observe({
+      sessionId: input.sessionId,
+      passId: input.passId,
+      operationId: input.operationId,
+      native: input.native,
+    });
+    if (observation.kind === "unknown")
+      return yield* new WorkflowStore.PlanningControlError({ reason: "observation-unknown" });
+    return yield* workflows.settlePlanningPass({
+      sessionId: input.sessionId,
+      passId: input.passId,
+      operationId: input.operationId,
+      expectedVersion: input.expectedVersion,
+      report: input.report,
+      observation,
+    });
+  });
+  const recordDisposition = Effect.fn("DevelopmentPlanService.recordDisposition")(function* (
+    input: Omit<
+      Parameters<WorkflowStore.WorkflowRunStore["Service"]["recordPlanningDisposition"]>[0],
+      "context"
+    >,
+    context: PlanningContext,
+  ) {
+    yield* check(context, "update", []);
+    const session = yield* workflows.getPlanning({ sessionId: input.sessionId });
+    const review = yield* workflows.getPlanningPass({ passId: input.reviewPassId });
+    const repair = yield* workflows.getPlanningPass({ passId: input.repairPassId });
+    yield* authorizePlanning(session, context, "update", [review, repair]);
+    return yield* workflows.recordPlanningDisposition({ ...input, context });
+  });
   return {
     create,
     import: importPlan,
@@ -434,6 +646,14 @@ const make = Effect.gen(function* () {
     linkThread,
     unlinkThread,
     validateCoverage,
+    beginPlanning,
+    getPlanning,
+    pausePlanning,
+    resumePlanning,
+    stopPlanning,
+    beginPass,
+    settlePass,
+    recordDisposition,
   };
 });
 export class DevelopmentPlanService extends Context.Service<
