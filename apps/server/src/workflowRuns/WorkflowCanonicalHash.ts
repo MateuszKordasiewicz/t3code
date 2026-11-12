@@ -74,7 +74,15 @@ function hash(tag: string, payload: unknown): string {
     .digest("hex");
 }
 
+function command(workflowRunId: string, value: object): string {
+  preflight(value);
+  const payload = { ...value } as Record<string, unknown>;
+  delete payload.fingerprint;
+  return hash("t3.workflow-command.v1", { workflowRunId, command: payload });
+}
+
 export const WorkflowCanonicalHash = {
+  command,
   operation,
   verifyOperation: (value: WorkflowOperationV1): boolean =>
     operation(value) === field(value, "fingerprint"),

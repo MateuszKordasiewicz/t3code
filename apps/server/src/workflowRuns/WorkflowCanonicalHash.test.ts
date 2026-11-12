@@ -260,6 +260,28 @@ describe("WorkflowCanonicalHash", () => {
     ).toBe(digest);
   });
 
+  it.each([
+    ["run-1", "bc580e2e9abb8af0a158980c59267a4e27820fd83a90049e7aacc5218f0ba8c2"],
+    ["run-2", "3d0c6ff336b886c99537d2c30d0cd7b24d60431cc93eac5907fbf7bec4d3b6c0"],
+  ])("matches command vector for %s", (workflowRunId, digest) => {
+    const command = {
+      kind: "pause",
+      commandId: "cmd-1",
+      expectedVersion: 1,
+      expectedGeneration: 1,
+      expectedSpecHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    };
+    if (workflowRunId === "run-1") {
+      expect(stableStringify({ workflowRunId, command })).toBe(
+        '{"command":{"commandId":"cmd-1","expectedGeneration":1,"expectedSpecHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expectedVersion":1,"kind":"pause"},"workflowRunId":"run-1"}',
+      );
+    }
+    expect(WorkflowCanonicalHash.command(workflowRunId, command)).toBe(digest);
+    expect(
+      WorkflowCanonicalHash.command(workflowRunId, { ...command, fingerprint: "ignored" }),
+    ).toBe(digest);
+  });
+
   it("verifies fingerprints while excluding mutable operation fields", () => {
     const operation = {
       ...payload1,
