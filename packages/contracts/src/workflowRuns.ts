@@ -8,6 +8,7 @@ import {
   isWorkflowTimestamp,
   isWorkflowUint,
   PlanningPassV1,
+  PlanningSessionV1,
   RequirementId,
   Sha256Hex,
   WorkflowAccess,
@@ -292,4 +293,88 @@ export const decodeWorkflowRunSpecV1 = Effect.fn("WorkflowRunSpecV1.decode")(fun
   )
     return yield* fail("invalid mapping");
   return spec;
+});
+
+const WorkflowRunId = NonEmpty.pipe(Schema.brand("WorkflowRunId"));
+const ReferenceId = PlanningPassV1.fields.inputManifest.fields.sources.value.fields.id;
+export const WorkflowRunV1 = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  id: WorkflowRunId,
+  spec: Schema.Struct({
+    ref: Schema.Struct({
+      kind: Schema.Literal("configuration"),
+      id: ReferenceId,
+      sha256: Sha256Hex,
+    }),
+    plan: PlanningPassV1.fields.binding,
+  }),
+  mode: Schema.Literals(["ordinary", "qualification"]),
+  origin: PlanningSessionV1.fields.origin,
+  status: Schema.Literals([
+    "active",
+    "pausing",
+    "paused",
+    "stopping",
+    "stopped",
+    "completed",
+    "needs_attention",
+  ]),
+  controlGeneration: Schema.Number,
+  recordVersion: Schema.Number,
+  allowance: Schema.Struct({
+    maxAttempts: Schema.Number,
+    maxRepairRounds: Schema.Number,
+    maxActiveWriters: Schema.Literal(1),
+    attemptsConsumed: Schema.Number,
+    repairRoundsConsumed: Schema.Number,
+    deadline: NonEmpty,
+  }),
+  amendmentSequence: Schema.Number,
+  priorSpecHash: Schema.optionalKey(Sha256Hex),
+  createdAt: NonEmpty,
+  access: WorkflowAccess,
+});
+export type WorkflowRunV1 = typeof WorkflowRunV1.Type;
+
+export class WorkflowRunError extends Schema.TaggedError<WorkflowRunError>()("WorkflowRunError", {
+  reason: Schema.Literals(["invalid consumption", "invalid lineage", "invalid record"]),
+}) {}
+const runFail = (reason: WorkflowRunError["reason"]) => new WorkflowRunError({ reason });
+const decodeRunShape = Schema.decodeUnknownEffect(WorkflowRunV1);
+const timestampKey = (timestamp: string) => {
+  const [seconds, fraction = ""] = timestamp.slice(0, -1).split(".");
+  return `${seconds}.${fraction.replace(/0+$/, "")}`;
+};
+
+export const decodeWorkflowRunV1 = Effect.fn("WorkflowRunV1.decode")(function* (input: unknown) {
+  const run = yield* decodeRunShape(input, { onExcessProperty: "error" }).pipe(
+    Effect.mapError(() => runFail("invalid record")),
+  );
+  const allowance = run.allowance;
+  if (
+    !isWorkflowUint(run.controlGeneration) ||
+    !isWorkflowUint(run.recordVersion) ||
+    !isWorkflowUint(run.amendmentSequence) ||
+    !isWorkflowUint(allowance.maxAttempts) ||
+    allowance.maxAttempts === 0 ||
+    !isWorkflowUint(allowance.maxRepairRounds) ||
+    !isWorkflowUint(allowance.attemptsConsumed) ||
+    !isWorkflowUint(allowance.repairRoundsConsumed) ||
+    !isWorkflowTimestamp(run.createdAt) ||
+    !isWorkflowTimestamp(allowance.deadline) ||
+    timestampKey(allowance.deadline) < timestampKey(run.createdAt) ||
+    hasWorkflowDuplicates(
+      run.access.origins.map((o) => JSON.stringify([o.environmentId, o.projectId, o.threadId])),
+    )
+  )
+    return yield* runFail("invalid record");
+  if (
+    allowance.attemptsConsumed > allowance.maxAttempts ||
+    allowance.repairRoundsConsumed > allowance.maxRepairRounds ||
+    allowance.repairRoundsConsumed > allowance.attemptsConsumed
+  )
+    return yield* runFail("invalid consumption");
+  if (run.amendmentSequence > 0 !== (run.priorSpecHash !== undefined))
+    return yield* runFail("invalid lineage");
+  return run;
 });
