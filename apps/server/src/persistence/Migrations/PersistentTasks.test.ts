@@ -1,12 +1,15 @@
 import { assert, it } from "@effect/vitest";
+import { WorkTaskPersistedEvent } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { runMigrations } from "../Migrations.ts";
 
 const db = NodeSqliteClient.layer({ filename: ":memory:" });
+const decodePersistedEvent = Schema.decodeUnknownSync(WorkTaskPersistedEvent);
 
 it.effect("creates the task foundation on a fresh database and reruns without changes", () =>
   Effect.gen(function* () {
@@ -21,6 +24,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
     assert.deepInclude(migrations, [87, "WorkTaskResults"]);
     assert.deepInclude(migrations, [88, "WorkTaskClaims"]);
     assert.deepInclude(migrations, [89, "WorkTaskValidationIdentity"]);
+    assert.deepInclude(migrations, [90, "WorkTaskValidationReplay"]);
     const tables = yield* sql<{ readonly name: string }>`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'work_task_%' ORDER BY name
     `;
@@ -40,6 +44,8 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
         "work_task_thread_links",
         "work_task_validation_attempts",
         "work_task_validation_identity",
+        "work_task_validation_instant",
+        "work_task_validation_replay",
         "work_task_view_fence",
         "work_task_waits",
         "work_task_wake_reservations",
@@ -77,6 +83,7 @@ it.effect("upgrades predecessor rows and events without changing their bytes or 
       [87, "WorkTaskResults"],
       [88, "WorkTaskClaims"],
       [89, "WorkTaskValidationIdentity"],
+      [90, "WorkTaskValidationReplay"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM projection_projects ORDER BY project_id`,
@@ -116,6 +123,7 @@ it.effect("rolls back a failed migration and succeeds on rerun", () =>
       [87, "WorkTaskResults"],
       [88, "WorkTaskClaims"],
       [89, "WorkTaskValidationIdentity"],
+      [90, "WorkTaskValidationReplay"],
     ]);
     assert.deepStrictEqual(yield* runMigrations(), []);
   }).pipe(Effect.provide(db)),
@@ -236,6 +244,7 @@ it.effect(
         [87, "WorkTaskResults"],
         [88, "WorkTaskClaims"],
         [89, "WorkTaskValidationIdentity"],
+        [90, "WorkTaskValidationReplay"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -398,6 +407,7 @@ it.effect("preserves task custody through validation upgrade and rolls back migr
       [87, "WorkTaskResults"],
       [88, "WorkTaskClaims"],
       [89, "WorkTaskValidationIdentity"],
+      [90, "WorkTaskValidationReplay"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -533,6 +543,7 @@ it.effect("upgrades validation data atomically to action reviews and preserves p
       [87, "WorkTaskResults"],
       [88, "WorkTaskClaims"],
       [89, "WorkTaskValidationIdentity"],
+      [90, "WorkTaskValidationReplay"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -744,6 +755,7 @@ it.effect("upgrades existing tasks without inventing state and rolls back migrat
       [87, "WorkTaskResults"],
       [88, "WorkTaskClaims"],
       [89, "WorkTaskValidationIdentity"],
+      [90, "WorkTaskValidationReplay"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -840,6 +852,7 @@ it.effect("upgrades waits atomically while preserving task state and link proven
       [87, "WorkTaskResults"],
       [88, "WorkTaskClaims"],
       [89, "WorkTaskValidationIdentity"],
+      [90, "WorkTaskValidationReplay"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM work_task_thread_links ORDER BY link_event_id`,
@@ -963,6 +976,7 @@ it.effect("upgrades result history atomically without changing predecessor data"
       [87, "WorkTaskResults"],
       [88, "WorkTaskClaims"],
       [89, "WorkTaskValidationIdentity"],
+      [90, "WorkTaskValidationReplay"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_current_state`, state);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_thread_links`, links);
@@ -1102,6 +1116,7 @@ it.effect("upgrades claim history atomically and preserves prior task and ordina
     assert.deepStrictEqual(yield* runMigrations(), [
       [88, "WorkTaskClaims"],
       [89, "WorkTaskValidationIdentity"],
+      [90, "WorkTaskValidationReplay"],
     ]);
     assert.deepStrictEqual(
       yield* Effect.forEach(tables, (name) => sql.unsafe(`SELECT * FROM ${name}`)),
@@ -1221,13 +1236,15 @@ it.effect(
         attempts,
       );
       yield* sql`DROP INDEX work_task_validation_state_history_idx`;
-      assert.deepStrictEqual(yield* runMigrations(), [[89, "WorkTaskValidationIdentity"]]);
+      assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 89 }), [
+        [89, "WorkTaskValidationIdentity"],
+      ]);
       assert.deepStrictEqual(
         yield* sql`SELECT * FROM work_task_validation_attempts ORDER BY attempt_id`,
         attempts,
       );
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_identity`, []);
-      assert.deepStrictEqual(yield* runMigrations(), []);
+      assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 89 }), []);
     }).pipe(Effect.provide(db)),
 );
 
@@ -1403,5 +1420,477 @@ it.effect("applies validation identity contract bounds without truncating NUL or
         yield* sql`UPDATE work_task_validation_attempts SET definition_revision = 1, completion_policy_revision = 1, manager_generation = 1 WHERE attempt_id = 'numeric'`;
       }
     }
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect("preserves legacy validation rows and rolls replay migration back before retry", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations({ toMigrationInclusive: 89 });
+    yield* sql`INSERT INTO work_task_projections VALUES ('a', NULL, 1, 1, 1, 1, '{}', 't', 't')`;
+    yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('a', 1, 1, '{}', '{}', 'd', 't')`;
+    yield* sql`INSERT INTO work_task_manager_bindings VALUES ('a', 1, 'm', 't', NULL)`;
+    yield* sql`INSERT INTO work_task_allowances VALUES ('a', 1, 0)`;
+    yield* sql`INSERT INTO work_task_claims VALUES ('c', 'a', 'claim', 'e', 'm', 1, 1, 1, 0, '{"type":"server"}', 's', '[{"type":"run","threadId":"t","runId":"r"}]', 1, 't')`;
+    yield* sql`INSERT INTO work_task_validation_attempts VALUES ('legacy', 'a', 1, 1, 1, 'e', 'w', '{}', NULL, 'reserved', NULL, '2026-11-11T00:00:00.000001+01:00', NULL, NULL)`;
+    yield* sql`INSERT INTO work_task_validation_identity VALUES ('legacy', 'a', 'claim', 1)`;
+    const before = yield* sql`SELECT * FROM work_task_validation_attempts`;
+    const claims = yield* sql`SELECT * FROM work_task_claims`;
+    const identities = yield* sql`SELECT * FROM work_task_validation_identity`;
+    yield* sql`CREATE INDEX work_task_validation_chronological_idx ON work_task_projections(task_id)`;
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(runMigrations())));
+    assert.deepStrictEqual(
+      yield* sql`SELECT name FROM sqlite_master WHERE name = 'work_task_validation_replay'`,
+      [],
+    );
+    assert.deepStrictEqual(
+      yield* sql`SELECT migration_id FROM effect_sql_migrations WHERE migration_id = 90`,
+      [],
+    );
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_attempts`, before);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_claims`, claims);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_identity`, identities);
+    yield* sql`DROP INDEX work_task_validation_chronological_idx`;
+    assert.deepStrictEqual(yield* runMigrations(), [[90, "WorkTaskValidationReplay"]]);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_attempts`, before);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_claims`, claims);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_identity`, identities);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_replay`, []);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_instant`, []);
+    assert.deepStrictEqual(yield* runMigrations(), []);
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect("stores validation phases and indexes sequence and lossless chronological keys", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations();
+    yield* sql`PRAGMA foreign_keys = ON`;
+    yield* sql`INSERT INTO work_task_projections VALUES ('a', NULL, 1, 1, 1, 1, '{}', 't', 't')`;
+    yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('a', 1, 1, '{}', '{}', 'd', 't')`;
+    yield* sql`INSERT INTO work_task_allowances VALUES ('a', 10, 0)`;
+    yield* sql`INSERT INTO work_task_manager_bindings VALUES ('a', 1, 'm', 't', NULL)`;
+    yield* sql`INSERT INTO work_task_claims VALUES ('claim-event', 'a', 'claim', 'e', 'm', 1, 1, 1, 0, '{"type":"server"}', 's', '[{"type":"run","threadId":"t","runId":"r"}]', 1, 't')`;
+    const validator = {
+      projectId: "p",
+      modelSelection: { instanceId: "codex", model: "m" },
+      workspace: { type: "root" },
+    };
+    const validatorJson = JSON.stringify(validator);
+    const time = "2026-11-11T00:00:00Z";
+    yield* sql`INSERT INTO work_task_validation_attempts VALUES ('v', 'a', 1, 1, 1, 'e', 'w', ${validatorJson}, NULL, 'reserved', NULL, ${time}, NULL, NULL)`;
+    yield* sql`INSERT INTO work_task_validation_identity VALUES ('v', 'a', 'claim', 1)`;
+    const common = {
+      taskId: "a",
+      attemptId: "v",
+      commandId: "cmd",
+      attribution: { type: "server" },
+      definitionRevision: 1,
+      lifecycleRevision: 1,
+      completionPolicyRevision: 1,
+      actionPolicyRevision: 1,
+      managerGeneration: 1,
+      claimId: "claim",
+      evidenceId: "e",
+      workWatermark: "w",
+      validator,
+      allowanceUnit: 1,
+      createdAt: time,
+      occurredAt: time,
+    };
+    const reserved = { ...common, id: "ev1", type: "task.validation-reserved" };
+    const started = {
+      ...common,
+      id: "ev2",
+      type: "task.validation-started",
+      runId: "run",
+      startedAt: time,
+    };
+    const result = {
+      ...started,
+      id: "ev3",
+      type: "task.validation-result",
+      finishedAt: time,
+      outcome: "pass",
+      findings: [
+        {
+          criterionId: "c",
+          outcome: "pass",
+          reason: "yes",
+          evidence: [{ type: "artifact", uri: "file", hash: "hash" }],
+        },
+      ],
+    };
+    const uncertain = {
+      ...started,
+      id: "ev4",
+      type: "task.validation-uncertain",
+      finishedAt: time,
+      reason: "lost",
+    };
+    const record = <T extends { id: string; attemptId: string }>(event: T, sequence: number) => {
+      const payload = JSON.stringify(event);
+      decodePersistedEvent({
+        event,
+        context: { sequence, eventId: event.id, occurredAt: time, commandId: "cmd" },
+      });
+      return sql`INSERT INTO work_task_validation_replay VALUES (${event.id}, ${event.attemptId}, 'a', ${sequence}, 'cmd', ${time}, ${payload})`;
+    };
+    yield* record(reserved, 1);
+    yield* sql`INSERT INTO work_task_validation_instant VALUES ('v', 'a', 'reserved', 1794355200, '')`;
+    yield* sql`UPDATE work_task_validation_attempts SET state = 'started', run_id = 'run', started_at = ${time} WHERE attempt_id = 'v'`;
+    assert.deepStrictEqual(
+      yield* sql`SELECT * FROM work_task_validation_instant WHERE attempt_id = 'v'`,
+      [],
+    );
+    yield* record(started, 2);
+    yield* sql`UPDATE work_task_validation_attempts SET state = 'result', finished_at = ${time}, outcome_json = '{}' WHERE attempt_id = 'v'`;
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(record(result, 3))));
+    yield* sql`UPDATE work_task_validation_attempts SET outcome_json = '{"outcome":"fail","findings":[]}' WHERE attempt_id = 'v'`;
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(record(result, 3))));
+    const outcome = { outcome: result.outcome, findings: result.findings };
+    yield* sql`UPDATE work_task_validation_attempts SET outcome_json = ${JSON.stringify(outcome)} WHERE attempt_id = 'v'`;
+    yield* record(result, 3);
+    const recordResult = Effect.fn("PersistentTasks.recordResult")(function* (
+      event: typeof result & { reason?: string },
+      sequence: number,
+    ) {
+      const attemptId = event.id;
+      const runId = `run-${event.id}`;
+      const allowanceUnit = sequence + 20;
+      const eventOutcome = JSON.stringify({
+        outcome: event.outcome,
+        findings: event.findings,
+        reason: event.reason,
+      });
+      yield* sql`INSERT INTO work_task_validation_attempts VALUES (${attemptId}, 'a', 1, 1, 1, 'e', 'w', ${JSON.stringify(event.validator)}, ${runId}, 'result', ${eventOutcome}, ${time}, ${time}, ${time})`;
+      yield* sql`INSERT INTO work_task_validation_identity VALUES (${attemptId}, 'a', 'claim', ${allowanceUnit})`;
+      yield* record({ ...event, attemptId, runId, allowanceUnit }, sequence);
+    });
+    yield* sql`INSERT INTO work_task_validation_attempts VALUES ('u', 'a', 1, 1, 1, 'e', 'w', ${validatorJson}, NULL, 'reserved', NULL, ${time}, NULL, NULL)`;
+    yield* sql`INSERT INTO work_task_validation_identity VALUES ('u', 'a', 'claim', 2)`;
+    yield* record({ ...reserved, id: "ev4", attemptId: "u", allowanceUnit: 2 }, 4);
+    yield* sql`UPDATE work_task_validation_attempts SET state = 'started', run_id = 'run-u', started_at = ${time} WHERE attempt_id = 'u'`;
+    yield* record({ ...started, id: "ev5", attemptId: "u", allowanceUnit: 2, runId: "run-u" }, 5);
+    yield* sql`UPDATE work_task_validation_attempts SET state = 'uncertain', finished_at = ${time} WHERE attempt_id = 'u'`;
+    yield* record({ ...uncertain, id: "ev6", attemptId: "u", allowanceUnit: 2, runId: "run-u" }, 6);
+    const bad = [
+      { ...reserved, id: "bad", runId: "run" },
+      { ...result, id: "bad", findings: [] },
+      { ...result, id: "bad", outcome: "error", findings: [] },
+      { ...result, id: "bad", findings: [{ ...result.findings[0], reason: " " }] },
+      { ...uncertain, id: "bad", reason: null },
+      { ...reserved, id: "bad", claimId: "other" },
+      { ...started, id: "bad", runId: "another-run" },
+      { ...reserved, id: "bad", definitionRevision: 1.5 },
+      { ...result, id: "bad", reason: "😀".repeat(1001) },
+      { ...result, id: "bad", findings: [result.findings[0], result.findings[0]] },
+      { ...result, id: "bad", findings: Array(65).fill(result.findings[0]) },
+      { ...reserved, id: "bad", validator: { ...validator, workspace: { type: "other" } } },
+    ];
+    for (const event of bad) {
+      const payload = JSON.stringify(event);
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`INSERT INTO work_task_validation_replay VALUES ('bad', 'v', 'a', 9, 'cmd', ${time}, ${payload})`,
+          ),
+        ),
+      );
+    }
+    yield* recordResult({ ...result, id: "nul", reason: " \0 " }, 7);
+    yield* recordResult({ ...result, id: "utf16", reason: "😀".repeat(1000) }, 8);
+    const manyFindings = Array.from({ length: 64 }, (_, i) => ({
+      criterionId: `criterion-${i}`,
+      outcome: "inconclusive" as const,
+      reason: "reason",
+      evidence: Array.from({ length: 32 }, () => ({
+        type: "artifact" as const,
+        uri: "file",
+        hash: "hash",
+      })),
+    }));
+    yield* recordResult(
+      { ...result, id: "large-findings", outcome: "inconclusive", findings: manyFindings },
+      9,
+    );
+    for (const [index, [instanceId, valid]] of [
+      ["x".repeat(64), true],
+      ["a/b", false],
+      ["x".repeat(65), false],
+    ].entries()) {
+      const attemptId = `slug-${index}`;
+      const selected = {
+        ...validator,
+        modelSelection: { ...validator.modelSelection, instanceId },
+      };
+      yield* sql`INSERT INTO work_task_validation_attempts VALUES (${attemptId}, 'a', 1, 1, 1, 'e', 'w', ${JSON.stringify(selected)}, NULL, 'reserved', NULL, ${time}, NULL, NULL)`;
+      yield* sql`INSERT INTO work_task_validation_identity VALUES (${attemptId}, 'a', 'claim', ${100 + index})`;
+      const payload = JSON.stringify({
+        ...reserved,
+        id: attemptId,
+        attemptId,
+        validator: selected,
+        allowanceUnit: 100 + index,
+      });
+      assert.strictEqual(
+        Exit.isSuccess(
+          yield* Effect.exit(
+            sql`INSERT INTO work_task_validation_replay VALUES (${attemptId}, ${attemptId}, 'a', 0, 'cmd', ${time}, ${payload})`,
+          ),
+        ),
+        valid,
+      );
+      if (valid) yield* sql`DELETE FROM work_task_validation_replay WHERE event_id = ${attemptId}`;
+    }
+    const duplicateFindings = [
+      result.findings[0],
+      { ...result.findings[0], criterionId: " \t c \u3000" },
+    ];
+    const duplicateOutcome = JSON.stringify({ outcome: "pass", findings: duplicateFindings });
+    yield* sql`INSERT INTO work_task_validation_attempts VALUES ('trimmed-findings', 'a', 1, 1, 1, 'e', 'w', ${validatorJson}, 'trimmed-run', 'result', ${duplicateOutcome}, ${time}, ${time}, ${time})`;
+    yield* sql`INSERT INTO work_task_validation_identity VALUES ('trimmed-findings', 'a', 'claim', 110)`;
+    const duplicateEvent = {
+      ...result,
+      id: "trimmed-findings-event",
+      attemptId: "trimmed-findings",
+      runId: "trimmed-run",
+      allowanceUnit: 110,
+      findings: duplicateFindings,
+    };
+    assert.throws(() =>
+      decodePersistedEvent({
+        event: duplicateEvent,
+        context: { sequence: 20, eventId: duplicateEvent.id, occurredAt: time, commandId: "cmd" },
+      }),
+    );
+    assert.isTrue(
+      Exit.isFailure(
+        yield* Effect.exit(
+          sql`INSERT INTO work_task_validation_replay VALUES ('trimmed-findings-event', 'trimmed-findings', 'a', 20, 'cmd', ${time}, ${JSON.stringify(duplicateEvent)})`,
+        ),
+      ),
+    );
+    const reorderedValidator = {
+      workspace: validator.workspace,
+      modelSelection: validator.modelSelection,
+      projectId: validator.projectId,
+    };
+    yield* recordResult({ ...result, id: "reordered", validator: reorderedValidator }, 10);
+    const emptyModel = { ...validator, modelSelection: { ...validator.modelSelection, model: "" } };
+    const maxValidator = {
+      ...validator,
+      modelSelection: {
+        ...validator.modelSelection,
+        model: "x".repeat(16000 - JSON.stringify(emptyModel).length),
+      },
+    };
+    assert.strictEqual(new TextEncoder().encode(JSON.stringify(maxValidator)).length, 16000);
+    const maxValidatorJson = JSON.stringify(maxValidator);
+    yield* sql`INSERT INTO work_task_validation_attempts VALUES ('max-validator', 'a', 1, 1, 1, 'e', 'w', ${maxValidatorJson}, NULL, 'reserved', NULL, ${time}, NULL, NULL)`;
+    yield* sql`INSERT INTO work_task_validation_identity VALUES ('max-validator', 'a', 'claim', 3)`;
+    yield* record(
+      {
+        ...reserved,
+        id: "max-validator-event",
+        attemptId: "max-validator",
+        allowanceUnit: 3,
+        validator: maxValidator,
+      },
+      11,
+    );
+    const overValidator = {
+      ...maxValidator,
+      modelSelection: {
+        ...maxValidator.modelSelection,
+        model: maxValidator.modelSelection.model + "x",
+      },
+    };
+    const overValidatorJson = JSON.stringify(overValidator);
+    yield* sql`INSERT INTO work_task_validation_attempts VALUES ('over-validator', 'a', 1, 1, 1, 'e', 'w', ${overValidatorJson}, NULL, 'reserved', NULL, ${time}, NULL, NULL)`;
+    yield* sql`INSERT INTO work_task_validation_identity VALUES ('over-validator', 'a', 'claim', 4)`;
+    const overEvent = JSON.stringify({
+      ...reserved,
+      id: "over-validator-event",
+      attemptId: "over-validator",
+      allowanceUnit: 4,
+      validator: overValidator,
+    });
+    assert.isTrue(
+      Exit.isFailure(
+        yield* Effect.exit(
+          sql`INSERT INTO work_task_validation_replay VALUES ('over-validator-event', 'over-validator', 'a', 12, 'cmd', ${time}, ${overEvent})`,
+        ),
+      ),
+    );
+    assert.isTrue(
+      Exit.isFailure(yield* Effect.exit(record({ ...reserved, id: "duplicate-sequence" }, 11))),
+    );
+    assert.isTrue(
+      Exit.isFailure(
+        yield* Effect.exit(record({ ...reserved, id: "missing", attemptId: "missing" }, 12)),
+      ),
+    );
+    for (const statement of [
+      sql`UPDATE work_task_validation_attempts SET outcome_json = '{"outcome":"fail","findings":[]}' WHERE attempt_id = 'v'`,
+      sql`UPDATE work_task_validation_attempts SET created_at = 'changed' WHERE attempt_id = 'v'`,
+      sql`UPDATE work_task_validation_attempts SET validator_json = '{}' WHERE attempt_id = 'v'`,
+      sql`UPDATE work_task_validation_attempts SET run_id = 'other' WHERE attempt_id = 'v'`,
+      sql`UPDATE work_task_validation_attempts SET started_at = 'other' WHERE attempt_id = 'v'`,
+      sql`UPDATE work_task_validation_attempts SET finished_at = 'other' WHERE attempt_id = 'v'`,
+      sql`UPDATE work_task_validation_identity SET allowance_unit = 3 WHERE attempt_id = 'v'`,
+      sql`INSERT OR REPLACE INTO work_task_validation_identity VALUES ('v', 'a', 'claim', 3)`,
+      sql`DELETE FROM work_task_validation_identity WHERE attempt_id = 'v'`,
+    ])
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(statement)));
+    for (const [attemptId, unit] of [
+      ["\ud800", 5],
+      ["\ufffd", 6],
+    ] as const) {
+      const encodedId = JSON.stringify(attemptId);
+      yield* sql`INSERT INTO work_task_validation_attempts VALUES (json_extract(${encodedId}, '$'), 'a', 1, 1, 1, 'e', 'w', ${validatorJson}, NULL, 'reserved', NULL, ${time}, NULL, NULL)`;
+      yield* sql`INSERT INTO work_task_validation_identity VALUES (json_extract(${encodedId}, '$'), 'a', 'claim', ${unit})`;
+      const event = { ...reserved, id: `unicode-${unit}`, attemptId, allowanceUnit: unit };
+      decodePersistedEvent({
+        event,
+        context: { sequence: unit + 7, eventId: event.id, occurredAt: time, commandId: "cmd" },
+      });
+      const payload = JSON.stringify(event);
+      yield* sql`INSERT INTO work_task_validation_replay VALUES (${event.id}, json_extract(${encodedId}, '$'), 'a', ${unit + 7}, 'cmd', ${time}, ${payload})`;
+    }
+    const unicode = yield* sql<{
+      encoded: string;
+      event_json: string;
+    }>`SELECT hex(attempt_id) AS encoded, event_json FROM work_task_validation_replay WHERE event_id IN ('unicode-5', 'unicode-6') ORDER BY event_id`;
+    assert.deepStrictEqual(
+      unicode.map((row) => row.encoded),
+      ["EDA080", "EFBFBD"],
+    );
+    assert.deepStrictEqual(
+      unicode.map((row) => JSON.parse(row.event_json).attemptId),
+      ["\ud800", "\ufffd"],
+    );
+    const firstHistory = yield* sql<{
+      event_id: string;
+      attempt_hex: string;
+      sequence: number;
+    }>`SELECT event_id, hex(attempt_id) AS attempt_hex, sequence FROM work_task_validation_replay WHERE task_id = 'a' ORDER BY sequence DESC, attempt_id DESC LIMIT 2`;
+    assert.deepStrictEqual(
+      firstHistory.map((row) => row.event_id),
+      ["unicode-6", "unicode-5"],
+    );
+    const historyCursor = firstHistory[1]!;
+    const nextHistory = yield* sql<{
+      event_id: string;
+    }>`SELECT event_id FROM work_task_validation_replay WHERE task_id = 'a' AND (sequence, attempt_id) < (${historyCursor.sequence}, CAST(unhex(${historyCursor.attempt_hex}) AS TEXT)) ORDER BY sequence DESC, attempt_id DESC LIMIT 2`;
+    assert.deepStrictEqual(
+      nextHistory.map((row) => row.event_id),
+      ["max-validator-event", "reordered"],
+    );
+    const historyPlan = yield* sql<{
+      detail: string;
+    }>`EXPLAIN QUERY PLAN SELECT attempt_id FROM work_task_validation_replay WHERE task_id = 'a' AND (sequence, attempt_id) < (${historyCursor.sequence}, CAST(unhex(${historyCursor.attempt_hex}) AS TEXT)) ORDER BY sequence DESC, attempt_id DESC LIMIT 50`;
+    assert.isTrue(
+      historyPlan.some((row) => row.detail.includes("work_task_validation_replay_history_idx")),
+    );
+    assert.isFalse(historyPlan.some((row) => row.detail.includes("TEMP B-TREE")));
+
+    const maxPrecision = "1" + "0".repeat(1977) + "1";
+    const timestamps = [
+      ["zero", "2026-11-11T00:00:00Z"],
+      ["equal-a", "2026-11-11T01:00:00.1000+01:00"],
+      ["equal-b", "2026-11-11T00:00:00.1Z"],
+      ["small", "2026-11-11T00:00:00.000000000000000000001Z"],
+      ["large", "2026-11-11T00:00:00.100000000000000000001Z"],
+      ["full-precision", `2026-11-11T00:00:00.${maxPrecision}Z`],
+    ] as const;
+    for (const [id, raw] of timestamps) {
+      const seconds = Math.floor(Date.parse(raw.replace(/\.\d+/, "")) / 1000);
+      const fraction = (raw.match(/\.(\d+)/)?.[1] ?? "").replace(/0+$/, "");
+      yield* sql`INSERT INTO work_task_validation_attempts VALUES (${id}, 'a', 1, 1, 1, 'e', 'w', ${validatorJson}, NULL, 'reserved', NULL, ${raw}, NULL, NULL)`;
+      yield* sql`INSERT INTO work_task_validation_instant VALUES (${id}, 'a', 'reserved', ${seconds}, ${fraction})`;
+    }
+    for (const fraction of ["10", "1x", "1\0x"]) {
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`INSERT INTO work_task_validation_instant VALUES ('v', 'a', 'result', 0, ${fraction})`,
+          ),
+        ),
+      );
+    }
+    assert.isTrue(
+      Exit.isFailure(
+        yield* Effect.exit(
+          sql`INSERT INTO work_task_validation_instant VALUES ('v', 'a', 'reserved', 0, '')`,
+        ),
+      ),
+    );
+    assert.strictEqual(`2026-11-11T00:00:00.${maxPrecision}Z`.length, 2000);
+    const rows = yield* sql<{
+      attempt_id: string;
+      utc_seconds: number;
+      fraction: string;
+    }>`SELECT attempt_id, utc_seconds, fraction FROM work_task_validation_instant WHERE task_id = 'a' AND state = 'reserved' ORDER BY utc_seconds DESC, fraction DESC, attempt_id DESC LIMIT 3`;
+    assert.deepStrictEqual(
+      rows.map((row) => row.attempt_id),
+      ["large", "full-precision", "equal-b"],
+    );
+    const cursor = rows[2]!;
+    const next = yield* sql<{
+      attempt_id: string;
+    }>`SELECT attempt_id FROM work_task_validation_instant WHERE task_id = 'a' AND state = 'reserved' AND (utc_seconds, fraction, attempt_id) < (${cursor.utc_seconds}, ${cursor.fraction}, ${cursor.attempt_id}) ORDER BY utc_seconds DESC, fraction DESC, attempt_id DESC LIMIT 3`;
+    assert.deepStrictEqual(
+      next.map((row) => row.attempt_id),
+      ["equal-a", "small", "zero"],
+    );
+    const wholeSeconds = Math.floor(Date.parse(time) / 1000);
+    for (const attemptId of ["\ud800", "\ufffd"]) {
+      const encodedId = JSON.stringify(attemptId);
+      yield* sql`INSERT INTO work_task_validation_instant VALUES (json_extract(${encodedId}, '$'), 'a', 'reserved', ${wholeSeconds}, '')`;
+    }
+    const unicodePage = yield* sql<{
+      attempt_hex: string;
+    }>`SELECT hex(attempt_id) AS attempt_hex FROM work_task_validation_instant WHERE task_id = 'a' AND state = 'reserved' AND utc_seconds = ${wholeSeconds} AND fraction = '' ORDER BY utc_seconds DESC, fraction DESC, attempt_id DESC LIMIT 2`;
+    assert.deepStrictEqual(
+      unicodePage.map((row) => row.attempt_hex),
+      ["EFBFBD", "EDA080"],
+    );
+    const unicodeCursor = unicodePage[1]!;
+    const unicodeNext = yield* sql<{
+      attempt_hex: string;
+    }>`SELECT hex(attempt_id) AS attempt_hex FROM work_task_validation_instant WHERE task_id = 'a' AND state = 'reserved' AND (utc_seconds, fraction, attempt_id) < (${wholeSeconds}, '', CAST(unhex(${unicodeCursor.attempt_hex}) AS TEXT)) ORDER BY utc_seconds DESC, fraction DESC, attempt_id DESC LIMIT 2`;
+    assert.deepStrictEqual(
+      unicodeNext.map((row) => row.attempt_hex),
+      ["7A65726F"],
+    );
+    const plan = yield* sql<{
+      detail: string;
+    }>`EXPLAIN QUERY PLAN SELECT attempt_id FROM work_task_validation_instant WHERE task_id = 'a' AND state = 'reserved' AND (utc_seconds, fraction, attempt_id) < (${wholeSeconds}, '', CAST(unhex(${unicodeCursor.attempt_hex}) AS TEXT)) ORDER BY utc_seconds DESC, fraction DESC, attempt_id DESC LIMIT 50`;
+    assert.isTrue(
+      plan.some((row) => row.detail.includes("work_task_validation_chronological_idx")),
+    );
+    assert.isFalse(plan.some((row) => row.detail.includes("TEMP B-TREE")));
+    assert.isTrue(
+      Exit.isFailure(
+        yield* Effect.exit(
+          sql`INSERT OR REPLACE INTO work_task_validation_attempts VALUES ('zero', 'a', 1, 1, 1, 'e', 'w', ${validatorJson}, 'legacy-run', 'started', NULL, ${time}, ${time}, NULL)`,
+        ),
+      ),
+    );
+    yield* sql`UPDATE work_task_validation_attempts SET state = 'started', run_id = 'legacy-run', started_at = ${time} WHERE attempt_id = 'zero'`;
+    assert.deepStrictEqual(
+      yield* sql`SELECT * FROM work_task_validation_instant WHERE attempt_id = 'zero'`,
+      [],
+    );
+    yield* sql`INSERT INTO work_task_validation_instant VALUES ('zero', 'a', 'started', ${wholeSeconds}, '')`;
+    assert.deepStrictEqual(
+      (yield* sql<{
+        state: string;
+      }>`SELECT state FROM work_task_validation_instant WHERE attempt_id = 'zero'`).map(
+        (row) => row.state,
+      ),
+      ["started"],
+    );
   }).pipe(Effect.provide(db)),
 );
