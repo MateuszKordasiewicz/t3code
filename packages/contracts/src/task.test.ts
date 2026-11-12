@@ -90,6 +90,123 @@ describe("staged task events", () => {
     }
   });
 
+  it("records terminal review evidence and purpose-bound continuations in persisted context", () => {
+    const binding = {
+      taskId: "task",
+      reviewId: "review",
+      reviewRevision: 1,
+      definitionRevision: 1,
+      actionPolicyRevision: 4,
+      payloadIdentity: identity,
+      ruleId: "rule",
+      runtimeRequestId: "runtime",
+      providerSessionId: "session",
+      managerThreadId: "manager",
+      managerGeneration: 5,
+      runId: "run",
+    };
+    const source = {
+      type: "task.archive",
+      commandId: "archive-command",
+      human: { subject: "human", sessionId: "session" },
+    };
+    const invalidated = {
+      ...base,
+      type: "task.action-review-invalidated",
+      cause: "policy_changed",
+      binding,
+      reason: "policy changed",
+    };
+    const cancelled = {
+      ...base,
+      type: "task.action-review-cancelled",
+      binding,
+      reason: "archived",
+      source,
+    };
+    const release = {
+      ...base,
+      type: "task.action-review-continuation-released",
+      binding,
+      continuationId: "continuation",
+      reason: "human decision",
+      decisionEventId: "decision",
+      purpose: "approved_action",
+      decision: "approve",
+    };
+    const persisted = Schema.decodeUnknownSync(task.WorkTaskPersistedEvent);
+    const context = { sequence: 2, eventId: "event", occurredAt: base.occurredAt, commandId: null };
+    for (const event of [invalidated, cancelled, release]) {
+      expect(decode(event)).toBeDefined();
+      expect(
+        persisted({
+          event,
+          context: { ...context, commandId: event === cancelled ? source.commandId : null },
+        }),
+      ).toBeDefined();
+      for (const field of [
+        "taskId",
+        "reviewId",
+        "reviewRevision",
+        "definitionRevision",
+        "actionPolicyRevision",
+        "payloadIdentity",
+        "ruleId",
+        "runtimeRequestId",
+        "providerSessionId",
+        "managerThreadId",
+        "managerGeneration",
+        "runId",
+      ]) {
+        expect(() => decode({ ...event, binding: { ...binding, [field]: undefined } })).toThrow();
+      }
+      for (const field of ["taskId", "definitionRevision", "actionPolicyRevision"]) {
+        expect(() =>
+          decode({ ...event, binding: { ...binding, [field]: field === "taskId" ? "other" : 99 } }),
+        ).toThrow();
+      }
+      expect(() => persisted({ event, context: { ...context, eventId: "other" } })).toThrow();
+      expect(() =>
+        persisted({ event, context: { ...context, occurredAt: "2026-11-12T00:00:00Z" } }),
+      ).toThrow();
+      expect(() => decode({ ...event, attribution: { type: "user", subject: "human" } })).toThrow();
+    }
+    for (const cause of ["stop", "pause", "timeout", "dismissal"])
+      expect(() => decode({ ...invalidated, cause })).toThrow();
+    for (const key of ["action", "target", "fingerprint"])
+      expect(() =>
+        decode({
+          ...release,
+          binding: { ...binding, payloadIdentity: { ...identity, [key]: " " } },
+        }),
+      ).toThrow();
+    for (const decision of ["reject", "request_changes"]) {
+      const feedback = { ...release, purpose: "feedback", decision };
+      expect(decode({ ...feedback, actionAuthority: "grant" })).toEqual(feedback);
+      expect(() => decode({ ...feedback, purpose: "approved_action" })).toThrow();
+    }
+    expect(() => decode({ ...release, purpose: "feedback" })).toThrow();
+    for (const field of ["continuationId", "decisionEventId"]) {
+      for (const value of [undefined, " ", "x".repeat(2_001)])
+        expect(() => decode({ ...release, [field]: value })).toThrow();
+      expect(decode({ ...release, [field]: "x".repeat(2_000) })).toBeDefined();
+    }
+    for (const event of [invalidated, cancelled, release]) {
+      for (const reason of [undefined, " ", "x".repeat(2_001)])
+        expect(() => decode({ ...event, reason })).toThrow();
+      expect(decode({ ...event, reason: "x".repeat(2_000) })).toBeDefined();
+    }
+    for (const badSource of [
+      undefined,
+      { ...source, type: "task.stop" },
+      { ...source, human: undefined },
+      { ...source, commandId: " " },
+    ])
+      expect(() => decode({ ...cancelled, source: badSource })).toThrow();
+    for (const commandId of [null, "other", undefined])
+      expect(() => persisted({ event: cancelled, context: { ...context, commandId } })).toThrow();
+  });
+
   it("keeps server-recorded human action decisions distinct from validation", () => {
     const request = {
       ...base,
