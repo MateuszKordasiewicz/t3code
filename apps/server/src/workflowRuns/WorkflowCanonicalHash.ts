@@ -82,6 +82,8 @@ function command(workflowRunId: string, value: object): string {
 }
 
 export const WorkflowCanonicalHash = {
+  tagged: hash,
+  assertCanonical: (value: unknown): void => preflight(value),
   command,
   operation,
   verifyOperation: (value: WorkflowOperationV1): boolean =>

@@ -246,6 +246,18 @@ const asOperation = (value: unknown) => value as WorkflowOperationV1;
 const asSpec = (value: unknown) => value as WorkflowRunSpecV1;
 
 describe("WorkflowCanonicalHash", () => {
+  it("matches a tagged literal vector", () => {
+    expect(
+      WorkflowCanonicalHash.tagged("t3.planning-source-packet.v1", {
+        schemaVersion: 1,
+        sources: [],
+        statements: [],
+        selectionLimitations: [],
+        access: { origins: [] },
+      }),
+    ).toBe("1b697c03819fb262e91d2d9cf64128c3e0a3df6712eb6fde2dadb630d83bd6be");
+  });
+
   it.each([
     [payload1, canonical1, digest1, "operation"],
     [payload2, canonical2, digest2, "operation"],
