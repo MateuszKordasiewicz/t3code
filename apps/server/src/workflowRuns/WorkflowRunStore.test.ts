@@ -618,3 +618,294 @@ it.effect("rolls back allowance and operation if attempt insertion fails", () =>
     assert.strictEqual((parse(rows[0]!.record_json) as typeof run).allowance.attemptsConsumed, 0);
   }).pipe(Effect.provide(layer)),
 );
+
+const itemBinding = {
+  specHash: hash,
+  policyHash: hash,
+  candidateHash: hash,
+  configurationHash: hash,
+  itemId: "item",
+  attemptId: "attempt",
+};
+const finalBinding = {
+  specHash: hash,
+  policyHash: hash,
+  candidateHash: hash,
+  configurationHash: hash,
+};
+const ref = (id: string) => ({ kind: "report", id, sha256: hash });
+const roleRecord = (
+  id: string,
+  operationId: string,
+  binding: typeof finalBinding | typeof itemBinding,
+  result: unknown,
+) => ({
+  schemaVersion: 1,
+  id,
+  workflowRunId: "run",
+  operationId,
+  binding,
+  result,
+  access: { origins: [] },
+});
+const reviewResult = {
+  kind: "code_review",
+  verdict: "pass",
+  findings: [],
+  output: { ref: ref("output"), byteLength: 1, availability: "available", access: { origins: [] } },
+};
+const rollupResult = (verdict = "accepted", resultId = "review") => ({
+  kind: "rollup",
+  verdict,
+  resultRefs: [ref(resultId)],
+  summary: "Review",
+});
+const settled = (op: WorkflowOperationV1) => ({
+  ...op,
+  status: "settled",
+  outcome: { kind: "succeeded", summary: "Done", evidence: [] },
+});
+const reviewOperation = (id: string, final = false, sameProvider = false) => {
+  const op = operationFor(id, "attempt");
+  return {
+    ...settled(op),
+    parameters: {
+      kind: "stage_launch",
+      stage: "code_review",
+      context: final ? finalBinding : itemBinding,
+      provider: { providerInstanceId: sameProvider ? "provider" : "reviewer", model: "model" },
+      nativeThreadId: "thread",
+      nativeRunId: id,
+    },
+  };
+};
+const insertOperation = (id: string, kind: string, record: unknown, status = "settled") =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const fingerprint = WorkflowCanonicalHash.command(id, {});
+    yield* sql`INSERT INTO workflow_operations (id, workflow_run_id, kind, fingerprint, status, generation, record_json) VALUES (${id}, 'run', ${kind}, ${fingerprint}, ${status}, 0, ${json(record)})`;
+  });
+const setupEvidence = (sameProvider = false) =>
+  Effect.gen(function* () {
+    yield* setup;
+    const sql = yield* SqlClient.SqlClient;
+    yield* insertOperation("impl", "stage_launch", settled(operationFor("impl", "attempt")));
+    yield* sql`INSERT INTO workflow_attempts VALUES ('attempt', 'run', 'impl', 'item', 0)`;
+    yield* insertOperation(
+      "review-op",
+      "stage_launch",
+      reviewOperation("review-op", false, sameProvider),
+    );
+  });
+const advance = (
+  binding: typeof finalBinding | typeof itemBinding,
+  finalCombined = false,
+  version = 0,
+): Input["command"] => ({
+  ...command,
+  commandId: finalCombined ? "final" : "advance",
+  expectedVersion: version,
+  kind: "advance",
+  binding,
+  finalCombined,
+});
+
+it.effect.each([
+  "happy",
+  "binding mismatch",
+  "foreign operation",
+  "unsettled operation",
+  "duplicate id",
+] as const)("records role result: %s", (scenario) =>
+  Effect.gen(function* () {
+    yield* setupEvidence();
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const record = roleRecord(
+      "review",
+      "review-op",
+      scenario === "binding mismatch" ? { ...itemBinding, policyHash: nextHash } : itemBinding,
+      reviewResult,
+    );
+    if (scenario === "unsettled operation")
+      yield* sql`UPDATE workflow_operations SET status = 'pending' WHERE id = 'review-op'`;
+    if (scenario === "duplicate id")
+      yield* sql`INSERT INTO workflow_role_results VALUES ('review', 'run', 'review-op', '{}', 0)`;
+    const before = yield* sql`SELECT * FROM workflow_role_results`;
+    const input = {
+      runId: scenario === "foreign operation" ? "other" : "run",
+      operationId: "review-op",
+      resultId: "review",
+      record: scenario === "foreign operation" ? { ...record, workflowRunId: "other" } : record,
+    };
+    const exit = yield* Effect.exit(store.recordRoleResult(input));
+    assert.strictEqual(Exit.isSuccess(exit), scenario === "happy");
+    const after = yield* sql`SELECT * FROM workflow_role_results`;
+    assert.strictEqual(after.length, before.length + (scenario === "happy" ? 1 : 0));
+    if (scenario !== "happy") assert.deepStrictEqual(after, before);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  "accepted",
+  "same provider",
+  "missing result",
+  "rejected",
+  "invalidated review",
+] as const)("item advance: %s", (scenario) =>
+  Effect.gen(function* () {
+    yield* setupEvidence(scenario === "same provider");
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    yield* store.recordRoleResult({
+      runId: "run",
+      operationId: "review-op",
+      resultId: "review",
+      record: roleRecord("review", "review-op", itemBinding, reviewResult),
+    });
+    yield* store.recordRoleResult({
+      runId: "run",
+      operationId: "impl",
+      resultId: "rollup",
+      record: roleRecord(
+        "rollup",
+        "impl",
+        itemBinding,
+        rollupResult(
+          scenario === "rejected" ? "rejected" : "accepted",
+          scenario === "missing result" ? "missing" : "review",
+        ),
+      ),
+    });
+    if (scenario === "invalidated review")
+      yield* sql`UPDATE workflow_role_results SET invalidated = 1 WHERE id = 'review'`;
+    const result = yield* store.commitTransition({
+      runId: "run",
+      command: advance(itemBinding),
+      externalFacts: admissionFacts,
+      receiptId: "receipt",
+    });
+    assert.deepStrictEqual(
+      result,
+      scenario === "accepted"
+        ? { kind: "accepted", receiptId: "receipt" }
+        : { kind: "rejected", reason: "evidence" },
+    );
+    assert.strictEqual(
+      (yield* sql`SELECT * FROM workflow_acceptances WHERE acceptance_key = 'item:item'`).length,
+      scenario === "accepted" ? 1 : 0,
+    );
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect(
+  "accepts a final combined review and completes only for matching published and CI heads",
+  () =>
+    Effect.gen(function* () {
+      yield* setupEvidence();
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      assert.deepStrictEqual(
+        yield* store.commitTransition({
+          runId: "run",
+          command: { ...command, kind: "complete", commandId: "premature" },
+          externalFacts: {
+            ...facts,
+            finalAccepted: true,
+            publicationSettled: true,
+            requiredCiPassed: true,
+            publishedHead: "head",
+            ciHead: "head",
+          },
+          receiptId: "premature",
+        }),
+        { kind: "rejected", reason: "evidence" },
+      );
+      yield* sql`INSERT INTO workflow_acceptances VALUES ('run', 'item:item', ${json(itemBinding)}, 0)`;
+      yield* insertOperation(
+        "final-review-op",
+        "stage_launch",
+        reviewOperation("final-review-op", true),
+      );
+      yield* store.recordRoleResult({
+        runId: "run",
+        operationId: "final-review-op",
+        resultId: "final-review",
+        record: roleRecord("final-review", "final-review-op", finalBinding, reviewResult),
+      });
+      yield* store.recordRoleResult({
+        runId: "run",
+        operationId: "impl",
+        resultId: "final-rollup",
+        record: roleRecord(
+          "final-rollup",
+          "impl",
+          finalBinding,
+          rollupResult("accepted", "final-review"),
+        ),
+      });
+      assert.deepStrictEqual(
+        yield* store.commitTransition({
+          runId: "run",
+          command: advance(finalBinding, true),
+          externalFacts: admissionFacts,
+          receiptId: "final-receipt",
+        }),
+        { kind: "accepted", receiptId: "final-receipt" },
+      );
+      assert.strictEqual(
+        (yield* sql`SELECT * FROM workflow_acceptances WHERE acceptance_key = 'final'`).length,
+        1,
+      );
+      const completion: Input["command"] = {
+        ...command,
+        kind: "complete",
+        commandId: "complete",
+        expectedVersion: 1,
+      };
+      const complete = () =>
+        store.commitTransition({
+          runId: "run",
+          command: completion,
+          externalFacts: {
+            ...facts,
+            publicationSettled: true,
+            requiredCiPassed: true,
+            publishedHead: "fake",
+            ciHead: "fake",
+          },
+          receiptId: "completed",
+        });
+      assert.deepStrictEqual(yield* complete(), { kind: "rejected", reason: "evidence" });
+      const op = settled(operationFor("publication", "attempt"));
+      yield* insertOperation("publication", "publication", {
+        ...op,
+        kind: "publication",
+        parameters: {
+          kind: "publication",
+          context: finalBinding,
+          repositoryId: "repo",
+          baseRef: "main",
+          headRef: "branch",
+          expectedRemoteHead: "old",
+          candidateCommit: "head",
+        },
+      });
+      yield* insertOperation("ci", "ci_observation", {
+        ...op,
+        id: "ci",
+        kind: "ci_observation",
+        parameters: {
+          kind: "ci_observation",
+          context: finalBinding,
+          repositoryId: "repo",
+          pullRequestId: "pr",
+          headCommit: "other",
+          requiredChecks: [],
+        },
+      });
+      assert.deepStrictEqual(yield* complete(), { kind: "rejected", reason: "evidence" });
+      yield* sql`UPDATE workflow_operations SET record_json = json_set(record_json, '$.parameters.headCommit', 'head') WHERE id = 'ci'`;
+      assert.deepStrictEqual(yield* complete(), { kind: "accepted", receiptId: "completed" });
+    }).pipe(Effect.provide(layer)),
+);

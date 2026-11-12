@@ -1,6 +1,7 @@
 import {
   decodePlanningSessionV1,
   decodeWorkflowOperationV1,
+  decodeWorkflowRoleResultV1,
   decodeWorkflowRunV1,
   type WorkflowOperationV1,
 } from "@t3tools/contracts";
@@ -15,6 +16,34 @@ import { WorkflowRunPolicy } from "./WorkflowRunPolicy.ts";
 type PolicyInput = Parameters<typeof WorkflowRunPolicy.decide>[0];
 type Command = PolicyInput["command"];
 type Facts = PolicyInput["facts"];
+type Binding = NonNullable<Facts["currentBinding"]>;
+const sameBinding = (a: Binding, b: Binding) =>
+  a.specHash === b.specHash &&
+  a.policyHash === b.policyHash &&
+  a.candidateHash === b.candidateHash &&
+  a.configurationHash === b.configurationHash &&
+  a.itemId === b.itemId &&
+  a.attemptId === b.attemptId;
+const contextBinding = (operation: WorkflowOperationV1): Binding | undefined => {
+  const params = operation.parameters;
+  if (params.kind === "planning_pass") return undefined;
+  const c = params.context;
+  if (
+    !c.candidateHash ||
+    !c.configurationHash ||
+    (c.itemId === undefined) !== (c.attemptId === undefined)
+  )
+    return undefined;
+  return {
+    specHash: c.specHash,
+    policyHash: c.policyHash,
+    candidateHash: c.candidateHash,
+    configurationHash: c.configurationHash,
+    ...(c.itemId !== undefined && c.attemptId !== undefined
+      ? { itemId: c.itemId, attemptId: c.attemptId }
+      : {}),
+  };
+};
 const encode = (value: unknown) => JSON.stringify(value);
 const parse = (value: string): unknown => JSON.parse(value);
 
@@ -91,6 +120,54 @@ const make = Effect.gen(function* () {
     });
     return yield* inTransaction(work);
   });
+  const recordRoleResult = Effect.fn("WorkflowRunStore.recordRoleResult")(function* (input: {
+    readonly runId: string;
+    readonly operationId: string;
+    readonly resultId: string;
+    readonly record: unknown;
+  }) {
+    const result = yield* decodeWorkflowRoleResultV1(input.record).pipe(Effect.mapError(integrity));
+    if (
+      result.id !== input.resultId ||
+      result.operationId !== input.operationId ||
+      result.workflowRunId !== input.runId
+    )
+      return yield* integrity();
+    return yield* inTransaction(
+      Effect.gen(function* () {
+        const rows = yield* sql<{
+          record_json: string;
+          status: string;
+        }>`SELECT record_json, status FROM workflow_operations WHERE id = ${input.operationId} AND workflow_run_id = ${input.runId}`;
+        if (!rows[0] || rows[0].status !== "settled") return yield* integrity();
+        const operation = yield* Effect.try({
+          try: () => parse(rows[0]!.record_json),
+          catch: integrity,
+        }).pipe(Effect.flatMap(decodeWorkflowOperationV1), Effect.mapError(integrity));
+        if (
+          operation.id !== input.operationId ||
+          operation.owner.kind !== "workflow_run" ||
+          operation.owner.workflowRunId !== input.runId ||
+          operation.status !== "settled"
+        )
+          return yield* integrity();
+        if (result.result.kind !== "rollup") {
+          const binding = contextBinding(operation);
+          if (
+            (operation.kind !== "check" && operation.kind !== "stage_launch") ||
+            !binding ||
+            !sameBinding(binding, result.binding)
+          )
+            return yield* integrity();
+        }
+        const inserted = yield* sql<{
+          id: string;
+        }>`INSERT INTO workflow_role_results (id, workflow_run_id, operation_id, record_json) VALUES (${input.resultId}, ${input.runId}, ${input.operationId}, ${encode(result)}) ON CONFLICT DO NOTHING RETURNING id`;
+        if (inserted.length !== 1) return yield* integrity();
+        return result;
+      }),
+    );
+  });
   const commitTransition = Effect.fn("WorkflowRunStore.commitTransition")(function* (input: {
     readonly runId: string;
     readonly command: Command;
@@ -135,21 +212,30 @@ const make = Effect.gen(function* () {
         has_receipt: number;
         workflow_run_id: string | null;
         record_json: string;
-      }>`SELECT o.id, o.fingerprint, o.status, o.held, o.generation, o.kind, json_extract(o.record_json, '$.parameters.stage') AS stage, EXISTS(SELECT 1 FROM workflow_command_receipts r WHERE r.operation_id = o.id) AS has_receipt, o.workflow_run_id, o.record_json FROM workflow_operations o WHERE o.workflow_run_id = ${input.runId}`;
+      }>`SELECT o.id, o.fingerprint, o.status, o.held, o.generation, o.kind, json_extract(o.record_json, '$.parameters.stage') AS stage, EXISTS(SELECT 1 FROM workflow_command_receipts r WHERE r.operation_id = o.id) AS has_receipt, o.workflow_run_id, o.record_json FROM workflow_operations o WHERE o.workflow_run_id = ${input.runId} ORDER BY o.rowid`;
       const attempts = yield* sql<{
         id: string;
         item_id: string;
         status: WorkflowOperationV1["status"];
         outcome: string | null;
-      }>`SELECT a.id, a.item_id, o.status, json_extract(o.record_json, '$.outcome.kind') AS outcome FROM workflow_attempts a JOIN workflow_operations o ON o.id = a.operation_id AND o.workflow_run_id = a.workflow_run_id WHERE a.workflow_run_id = ${input.runId} ORDER BY a.rowid`;
+        operation_id: string;
+      }>`SELECT a.id, a.item_id, a.operation_id, o.status, json_extract(o.record_json, '$.outcome.kind') AS outcome FROM workflow_attempts a JOIN workflow_operations o ON o.id = a.operation_id AND o.workflow_run_id = a.workflow_run_id WHERE a.workflow_run_id = ${input.runId} ORDER BY a.rowid`;
       const acceptances = yield* sql<{
         acceptance_key: string;
-      }>`SELECT acceptance_key FROM workflow_acceptances WHERE workflow_run_id = ${input.runId} AND invalidated = 0 ORDER BY rowid`;
-      if (command.kind === "advance" || command.kind === "complete") return yield* integrity();
+        binding_json: string;
+      }>`SELECT acceptance_key, binding_json FROM workflow_acceptances WHERE workflow_run_id = ${input.runId} AND invalidated = 0 ORDER BY rowid`;
+
       const {
         commandReceipt: _commandReceipt,
         operationReceipt: _operationReceipt,
         currentAttemptItemId: _currentAttemptItemId,
+        currentBinding: _currentBinding,
+        acceptance: _acceptance,
+        finalAccepted: _finalAccepted,
+        publicationSettled: _publicationSettled,
+        publishedHead: _publishedHead,
+        requiredCiPassed: _requiredCiPassed,
+        ciHead: _ciHead,
         ...externalFacts
       } = input.externalFacts;
       const acceptedItemIds = acceptances
@@ -184,6 +270,118 @@ const make = Effect.gen(function* () {
       const orderedItemIds = externalFacts.orderedItemIds;
       const itemIndex =
         command.kind === "admitAttempt" ? orderedItemIds?.indexOf(command.itemId) : undefined;
+      let currentBinding: Binding | undefined;
+      let acceptance: Facts["acceptance"];
+      if (command.kind === "advance") {
+        const acceptedItem = acceptances.filter((a) => a.acceptance_key.startsWith("item:")).at(-1);
+        const priorBinding = acceptedItem
+          ? yield* Effect.try({
+              try: () => parse(acceptedItem.binding_json) as Binding,
+              catch: integrity,
+            })
+          : undefined;
+        const relevantAttempt = command.finalCombined
+          ? attempts.find(
+              (a) =>
+                a.id === priorBinding?.attemptId &&
+                a.item_id === acceptedItem?.acceptance_key.slice(5),
+            )
+          : latest;
+        const implementationRow = operations.find((o) => o.id === relevantAttempt?.operation_id);
+        const implementation = implementationRow
+          ? yield* Effect.try({
+              try: () => parse(implementationRow.record_json),
+              catch: integrity,
+            }).pipe(Effect.flatMap(decodeWorkflowOperationV1), Effect.mapError(integrity))
+          : undefined;
+        if (command.finalCombined && acceptedItem) {
+          if (
+            priorBinding &&
+            priorBinding.candidateHash &&
+            priorBinding.configurationHash &&
+            priorBinding.policyHash
+          )
+            currentBinding = {
+              specHash: run.spec.ref.sha256,
+              candidateHash: priorBinding.candidateHash,
+              configurationHash: priorBinding.configurationHash,
+              policyHash: priorBinding.policyHash,
+            };
+        } else if (!command.finalCombined && implementation)
+          currentBinding = contextBinding(implementation);
+        const resultRows = yield* sql<{
+          id: string;
+          operation_id: string;
+          record_json: string;
+        }>`SELECT id, operation_id, record_json FROM workflow_role_results WHERE workflow_run_id = ${input.runId} AND invalidated = 0 ORDER BY rowid`;
+        const results = yield* Effect.forEach(resultRows, (row) =>
+          Effect.try({ try: () => parse(row.record_json), catch: integrity }).pipe(
+            Effect.flatMap(decodeWorkflowRoleResultV1),
+            Effect.mapError(integrity),
+          ),
+        );
+        const rollup = results.findLast(
+          (r) => r.result.kind === "rollup" && sameBinding(r.binding, command.binding),
+        );
+        if (
+          rollup?.result.kind === "rollup" &&
+          implementation?.parameters.kind === "stage_launch" &&
+          implementation.parameters.stage === "implementation"
+        ) {
+          const provider = implementation.parameters.provider;
+          let independent = false;
+          for (const result of results) {
+            if (
+              (result.result.kind !== "code_review" && result.result.kind !== "semantic_review") ||
+              !sameBinding(result.binding, command.binding)
+            )
+              continue;
+            const row = operations.find((o) => o.id === result.operationId);
+            if (!row) continue;
+            const op = yield* Effect.try({
+              try: () => parse(row.record_json),
+              catch: integrity,
+            }).pipe(Effect.flatMap(decodeWorkflowOperationV1), Effect.mapError(integrity));
+            if (
+              op.parameters.kind === "stage_launch" &&
+              op.parameters.stage === result.result.kind &&
+              (op.parameters.provider.providerInstanceId !== provider.providerInstanceId ||
+                op.parameters.provider.model !== provider.model)
+            )
+              independent = true;
+          }
+          acceptance = {
+            binding: rollup.binding,
+            verdict: rollup.result.verdict,
+            finalCombined: rollup.binding.itemId === undefined,
+            evidenceAvailable: rollup.result.resultRefs.every((ref) =>
+              results.some((r) => String(r.id) === String(ref.id)),
+            ),
+            independent,
+          };
+        }
+      }
+      const succeeded = operations
+        .filter((o) => o.status === "settled")
+        .map((o) => ({ ...o, raw: parse(o.record_json) as WorkflowOperationV1 }));
+      const publication = succeeded.findLast(
+        (o) =>
+          o.kind === "publication" &&
+          o.raw.outcome?.kind === "succeeded" &&
+          o.raw.parameters.kind === "publication",
+      );
+      const ci = succeeded.findLast(
+        (o) =>
+          o.kind === "ci_observation" &&
+          o.raw.outcome?.kind === "succeeded" &&
+          o.raw.parameters.kind === "ci_observation",
+      );
+      const publishedHead =
+        publication?.raw.parameters.kind === "publication"
+          ? publication.raw.parameters.candidateCommit
+          : undefined;
+      const ciHead =
+        ci?.raw.parameters.kind === "ci_observation" ? ci.raw.parameters.headCommit : undefined;
       const facts: Facts = {
         ...externalFacts,
         custody: operations.some((o) => o.status === "unknown")
@@ -209,6 +407,12 @@ const make = Effect.gen(function* () {
             }
           : {}),
         acceptedItemIds,
+        ...(currentBinding ? { currentBinding } : {}),
+        ...(acceptance ? { acceptance } : {}),
+        publicationSettled: !!publishedHead,
+        requiredCiPassed: !!ciHead,
+        ...(publishedHead ? { publishedHead } : {}),
+        ...(ciHead ? { ciHead } : {}),
         predecessorAccepted:
           itemIndex !== undefined &&
           itemIndex >= 0 &&
@@ -227,9 +431,6 @@ const make = Effect.gen(function* () {
       const decision = WorkflowRunPolicy.decide({ run, command, facts });
       if (decision.kind !== "accepted") return decision;
       if (decision.actions.some((a) => a.kind === "invalidate_evidence" && a.scope === "selected"))
-        return yield* integrity();
-      // Evidence lineage is not yet available to verify acceptance against stored results.
-      if (decision.actions.some((a) => a.kind === "accept_item" || a.kind === "accept_final"))
         return yield* integrity();
       const reserve = decision.actions.find((a) => a.kind === "reserve_attempt");
       if (!!reserve !== !!input.operation) return yield* integrity();
@@ -305,8 +506,11 @@ const make = Effect.gen(function* () {
             break;
           }
           case "accept_item":
-          case "accept_final":
-            return yield* integrity();
+          case "accept_final": {
+            const key = action.kind === "accept_final" ? "final" : `item:${action.binding.itemId}`;
+            yield* sql`INSERT INTO workflow_acceptances (workflow_run_id, acceptance_key, binding_json) VALUES (${run.id}, ${key}, ${encode(action.binding)}) ON CONFLICT(workflow_run_id, acceptance_key) DO UPDATE SET binding_json = excluded.binding_json, invalidated = 0 WHERE workflow_acceptances.invalidated = 1`;
+            break;
+          }
         }
       }
       const result = { kind: "accepted" as const, receiptId: input.receiptId };
@@ -315,7 +519,7 @@ const make = Effect.gen(function* () {
     });
     return yield* inTransaction(work);
   });
-  return { createRun, createPlanningSession, commitTransition };
+  return { createRun, createPlanningSession, recordRoleResult, commitTransition };
 });
 
 export class WorkflowRunStore extends Context.Service<
