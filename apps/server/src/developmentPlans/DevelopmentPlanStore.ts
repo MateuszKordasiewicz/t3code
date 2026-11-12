@@ -99,9 +99,13 @@ const make = Effect.gen(function* () {
     if (!rows[0]) return yield* error("not-found");
     return rows[0];
   });
+  // createdAt is server-assigned, so retries of one command must fingerprint identically.
   const fingerprint = (method: string, input: object, context: MutationContext) =>
     Effect.try({
-      try: () => DevelopmentPlanHash.command({ ...context, method, input }),
+      try: () => {
+        const { createdAt: _createdAt, ...stable } = input as Record<string, unknown>;
+        return DevelopmentPlanHash.command({ ...context, method, input: stable });
+      },
       catch: () => error("invalid"),
     });
   const receipt = Effect.fn("DevelopmentPlanStore.receipt")(function* (

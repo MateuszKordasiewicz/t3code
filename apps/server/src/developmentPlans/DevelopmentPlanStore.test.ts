@@ -116,6 +116,9 @@ describe("DevelopmentPlanStore", () => {
           .plan.linkedThreadIds,
       ).toEqual([]);
       expect(yield* store.create(input, context)).toEqual({ kind: "replay", plan: created.plan });
+      expect(yield* store.create({ ...input, createdAt: "2030-01-01T00:00:00Z" }, context)).toEqual(
+        { kind: "replay", plan: created.plan },
+      );
       expect(
         (yield* Effect.flip(store.linkThread({ ...link, threadId: "other" }, context))).reason,
       ).toBe("integrity");
