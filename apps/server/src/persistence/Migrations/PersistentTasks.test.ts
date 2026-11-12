@@ -19,6 +19,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
     assert.deepInclude(migrations, [85, "WorkTaskCurrentState"]);
     assert.deepInclude(migrations, [86, "WorkTaskWaits"]);
     assert.deepInclude(migrations, [87, "WorkTaskResults"]);
+    assert.deepInclude(migrations, [88, "WorkTaskClaims"]);
     const tables = yield* sql<{ readonly name: string }>`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'work_task_%' ORDER BY name
     `;
@@ -30,6 +31,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
         "work_task_action_review_releases",
         "work_task_action_reviews",
         "work_task_allowances",
+        "work_task_claims",
         "work_task_current_state",
         "work_task_manager_bindings",
         "work_task_projections",
@@ -71,6 +73,7 @@ it.effect("upgrades predecessor rows and events without changing their bytes or 
       [85, "WorkTaskCurrentState"],
       [86, "WorkTaskWaits"],
       [87, "WorkTaskResults"],
+      [88, "WorkTaskClaims"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM projection_projects ORDER BY project_id`,
@@ -108,6 +111,7 @@ it.effect("rolls back a failed migration and succeeds on rerun", () =>
       [85, "WorkTaskCurrentState"],
       [86, "WorkTaskWaits"],
       [87, "WorkTaskResults"],
+      [88, "WorkTaskClaims"],
     ]);
     assert.deepStrictEqual(yield* runMigrations(), []);
   }).pipe(Effect.provide(db)),
@@ -226,6 +230,7 @@ it.effect(
         [85, "WorkTaskCurrentState"],
         [86, "WorkTaskWaits"],
         [87, "WorkTaskResults"],
+        [88, "WorkTaskClaims"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -386,6 +391,7 @@ it.effect("preserves task custody through validation upgrade and rolls back migr
       [85, "WorkTaskCurrentState"],
       [86, "WorkTaskWaits"],
       [87, "WorkTaskResults"],
+      [88, "WorkTaskClaims"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -519,6 +525,7 @@ it.effect("upgrades validation data atomically to action reviews and preserves p
       [85, "WorkTaskCurrentState"],
       [86, "WorkTaskWaits"],
       [87, "WorkTaskResults"],
+      [88, "WorkTaskClaims"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -728,6 +735,7 @@ it.effect("upgrades existing tasks without inventing state and rolls back migrat
       [85, "WorkTaskCurrentState"],
       [86, "WorkTaskWaits"],
       [87, "WorkTaskResults"],
+      [88, "WorkTaskClaims"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -822,6 +830,7 @@ it.effect("upgrades waits atomically while preserving task state and link proven
     assert.deepStrictEqual(yield* runMigrations(), [
       [86, "WorkTaskWaits"],
       [87, "WorkTaskResults"],
+      [88, "WorkTaskClaims"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM work_task_thread_links ORDER BY link_event_id`,
@@ -941,7 +950,10 @@ it.effect("upgrades result history atomically without changing predecessor data"
       [],
     );
     yield* sql`DROP INDEX work_task_results_history_idx`;
-    assert.deepStrictEqual(yield* runMigrations(), [[87, "WorkTaskResults"]]);
+    assert.deepStrictEqual(yield* runMigrations(), [
+      [87, "WorkTaskResults"],
+      [88, "WorkTaskClaims"],
+    ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_current_state`, state);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_thread_links`, links);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_waits`, waits);
@@ -1034,6 +1046,134 @@ it.effect("enforces result provenance and contract bounds with indexed history",
       detail: string;
     }>`EXPLAIN QUERY PLAN SELECT event_id FROM work_task_results WHERE task_id = 'a' AND (sequence, event_id) < (6, 'large') ORDER BY sequence DESC, event_id DESC LIMIT 50`;
     assert.isTrue(plan.some((row) => row.detail.includes("work_task_results_history_idx")));
+    assert.isFalse(plan.some((row) => row.detail.includes("TEMP B-TREE")));
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect("upgrades claim history atomically and preserves prior task and ordinary data", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations({ toMigrationInclusive: 87 });
+    yield* sql`INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at) VALUES ('p', 'Project', '/p', '[]', 't', 't')`;
+    yield* sql`INSERT INTO orchestration_v2_projection_threads (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode, created_at, updated_at, payload_json) VALUES ('thread', 'p', 'Thread', 'codex', 'full-access', 'default', 't', 't', '{}')`;
+    yield* sql`INSERT INTO work_task_projections VALUES ('a', 'p', 1, 1, 1, 1, '{}', 't', 't')`;
+    yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('a', 1, 1, '{}', '{}', 'accepted', 't')`;
+    yield* sql`INSERT INTO work_task_current_state (task_id) VALUES ('a')`;
+    yield* sql`INSERT INTO work_task_manager_bindings VALUES ('a', 1, 'manager', 't', NULL)`;
+    yield* sql`INSERT INTO work_task_thread_links VALUES ('link', 'a', 'thread', 't', '{}', 'unlink', 'later', '{}')`;
+    yield* sql`INSERT INTO work_task_waits VALUES ('a', 'wait', 1, '{"type":"source","sourceId":"s"}', 'registered', 2, 't')`;
+    yield* sql`INSERT INTO work_task_results VALUES ('result', 'a', 'source', NULL, '{"type":"server"}', 'summary', '[]', 3, 't')`;
+    yield* sql`INSERT INTO orchestration_events (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, actor_kind, payload_json, metadata_json) VALUES ('ordinary', 'thread', 'thread', 1, 'thread.created', 't', 'client', '{ "ordinary": true }', '{}'), ('task-event', 'task', 'a', 1, 'task.created', 't', 'client', '{ "task": true }', '{}')`;
+    const tables = [
+      "projection_projects",
+      "orchestration_v2_projection_threads",
+      "orchestration_events",
+      "work_task_projections",
+      "work_task_accepted_definitions",
+      "work_task_current_state",
+      "work_task_manager_bindings",
+      "work_task_view_fence",
+      "work_task_thread_links",
+      "work_task_waits",
+      "work_task_results",
+    ];
+    const before = yield* Effect.forEach(tables, (name) => sql.unsafe(`SELECT * FROM ${name}`));
+    yield* sql`CREATE INDEX work_task_claims_history_idx ON work_task_projections(task_id)`;
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(runMigrations())));
+    assert.deepStrictEqual(
+      yield* sql`SELECT name FROM sqlite_master WHERE name = 'work_task_claims'`,
+      [],
+    );
+    assert.deepStrictEqual(
+      yield* sql`SELECT migration_id FROM effect_sql_migrations WHERE migration_id = 88`,
+      [],
+    );
+    yield* sql`DROP INDEX work_task_claims_history_idx`;
+    assert.deepStrictEqual(yield* runMigrations(), [[88, "WorkTaskClaims"]]);
+    assert.deepStrictEqual(
+      yield* Effect.forEach(tables, (name) => sql.unsafe(`SELECT * FROM ${name}`)),
+      before,
+    );
+    assert.deepStrictEqual(yield* runMigrations(), []);
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect("constrains claim identity, evidence, bindings and indexed history", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations();
+    yield* sql`PRAGMA foreign_keys = ON`;
+    yield* sql`INSERT INTO work_task_projections VALUES ('a', 'p', 1, 1, 1, 1, '{}', 't', 't'), ('b', 'p', 1, 1, 1, 1, '{}', 't', 't')`;
+    yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('a', 1, 1, '{}', '{}', 'accepted', 't'), ('b', 1, 1, '{}', '{}', 'accepted-b', 't')`;
+    yield* sql`INSERT INTO work_task_manager_bindings VALUES ('a', 1, 'manager', 't', NULL), ('b', 1, 'other', 't', NULL)`;
+    const references = [
+      { type: "run", threadId: "thread", runId: "run" },
+      { type: "artifact", uri: "u", hash: "h" },
+      { type: "source_revision", repository: "r", revision: "v" },
+    ];
+    const batch = Array.from({ length: 32 }, () => ({
+      type: "artifact",
+      uri: "😀".repeat(1000),
+      hash: "x".repeat(2000),
+    }));
+    yield* sql`INSERT INTO work_task_claims VALUES ('event1', 'a', 'claim1', 'evidence1', 'manager', 1, 1, 1, 0, '{"type":"server"}', ${"😀".repeat(1000)}, ${JSON.stringify(batch)}, 5, 't')`;
+    yield* sql`INSERT INTO work_task_claims VALUES ('event2', 'a', 'claim2', 'evidence2', 'manager', 1, 1, 1, 2, '{"type":"manager","threadId":"manager","providerSessionId":"s","runId":"r","generation":1}', ${" \0 "}, ${JSON.stringify(references)}, 5, 't')`;
+    yield* sql`INSERT INTO work_task_claims VALUES ('event-b', 'b', 'claim1', 'evidence1', 'other', 1, 1, 1, 0, '{"type":"server"}', 'summary', ${JSON.stringify(references)}, 1, 't')`;
+    const invalid = [
+      sql`INSERT INTO work_task_claims SELECT event_id, task_id, 'new', 'new', manager_thread_id, manager_generation, definition_revision, completion_policy_revision, observed_work_sequence, attribution_json, summary, evidence_json, sequence, recorded_at FROM work_task_claims WHERE event_id = 'event1'`,
+      sql`INSERT INTO work_task_claims SELECT 'new', task_id, claim_id, 'new', manager_thread_id, manager_generation, definition_revision, completion_policy_revision, observed_work_sequence, attribution_json, summary, evidence_json, sequence, recorded_at FROM work_task_claims WHERE event_id = 'event1'`,
+      sql`INSERT INTO work_task_claims SELECT 'new', task_id, 'new', evidence_id, manager_thread_id, manager_generation, definition_revision, completion_policy_revision, observed_work_sequence, attribution_json, summary, evidence_json, sequence, recorded_at FROM work_task_claims WHERE event_id = 'event1'`,
+      sql`UPDATE work_task_claims SET task_id = 'b' WHERE event_id = 'event1'`,
+      sql`UPDATE work_task_claims SET definition_revision = 2 WHERE event_id = 'event1'`,
+      sql`UPDATE work_task_claims SET manager_generation = 2 WHERE event_id = 'event1'`,
+      sql`UPDATE work_task_claims SET manager_thread_id = 'other' WHERE event_id = 'event1'`,
+      sql`UPDATE work_task_claims SET completion_policy_revision = 0 WHERE event_id = 'event1'`,
+      sql`UPDATE work_task_claims SET observed_work_sequence = -1 WHERE event_id = 'event1'`,
+      sql`UPDATE work_task_claims SET sequence = -1 WHERE event_id = 'event1'`,
+      sql`UPDATE work_task_claims SET claim_id = ${"x\0" + "x".repeat(1999)} WHERE event_id = 'event1'`,
+      sql`UPDATE work_task_claims SET evidence_id = ${"😀".repeat(1001)} WHERE event_id = 'event1'`,
+      sql`UPDATE work_task_claims SET summary = ${"😀".repeat(1001)} WHERE event_id = 'event1'`,
+      sql`UPDATE work_task_claims SET evidence_json = '[]' WHERE event_id = 'event1'`,
+      sql`UPDATE work_task_claims SET evidence_json = ${JSON.stringify([...batch, batch[0]])} WHERE event_id = 'event1'`,
+      sql`UPDATE work_task_claims SET evidence_json = '[{"type":"run","threadId":"t"}]' WHERE event_id = 'event1'`,
+      sql`UPDATE work_task_claims SET evidence_json = ${JSON.stringify([{ type: "artifact", uri: "u", hash: "\ufeff" }])} WHERE event_id = 'event1'`,
+      sql`UPDATE work_task_claims SET attribution_json = '{"type":"user","sessionId":"s"}' WHERE event_id = 'event1'`,
+      sql`UPDATE work_task_claims SET attribution_json = ${JSON.stringify({ type: "user", sessionId: "s", subject: "\u3000" })} WHERE event_id = 'event1'`,
+    ];
+    for (const statement of invalid) assert.isTrue(Exit.isFailure(yield* Effect.exit(statement)));
+    for (const whitespace of [
+      "\t",
+      "\r\n",
+      "\v\f",
+      "\u00a0",
+      "\u1680",
+      "\u2000\u200a",
+      "\u2028\u2029",
+      "\u202f",
+      "\u205f",
+      "\u3000",
+      "\ufeff",
+    ]) {
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`UPDATE work_task_claims SET summary = ${whitespace} WHERE event_id = 'event1'`,
+          ),
+        ),
+      );
+    }
+    yield* sql`UPDATE work_task_claims SET evidence_json = ${JSON.stringify([{ type: "run", threadId: " \0 ", runId: "r" }])} WHERE event_id = 'event2'`;
+    const rows = yield* sql<{
+      claim_id: string;
+    }>`SELECT claim_id FROM work_task_claims WHERE task_id = 'a' AND (sequence, claim_id) < (6, 'z') ORDER BY sequence DESC, claim_id DESC LIMIT 50`;
+    assert.deepStrictEqual(
+      rows.map((row) => row.claim_id),
+      ["claim2", "claim1"],
+    );
+    const plan = yield* sql<{
+      detail: string;
+    }>`EXPLAIN QUERY PLAN SELECT claim_id FROM work_task_claims WHERE task_id = 'a' AND (sequence, claim_id) < (6, 'z') ORDER BY sequence DESC, claim_id DESC LIMIT 50`;
+    assert.isTrue(plan.some((row) => row.detail.includes("work_task_claims_history_idx")));
     assert.isFalse(plan.some((row) => row.detail.includes("TEMP B-TREE")));
   }).pipe(Effect.provide(db)),
 );
