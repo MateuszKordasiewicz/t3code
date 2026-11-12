@@ -172,6 +172,12 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     Effect.asVoid,
   );
   const sql = yield* SqlClient.SqlClient;
+  // Shares the reservation transaction's span and writer connection.
+  const runningNativeEffect = Effect.fnUntraced(function* (threadId: string) {
+    const rows =
+      yield* sql`SELECT 1 FROM orchestration_v2_effect_outbox WHERE thread_id = ${threadId} AND status = 'running' AND effect_type IN ('provider-turn.start', 'provider-turn.restart', 'provider-runtime.continue') LIMIT 1`;
+    return rows.length > 0;
+  });
   const inTransaction = <A, E, R>(work: Effect.Effect<A, E, R>) =>
     sql
       .withTransaction(work)
@@ -208,14 +214,17 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     yield* notify;
     return result;
   });
-  const planningTransaction = <A, E, R>(work: Effect.Effect<A, E, R>) =>
+  const planningTransaction = <A, E, R>(
+    work: Effect.Effect<A, E, R>,
+    contentionReason: "conflict" | "storage" = "conflict",
+  ) =>
     sql
       .withTransaction(work)
       .pipe(
         Effect.mapError((error) =>
           isPlanningError(error)
             ? error
-            : planningError(isWriteContention(error) ? "conflict" : "storage"),
+            : planningError(isWriteContention(error) ? contentionReason : "storage"),
         ),
       );
   const readSession = Effect.fn("WorkflowRunStore.readPlanningSession")(function* (id: S["id"]) {
@@ -630,6 +639,7 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
               fingerprint,
             };
           }
+          if (yield* runningNativeEffect(input.threadId)) return yield* planningError("custody");
           const custody = yield* readThreadCustodyInTransaction(input.threadId).pipe(
             Effect.mapError((error) =>
               planningError(error.reason === "integrity" ? "integrity" : "storage"),
@@ -714,6 +724,7 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
             fingerprint,
           };
         }),
+        "storage",
       );
       if (result.kind === "reserved") yield* notify;
       return result;
@@ -2279,6 +2290,8 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
             fingerprint: replayFingerprint,
           };
         }
+        if (yield* runningNativeEffect(input.threadId))
+          return { kind: "rejected" as const, reason: "custody" as const };
         const custody = yield* readThreadCustodyInTransaction(input.threadId);
         if (
           custody.kind === "owned" &&

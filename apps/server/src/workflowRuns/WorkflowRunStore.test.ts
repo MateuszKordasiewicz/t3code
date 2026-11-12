@@ -6,6 +6,13 @@ import * as NodeSqlite from "node:sqlite";
 
 import { assert, it } from "@effect/vitest";
 import {
+  CommandId,
+  RunId,
+  RunAttemptId,
+  ProviderSessionId,
+  ProviderThreadId,
+  ProviderTurnId,
+  ThreadId,
   PlanningPassV1,
   PlanningSessionV1,
   WorkflowOperationV1,
@@ -19,13 +26,16 @@ import * as Digest from "effect/crypto/Digest";
 import * as Ref from "effect/Ref";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import migration from "../persistence/Migrations/081_WorkflowRuns.ts";
 import planMigration from "../persistence/Migrations/082_DevelopmentPlans.ts";
 import intentMigration from "../persistence/Migrations/084_WorkflowNativeLaunchIntents.ts";
-import evidenceMigration from "../persistence/Migrations/083_PlanningEvidence.ts";
+import { runMigrations } from "../persistence/Migrations.ts";
+import * as EffectOutbox from "../orchestration-v2/EffectOutbox.ts";
+import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
 import { DevelopmentPlanHash } from "../developmentPlans/DevelopmentPlanHash.ts";
 import * as Store from "./WorkflowRunStore.ts";
 import * as Recovery from "./WorkflowRunRecovery.ts";
@@ -141,9 +151,7 @@ const seedPlan = (level: "identity" | "plan" | "complete" = "complete") =>
 const setup = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   yield* sql`PRAGMA foreign_keys = ON`;
-  yield* migration;
-  yield* planMigration;
-  yield* intentMigration;
+  yield* runMigrations();
   yield* seedPlan();
   yield* sql`INSERT INTO workflow_runs VALUES ('run', 'plan', 'revision', ${hash}, ${hash}, ${hash}, 'active', 0, 0, ${json(run)})`;
 });
@@ -2389,9 +2397,7 @@ it.effect("planning receipts survive database reopen and corruption is rejected"
 const seedAdmission = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   yield* sql`PRAGMA foreign_keys = ON`;
-  yield* migration;
-  yield* planMigration;
-  yield* intentMigration;
+  yield* runMigrations();
   const example = {
     schemaVersion: 1,
     planId: "plan",
@@ -2547,6 +2553,446 @@ const planningReservation = (admission: ReturnType<typeof admissionInput>) => {
     now: admission.now,
   };
 };
+
+const layerWithOutbox = Layer.merge(Store.layer, EffectOutbox.layer).pipe(
+  Layer.provideMerge(NodeSqliteClient.layer({ filename: ":memory:" })),
+);
+
+const nativeRequests = [
+  { type: "provider-turn.start", runId: RunId.make("native-run") },
+  {
+    type: "provider-turn.restart",
+    runId: RunId.make("native-run"),
+    interruptedAttemptId: RunAttemptId.make("attempt"),
+    providerSessionId: ProviderSessionId.make("session"),
+    providerThreadId: ProviderThreadId.make("provider-thread"),
+    providerTurnId: ProviderTurnId.make("turn"),
+  },
+  { type: "provider-runtime.continue", sourceRunId: RunId.make("native-run") },
+] as const;
+const rawReservationState = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  return {
+    runs: yield* sql`SELECT * FROM workflow_runs`,
+    sessions: yield* sql`SELECT * FROM workflow_planning_sessions`,
+    intents: yield* sql`SELECT * FROM workflow_native_launch_intents`,
+    receipts: yield* sql`SELECT * FROM workflow_native_intent_receipts`,
+    commands: yield* sql`SELECT * FROM workflow_command_receipts`,
+    operations: yield* sql`SELECT * FROM workflow_operations`,
+    attempts: yield* sql`SELECT * FROM workflow_attempts`,
+    passes: yield* sql`SELECT * FROM workflow_planning_passes`,
+    outbox: yield* sql`SELECT * FROM orchestration_v2_effect_outbox`,
+  };
+});
+
+it.effect.each(
+  (["workflow", "planning"] as const).flatMap((owner) =>
+    nativeRequests.map((request) => ({ owner, request })),
+  ),
+)("refuses a new $owner reservation after a $request.type claim", ({ owner, request }) =>
+  Effect.gen(function* () {
+    const store = yield* Store.WorkflowRunStore;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    let input;
+    if (owner === "workflow") {
+      yield* setupAdmission;
+      input = reservation(operationFor("running-op", "running-attempt"), "running-attempt");
+    } else {
+      const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+      yield* begin(store, session);
+      input = planningReservation(admissionInput(binding, "running"));
+    }
+    yield* outbox.enqueue([
+      {
+        id: "running-effect",
+        commandId: CommandId.make("running-effect-command"),
+        threadId: ThreadId.make(input.threadId),
+        request,
+      },
+    ]);
+    assert.isTrue(Option.isSome(yield* outbox.claimNext({ workerId: "worker" })));
+    const before = yield* rawReservationState;
+    if (owner === "workflow") {
+      assert.deepStrictEqual(
+        yield* store.reserveWorkflowNativeIntent(input as ReturnType<typeof reservation>),
+        {
+          kind: "rejected",
+          reason: "custody",
+        },
+      );
+    } else {
+      assert.strictEqual(
+        (yield* Effect.flip(
+          store.reservePlanningNativeIntent(input as ReturnType<typeof planningReservation>),
+        )).reason,
+        "custody",
+      );
+    }
+    assert.deepStrictEqual(yield* rawReservationState, before);
+  }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect.each([
+  ["workflow", "pending"],
+  ["planning", "pending"],
+  ["workflow", "succeeded"],
+  ["planning", "succeeded"],
+  ["workflow", "other"],
+  ["planning", "other"],
+] as const)("%s reservation allows %s outbox effects", ([owner, state]) =>
+  Effect.gen(function* () {
+    const store = yield* Store.WorkflowRunStore;
+    const sql = yield* SqlClient.SqlClient;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    let input;
+    if (owner === "workflow") {
+      yield* setupAdmission;
+      input = reservation(operationFor("allowed-op", "allowed-attempt"), "allowed-attempt");
+    } else {
+      const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+      yield* begin(store, session);
+      input = planningReservation(admissionInput(binding, "allowed"));
+    }
+    yield* outbox.enqueue([
+      {
+        id: "allowed-effect",
+        commandId: CommandId.make("allowed-command"),
+        threadId: ThreadId.make(input.threadId),
+        request: state === "other" ? { type: "terminal.cleanup" } : nativeRequests[0],
+      },
+    ]);
+    if (state === "other")
+      assert.isTrue(Option.isSome(yield* outbox.claimNext({ workerId: "worker" })));
+    if (state === "succeeded")
+      yield* sql`UPDATE orchestration_v2_effect_outbox SET status = 'succeeded' WHERE effect_id = 'allowed-effect'`;
+    const result =
+      owner === "workflow"
+        ? yield* store.reserveWorkflowNativeIntent(input as ReturnType<typeof reservation>)
+        : yield* store.reservePlanningNativeIntent(input as ReturnType<typeof planningReservation>);
+    assert.strictEqual(result.kind, "reserved");
+  }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "%s replay bypasses running and missing outbox; new reservations fail closed",
+  (owner) =>
+    Effect.gen(function* () {
+      const store = yield* Store.WorkflowRunStore;
+      const sql = yield* SqlClient.SqlClient;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      let first;
+      let next;
+      if (owner === "workflow") {
+        yield* setupAdmission;
+        first = reservation(operationFor("replay-op", "replay-attempt"), "replay-attempt");
+        next = reservation(operationFor("next-op", "next-attempt"), "next-attempt");
+      } else {
+        const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+        yield* begin(store, session);
+        first = planningReservation(admissionInput(binding, "replay"));
+        next = planningReservation(admissionInput(binding, "next"));
+      }
+      const reserve = (input: typeof first) =>
+        Effect.gen(function* () {
+          if (owner === "workflow")
+            return yield* store.reserveWorkflowNativeIntent(
+              input as ReturnType<typeof reservation>,
+            );
+          return yield* store.reservePlanningNativeIntent(
+            input as ReturnType<typeof planningReservation>,
+          );
+        });
+      const initial = yield* reserve(first);
+      assert.strictEqual(initial.kind, "reserved");
+      yield* outbox.enqueue([
+        {
+          id: "replay-effect",
+          commandId: CommandId.make("replay-effect-command"),
+          threadId: ThreadId.make(first.threadId),
+          request: nativeRequests[0],
+        },
+      ]);
+      yield* sql`UPDATE orchestration_v2_effect_outbox SET status = 'running', attempt_count = 1, lease_owner = 'worker' WHERE effect_id = 'replay-effect'`;
+      const before = yield* rawReservationState;
+      assert.deepStrictEqual(yield* reserve(first), { ...initial, kind: "replay" });
+      assert.deepStrictEqual(yield* rawReservationState, before);
+      yield* sql`DROP TABLE orchestration_v2_effect_outbox`;
+      assert.deepStrictEqual(yield* reserve(first), { ...initial, kind: "replay" });
+      const failure = yield* Effect.flip(reserve(next));
+      assert.strictEqual(failure.reason, owner === "workflow" ? "persistence" : "storage");
+      assert.deepStrictEqual(
+        yield* sql`SELECT * FROM workflow_native_launch_intents`,
+        before.intents,
+      );
+      assert.deepStrictEqual(
+        yield* sql`SELECT * FROM workflow_native_intent_receipts`,
+        before.receipts,
+      );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_runs`, before.runs);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_planning_sessions`, before.sessions);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_command_receipts`, before.commands);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_operations`, before.operations);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_attempts`, before.attempts);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_planning_passes`, before.passes);
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "%s reservation maps a writer lock failure without writes",
+  (owner) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const directory = yield* Effect.acquireRelease(
+          Effect.sync(() => NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "native-locked-"))),
+          (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
+        );
+        const filename = NodePath.join(directory, "state.sqlite");
+        const fileLayer = Store.layer.pipe(
+          Layer.provideMerge(NodeSqliteClient.layer({ filename })),
+        );
+        yield* Effect.gen(function* () {
+          const store = yield* Store.WorkflowRunStore;
+          const sql = yield* SqlClient.SqlClient;
+          let input;
+          if (owner === "workflow") {
+            yield* setupAdmission;
+            input = reservation(operationFor("locked-op", "locked-attempt"), "locked-attempt");
+          } else {
+            const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+            yield* begin(store, session);
+            input = planningReservation(admissionInput(binding, "locked"));
+          }
+          const before = yield* rawReservationState;
+          yield* sql`PRAGMA busy_timeout = 0`;
+          const other = yield* Effect.acquireRelease(
+            Effect.sync(() => {
+              const database = new NodeSqlite.DatabaseSync(filename);
+              database.exec("BEGIN IMMEDIATE");
+              return database;
+            }),
+            (database) => Effect.sync(() => database.close()),
+          );
+          const failure =
+            owner === "workflow"
+              ? yield* Effect.flip(
+                  store.reserveWorkflowNativeIntent(input as ReturnType<typeof reservation>),
+                )
+              : yield* Effect.flip(
+                  store.reservePlanningNativeIntent(
+                    input as ReturnType<typeof planningReservation>,
+                  ),
+                );
+          assert.strictEqual(failure.reason, owner === "workflow" ? "persistence" : "storage");
+          yield* Effect.sync(() => other.exec("ROLLBACK"));
+          assert.deepStrictEqual(yield* rawReservationState, before);
+        }).pipe(Effect.provide(fileLayer));
+      }),
+    ),
+);
+
+it.effect.each([
+  ["workflow", "reservation"],
+  ["workflow", "claim"],
+  ["planning", "reservation"],
+  ["planning", "claim"],
+] as const)(
+  "independent connections preserve $0 custody when $1 commits first",
+  ([owner, winner]) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const directory = yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "native-commit-order-")),
+          ),
+          (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
+        );
+        const filename = NodePath.join(directory, "state.sqlite");
+        const fileLayer = () =>
+          Layer.merge(Store.layer, EffectOutbox.layer).pipe(
+            Layer.provideMerge(NodeSqliteClient.layer({ filename })),
+          );
+        const prepared = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* Store.WorkflowRunStore;
+            const outbox = yield* EffectOutbox.EffectOutboxV2;
+            let input;
+            if (owner === "workflow") {
+              yield* setupAdmission;
+              input = reservation(operationFor("race-op", "race-attempt"), "race-attempt");
+            } else {
+              const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+              yield* begin(store, session);
+              input = planningReservation(admissionInput(binding, "race"));
+            }
+            yield* outbox.enqueue([
+              {
+                id: "race-effect",
+                commandId: CommandId.make("race-command"),
+                threadId: ThreadId.make(input.threadId),
+                request: nativeRequests[0],
+              },
+            ]);
+            return { input, before: yield* rawReservationState };
+          }).pipe(Effect.provide(fileLayer())),
+        );
+        const ready = yield* Deferred.make<void>();
+        const arrivals = yield* Ref.make(0);
+        const firstCommitted = yield* Deferred.make<void>();
+        const secondFinished = yield* Deferred.make<void>();
+        const proofFinished = yield* Deferred.make<void>();
+        const rendezvous = Effect.gen(function* () {
+          if ((yield* Ref.updateAndGet(arrivals, (n) => n + 1)) === 2)
+            yield* Deferred.succeed(ready, undefined);
+          yield* Deferred.await(ready);
+        });
+        const reserve = Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* Store.WorkflowRunStore;
+            yield* rendezvous;
+            if (winner === "claim") yield* Deferred.await(firstCommitted);
+            const before = yield* rawReservationState;
+            const result =
+              owner === "workflow"
+                ? yield* Effect.result(
+                    store.reserveWorkflowNativeIntent(
+                      prepared.input as ReturnType<typeof reservation>,
+                    ),
+                  )
+                : yield* Effect.result(
+                    store.reservePlanningNativeIntent(
+                      prepared.input as ReturnType<typeof planningReservation>,
+                    ),
+                  );
+            const after = yield* rawReservationState;
+            if (winner === "reservation") {
+              yield* Deferred.succeed(firstCommitted, undefined);
+              yield* Deferred.await(secondFinished);
+            } else {
+              yield* Deferred.succeed(secondFinished, undefined);
+            }
+            const final = yield* rawReservationState;
+            const replay =
+              winner === "reservation"
+                ? owner === "workflow"
+                  ? yield* Effect.result(
+                      store.reserveWorkflowNativeIntent(
+                        prepared.input as ReturnType<typeof reservation>,
+                      ),
+                    )
+                  : yield* Effect.result(
+                      store.reservePlanningNativeIntent(
+                        prepared.input as ReturnType<typeof planningReservation>,
+                      ),
+                    )
+                : undefined;
+            const afterReplay = yield* rawReservationState;
+            if (winner === "reservation") yield* Deferred.succeed(proofFinished, undefined);
+            else yield* Deferred.await(proofFinished);
+            return { before, result, after, final, replay, afterReplay };
+          }).pipe(Effect.provide(fileLayer())),
+        );
+        const claim = Effect.scoped(
+          Effect.gen(function* () {
+            const outbox = yield* EffectOutbox.EffectOutboxV2;
+            yield* rendezvous;
+            if (winner === "reservation") yield* Deferred.await(firstCommitted);
+            const before = yield* rawReservationState;
+            const result = yield* outbox.claimNext({ workerId: "race-worker" });
+            const executed = yield* Ref.make<Array<string>>([]);
+            const executor = Layer.succeed(
+              EffectWorker.OrchestrationEffectExecutorV2,
+              EffectWorker.OrchestrationEffectExecutorV2.of({
+                execute: (effect) => Ref.update(executed, (ids) => [...ids, effect.id]),
+              }),
+            );
+            const workerLayer = EffectWorker.layerWithOptions({ workerId: "proof-worker" }).pipe(
+              Layer.provide(
+                Layer.merge(Layer.succeed(EffectOutbox.EffectOutboxV2, outbox), executor),
+              ),
+            );
+            const worked =
+              winner === "reservation"
+                ? yield* Effect.gen(function* () {
+                    const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+                    return yield* worker.runOnce;
+                  }).pipe(Effect.provide(workerLayer))
+                : undefined;
+            const executedIds = yield* Ref.get(executed);
+            const after = yield* rawReservationState;
+            if (winner === "claim") {
+              yield* Deferred.succeed(firstCommitted, undefined);
+              yield* Deferred.await(secondFinished);
+            } else {
+              yield* Deferred.succeed(secondFinished, undefined);
+            }
+            const final = yield* rawReservationState;
+            if (winner === "claim") yield* Deferred.succeed(proofFinished, undefined);
+            else yield* Deferred.await(proofFinished);
+            return { before, result, after, final, worked, executedIds };
+          }).pipe(Effect.provide(fileLayer())),
+        );
+        const [reservationResult, claimResult] = yield* Effect.all([reserve, claim], {
+          concurrency: 2,
+        });
+        if (winner === "reservation") {
+          assert.strictEqual(reservationResult.result._tag, "Success");
+          if (reservationResult.result._tag !== "Success") throw new Error("reservation failed");
+          assert.strictEqual(reservationResult.result.success.kind, "reserved");
+          assert.deepStrictEqual(claimResult.before, reservationResult.after);
+          assert.isTrue(Option.isNone(claimResult.result));
+          assert.isFalse(claimResult.worked);
+          assert.deepStrictEqual(claimResult.executedIds, []);
+          assert.deepStrictEqual(claimResult.after, claimResult.before);
+          assert.strictEqual(reservationResult.replay?._tag, "Success");
+          if (reservationResult.replay?._tag !== "Success") throw new Error("replay failed");
+          assert.deepStrictEqual(reservationResult.replay.success, {
+            ...reservationResult.result.success,
+            kind: "replay",
+          });
+          assert.deepStrictEqual(reservationResult.final, reservationResult.after);
+          assert.deepStrictEqual(reservationResult.afterReplay, reservationResult.after);
+        } else {
+          assert.isTrue(Option.isSome(claimResult.result));
+          assert.deepStrictEqual(claimResult.before, prepared.before);
+          assert.deepStrictEqual(reservationResult.before, claimResult.after);
+          assert.deepStrictEqual(reservationResult.after, reservationResult.before);
+          assert.deepStrictEqual(claimResult.final, claimResult.after);
+          if (owner === "workflow") {
+            assert.strictEqual(reservationResult.result._tag, "Success");
+            if (reservationResult.result._tag !== "Success")
+              throw new Error("workflow reservation failed");
+            assert.deepStrictEqual(reservationResult.result.success, {
+              kind: "rejected",
+              reason: "custody",
+            });
+          } else {
+            assert.strictEqual(reservationResult.result._tag, "Failure");
+            if (reservationResult.result._tag !== "Failure")
+              throw new Error("planning reservation succeeded");
+            assert.strictEqual(reservationResult.result.failure.reason, "custody");
+          }
+          assert.strictEqual(claimResult.after.outbox[0]?.status, "running");
+          assert.strictEqual(claimResult.after.outbox[0]?.attempt_count, 1);
+          assert.strictEqual(claimResult.after.outbox[0]?.lease_owner, "race-worker");
+        }
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const outbox = yield* EffectOutbox.EffectOutboxV2;
+            yield* outbox.enqueue([
+              {
+                id: "ordinary-effect",
+                commandId: CommandId.make("ordinary-command"),
+                threadId: ThreadId.make("ordinary-thread"),
+                request: nativeRequests[0],
+              },
+            ]);
+            const ordinary = yield* outbox.claimNext({ workerId: "ordinary-worker" });
+            assert.strictEqual(Option.getOrThrow(ordinary).id, "ordinary-effect");
+          }).pipe(Effect.provide(fileLayer())),
+        );
+      }),
+    ),
+);
 
 it.effect.each(["reserved", "dispatching", "unknown", "cancelled"] as const)(
   "thread custody recognizes workflow intent in %s state and ignores unrelated malformed records",
@@ -3944,7 +4390,7 @@ it.effect(
           loser.result._tag !== "Failure"
         )
           return;
-        assert.include(["conflict", "limit"], loser.result.failure.reason);
+        assert.include(["conflict", "limit", "storage"], loser.result.failure.reason);
         const won = winner.result.success;
         yield* Effect.scoped(
           Effect.gen(function* () {
@@ -4308,7 +4754,6 @@ it.effect.each([
   Effect.gen(function* () {
     const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
     const sql = yield* SqlClient.SqlClient;
-    yield* evidenceMigration;
     const store = yield* Store.WorkflowRunStore;
     const review = scenario === "review revision hash" || scenario === "review source hash";
     const owner = review ? { ...session, allowedRoles: ["review"] as const } : session;
@@ -4445,7 +4890,6 @@ it.effect(
         const first = yield* Effect.scoped(
           Effect.gen(function* () {
             const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
-            yield* evidenceMigration;
             const store = yield* Store.WorkflowRunStore;
             yield* begin(store, session);
             const admission = admissionInput(binding, "persist");
@@ -4565,7 +5009,6 @@ it.effect.each([
 ] as const)("planning repair disposition: %s", (scenario) =>
   Effect.gen(function* () {
     const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
-    yield* evidenceMigration;
     const store = yield* Store.WorkflowRunStore;
     const sql = yield* SqlClient.SqlClient;
     const owner = { ...session, allowedRoles: ["review", "repair"] as const };
@@ -4772,7 +5215,6 @@ it.effect.each([
   ([initial, expected, eligible, intentState]) =>
     Effect.gen(function* () {
       const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
-      yield* evidenceMigration;
       const store = yield* Store.WorkflowRunStore;
       const sql = yield* SqlClient.SqlClient;
       const owner = { ...session, allowedRoles: ["author", "review"] as const };
