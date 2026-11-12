@@ -76,6 +76,7 @@ export type ServerSelfUpdateCapability = typeof ServerSelfUpdateCapability.Type;
 
 export const ExecutionEnvironmentCapabilities = Schema.Struct({
   repositoryIdentity: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  workflowV1: Schema.optionalKey(Schema.Struct({ planning: Schema.Boolean, runs: Schema.Boolean })),
   connectionProbe: Schema.optionalKey(Schema.Boolean),
   attachmentUploads: Schema.optionalKey(Schema.Boolean),
   questionAttachments: Schema.optionalKey(Schema.Boolean),
