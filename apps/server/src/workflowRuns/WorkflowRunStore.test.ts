@@ -1,5 +1,5 @@
 import { assert, it } from "@effect/vitest";
-import { PlanningSessionV1, WorkflowRunV1 } from "@t3tools/contracts";
+import { PlanningSessionV1, WorkflowOperationV1, WorkflowRunV1 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -8,6 +8,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import migration from "../persistence/Migrations/081_WorkflowRuns.ts";
 import * as Store from "./WorkflowRunStore.ts";
+import { WorkflowCanonicalHash } from "./WorkflowCanonicalHash.ts";
 import { WorkflowRunPolicy } from "./WorkflowRunPolicy.ts";
 
 const hash = "a".repeat(64);
@@ -82,6 +83,7 @@ const command: Input["command"] = {
   expectedSpecHash: hash,
 };
 const json = (value: unknown) => JSON.stringify(value);
+const parse = (value: string): unknown => JSON.parse(value);
 const layer = Store.layer.pipe(
   Layer.provideMerge(NodeSqliteClient.layer({ filename: ":memory:" })),
 );
@@ -381,5 +383,238 @@ it.effect.each([
       { record_version: expected },
     ]);
     assert.strictEqual((yield* sql`SELECT * FROM workflow_command_receipts`).length, expected);
+  }).pipe(Effect.provide(layer)),
+);
+
+const decodeOperation = Schema.decodeSync(WorkflowOperationV1);
+const destination = { environmentId: "environment", projectId: "project" };
+const operationFor = (id: string, attemptId: string) => {
+  const value = decodeOperation({
+    schemaVersion: 1,
+    id,
+    owner: { kind: "workflow_run", workflowRunId: run.id },
+    kind: "stage_launch",
+    parameters: {
+      kind: "stage_launch",
+      stage: "implementation",
+      context: {
+        specHash: hash,
+        policyHash: hash,
+        itemId: "item",
+        attemptId,
+        candidateHash: hash,
+        configurationHash: hash,
+      },
+      provider: { providerInstanceId: "provider", model: "model" },
+      nativeThreadId: "thread",
+      nativeRunId: id,
+    },
+    fingerprint: hash,
+    origin: run.origin,
+    destination,
+    controlGeneration: 0,
+    status: "pending",
+    access: { origins: [] },
+  });
+  return { ...value, fingerprint: WorkflowCanonicalHash.operation(value) };
+};
+const admission = (
+  operation: WorkflowOperationV1,
+  attemptId: string,
+  repair = false,
+): Extract<Input["command"], { kind: "admitAttempt" }> => ({
+  ...command,
+  kind: "admitAttempt",
+  commandId: attemptId,
+  operationId: operation.id,
+  operationFingerprint: operation.fingerprint,
+  attemptId,
+  itemId: "item",
+  repair,
+});
+const admissionFacts = { ...facts, orderedItemIds: ["item"] };
+const setupAdmission = Effect.gen(function* () {
+  yield* setup;
+  const sql = yield* SqlClient.SqlClient;
+  const updated = { ...run, access: { origins: [{ ...destination, threadId: "thread" }] } };
+  yield* sql`UPDATE workflow_runs SET record_json = ${json(updated)} WHERE id = ${run.id}`;
+});
+
+it.effect("admits, replays, blocks a concurrent attempt, and permits a repair after failure", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const first = operationFor("op-1", "attempt-1");
+    const input = {
+      runId: run.id,
+      command: admission(first, "attempt-1"),
+      externalFacts: admissionFacts,
+      operation: first,
+      receiptId: "receipt-1",
+    };
+    assert.deepStrictEqual(yield* store.commitTransition(input), {
+      kind: "accepted",
+      receiptId: "receipt-1",
+    });
+    assert.deepStrictEqual(
+      yield* sql`SELECT id, operation_id, item_id, repair FROM workflow_attempts`,
+      [{ id: "attempt-1", operation_id: "op-1", item_id: "item", repair: 0 }],
+    );
+    assert.strictEqual((yield* sql`SELECT id FROM workflow_operations`).length, 1);
+    const stored = yield* sql<{ record_json: string }>`SELECT record_json FROM workflow_runs`;
+    assert.strictEqual((parse(stored[0]!.record_json) as typeof run).allowance.attemptsConsumed, 1);
+    assert.deepStrictEqual(
+      yield* store.commitTransition({
+        ...input,
+        command: { ...input.command, commandId: "replay" },
+        receiptId: "other",
+      }),
+      { kind: "replay", receiptId: "receipt-1" },
+    );
+    assert.deepStrictEqual(
+      yield* store.commitTransition({
+        ...input,
+        command: {
+          ...admission(first, "attempt-1"),
+          commandId: "different",
+          operationFingerprint: nextHash,
+        },
+        receiptId: "different",
+      }),
+      { kind: "rejected", reason: "integrity" },
+    );
+    const second = operationFor("op-2", "attempt-2");
+    const next = {
+      runId: run.id,
+      command: { ...admission(second, "attempt-2", true), expectedVersion: 1 },
+      externalFacts: admissionFacts,
+      operation: second,
+      receiptId: "receipt-2",
+    };
+    assert.deepStrictEqual(yield* store.commitTransition(next), {
+      kind: "rejected",
+      reason: "custody",
+    });
+    const failed = {
+      ...first,
+      status: "settled",
+      outcome: { kind: "failed", summary: "Failed", evidence: [] },
+    };
+    yield* sql`UPDATE workflow_operations SET status = 'settled', record_json = ${json(failed)} WHERE id = ${first.id}`;
+    assert.deepStrictEqual(yield* store.commitTransition(next), {
+      kind: "accepted",
+      receiptId: "receipt-2",
+    });
+    const final = yield* sql<{ record_json: string }>`SELECT record_json FROM workflow_runs`;
+    assert.deepStrictEqual((parse(final[0]!.record_json) as typeof run).allowance, {
+      ...run.allowance,
+      attemptsConsumed: 2,
+      repairRoundsConsumed: 1,
+    });
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  ["claimed", "custody"],
+  ["unknown", "custody"],
+  ["exhausted", "exhausted"],
+  ["receipted held", "custody"],
+] as const)("resume refuses %s", ([scenario, reason]) =>
+  Effect.gen(function* () {
+    yield* setup;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const paused = {
+      ...run,
+      status: "paused",
+      allowance: { ...run.allowance, attemptsConsumed: scenario === "exhausted" ? 2 : 0 },
+    };
+    yield* sql`UPDATE workflow_runs SET status = 'paused', record_json = ${json(paused)}`;
+    const op = operationFor("op", "attempt");
+    if (scenario !== "exhausted") {
+      const status = scenario === "claimed" || scenario === "unknown" ? scenario : "pending";
+      const held = status === "pending" ? 1 : 0;
+      yield* sql`INSERT INTO workflow_operations (id, workflow_run_id, kind, fingerprint, status, held, generation, record_json) VALUES (${op.id}, ${run.id}, ${op.kind}, ${op.fingerprint}, ${status}, ${held}, 0, ${json(op)})`;
+      if (scenario === "receipted held")
+        yield* sql`INSERT INTO workflow_command_receipts VALUES ('old', 'run', NULL, ${hash}, 'old-receipt', ${op.id}, '{}')`;
+    }
+    assert.deepStrictEqual(
+      yield* store.commitTransition({
+        runId: run.id,
+        command: { ...command, kind: "resume" },
+        externalFacts: { ...facts, custody: "none" },
+        receiptId: "receipt",
+      }),
+      { kind: "rejected", reason },
+    );
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("pause then resume rearms a provably unstarted held operation", () =>
+  Effect.gen(function* () {
+    yield* setup;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const op = operationFor("op", "attempt");
+    yield* sql`INSERT INTO workflow_operations (id, workflow_run_id, kind, fingerprint, status, held, generation, record_json) VALUES (${op.id}, ${run.id}, ${op.kind}, ${op.fingerprint}, 'pending', 0, 0, ${json(op)})`;
+    assert.deepStrictEqual(
+      yield* store.commitTransition({
+        runId: run.id,
+        command,
+        externalFacts: facts,
+        receiptId: "pause",
+      }),
+      { kind: "accepted", receiptId: "pause" },
+    );
+    assert.deepStrictEqual(yield* sql`SELECT held, generation FROM workflow_operations`, [
+      { held: 1, generation: 0 },
+    ]);
+    assert.deepStrictEqual(
+      yield* store.commitTransition({
+        runId: run.id,
+        command: {
+          ...command,
+          kind: "resume",
+          commandId: "resume",
+          expectedVersion: 1,
+          expectedGeneration: 1,
+        },
+        externalFacts: facts,
+        receiptId: "resume",
+      }),
+      { kind: "accepted", receiptId: "resume" },
+    );
+    assert.deepStrictEqual(yield* sql`SELECT held, generation FROM workflow_operations`, [
+      { held: 0, generation: 2 },
+    ]);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("rolls back allowance and operation if attempt insertion fails", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const operation = operationFor("op", "attempt");
+    yield* sql`CREATE TRIGGER reject_attempt BEFORE INSERT ON workflow_attempts BEGIN SELECT RAISE(ABORT, 'failure'); END`;
+    assert.isTrue(
+      Exit.isFailure(
+        yield* Effect.exit(
+          store.commitTransition({
+            runId: run.id,
+            command: admission(operation, "attempt"),
+            externalFacts: admissionFacts,
+            operation,
+            receiptId: "receipt",
+          }),
+        ),
+      ),
+    );
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_operations`).length, 0);
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_attempts`).length, 0);
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_command_receipts`).length, 0);
+    const rows = yield* sql<{ record_json: string }>`SELECT record_json FROM workflow_runs`;
+    assert.strictEqual((parse(rows[0]!.record_json) as typeof run).allowance.attemptsConsumed, 0);
   }).pipe(Effect.provide(layer)),
 );

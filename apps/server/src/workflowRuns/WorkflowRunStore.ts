@@ -129,32 +129,91 @@ const make = Effect.gen(function* () {
         fingerprint: string;
         status: WorkflowOperationV1["status"];
         held: number;
+        generation: number;
+        kind: string;
+        stage: string | null;
+        has_receipt: number;
         workflow_run_id: string | null;
         record_json: string;
-      }>`SELECT id, fingerprint, status, held, workflow_run_id, record_json FROM workflow_operations WHERE workflow_run_id = ${input.runId}`;
+      }>`SELECT o.id, o.fingerprint, o.status, o.held, o.generation, o.kind, json_extract(o.record_json, '$.parameters.stage') AS stage, EXISTS(SELECT 1 FROM workflow_command_receipts r WHERE r.operation_id = o.id) AS has_receipt, o.workflow_run_id, o.record_json FROM workflow_operations o WHERE o.workflow_run_id = ${input.runId}`;
       const attempts = yield* sql<{
         id: string;
         item_id: string;
-      }>`SELECT id, item_id FROM workflow_attempts WHERE workflow_run_id = ${input.runId}`;
+        status: WorkflowOperationV1["status"];
+        outcome: string | null;
+      }>`SELECT a.id, a.item_id, o.status, json_extract(o.record_json, '$.outcome.kind') AS outcome FROM workflow_attempts a JOIN workflow_operations o ON o.id = a.operation_id AND o.workflow_run_id = a.workflow_run_id WHERE a.workflow_run_id = ${input.runId} ORDER BY a.rowid`;
       const acceptances = yield* sql<{
         acceptance_key: string;
       }>`SELECT acceptance_key FROM workflow_acceptances WHERE workflow_run_id = ${input.runId} AND invalidated = 0 ORDER BY rowid`;
-      // Admission remains closed until operation replay and durable attempt facts are verified.
-      if (command.kind === "admitAttempt") return yield* integrity();
-      if (command.kind === "advance" || command.kind === "complete" || command.kind === "resume")
-        return yield* integrity();
+      if (command.kind === "advance" || command.kind === "complete") return yield* integrity();
       const {
         commandReceipt: _commandReceipt,
         operationReceipt: _operationReceipt,
+        currentAttemptItemId: _currentAttemptItemId,
         ...externalFacts
       } = input.externalFacts;
+      const acceptedItemIds = acceptances
+        .filter((a) => a.acceptance_key.startsWith("item:"))
+        .map((a) => a.acceptance_key.slice(5));
+      const latest = attempts.at(-1);
+      if (
+        latest?.status === "settled" &&
+        latest.outcome !== "succeeded" &&
+        latest.outcome !== "failed"
+      )
+        return yield* integrity();
+      const currentAttemptState: NonNullable<Facts["currentAttemptState"]> = !latest
+        ? "none"
+        : latest.status === "unknown"
+          ? "unknown"
+          : latest.status === "pending" || latest.status === "claimed"
+            ? "active"
+            : latest.status === "settled" && latest.outcome === "succeeded"
+              ? "settled_succeeded"
+              : "settled_failed";
+      const operationReceipts =
+        command.kind === "admitAttempt"
+          ? yield* sql<{
+              operation_id: WorkflowOperationV1["id"];
+              fingerprint: string;
+              receipt_id: string;
+            }>`SELECT o.id AS operation_id, o.fingerprint, r.receipt_id FROM workflow_command_receipts r JOIN workflow_operations o ON o.id = r.operation_id WHERE r.workflow_run_id = ${input.runId} AND r.operation_id = ${command.operationId} LIMIT 1`
+          : [];
+      const operationReceipt = operationReceipts[0];
+      // The run stores a spec reference, not its ordered item payload.
+      const orderedItemIds = externalFacts.orderedItemIds;
+      const itemIndex =
+        command.kind === "admitAttempt" ? orderedItemIds?.indexOf(command.itemId) : undefined;
       const facts: Facts = {
         ...externalFacts,
+        custody: operations.some((o) => o.status === "unknown")
+          ? "unknown"
+          : operations.some((o) => o.status === "claimed")
+            ? "active"
+            : "none",
+        activeWriterCount: operations.filter(
+          (o) =>
+            o.status === "claimed" && o.kind === "stage_launch" && o.stage === "implementation",
+        ).length,
         knownAttemptIds: attempts.map((a) => a.id),
         knownOperationIds: operations.map((o) => o.id),
-        acceptedItemIds: acceptances
-          .filter((a) => a.acceptance_key.startsWith("item:"))
-          .map((a) => a.acceptance_key.slice(5)),
+        currentAttemptState,
+        ...(latest ? { currentAttemptItemId: latest.item_id } : {}),
+        ...(operationReceipt
+          ? {
+              operationReceipt: {
+                operationId: operationReceipt.operation_id,
+                fingerprint: operationReceipt.fingerprint,
+                receiptId: operationReceipt.receipt_id,
+              },
+            }
+          : {}),
+        acceptedItemIds,
+        predecessorAccepted:
+          itemIndex !== undefined &&
+          itemIndex >= 0 &&
+          acceptedItemIds.length === itemIndex &&
+          acceptedItemIds.every((id, i) => id === orderedItemIds?.[i]),
         finalAccepted: acceptances.some((a) => a.acceptance_key === "final"),
         heldOperations: operations
           .filter((o) => o.held === 1)
@@ -162,7 +221,7 @@ const make = Effect.gen(function* () {
             id: o.id,
             fingerprint: o.fingerprint,
             status: o.status,
-            provablyUnstarted: o.status === "pending",
+            provablyUnstarted: o.status === "pending" && o.has_receipt === 0,
           })),
       };
       const decision = WorkflowRunPolicy.decide({ run, command, facts });
