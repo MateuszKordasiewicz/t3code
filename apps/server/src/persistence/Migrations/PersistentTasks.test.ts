@@ -16,6 +16,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
     assert.deepInclude(migrations, [82, "WorkTaskManagerCustody"]);
     assert.deepInclude(migrations, [83, "WorkTaskValidation"]);
     assert.deepInclude(migrations, [84, "WorkTaskActionReviews"]);
+    assert.deepInclude(migrations, [85, "WorkTaskCurrentState"]);
     const tables = yield* sql<{ readonly name: string }>`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'work_task_%' ORDER BY name
     `;
@@ -27,10 +28,12 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
         "work_task_action_review_releases",
         "work_task_action_reviews",
         "work_task_allowances",
+        "work_task_current_state",
         "work_task_manager_bindings",
         "work_task_projections",
         "work_task_thread_links",
         "work_task_validation_attempts",
+        "work_task_view_fence",
         "work_task_wake_reservations",
         "work_task_wake_sources",
       ],
@@ -61,6 +64,7 @@ it.effect("upgrades predecessor rows and events without changing their bytes or 
       [82, "WorkTaskManagerCustody"],
       [83, "WorkTaskValidation"],
       [84, "WorkTaskActionReviews"],
+      [85, "WorkTaskCurrentState"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM projection_projects ORDER BY project_id`,
@@ -95,6 +99,7 @@ it.effect("rolls back a failed migration and succeeds on rerun", () =>
       [82, "WorkTaskManagerCustody"],
       [83, "WorkTaskValidation"],
       [84, "WorkTaskActionReviews"],
+      [85, "WorkTaskCurrentState"],
     ]);
     assert.deepStrictEqual(yield* runMigrations(), []);
   }).pipe(Effect.provide(db)),
@@ -210,6 +215,7 @@ it.effect(
         [82, "WorkTaskManagerCustody"],
         [83, "WorkTaskValidation"],
         [84, "WorkTaskActionReviews"],
+        [85, "WorkTaskCurrentState"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -367,6 +373,7 @@ it.effect("preserves task custody through validation upgrade and rolls back migr
     assert.deepStrictEqual(yield* runMigrations(), [
       [83, "WorkTaskValidation"],
       [84, "WorkTaskActionReviews"],
+      [85, "WorkTaskCurrentState"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -495,7 +502,10 @@ it.effect("upgrades validation data atomically to action reviews and preserves p
       [],
     );
     yield* sql`DROP INDEX work_task_action_reviews_task_idx`;
-    assert.deepStrictEqual(yield* runMigrations(), [[84, "WorkTaskActionReviews"]]);
+    assert.deepStrictEqual(yield* runMigrations(), [
+      [84, "WorkTaskActionReviews"],
+      [85, "WorkTaskCurrentState"],
+    ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_manager_bindings`, managers);
@@ -679,4 +689,92 @@ it.effect(
         },
       ]);
     }).pipe(Effect.provide(db)),
+);
+
+it.effect("upgrades existing tasks without inventing state and rolls back migration 85", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations({ toMigrationInclusive: 84 });
+    yield* sql`INSERT INTO work_task_projections VALUES ('a', 'p', 1, 1, 1, 1, '{ "original": true }', 't', 't')`;
+    yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('a', 1, 1, '{}', '{}', 'event', 't')`;
+    const tasks = yield* sql`SELECT * FROM work_task_projections`;
+    const definitions = yield* sql`SELECT * FROM work_task_accepted_definitions`;
+    yield* sql`CREATE INDEX work_task_projections_updated_desc_idx ON work_task_projections(task_id)`;
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(runMigrations())));
+    assert.deepStrictEqual(
+      yield* sql`SELECT name FROM sqlite_master WHERE name IN ('work_task_current_state', 'work_task_view_fence')`,
+      [],
+    );
+    assert.deepStrictEqual(
+      yield* sql`SELECT migration_id FROM effect_sql_migrations WHERE migration_id = 85`,
+      [],
+    );
+    yield* sql`DROP INDEX work_task_projections_updated_desc_idx`;
+    assert.deepStrictEqual(yield* runMigrations(), [[85, "WorkTaskCurrentState"]]);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_current_state`, []);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_view_fence`, [
+      { singleton_id: 1, generation: 0, high_water_sequence: 0 },
+    ]);
+    yield* sql`INSERT INTO work_task_current_state (task_id) VALUES ('a')`;
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_current_state`, [
+      {
+        task_id: "a",
+        configuration_json: null,
+        desired_mode: null,
+        execution_mode: null,
+        manager_thread_id: null,
+        manager_generation: null,
+        attention_json: null,
+        completion: null,
+        archived: null,
+        last_applied_sequence: null,
+      },
+    ]);
+    assert.deepStrictEqual(yield* runMigrations(), []);
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect("constrains current state and the singleton fence and supports indexed lists", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations();
+    yield* sql`PRAGMA foreign_keys = ON`;
+    yield* sql`INSERT INTO work_task_projections VALUES ('a', 'p', 1, 1, 1, 1, '{}', 't', 't')`;
+    yield* sql`INSERT INTO work_task_current_state VALUES ('a', '{"allowanceOverride":null}', 'active', 'running', 'manager', 1, '{"state":"none"}', 'incomplete', 0, 0)`;
+    const invalid = [
+      sql`UPDATE work_task_current_state SET manager_generation = 0`,
+      sql`UPDATE work_task_current_state SET manager_generation = 9007199254740992`,
+      sql`UPDATE work_task_current_state SET manager_thread_id = NULL`,
+      sql`UPDATE work_task_current_state SET last_applied_sequence = -1`,
+      sql`UPDATE work_task_current_state SET last_applied_sequence = 1.5`,
+      sql`UPDATE work_task_current_state SET desired_mode = 'unknown'`,
+      sql`UPDATE work_task_current_state SET archived = 2`,
+      sql`UPDATE work_task_current_state SET configuration_json = 'invalid'`,
+      sql`INSERT INTO work_task_current_state (task_id) VALUES ('missing')`,
+      sql`INSERT INTO work_task_view_fence VALUES (2, 0, 0)`,
+      sql`UPDATE work_task_view_fence SET generation = -1`,
+      sql`UPDATE work_task_view_fence SET high_water_sequence = 9007199254740992`,
+      sql`UPDATE work_task_view_fence SET generation = 1.5`,
+    ];
+    for (const statement of invalid) assert.isTrue(Exit.isFailure(yield* Effect.exit(statement)));
+    const globalPlan = yield* sql<{
+      detail: string;
+    }>`EXPLAIN QUERY PLAN SELECT task_id FROM work_task_projections WHERE (updated_at, task_id) < ('t', 'z') ORDER BY updated_at DESC, task_id DESC LIMIT 50`;
+    const projectPlan = yield* sql<{
+      detail: string;
+    }>`EXPLAIN QUERY PLAN SELECT task_id FROM work_task_projections WHERE project_id = 'p' AND (updated_at, task_id) < ('t', 'z') ORDER BY updated_at DESC, task_id DESC LIMIT 50`;
+    assert.isTrue(
+      globalPlan.some((row) => row.detail.includes("work_task_projections_updated_desc_idx")),
+    );
+    assert.isTrue(
+      projectPlan.some((row) =>
+        row.detail.includes("work_task_projections_project_updated_desc_idx"),
+      ),
+    );
+    assert.isFalse(
+      [...globalPlan, ...projectPlan].some((row) => row.detail.includes("TEMP B-TREE")),
+    );
+  }).pipe(Effect.provide(db)),
 );
