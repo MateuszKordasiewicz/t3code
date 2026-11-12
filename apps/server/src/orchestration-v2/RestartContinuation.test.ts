@@ -21,6 +21,7 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as ServerSettings from "../serverSettings.ts";
+import * as WorkflowRunStore from "../workflowRuns/WorkflowRunStore.ts";
 import { restartContinuationRun, continueRestartedRun } from "./RestartContinuation.ts";
 import { continuationStartRetryDelayMs } from "./RestartBackgroundNote.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
@@ -30,6 +31,10 @@ import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as EffectWorker from "./EffectWorker.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
+
+const layerOrdinaryCustody = Layer.mock(WorkflowRunStore.WorkflowRunStore)({
+  readRecoveryCustodyInTransaction: () => Effect.succeed({ kind: "ordinary" }),
+});
 
 const threadId = ThreadId.make("thread:restart");
 const runId = RunId.make("run:restart");
@@ -265,7 +270,9 @@ it.effect.each([
               getRecoveryThreadIds: () => Effect.succeed([threadId]),
               getRuntimeRecoveryProjection: () => Effect.succeed(makeProjection()),
             }),
+            layerOrdinaryCustody,
             Layer.mock(EventSink.EventSinkV2)({
+              withProviderBatch: (work) => work,
               commitCommand: (input) => {
                 committed = input;
                 return Effect.succeed({ committed: true, cancelledEffectCount: 1 } as never);
@@ -328,7 +335,9 @@ it.effect("lets a cut blocking delegate_task wake its parent like an async task"
             getRecoveryThreadIds: () => Effect.succeed([threadId]),
             getRuntimeRecoveryProjection: () => Effect.succeed(projection),
           }),
+          layerOrdinaryCustody,
           Layer.mock(EventSink.EventSinkV2)({
+            withProviderBatch: (work) => work,
             commitCommand: (input) => {
               committed = input;
               return Effect.succeed({ committed: true, cancelledEffectCount: 0 } as never);
@@ -393,7 +402,9 @@ it.effect.each(["running", "waiting"])(
               getRecoveryThreadIds: () => Effect.succeed([threadId]),
               getRuntimeRecoveryProjection: () => Effect.succeed(projection),
             }),
+            layerOrdinaryCustody,
             Layer.mock(EventSink.EventSinkV2)({
+              withProviderBatch: (work) => work,
               commitCommand: (input) => {
                 committed = input;
                 return Effect.succeed({ committed: true, cancelledEffectCount: 0 } as never);
@@ -518,7 +529,9 @@ it.effect("prepares no continuation for background work another provider thread 
             getRecoveryThreadIds: () => Effect.succeed([threadId]),
             getRuntimeRecoveryProjection: () => Effect.succeed(projection),
           }),
+          layerOrdinaryCustody,
           Layer.mock(EventSink.EventSinkV2)({
+            withProviderBatch: (work) => work,
             writeWithEffects: (input) =>
               Effect.sync(() => {
                 writes.push(input);
@@ -545,7 +558,9 @@ it.effect("prepares no continuation for background work another provider thread 
             getRecoveryThreadIds: () => Effect.succeed([threadId]),
             getRuntimeRecoveryProjection: () => Effect.succeed(ownWork),
           }),
+          layerOrdinaryCustody,
           Layer.mock(EventSink.EventSinkV2)({
+            withProviderBatch: (work) => work,
             writeWithEffects: (input) =>
               Effect.sync(() => {
                 writes.push(input);
@@ -640,7 +655,9 @@ it.effect.each([
                 getRecoveryThreadIds: () => Effect.succeed([threadId]),
                 getRuntimeRecoveryProjection: () => Effect.succeed(projection),
               }),
+              layerOrdinaryCustody,
               Layer.mock(EventSink.EventSinkV2)({
+                withProviderBatch: (work) => work,
                 writeWithEffects: (input) =>
                   Effect.sync(() => {
                     writes.push(input);
@@ -791,7 +808,9 @@ it.effect("does not cancel or resume a run that completes while shutdown intent 
             getRecoveryThreadIds: () => Effect.succeed([threadId]),
             getRuntimeRecoveryProjection: () => Effect.sync(() => projection),
           }),
+          layerOrdinaryCustody,
           Layer.mock(EventSink.EventSinkV2)({
+            withProviderBatch: (work) => work,
             writeWithEffects: (input) =>
               Effect.sync(() => {
                 assert.lengthOf(input.events, 0);
@@ -1149,7 +1168,9 @@ it.effect("prepares later threads' continuations when one thread fails", () =>
                   )
                 : Effect.succeed(makeProjection()),
           }),
+          layerOrdinaryCustody,
           Layer.mock(EventSink.EventSinkV2)({
+            withProviderBatch: (work) => work,
             writeWithEffects: (input) =>
               Effect.sync(() => {
                 writes.push(input);
@@ -1285,7 +1306,9 @@ it.effect("prepares independent continuations together and waits for durable wri
                 return makeProjection();
               }),
           }),
+          layerOrdinaryCustody,
           Layer.mock(EventSink.EventSinkV2)({
+            withProviderBatch: (work) => work,
             writeWithEffects: () =>
               Effect.gen(function* () {
                 if (++writes === 2) yield* Deferred.succeed(bothWriting, undefined);
@@ -1315,7 +1338,8 @@ it.effect("skips restart discovery when no project enables continuation", () =>
         Layer.mergeAll(
           ServerSettings.layerTest({ continueThreadsAfterServerUpdate: false }),
           Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
-          Layer.mock(EventSink.EventSinkV2)({}),
+          layerOrdinaryCustody,
+          Layer.mock(EventSink.EventSinkV2)({ withProviderBatch: (work) => work }),
           IdAllocator.layer,
           Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({}),
           Layer.mock(EffectOutbox.EffectOutboxV2)({}),

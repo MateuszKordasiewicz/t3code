@@ -16,6 +16,11 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderRuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as WorkflowRunStore from "../workflowRuns/WorkflowRunStore.ts";
+
+const layerOrdinaryCustody = Layer.mock(WorkflowRunStore.WorkflowRunStore)({
+  readRecoveryCustodyInTransaction: () => Effect.succeed({ kind: "ordinary" }),
+});
 
 it("uses the thread provider for stale background work without provider threads", async () => {
   const threadId = ThreadId.make("thread_recovery_background_no_provider_threads");
@@ -54,7 +59,9 @@ it("uses the thread provider for stale background work without provider threads"
           getRecoveryThreadIds: () => Effect.succeed([threadId]),
           getRuntimeRecoveryProjection: () => Effect.succeed(projection),
         }),
+        layerOrdinaryCustody,
         Layer.mock(EventSink.EventSinkV2)({
+          withProviderBatch: (work) => work,
           commitCommand: (input) => {
             committedInput = input;
             return Effect.succeed({ committed: true, cancelledEffectCount: 0 } as never);

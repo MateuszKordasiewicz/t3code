@@ -59,6 +59,7 @@ import { vi } from "vite-plus/test";
 import * as ServerConfig from "../config.ts";
 import * as DatabaseStorage from "../persistence/DatabaseStorage.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as WorkflowRunStore from "../workflowRuns/WorkflowRunStore.ts";
 import { LIVE_STREAM_MAX_ITEMS, LiveStreamBufferError } from "./LiveStreamBudget.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
@@ -101,6 +102,7 @@ const layerProjectionReplayProvided = ProjectionReplay.layer.pipe(
 const layerTest = Layer.mergeAll(
   layerStoresProvided,
   layerEventSinkProvided,
+  WorkflowRunStore.layer.pipe(Layer.provide(layerDatabase)),
   layerEffectOutboxProvided,
   layerCommandReceiptStoreProvided,
   IdAllocator.layer,
@@ -3530,6 +3532,9 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
           Effect.provide(
             Layer.mergeAll(
               ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+              Layer.mock(WorkflowRunStore.WorkflowRunStore)({
+                readRecoveryCustodyInTransaction: () => Effect.succeed({ kind: "ordinary" }),
+              }),
               Layer.mock(ProjectionStore.ProjectionStoreV2)({
                 getRecoveryThreadIds: () => Effect.succeed([threadId]),
                 getRuntimeRecoveryProjection: () => Effect.succeed(projection),
