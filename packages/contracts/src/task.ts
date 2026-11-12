@@ -694,6 +694,36 @@ export const WorkTaskActionPayloadIdentity = Schema.Struct({
 });
 export type WorkTaskActionPayloadIdentity = typeof WorkTaskActionPayloadIdentity.Type;
 
+const persistedTime = IsoDateTime.check(
+  Schema.isMaxLength(2_000),
+  Schema.makeFilter(
+    (value) => {
+      const match =
+        /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(
+          value,
+        );
+      if (!match || !Number.isFinite(Date.parse(value))) return false;
+      const [, year, month, day, hour, minute, second, zone] = match;
+      if (!year || !month || !day || !hour || !minute || !second || !zone) return false;
+      const y = Number(year);
+      const m = Number(month);
+      const leap = y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0);
+      const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+      return (
+        m >= 1 &&
+        m <= 12 &&
+        Number(day) >= 1 &&
+        Number(day) <= (days[m - 1] ?? 0) &&
+        Number(hour) <= 23 &&
+        Number(minute) <= 59 &&
+        Number(second) <= 59 &&
+        (zone === "Z" || (Number(zone.slice(1, 3)) <= 23 && Number(zone.slice(4, 6)) <= 59))
+      );
+    },
+    { expected: "a valid ISO timestamp" },
+  ),
+);
+
 const eventRevisions = {
   definitionRevision: PositiveInt,
   lifecycleRevision: PositiveInt,
@@ -793,7 +823,35 @@ const reviewContinuationReleased = Schema.Union([
   }).check(reviewBindingMatches),
 ]);
 
+export class WorkTaskManagerBindingReplayConflict extends Schema.TaggedError<WorkTaskManagerBindingReplayConflict>()(
+  "WorkTaskManagerBindingReplayConflict",
+  {
+    code: Schema.Literals([
+      "binding_identity_conflict",
+      "thread_already_bound",
+      "current_binding_conflict",
+      "binding_not_found",
+      "binding_already_retired",
+    ]),
+    taskId: WorkTaskId.check(Schema.isMaxLength(2_000)),
+    managerThreadId: referenceThreadId,
+    managerGeneration: PositiveInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER)),
+  },
+) {}
+
+const managerBindingEventBase = {
+  ...eventBase,
+  id: EventId.check(Schema.isMaxLength(2_000)),
+  taskId: WorkTaskId.check(Schema.isMaxLength(2_000)),
+  occurredAt: persistedTime,
+  attribution: resultAttribution,
+  managerThreadId: referenceThreadId,
+  managerGeneration: PositiveInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER)),
+};
+
 const WorkTaskNonReviewRequestedEvent = Schema.Union([
+  Schema.Struct({ ...managerBindingEventBase, type: Schema.Literal("task.manager-bound") }),
+  Schema.Struct({ ...managerBindingEventBase, type: Schema.Literal("task.manager-retired") }),
   reviewInvalidated,
   reviewCancelled,
   reviewContinuationReleased,
@@ -926,36 +984,6 @@ export const WorkTaskEvent = Schema.Union([
   WorkTaskReviewRequestedEvent,
 ]);
 export type WorkTaskEvent = typeof WorkTaskEvent.Type;
-
-const persistedTime = IsoDateTime.check(
-  Schema.isMaxLength(2_000),
-  Schema.makeFilter(
-    (value) => {
-      const match =
-        /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(
-          value,
-        );
-      if (!match || !Number.isFinite(Date.parse(value))) return false;
-      const [, year, month, day, hour, minute, second, zone] = match;
-      if (!year || !month || !day || !hour || !minute || !second || !zone) return false;
-      const y = Number(year);
-      const m = Number(month);
-      const leap = y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0);
-      const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-      return (
-        m >= 1 &&
-        m <= 12 &&
-        Number(day) >= 1 &&
-        Number(day) <= (days[m - 1] ?? 0) &&
-        Number(hour) <= 23 &&
-        Number(minute) <= 59 &&
-        Number(second) <= 59 &&
-        (zone === "Z" || (Number(zone.slice(1, 3)) <= 23 && Number(zone.slice(4, 6)) <= 59))
-      );
-    },
-    { expected: "a valid ISO timestamp" },
-  ),
-);
 
 export const WorkTaskPersistedEventContext = Schema.Struct({
   sequence: NonNegativeInt,
