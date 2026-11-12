@@ -378,3 +378,214 @@ export const decodeWorkflowRunV1 = Effect.fn("WorkflowRunV1.decode")(function* (
     return yield* runFail("invalid lineage");
   return run;
 });
+
+const WorkflowOperationId = PlanningPassV1.fields.operationId;
+const WorkflowAttemptId = NonEmpty.pipe(Schema.brand("WorkflowAttemptId"));
+const WorkspaceId = NonEmpty.pipe(Schema.brand("WorkspaceId"));
+const RepositoryId = NonEmpty.pipe(Schema.brand("RepositoryId"));
+const IncidentId = NonEmpty.pipe(Schema.brand("IncidentId"));
+const BootId = NonEmpty.pipe(Schema.brand("BootId"));
+const WorkerId = NonEmpty.pipe(Schema.brand("WorkerId"));
+const WorkflowContext = Schema.Struct({
+  specHash: Sha256Hex,
+  policyHash: Sha256Hex,
+  itemId: Schema.optionalKey(WorkflowItemId),
+  attemptId: Schema.optionalKey(WorkflowAttemptId),
+  candidateHash: Schema.optionalKey(Sha256Hex),
+  configurationHash: Schema.optionalKey(Sha256Hex),
+});
+const operationKinds = [
+  "planning_pass",
+  "workspace_preparation",
+  "workspace_release",
+  "provisioning",
+  "stage_launch",
+  "check",
+  "supervision",
+  "publication",
+  "ci_observation",
+] as const;
+const native = PlanningPassV1.fields.native.schema.fields;
+const OperationParameters = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("planning_pass"),
+    passId: PlanningPassV1.fields.id,
+    binding: PlanningPassV1.fields.binding,
+    role: PlanningPassV1.fields.role,
+    provider: WorkflowProvider,
+    limits: PlanningSessionV1.fields.limits,
+    inputManifestHash: Sha256Hex,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("workspace_preparation"),
+    context: WorkflowContext,
+    workspaceId: WorkspaceId,
+    baseCommit: NonEmpty,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("workspace_release"),
+    context: WorkflowContext,
+    workspaceId: WorkspaceId,
+    retentionPolicyHash: Sha256Hex,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("provisioning"),
+    context: WorkflowContext,
+    commandId: WorkflowCheckId,
+    workspaceId: WorkspaceId,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("stage_launch"),
+    context: WorkflowContext,
+    stage: Schema.Literals(["implementation", "code_review", "semantic_review"]),
+    provider: WorkflowProvider,
+    nativeThreadId: native.threadId,
+    nativeRunId: native.runId,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("check"),
+    context: WorkflowContext,
+    checkId: WorkflowCheckId,
+    workspaceId: WorkspaceId,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("supervision"),
+    context: WorkflowContext,
+    incidentId: IncidentId,
+    provider: WorkflowProvider,
+    nativeThreadId: native.threadId,
+    nativeRunId: native.runId,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("publication"),
+    context: WorkflowContext,
+    repositoryId: RepositoryId,
+    baseRef: NonEmpty,
+    headRef: NonEmpty,
+    expectedRemoteHead: NonEmpty,
+    candidateCommit: NonEmpty,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("ci_observation"),
+    context: WorkflowContext,
+    repositoryId: RepositoryId,
+    pullRequestId: NonEmpty,
+    headCommit: NonEmpty,
+    requiredChecks: Schema.Array(NonEmpty),
+  }),
+]);
+const OperationReference = PlanningPassV1.fields.inputManifest.fields.sources.value;
+export const WorkflowOperationV1 = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  id: WorkflowOperationId,
+  owner: Schema.Union([
+    Schema.Struct({ kind: Schema.Literal("workflow_run"), workflowRunId: WorkflowRunId }),
+    Schema.Struct({
+      kind: Schema.Literal("planning_session"),
+      planningSessionId: PlanningSessionV1.fields.id,
+    }),
+  ]),
+  kind: Schema.Literals(operationKinds),
+  parameters: OperationParameters,
+  fingerprint: Sha256Hex,
+  origin: PlanningSessionV1.fields.origin,
+  destination: Schema.Struct({ environmentId: EnvironmentId, projectId: ProjectId }),
+  controlGeneration: Schema.Number,
+  status: Schema.Literals(["pending", "claimed", "settled", "cancelled", "unknown"]),
+  access: WorkflowAccess,
+  claim: Schema.optionalKey(
+    Schema.Struct({
+      bootId: BootId,
+      workerId: WorkerId,
+      generation: Schema.Number,
+      claimedAt: NonEmpty,
+    }),
+  ),
+  outcome: Schema.optionalKey(
+    Schema.Struct({
+      kind: Schema.Literals(["succeeded", "failed", "cancelled", "unknown"]),
+      summary: NonEmpty,
+      evidence: Schema.Array(OperationReference),
+    }),
+  ),
+  nextDueAt: Schema.optionalKey(NonEmpty),
+});
+export type WorkflowOperationV1 = typeof WorkflowOperationV1.Type;
+
+export class WorkflowOperationError extends Schema.TaggedError<WorkflowOperationError>()(
+  "WorkflowOperationError",
+  { reason: Schema.Literals(["invalid owner union", "invalid journal state", "invalid record"]) },
+) {}
+const operationFail = (reason: WorkflowOperationError["reason"]) =>
+  new WorkflowOperationError({ reason });
+const decodeOperationShape = Schema.decodeUnknownEffect(WorkflowOperationV1);
+export const decodeWorkflowOperationV1 = Effect.fn("WorkflowOperationV1.decode")(function* (
+  input: unknown,
+) {
+  if (record(input) && record(input.owner)) {
+    const owner = input.owner;
+    if (
+      (owner.kind === "planning_session" && "workflowRunId" in owner) ||
+      (owner.kind === "workflow_run" && "planningSessionId" in owner)
+    )
+      return yield* operationFail("invalid owner union");
+  }
+  const operation = yield* decodeOperationShape(input, { onExcessProperty: "error" }).pipe(
+    Effect.mapError(() => operationFail("invalid record")),
+  );
+  const { owner, parameters, status, claim, outcome } = operation;
+  if (
+    operation.kind !== parameters.kind ||
+    (owner.kind === "planning_session") !== (parameters.kind === "planning_pass")
+  )
+    return yield* operationFail("invalid owner union");
+  if (
+    (status === "pending" && (claim !== undefined || outcome !== undefined)) ||
+    (status === "claimed" && (claim === undefined || outcome !== undefined)) ||
+    (status === "settled" && outcome?.kind !== "succeeded" && outcome?.kind !== "failed") ||
+    (status === "cancelled" && outcome?.kind !== "cancelled") ||
+    (status === "unknown" && outcome?.kind !== "unknown")
+  )
+    return yield* operationFail("invalid journal state");
+  if (
+    !isWorkflowUint(operation.controlGeneration) ||
+    (claim !== undefined &&
+      (!isWorkflowUint(claim.generation) || !isWorkflowTimestamp(claim.claimedAt))) ||
+    (operation.nextDueAt !== undefined && !isWorkflowTimestamp(operation.nextDueAt)) ||
+    hasWorkflowDuplicates(
+      operation.access.origins.map((o) =>
+        JSON.stringify([o.environmentId, o.projectId, o.threadId]),
+      ),
+    ) ||
+    (outcome !== undefined &&
+      hasWorkflowDuplicates(outcome.evidence.map((r) => JSON.stringify([r.kind, r.id]))))
+  )
+    return yield* operationFail("invalid record");
+  if (parameters.kind === "planning_pass") {
+    if (
+      !isWorkflowUint(parameters.limits.maxPasses) ||
+      parameters.limits.maxPasses === 0 ||
+      !isWorkflowUint(parameters.limits.maxRepairRounds) ||
+      !isWorkflowTimestamp(parameters.limits.deadline)
+    )
+      return yield* operationFail("invalid record");
+  } else {
+    const context = parameters.context;
+    if (
+      (parameters.kind === "stage_launch" || parameters.kind === "check") &&
+      (context.itemId === undefined ||
+        context.attemptId === undefined ||
+        context.candidateHash === undefined ||
+        context.configurationHash === undefined)
+    )
+      return yield* operationFail("invalid record");
+    if (
+      (parameters.kind === "publication" || parameters.kind === "ci_observation") &&
+      (context.candidateHash === undefined || context.configurationHash === undefined)
+    )
+      return yield* operationFail("invalid record");
+    if (parameters.kind === "ci_observation" && hasWorkflowDuplicates(parameters.requiredChecks))
+      return yield* operationFail("invalid record");
+  }
+  return operation;
+});

@@ -3,6 +3,8 @@ import * as Digest from "effect/crypto/Digest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import {
+  decodeWorkflowOperationV1,
+  WorkflowOperationV1,
   decodeWorkflowRunSpecV1,
   WorkflowRunSpecV1,
   decodeWorkflowRunV1,
@@ -448,6 +450,276 @@ describe("workflow run", () => {
         expect(result).toMatchObject({ _tag: "Success", success: input });
         if (result._tag === "Success")
           expect(yield* encodeWorkflowRun(result.success)).toEqual(input);
+      }
+    }),
+  );
+});
+
+const operationHash = "a".repeat(64);
+const operationExample = () => ({
+  schemaVersion: 1,
+  id: "op-1",
+  owner: { kind: "planning_session", planningSessionId: "session-1" },
+  kind: "planning_pass",
+  parameters: {
+    kind: "planning_pass",
+    passId: "pass-1",
+    binding: {
+      planId: "plan-1",
+      revisionId: "revision-1",
+      revisionSchemaVersion: 1,
+      revisionHash: operationHash,
+      sourcePacketHash: operationHash,
+    },
+    role: "review",
+    provider: { providerInstanceId: "codex", model: "example-model" },
+    limits: { maxPasses: 3, maxRepairRounds: 1, deadline: "2026-12-01T00:00:00Z" },
+    inputManifestHash: operationHash,
+  },
+  fingerprint: "bced6ed35e837b84f405446260f877f147094b212485c7cded46d1235fd0714a",
+  origin: { kind: "human", id: "user-1" },
+  destination: { environmentId: "env-1", projectId: "project-1" },
+  controlGeneration: 1,
+  status: "pending",
+  access: { origins: [{ environmentId: "env-1", projectId: "project-1", threadId: "thread-1" }] },
+});
+const context = {
+  specHash: operationHash,
+  policyHash: operationHash,
+  itemId: "item-1",
+  attemptId: "attempt-1",
+  candidateHash: operationHash,
+  configurationHash: operationHash,
+};
+const provider = { providerInstanceId: "codex", model: "model" };
+const workflowOperation = <T extends { kind: string }>(parameters: T) => ({
+  ...operationExample(),
+  owner: { kind: "workflow_run", workflowRunId: "run-1" },
+  kind: parameters.kind,
+  parameters,
+});
+const claim = {
+  bootId: "boot-1",
+  workerId: "worker-1",
+  generation: 1,
+  claimedAt: "2026-11-11T00:00:00Z",
+};
+const reference = { kind: "report", id: "ref-1", sha256: operationHash };
+const outcome = { kind: "succeeded", summary: "Done", evidence: [reference] };
+const operationCases: { name: string; input: unknown; reason?: string }[] = [
+  { name: "canonical pending operation", input: operationExample() },
+  {
+    name: "reordered keys and changed generation",
+    input: {
+      controlGeneration: 2,
+      ...Object.fromEntries(
+        Object.entries(operationExample())
+          .filter(([key]) => key !== "controlGeneration")
+          .reverse(),
+      ),
+    },
+  },
+  ...[
+    { kind: "workspace_preparation", context, workspaceId: "workspace-1", baseCommit: "abc" },
+    {
+      kind: "workspace_release",
+      context,
+      workspaceId: "workspace-1",
+      retentionPolicyHash: operationHash,
+    },
+    { kind: "provisioning", context, commandId: "cmd-1", workspaceId: "workspace-1" },
+    {
+      kind: "stage_launch",
+      context,
+      stage: "implementation",
+      provider,
+      nativeThreadId: "thread-1",
+      nativeRunId: "run-1",
+    },
+    { kind: "check", context, checkId: "check-1", workspaceId: "workspace-1" },
+    {
+      kind: "supervision",
+      context,
+      incidentId: "incident-1",
+      provider,
+      nativeThreadId: "thread-1",
+      nativeRunId: "run-1",
+    },
+    {
+      kind: "publication",
+      context,
+      repositoryId: "repo-1",
+      baseRef: "main",
+      headRef: "branch",
+      expectedRemoteHead: "abc",
+      candidateCommit: "def",
+    },
+    {
+      kind: "ci_observation",
+      context,
+      repositoryId: "repo-1",
+      pullRequestId: "1",
+      headCommit: "def",
+      requiredChecks: [] as string[],
+    },
+  ].map((parameters) => ({ name: parameters.kind, input: workflowOperation(parameters) })),
+  { name: "claimed", input: { ...operationExample(), status: "claimed", claim } },
+  {
+    name: "settled retains claim",
+    input: { ...operationExample(), status: "settled", claim, outcome },
+  },
+  {
+    name: "cancelled",
+    input: {
+      ...operationExample(),
+      status: "cancelled",
+      outcome: { ...outcome, kind: "cancelled" },
+    },
+  },
+  {
+    name: "unknown",
+    input: {
+      ...operationExample(),
+      status: "unknown",
+      outcome: { ...outcome, kind: "unknown" },
+      nextDueAt: "2026-12-01T00:00:00Z",
+    },
+  },
+  {
+    name: "both owner IDs",
+    input: {
+      ...operationExample(),
+      owner: { ...operationExample().owner, workflowRunId: "run-1" },
+    },
+    reason: "invalid owner union",
+  },
+  {
+    name: "owner and kind mismatch",
+    input: { ...operationExample(), owner: { kind: "workflow_run", workflowRunId: "run-1" } },
+    reason: "invalid owner union",
+  },
+  {
+    name: "kind and parameters mismatch",
+    input: { ...operationExample(), kind: "check" },
+    reason: "invalid owner union",
+  },
+  {
+    name: "claimed without claim",
+    input: { ...operationExample(), status: "claimed" },
+    reason: "invalid journal state",
+  },
+  {
+    name: "pending with outcome",
+    input: { ...operationExample(), outcome },
+    reason: "invalid journal state",
+  },
+  {
+    name: "pending with claim",
+    input: { ...operationExample(), claim },
+    reason: "invalid journal state",
+  },
+  {
+    name: "settled with wrong outcome",
+    input: { ...operationExample(), status: "settled", outcome: { ...outcome, kind: "unknown" } },
+    reason: "invalid journal state",
+  },
+  {
+    name: "unknown with no outcome",
+    input: { ...operationExample(), status: "unknown" },
+    reason: "invalid journal state",
+  },
+  {
+    name: "invalid hash format",
+    input: { ...operationExample(), fingerprint: "A".repeat(64) },
+    reason: "invalid record",
+  },
+  { name: "extra field", input: { ...operationExample(), extra: true }, reason: "invalid record" },
+  {
+    name: "invalid generation",
+    input: { ...operationExample(), controlGeneration: Number.MAX_SAFE_INTEGER + 1 },
+    reason: "invalid record",
+  },
+  {
+    name: "invalid claim time",
+    input: {
+      ...operationExample(),
+      status: "claimed",
+      claim: { ...claim, claimedAt: "2026-02-30T00:00:00Z" },
+    },
+    reason: "invalid record",
+  },
+  {
+    name: "invalid planning limit",
+    input: {
+      ...operationExample(),
+      parameters: {
+        ...operationExample().parameters,
+        limits: { ...operationExample().parameters.limits, maxPasses: 0 },
+      },
+    },
+    reason: "invalid record",
+  },
+  {
+    name: "duplicate access",
+    input: {
+      ...operationExample(),
+      access: {
+        origins: [operationExample().access.origins[0], operationExample().access.origins[0]],
+      },
+    },
+    reason: "invalid record",
+  },
+  {
+    name: "duplicate evidence",
+    input: {
+      ...operationExample(),
+      status: "settled",
+      outcome: { ...outcome, evidence: [reference, { ...reference }] },
+    },
+    reason: "invalid record",
+  },
+  {
+    name: "conflicting evidence identity",
+    input: {
+      ...operationExample(),
+      status: "settled",
+      outcome: { ...outcome, evidence: [reference, { ...reference, sha256: "b".repeat(64) }] },
+    },
+    reason: "invalid record",
+  },
+  {
+    name: "missing check context",
+    input: workflowOperation({
+      kind: "check",
+      context: { specHash: operationHash, policyHash: operationHash },
+      checkId: "check-1",
+      workspaceId: "workspace-1",
+    }),
+    reason: "invalid record",
+  },
+  {
+    name: "duplicate required checks",
+    input: workflowOperation({
+      kind: "ci_observation",
+      context,
+      repositoryId: "repo-1",
+      pullRequestId: "1",
+      headCommit: "abc",
+      requiredChecks: ["build", "build"],
+    }),
+    reason: "invalid record",
+  },
+];
+const encodeWorkflowOperation = Schema.encodeEffect(WorkflowOperationV1);
+describe("workflow operation", () => {
+  it.effect.each(operationCases)("$name", ({ input, reason }) =>
+    Effect.gen(function* () {
+      const result = yield* Effect.result(decodeWorkflowOperationV1(input));
+      if (reason) expect(result).toMatchObject({ _tag: "Failure", failure: { reason } });
+      else {
+        expect(result).toMatchObject({ _tag: "Success", success: input });
+        if (result._tag === "Success")
+          expect(yield* encodeWorkflowOperation(result.success)).toEqual(input);
       }
     }),
   );
