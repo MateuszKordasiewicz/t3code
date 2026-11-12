@@ -21,8 +21,10 @@ import {
   ProviderInstanceId,
   ProviderSessionId,
   ProviderThreadId,
+  ProviderTurnId,
   RunAttemptId,
   RunId,
+  RuntimeRequestId,
   ThreadId,
   TurnItemId,
 } from "@t3tools/contracts";
@@ -105,6 +107,42 @@ const layerTest = Layer.mergeAll(
   layerProjectionMaintenanceProvided,
   layerProjectionReplayProvided,
 );
+
+const seedWorkflowAssociation = Effect.fn("test.seedWorkflowAssociation")(function* (
+  key: string,
+  threadId: ThreadId,
+  source: "intent" | "operation" | "supervision" | "pass" = "intent",
+  state: "reserved" | "dispatching" | "unknown" | "finalized" | "cancelled" = "reserved",
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const hash = "a".repeat(64);
+  const plan = `plan:${key}`;
+  const session = `session:${key}`;
+  const run = `workflow:${key}`;
+  const operation = `operation:${key}`;
+  yield* sql`INSERT INTO workflow_plan_identities VALUES (${plan})`;
+  yield* sql`INSERT INTO workflow_revision_identities VALUES (${plan}, 'revision', ${hash}, ${hash})`;
+  yield* sql`INSERT INTO workflow_runs VALUES (${run}, ${plan}, 'revision', ${hash}, ${hash}, ${hash}, 'active', 0, 0, '{}')`;
+  if (source === "pass") {
+    yield* sql`INSERT INTO workflow_planning_sessions VALUES (${session}, ${plan}, NULL, 'active', 0, 0, '{}')`;
+    yield* sql`INSERT INTO workflow_operations (id, planning_session_id, kind, fingerprint, status, generation, record_json) VALUES (${operation}, ${session}, 'planning_pass', ${hash}, 'pending', 0, '{}')`;
+    yield* sql`INSERT INTO workflow_planning_passes VALUES (${`pass:${key}`}, ${session}, ${plan}, 'revision', ${hash}, ${hash}, ${operation}, ${threadId}, ${`native-run:${key}`}, '{}')`;
+  } else {
+    const record =
+      source === "operation" || source === "supervision"
+        ? JSON.stringify({ parameters: { nativeThreadId: threadId }, malformed: true })
+        : "{}";
+    const kind = source === "supervision" ? "supervision" : "stage_launch";
+    yield* sql`INSERT INTO workflow_operations (id, workflow_run_id, kind, fingerprint, status, generation, record_json) VALUES (${operation}, ${run}, ${kind}, ${hash}, 'pending', 0, ${record})`;
+    if (source === "intent") {
+      const boot = state === "dispatching" || state === "unknown" ? "boot" : null;
+      const worker = boot === null ? null : "worker";
+      const nativeRun = state === "finalized" ? `native-run:${key}` : null;
+      const finalized = state === "finalized" ? operation : null;
+      yield* sql`INSERT INTO workflow_native_launch_intents (intent_id, workflow_run_id, operation_id, charge_attempt, repair, role, environment_id, project_id, launch_command_id, thread_id, message_id, fingerprint, draft_json, generation, state, boot_id, worker_id, native_run_id, finalized_operation_id) VALUES (${`intent:${key}`}, ${run}, ${operation}, 0, 0, 'implementation', 'environment', 'project', ${`launch:${key}`}, ${threadId}, ${`message:${key}`}, ${hash}, '{}', 0, ${state}, ${boot}, ${worker}, ${nativeRun}, ${finalized})`;
+    }
+  }
+});
 
 const providerInstanceId = ProviderInstanceId.make("codex");
 const providerDriver = ProviderDriverKind.make("codex");
@@ -2207,6 +2245,396 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
     }),
   );
 
+  it.effect("retains associated pending starts before claim", () =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const threadId = ThreadId.make("thread:retained-claim");
+      yield* seedWorkflowAssociation("retained-claim", threadId);
+      yield* outbox.enqueue([
+        {
+          id: "retained-claim",
+          commandId: CommandId.make("claim"),
+          threadId,
+          request: { type: "provider-turn.start", runId: RunId.make("run") },
+        },
+      ]);
+      assert.isTrue(Option.isNone(yield* outbox.claimNext({ workerId: "worker" })));
+    }).pipe(Effect.provide(layerIsolatedOutbox)),
+  );
+
+  it.effect("omits retained starts from the next deadline", () =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const threadId = ThreadId.make("thread:retained-deadline");
+      yield* seedWorkflowAssociation("retained-deadline", threadId);
+      yield* outbox.enqueue([
+        {
+          id: "retained-deadline",
+          commandId: CommandId.make("deadline"),
+          threadId,
+          request: { type: "provider-turn.start", runId: RunId.make("run") },
+        },
+      ]);
+      assert.isTrue(Option.isNone(yield* outbox.nextClaimableAt));
+    }).pipe(Effect.provide(layerIsolatedOutbox)),
+  );
+
+  it.effect("allows an interrupt past a retained pending start", () =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const threadId = ThreadId.make("thread:retained-interrupt");
+      yield* seedWorkflowAssociation("retained-interrupt", threadId);
+      const deadline = DateTime.add(yield* DateTime.now, { seconds: 10 });
+      yield* outbox.enqueue([
+        {
+          id: "retained-start",
+          commandId: CommandId.make("fifo"),
+          threadId,
+          request: { type: "provider-turn.start", runId: RunId.make("run") },
+        },
+        {
+          id: "retained-interrupt",
+          availableAt: deadline,
+          commandId: CommandId.make("fifo"),
+          threadId,
+          request: {
+            type: "provider-turn.interrupt",
+            providerSessionId: ProviderSessionId.make("session"),
+            providerThreadId: ProviderThreadId.make("provider-thread"),
+            providerTurnId: ProviderTurnId.make("turn"),
+          },
+        },
+      ]);
+      assert.equal(
+        DateTime.toEpochMillis(Option.getOrThrow(yield* outbox.nextClaimableAt)),
+        DateTime.toEpochMillis(deadline),
+      );
+      assert.isTrue(Option.isNone(yield* outbox.claimNext({ workerId: "worker" })));
+      yield* TestClock.adjust(Duration.seconds(10));
+      const claimed = yield* outbox.claimNext({ workerId: "worker" });
+      assert.equal(Option.getOrThrow(claimed).id, "retained-interrupt");
+    }).pipe(Effect.provide(layerIsolatedOutbox)),
+  );
+
+  it.effect("retains selected effects for every association source and intent state", () =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const sql = yield* SqlClient.SqlClient;
+      const requests = [
+        { type: "provider-turn.start", runId: RunId.make("run") },
+        {
+          type: "provider-turn.restart",
+          runId: RunId.make("run"),
+          interruptedAttemptId: RunAttemptId.make("attempt"),
+          providerSessionId: ProviderSessionId.make("session"),
+          providerThreadId: ProviderThreadId.make("provider-thread"),
+          providerTurnId: ProviderTurnId.make("turn"),
+          sessionTransition: { type: "detach" },
+        },
+        { type: "provider-runtime.continue", sourceRunId: RunId.make("run") },
+      ] as const;
+      const cases = [
+        { source: "intent", state: "reserved", request: requests[0] },
+        { source: "intent", state: "dispatching", request: requests[1] },
+        { source: "intent", state: "unknown", request: requests[2] },
+        { source: "intent", state: "finalized", request: requests[0] },
+        { source: "intent", state: "cancelled", request: requests[1] },
+        { source: "operation", state: "reserved", request: requests[2] },
+        { source: "supervision", state: "reserved", request: requests[1] },
+        { source: "pass", state: "reserved", request: requests[0] },
+      ] as const;
+      for (const [index, fixture] of cases.entries()) {
+        const threadId = ThreadId.make(`thread:retained-matrix:${index}`);
+        yield* seedWorkflowAssociation(
+          `retained-matrix:${index}`,
+          threadId,
+          fixture.source,
+          fixture.state,
+        );
+        yield* outbox.enqueue([
+          {
+            id: `matrix:${index}`,
+            commandId: CommandId.make(`matrix:${index}`),
+            threadId,
+            request: fixture.request,
+          },
+        ]);
+      }
+      yield* sql`UPDATE orchestration_v2_effect_outbox SET lease_expires_at = '2001-01-01T00:00:00.000Z', lease_owner = 'old-owner', last_error = 'old-error'`;
+      const before = yield* sql`SELECT * FROM orchestration_v2_effect_outbox ORDER BY effect_id`;
+      assert.lengthOf(before, 8);
+      assert.isTrue(Option.isNone(yield* outbox.claimNext({ workerId: "worker" })));
+      assert.isTrue(Option.isNone(yield* outbox.claimNext({ workerId: "worker" })));
+      assert.isTrue(Option.isNone(yield* outbox.nextClaimableAt));
+      const executed = yield* Ref.make<Array<string>>([]);
+      const executor = Layer.succeed(
+        EffectWorker.OrchestrationEffectExecutorV2,
+        EffectWorker.OrchestrationEffectExecutorV2.of({
+          execute: (effect) => Ref.update(executed, (ids) => [...ids, effect.id]),
+        }),
+      );
+      const workerLayer = EffectWorker.layerWithOptions({ workerId: "matrix-worker" }).pipe(
+        Layer.provide(Layer.merge(Layer.succeed(EffectOutbox.EffectOutboxV2, outbox), executor)),
+      );
+      yield* Effect.gen(function* () {
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        assert.isFalse(yield* worker.runOnce);
+        assert.isFalse(yield* worker.runOnce);
+      }).pipe(Effect.provide(workerLayer));
+      assert.deepEqual(yield* Ref.get(executed), []);
+      assert.deepEqual(
+        yield* sql`SELECT * FROM orchestration_v2_effect_outbox ORDER BY effect_id`,
+        before,
+      );
+      const ordinary = ThreadId.make("thread:matrix-ordinary");
+      yield* seedWorkflowAssociation(
+        "matrix-unrelated",
+        ThreadId.make("thread:matrix-unrelated"),
+        "operation",
+      );
+      yield* outbox.enqueue([
+        {
+          id: "matrix-ordinary",
+          commandId: CommandId.make("ordinary"),
+          threadId: ordinary,
+          request: requests[0],
+        },
+      ]);
+      assert.equal(
+        Option.getOrThrow(yield* outbox.claimNext({ workerId: "worker" })).id,
+        "matrix-ordinary",
+      );
+    }).pipe(Effect.provide(layerIsolatedOutbox)),
+  );
+
+  it.effect("returns the ordinary future deadline beside retained overdue work", () =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const threadId = ThreadId.make("thread:deadline-owned");
+      yield* seedWorkflowAssociation("deadline-owned", threadId);
+      const now = yield* DateTime.now;
+      const future = DateTime.add(now, { seconds: 10 });
+      yield* outbox.enqueue([
+        {
+          id: "owned-deadline",
+          commandId: CommandId.make("deadline"),
+          threadId,
+          request: { type: "provider-turn.start", runId: RunId.make("run") },
+        },
+        {
+          id: "ordinary-deadline",
+          commandId: CommandId.make("deadline"),
+          threadId: ThreadId.make("thread:deadline-other"),
+          availableAt: future,
+          request: { type: "terminal.cleanup" },
+        },
+      ]);
+      assert.equal(
+        DateTime.toEpochMillis(Option.getOrThrow(yield* outbox.nextClaimableAt)),
+        DateTime.toEpochMillis(future),
+      );
+      assert.isTrue(Option.isNone(yield* outbox.claimNext({ workerId: "worker" })));
+    }).pipe(Effect.provide(layerIsolatedOutbox)),
+  );
+
+  it.effect("keeps FIFO barriers and title lane around retained effects", () =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const threadId = ThreadId.make("thread:retained-lanes");
+      yield* seedWorkflowAssociation("retained-lanes", threadId);
+      const interrupt = {
+        type: "provider-turn.interrupt",
+        providerSessionId: ProviderSessionId.make("session"),
+        providerThreadId: ProviderThreadId.make("provider-thread"),
+        providerTurnId: ProviderTurnId.make("turn"),
+      } as const;
+      yield* outbox.enqueue([
+        {
+          id: "owned-continuation",
+          commandId: CommandId.make("lanes"),
+          threadId,
+          request: { type: "provider-runtime.continue", sourceRunId: RunId.make("run") },
+        },
+        {
+          id: "blocked-cleanup",
+          commandId: CommandId.make("lanes"),
+          threadId,
+          request: { type: "terminal.cleanup" },
+        },
+        {
+          id: "blocked-interrupt",
+          commandId: CommandId.make("lanes"),
+          threadId,
+          request: interrupt,
+        },
+        {
+          id: "free-title",
+          commandId: CommandId.make("lanes"),
+          threadId,
+          request: { type: "thread-title.generate", kind: { type: "regenerate" } },
+        },
+      ]);
+      const title = Option.getOrThrow(
+        yield* outbox.claimNext({ workerId: "worker", excludeRestartContinuations: true }),
+      );
+      assert.equal(title.id, "free-title");
+      assert.isTrue(
+        Option.isNone(
+          yield* outbox.claimNext({ workerId: "worker", excludeRestartContinuations: true }),
+        ),
+      );
+      yield* outbox.cancelUnsettled({
+        threadId,
+        effectTypes: ["terminal.cleanup"],
+        reason: "fixture",
+      });
+      assert.equal(
+        Option.getOrThrow(
+          yield* outbox.claimNext({ workerId: "worker", excludeRestartContinuations: true }),
+        ).id,
+        "blocked-interrupt",
+      );
+      yield* outbox.enqueue([
+        {
+          id: "second-interrupt",
+          commandId: CommandId.make("lanes"),
+          threadId,
+          request: interrupt,
+        },
+      ]);
+      assert.isTrue(Option.isNone(yield* outbox.claimNext({ workerId: "worker" })));
+    }).pipe(Effect.provide(layerIsolatedOutbox)),
+  );
+
+  it.effect("does not let other critical effects bypass a retained predecessor", () =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const requests = [
+        { type: "provider-session.detach", providerSessionId: ProviderSessionId.make("session") },
+        {
+          type: "provider-turn.steer",
+          providerSessionId: ProviderSessionId.make("session"),
+          providerThreadId: ProviderThreadId.make("provider-thread"),
+          providerTurnId: ProviderTurnId.make("turn"),
+          messageId: MessageId.make("message"),
+        },
+        {
+          type: "runtime-request.respond",
+          providerSessionId: ProviderSessionId.make("session"),
+          requestId: RuntimeRequestId.make("request"),
+        },
+        {
+          type: "provider-thread.rollback",
+          providerThreadId: ProviderThreadId.make("provider-thread"),
+          checkpointId: CheckpointId.make("checkpoint"),
+          scopeId: CheckpointScopeId.make("scope"),
+        },
+        { type: "terminal.cleanup" },
+      ] as const;
+      for (const [index, request] of requests.entries()) {
+        const threadId = ThreadId.make(`thread:blocked-kind:${index}`);
+        yield* seedWorkflowAssociation(`blocked-kind:${index}`, threadId);
+        yield* outbox.enqueue([
+          {
+            id: `predecessor:${index}`,
+            commandId: CommandId.make(`kind:${index}`),
+            threadId,
+            request: { type: "provider-turn.start", runId: RunId.make("run") },
+          },
+          { id: `blocked:${index}`, commandId: CommandId.make(`kind:${index}`), threadId, request },
+        ]);
+        assert.isTrue(Option.isNone(yield* outbox.claimNext({ workerId: "worker" })));
+        yield* outbox.cancelUnsettled({
+          threadId,
+          effectTypes: ["provider-turn.start"],
+          reason: "fixture",
+        });
+        assert.equal(
+          Option.getOrThrow(yield* outbox.claimNext({ workerId: "worker" })).id,
+          `blocked:${index}`,
+        );
+        yield* outbox.succeed({ effectId: `blocked:${index}`, workerId: "worker" });
+      }
+    }).pipe(Effect.provide(layerIsolatedOutbox)),
+  );
+
+  it.effect("does not bypass a running effect after an association appears", () =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const threadId = ThreadId.make("thread:running-barrier");
+      yield* outbox.enqueue([
+        {
+          id: "running-start",
+          commandId: CommandId.make("running"),
+          threadId,
+          request: { type: "provider-turn.start", runId: RunId.make("run") },
+        },
+      ]);
+      assert.equal(
+        Option.getOrThrow(yield* outbox.claimNext({ workerId: "worker" })).id,
+        "running-start",
+      );
+      yield* seedWorkflowAssociation("running-barrier", threadId);
+      yield* outbox.enqueue([
+        {
+          id: "running-interrupt",
+          commandId: CommandId.make("running"),
+          threadId,
+          request: {
+            type: "provider-turn.interrupt",
+            providerSessionId: ProviderSessionId.make("session"),
+            providerThreadId: ProviderThreadId.make("provider-thread"),
+            providerTurnId: ProviderTurnId.make("turn"),
+          },
+        },
+      ]);
+      assert.isTrue(Option.isNone(yield* outbox.claimNext({ workerId: "other" })));
+      assert.isTrue(Option.isNone(yield* outbox.nextClaimableAt));
+      yield* outbox.succeed({ effectId: "running-start", workerId: "worker" });
+      assert.equal(
+        Option.getOrThrow(yield* outbox.claimNext({ workerId: "other" })).id,
+        "running-interrupt",
+      );
+    }).pipe(Effect.provide(layerIsolatedOutbox)),
+  );
+
+  it.effect("propagates association lookup errors without claiming", () =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const sql = yield* SqlClient.SqlClient;
+      yield* outbox.enqueue([
+        {
+          id: "lookup-error",
+          commandId: CommandId.make("lookup"),
+          threadId: ThreadId.make("lookup"),
+          request: { type: "provider-turn.start", runId: RunId.make("run") },
+        },
+      ]);
+      const before = yield* sql`SELECT * FROM orchestration_v2_effect_outbox`;
+      yield* sql`DROP TABLE workflow_native_launch_intents`;
+      const claimError = yield* Effect.flip(outbox.claimNext({ workerId: "worker" }));
+      const deadlineError = yield* Effect.flip(outbox.nextClaimableAt);
+      assert.equal(claimError.operation, "claim");
+      assert.equal(deadlineError.operation, "next-claimable");
+      const executed = yield* Ref.make<Array<string>>([]);
+      const executor = Layer.succeed(
+        EffectWorker.OrchestrationEffectExecutorV2,
+        EffectWorker.OrchestrationEffectExecutorV2.of({
+          execute: (effect) => Ref.update(executed, (ids) => [...ids, effect.id]),
+        }),
+      );
+      const workerLayer = EffectWorker.layerWithOptions({ workerId: "error-worker" }).pipe(
+        Layer.provide(Layer.merge(Layer.succeed(EffectOutbox.EffectOutboxV2, outbox), executor)),
+      );
+      yield* Effect.gen(function* () {
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        yield* Effect.flip(worker.runOnce);
+      }).pipe(Effect.provide(workerLayer));
+      assert.deepEqual(yield* Ref.get(executed), []);
+      assert.deepEqual(yield* sql`SELECT * FROM orchestration_v2_effect_outbox`, before);
+    }).pipe(Effect.provide(layerIsolatedOutbox)),
+  );
+
   it.effect("interrupts a running process-bound effect when it is cancelled", () =>
     Effect.gen(function* () {
       const outbox = yield* EffectOutbox.EffectOutboxV2;
@@ -2251,6 +2679,7 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
         const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
         const workerFiber = yield* worker.runOnce.pipe(Effect.forkChild);
         yield* Deferred.await(started);
+        yield* seedWorkflowAssociation("cancel-running-owned", threadId);
         const cancelledEffectIds = yield* outbox.cancelUnsettled({
           threadId,
           effectTypes: ["provider-turn.start"],

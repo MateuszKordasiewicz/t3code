@@ -310,6 +310,19 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
         available,
         Array.from({ length: Math.min(64, Math.max(0, Math.floor(count))) }, () => undefined),
       ).pipe(Effect.asVoid);
+    const selected = (alias: "candidate" | "active") => {
+      const threadId = alias === "candidate" ? sql`candidate.thread_id` : sql`active.thread_id`;
+      const effectType =
+        alias === "candidate" ? sql`candidate.effect_type` : sql`active.effect_type`;
+      return sql`(
+        ${effectType} IN ('provider-turn.start', 'provider-turn.restart', 'provider-runtime.continue')
+        AND (
+          EXISTS (SELECT 1 FROM workflow_native_launch_intents AS i WHERE i.thread_id = ${threadId})
+          OR EXISTS (SELECT 1 FROM workflow_operations AS o WHERE CASE WHEN json_valid(o.record_json) THEN json_extract(o.record_json, '$.parameters.nativeThreadId') END = ${threadId})
+          OR EXISTS (SELECT 1 FROM workflow_planning_passes AS p WHERE p.native_thread_id = ${threadId})
+        )
+      )`;
+    };
     // Retry backoff must block later effects so turns cannot race a pending rollback.
     const claimableCandidatePredicate = (
       availableBefore?: string,
@@ -322,6 +335,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             : sql`candidate.available_at <= ${availableBefore}`
         }
         AND candidate.status = 'pending'
+        AND NOT ${selected("candidate")}
         AND NOT EXISTS (
           SELECT 1
           FROM orchestration_v2_effect_outbox AS active
@@ -333,9 +347,10 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
                 AND active.rowid < candidate.rowid
                 AND ${
                   excludeRestartContinuations
-                    ? sql`active.effect_type != 'provider-runtime.continue'`
+                    ? sql`(active.effect_type != 'provider-runtime.continue' OR ${selected("active")})`
                     : sql`1 = 1`
                 }
+                AND NOT (candidate.effect_type = 'provider-turn.interrupt' AND ${selected("active")})
               )
             )
             AND (
