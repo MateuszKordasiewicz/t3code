@@ -2,7 +2,7 @@ import * as Digest from "effect/crypto/Digest";
 import * as Effect from "effect/Effect";
 import * as Base64 from "effect/encoding/Base64";
 import * as Schema from "effect/Schema";
-import { EnvironmentId, ProjectId, ThreadId } from "./baseSchemas.ts";
+import { EnvironmentId, MessageId, ProjectId, ThreadId } from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 
 const NonEmpty = Schema.NonEmptyString;
@@ -341,4 +341,192 @@ export const decodePlanningSessionV1 = Effect.fn("PlanningSessionV1.decode")(fun
   )
     return yield* sessionFail("invalid allowance");
   return session;
+});
+
+const PlanningPassId = NonEmpty.pipe(Schema.brand("PlanningPassId"));
+const RevisionId = NonEmpty.pipe(Schema.brand("RevisionId"));
+const OperationId = NonEmpty.pipe(Schema.brand("OperationId"));
+const NativeRunId = NonEmpty.pipe(Schema.brand("NativeRunId"));
+const ReferenceId = NonEmpty.pipe(Schema.brand("ReferenceId"));
+const InventoryId = NonEmpty.pipe(Schema.brand("InventoryId"));
+const RequirementId = NonEmpty.pipe(Schema.brand("RequirementId"));
+const FindingId = NonEmpty.pipe(Schema.brand("FindingId"));
+const ObjectId = NonEmpty.pipe(Schema.brand("ObjectId"));
+const Hash = NonEmpty.check(Schema.isPattern(/^[0-9a-f]{64}$/));
+const Reference = Schema.Struct({
+  kind: Schema.Literals([
+    "source",
+    "plan_revision",
+    "candidate",
+    "configuration",
+    "policy",
+    "artifact",
+    "report",
+    "check",
+    "review",
+    "native_message",
+  ]),
+  id: ReferenceId,
+  sha256: Hash,
+});
+const Access = Schema.Struct({ origins: Schema.Array(SessionOrigin) });
+const InputManifest = Schema.Struct({
+  sources: Schema.Array(Reference),
+  references: Schema.Array(Reference),
+  additionalContext: Schema.Array(Reference),
+  access: Access,
+});
+const Inventory = Schema.Struct({
+  id: InventoryId,
+  text: NonEmpty,
+  sourceRefs: Schema.Array(Reference),
+  requirementIds: Schema.Array(RequirementId),
+  disposition: Schema.Literals(["mapped", "missing", "uncertain", "proposed_exclusion"]),
+});
+const Finding = Schema.Struct({
+  id: FindingId,
+  severity: Schema.Literals(["blocking", "nonblocking"]),
+  description: NonEmpty,
+  affectedObjectIds: Schema.Array(ObjectId),
+  evidence: Schema.Array(Reference),
+  proposedRemedy: NonEmpty,
+});
+const Disposition = Schema.Struct({
+  reportId: PlanningPassId,
+  findingId: FindingId,
+  decision: Schema.Literals(["accept", "reject", "defer"]),
+  rationale: NonEmpty,
+  affectedObjectIds: Schema.Array(ObjectId),
+  deferTrigger: Schema.optionalKey(NonEmpty),
+});
+const Report = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("author"),
+    summary: NonEmpty,
+    outputs: Schema.Array(Reference),
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("repair"),
+    summary: NonEmpty,
+    dispositions: Schema.Array(Disposition),
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("review"),
+    verdict: Schema.Literals(["pass", "changes_requested", "inconclusive"]),
+    assessment: Schema.Struct({
+      sourcePacketHash: Hash,
+      revisionHash: Hash,
+      inventory: Schema.Array(Inventory),
+    }),
+    findings: Schema.Array(Finding),
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("readback"),
+    buildDescription: NonEmpty,
+    inferredIntent: NonEmpty,
+    discrepancies: Schema.Array(NonEmpty),
+    questions: Schema.Array(NonEmpty),
+    actualInputs: InputManifest,
+  }),
+]);
+
+export const PlanningPassV1 = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  id: PlanningPassId,
+  planningSessionId: SessionId,
+  role: Schema.Literals(["author", "review", "repair", "readback"]),
+  provider: SessionProvider,
+  binding: Schema.Struct({
+    planId: PlanId,
+    revisionId: RevisionId,
+    revisionSchemaVersion: Schema.Literal(1),
+    revisionHash: Hash,
+    sourcePacketHash: Hash,
+  }),
+  operationId: OperationId,
+  inputManifest: InputManifest,
+  status: Schema.Literals(["pending", "claimed", "settled", "cancelled", "unknown"]),
+  native: Schema.optionalKey(
+    Schema.Struct({
+      threadId: ThreadId,
+      runId: NativeRunId,
+      terminalMessageId: Schema.optionalKey(MessageId),
+    }),
+  ),
+  report: Schema.optionalKey(Report),
+  access: Access,
+});
+export type PlanningPassV1 = typeof PlanningPassV1.Type;
+
+export class PlanningPassError extends Schema.TaggedError<PlanningPassError>()(
+  "PlanningPassError",
+  {
+    reason: Schema.Literals([
+      "role or binding mismatch",
+      "malformed report",
+      "unbound report",
+      "invalid record",
+    ]),
+  },
+) {}
+const passFail = (reason: PlanningPassError["reason"]) => new PlanningPassError({ reason });
+const decodePassShape = Schema.decodeUnknownEffect(PlanningPassV1);
+const duplicateReferences = (values: readonly (typeof Reference.Type)[]) =>
+  duplicate(values.map((value) => JSON.stringify([value.kind, value.id, value.sha256])));
+const duplicateOrigins = (access: typeof Access.Type) =>
+  duplicate(
+    access.origins.map((origin) =>
+      JSON.stringify([origin.environmentId, origin.projectId, origin.threadId]),
+    ),
+  );
+const invalidManifest = (manifest: typeof InputManifest.Type) =>
+  duplicateReferences(manifest.sources) ||
+  duplicateReferences(manifest.references) ||
+  duplicateReferences(manifest.additionalContext) ||
+  duplicateOrigins(manifest.access);
+
+export const decodePlanningPassV1 = Effect.fn("PlanningPassV1.decode")(function* (input: unknown) {
+  const pass = yield* decodePassShape(input, { onExcessProperty: "error" }).pipe(
+    Effect.mapError(() => passFail("invalid record")),
+  );
+  if (invalidManifest(pass.inputManifest) || duplicateOrigins(pass.access))
+    return yield* passFail("invalid record");
+  const report = pass.report;
+  if (!report) return pass;
+  if (
+    pass.role !== report.kind ||
+    (report.kind === "review" &&
+      (report.assessment.sourcePacketHash !== pass.binding.sourcePacketHash ||
+        report.assessment.revisionHash !== pass.binding.revisionHash))
+  )
+    return yield* passFail("role or binding mismatch");
+  if (pass.status !== "settled" || !pass.native?.terminalMessageId)
+    return yield* passFail("unbound report");
+  if (
+    (report.kind === "author" && duplicateReferences(report.outputs)) ||
+    (report.kind === "repair" &&
+      (duplicate(report.dispositions.map((d) => JSON.stringify([d.reportId, d.findingId]))) ||
+        report.dispositions.some(
+          (d) =>
+            duplicate(d.affectedObjectIds) ||
+            (d.decision === "defer" ? !d.deferTrigger : d.deferTrigger !== undefined),
+        ))) ||
+    (report.kind === "readback" && invalidManifest(report.actualInputs)) ||
+    (report.kind === "review" &&
+      (duplicate(report.assessment.inventory.map((item) => item.id)) ||
+        duplicate(report.findings.map((finding) => finding.id)) ||
+        report.assessment.inventory.some(
+          (item) =>
+            item.sourceRefs.length === 0 ||
+            duplicateReferences(item.sourceRefs) ||
+            duplicate(item.requirementIds) ||
+            (item.disposition === "mapped" && item.requirementIds.length === 0),
+        ) ||
+        report.findings.some(
+          (finding) =>
+            duplicate(finding.affectedObjectIds) || duplicateReferences(finding.evidence),
+        )))
+  )
+    return yield* passFail("malformed report");
+  return pass;
 });

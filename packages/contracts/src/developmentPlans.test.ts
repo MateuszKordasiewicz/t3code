@@ -5,6 +5,8 @@ import * as Schema from "effect/Schema";
 import {
   decodeDevelopmentPlanDocumentV1,
   decodePlanningSessionV1,
+  decodePlanningPassV1,
+  PlanningPassV1,
   PlanningSessionV1,
 } from "./developmentPlans.ts";
 
@@ -356,6 +358,309 @@ describe("planning session", () => {
           const encoded = yield* encodePlanningSession(result.success);
           expect(encoded).toEqual(input);
         }
+      }
+    }),
+  );
+});
+
+const passHash = "a".repeat(64);
+const passReference = () => ({ kind: "source", id: "artifact-1", sha256: passHash });
+const passManifest = () => ({
+  sources: [passReference()],
+  references: [],
+  additionalContext: [],
+  access: { origins: [{ environmentId: "env-1", projectId: "project-1", threadId: "thread-1" }] },
+});
+const passExample = () => ({
+  schemaVersion: 1,
+  id: "pass-1",
+  planningSessionId: "session-1",
+  role: "review",
+  provider: { providerInstanceId: "codex", model: "example-model" },
+  binding: {
+    planId: "plan-1",
+    revisionId: "revision-1",
+    revisionSchemaVersion: 1,
+    revisionHash: passHash,
+    sourcePacketHash: passHash,
+  },
+  operationId: "op-1",
+  inputManifest: passManifest(),
+  status: "settled",
+  native: { threadId: "thread-2", runId: "run-1", terminalMessageId: "message-1" },
+  report: {
+    kind: "review",
+    verdict: "pass",
+    assessment: {
+      sourcePacketHash: passHash,
+      revisionHash: passHash,
+      inventory: [
+        {
+          id: "inv-1",
+          text: "Requested behavior",
+          sourceRefs: [passReference()],
+          requirementIds: ["req-1"],
+          disposition: "mapped",
+        },
+      ],
+    },
+    findings: [] as {
+      id: string;
+      severity: string;
+      description: string;
+      affectedObjectIds: string[];
+      evidence: ReturnType<typeof passReference>[];
+      proposedRemedy: string;
+    }[],
+  },
+  access: passManifest().access,
+});
+const changedPass = (f: (pass: ReturnType<typeof passExample>) => void) => {
+  const pass = passExample();
+  f(pass);
+  return pass;
+};
+const passCases: { name: string; input: unknown; reason?: string }[] = [
+  { name: "review preserves source scope", input: passExample() },
+  {
+    name: "readback preserves actual inputs",
+    input: {
+      ...passExample(),
+      role: "readback",
+      report: {
+        kind: "readback",
+        buildDescription: "Build",
+        inferredIntent: "Intent",
+        discrepancies: [],
+        questions: [],
+        actualInputs: { ...passManifest(), additionalContext: [passReference()] },
+      },
+    },
+  },
+  {
+    name: "cancelled without report",
+    input: (() => {
+      const { report: _report, ...pass } = passExample();
+      return { ...pass, status: "cancelled" };
+    })(),
+  },
+  {
+    name: "author report",
+    input: {
+      ...passExample(),
+      role: "author",
+      report: { kind: "author", summary: "Summary", outputs: [passReference()] },
+    },
+  },
+  {
+    name: "repair defer with trigger",
+    input: {
+      ...passExample(),
+      role: "repair",
+      report: {
+        kind: "repair",
+        summary: "Summary",
+        dispositions: [
+          {
+            reportId: "pass-2",
+            findingId: "finding-1",
+            decision: "defer",
+            rationale: "Later",
+            affectedObjectIds: [],
+            deferTrigger: "Trigger",
+          },
+        ],
+      },
+    },
+  },
+  {
+    name: "conflicting dispositions for one finding",
+    input: (() => {
+      const disposition = {
+        reportId: "pass-2",
+        findingId: "finding-1",
+        decision: "accept",
+        rationale: "Fix",
+        affectedObjectIds: [],
+      };
+      return {
+        ...passExample(),
+        role: "repair",
+        report: {
+          kind: "repair",
+          summary: "Summary",
+          dispositions: [disposition, { ...disposition, decision: "reject" }],
+        },
+      };
+    })(),
+    reason: "malformed report",
+  },
+  {
+    name: "role mismatch",
+    input: changedPass((p) => {
+      p.role = "repair";
+    }),
+    reason: "role or binding mismatch",
+  },
+  ...(["revisionHash", "sourcePacketHash"] as const).map((key) => ({
+    name: `mismatched ${key}`,
+    input: changedPass((p) => {
+      p.report.assessment[key] = "b".repeat(64);
+    }),
+    reason: "role or binding mismatch",
+  })),
+  {
+    name: "defer without trigger",
+    input: {
+      ...passExample(),
+      role: "repair",
+      report: {
+        kind: "repair",
+        summary: "Summary",
+        dispositions: [
+          {
+            reportId: "pass-2",
+            findingId: "finding-1",
+            decision: "defer",
+            rationale: "Later",
+            affectedObjectIds: [],
+          },
+        ],
+      },
+    },
+    reason: "malformed report",
+  },
+  {
+    name: "trigger on accepted disposition",
+    input: {
+      ...passExample(),
+      role: "repair",
+      report: {
+        kind: "repair",
+        summary: "Summary",
+        dispositions: [
+          {
+            reportId: "pass-2",
+            findingId: "finding-1",
+            decision: "accept",
+            rationale: "Yes",
+            affectedObjectIds: [],
+            deferTrigger: "Later",
+          },
+        ],
+      },
+    },
+    reason: "malformed report",
+  },
+  {
+    name: "duplicate finding id",
+    input: changedPass((p) => {
+      const finding = {
+        id: "finding-1",
+        severity: "blocking",
+        description: "Problem",
+        affectedObjectIds: [],
+        evidence: [],
+        proposedRemedy: "Fix",
+      };
+      p.report.findings = [finding, { ...finding }];
+    }),
+    reason: "malformed report",
+  },
+  {
+    name: "duplicate inventory id",
+    input: changedPass((p) => {
+      p.report.assessment.inventory.push({ ...p.report.assessment.inventory[0]! });
+    }),
+    reason: "malformed report",
+  },
+  {
+    name: "mapped without requirement",
+    input: changedPass((p) => {
+      p.report.assessment.inventory[0]!.requirementIds = [];
+    }),
+    reason: "malformed report",
+  },
+  {
+    name: "inventory without source",
+    input: changedPass((p) => {
+      p.report.assessment.inventory[0]!.sourceRefs = [];
+    }),
+    reason: "malformed report",
+  },
+  {
+    name: "report before settled",
+    input: changedPass((p) => {
+      p.status = "claimed";
+    }),
+    reason: "unbound report",
+  },
+  {
+    name: "report without terminal message",
+    input: changedPass((p) => {
+      Reflect.deleteProperty(p.native, "terminalMessageId");
+    }),
+    reason: "unbound report",
+  },
+  {
+    name: "invalid hash format",
+    input: changedPass((p) => {
+      p.binding.revisionHash = "A".repeat(64);
+    }),
+    reason: "invalid record",
+  },
+  {
+    name: "duplicate input reference",
+    input: changedPass((p) => {
+      p.inputManifest.sources.push(passReference());
+    }),
+    reason: "invalid record",
+  },
+  {
+    name: "duplicate origin",
+    input: changedPass((p) => {
+      p.access.origins.push({ ...p.access.origins[0]! });
+    }),
+    reason: "invalid record",
+  },
+  {
+    name: "unknown nested field",
+    input: changedPass((p) => {
+      Object.assign(p.binding, { extra: true });
+    }),
+    reason: "invalid record",
+  },
+  {
+    name: "null optional field",
+    input: { ...passExample(), native: null },
+    reason: "invalid record",
+  },
+  {
+    name: "readback missing actual inputs",
+    input: {
+      ...passExample(),
+      role: "readback",
+      report: {
+        kind: "readback",
+        buildDescription: "Build",
+        inferredIntent: "Intent",
+        discrepancies: [],
+        questions: [],
+      },
+    },
+    reason: "invalid record",
+  },
+];
+const encodePlanningPass = Schema.encodeEffect(PlanningPassV1);
+describe("planning pass", () => {
+  it.effect.each(passCases)("$name", ({ input, reason }) =>
+    Effect.gen(function* () {
+      const result = yield* Effect.result(decodePlanningPassV1(input));
+      if (reason) expect(result).toMatchObject({ _tag: "Failure", failure: { reason } });
+      else {
+        expect(result).toMatchObject({ _tag: "Success", success: input });
+        if (result._tag === "Success")
+          expect(yield* encodePlanningPass(result.success)).toEqual(input);
       }
     }),
   );
