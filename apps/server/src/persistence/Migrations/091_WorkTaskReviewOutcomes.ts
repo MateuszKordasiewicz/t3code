@@ -15,7 +15,7 @@ export default Effect.gen(function* () {
     command_id TEXT,
     event_json TEXT NOT NULL CHECK (CASE WHEN json_valid(event_json) THEN json_type(event_json) IS 'object' ELSE 0 END),
     UNIQUE (task_id, sequence)
-  )`;
+  ) WITHOUT ROWID`;
   yield* sql.unsafe(`CREATE TRIGGER work_task_review_events_validate BEFORE INSERT ON work_task_review_events
     WHEN CASE WHEN json_valid(NEW.event_json) THEN NOT (
       json_extract(NEW.event_json, '$.id') IS NEW.event_id
@@ -32,15 +32,16 @@ export default Effect.gen(function* () {
       AND json_extract(NEW.event_json, '$.completionPolicyRevision') BETWEEN 1 AND 9007199254740991
       AND NOT EXISTS (
         WITH RECURSIVE strings(value) AS (
-          SELECT NEW.event_id UNION ALL SELECT NEW.task_id UNION ALL SELECT NEW.review_id
-          UNION ALL SELECT NEW.command_id WHERE NEW.command_id IS NOT NULL
+          SELECT NEW.review_id
+          UNION ALL SELECT NEW.task_id WHERE json_extract(NEW.event_json, '$.type') = 'task.action-review-requested'
+          UNION ALL SELECT NEW.command_id WHERE NEW.command_id IS NOT NULL AND json_extract(NEW.event_json, '$.type') = 'task.action-review-requested'
           UNION ALL SELECT r.manager_thread_id FROM work_task_action_reviews r WHERE r.review_id = NEW.review_id
-          UNION ALL SELECT r.provider_session_id FROM work_task_action_reviews r WHERE r.review_id = NEW.review_id
+          UNION ALL SELECT r.provider_session_id FROM work_task_action_reviews r WHERE r.review_id = NEW.review_id AND json_extract(NEW.event_json, '$.type') = 'task.action-review-requested'
           UNION ALL SELECT r.run_id FROM work_task_action_reviews r WHERE r.review_id = NEW.review_id
-          UNION ALL SELECT r.runtime_request_id FROM work_task_action_reviews r WHERE r.review_id = NEW.review_id
-          UNION ALL SELECT r.rule_id FROM work_task_action_reviews r WHERE r.review_id = NEW.review_id
+          UNION ALL SELECT r.runtime_request_id FROM work_task_action_reviews r WHERE r.review_id = NEW.review_id AND json_extract(NEW.event_json, '$.type') = 'task.action-review-requested'
+          UNION ALL SELECT r.rule_id FROM work_task_action_reviews r WHERE r.review_id = NEW.review_id AND json_extract(NEW.event_json, '$.type') = 'task.action-review-requested'
           UNION ALL SELECT r.action FROM work_task_action_reviews r WHERE r.review_id = NEW.review_id
-          UNION ALL SELECT r.label FROM work_task_action_reviews r WHERE r.review_id = NEW.review_id
+          UNION ALL SELECT r.label FROM work_task_action_reviews r WHERE r.review_id = NEW.review_id AND json_extract(NEW.event_json, '$.type') = 'task.action-review-requested'
           UNION ALL SELECT r.target FROM work_task_action_reviews r WHERE r.review_id = NEW.review_id
           UNION ALL SELECT r.fingerprint FROM work_task_action_reviews r WHERE r.review_id = NEW.review_id
           UNION ALL SELECT json_extract(NEW.event_json, '$.review.continuationId') WHERE json_type(NEW.event_json, '$.review.continuationId') IS 'text'
@@ -106,6 +107,11 @@ export default Effect.gen(function* () {
               EXCEPT SELECT '$.review.preview' || substr(fullkey, 2), type, atom FROM json_tree(r.preview_json))
             AND NOT EXISTS (SELECT '$.review.preview' || substr(fullkey, 2), type, atom FROM json_tree(r.preview_json)
               EXCEPT SELECT fullkey, type, atom FROM json_tree(NEW.event_json, '$.review.preview'))
+            AND NOT EXISTS (SELECT 1 FROM (
+              SELECT json_extract(r.preview_json, '$.content') AS value
+              UNION ALL SELECT json_extract(value, '$.uri') FROM json_each(r.preview_json, '$.artifacts')
+              UNION ALL SELECT json_extract(value, '$.hash') FROM json_each(r.preview_json, '$.artifacts'))
+              WHERE length(CAST(trim(value, ${whitespace}) AS BLOB)) = 0)
             AND json_extract(NEW.event_json, '$.review.createdSequence') IS r.created_sequence
             AND json_extract(NEW.event_json, '$.review.createdAt') IS r.created_at
             AND NEW.sequence IS r.created_sequence
@@ -155,9 +161,11 @@ export default Effect.gen(function* () {
     occurred_at TEXT NOT NULL,
     command_id TEXT,
     event_json TEXT NOT NULL CHECK (CASE WHEN json_valid(event_json) THEN json_type(event_json) IS 'object' ELSE 0 END),
+    decision_event_id TEXT GENERATED ALWAYS AS (CASE WHEN json_extract(event_json, '$.type') = 'task.action-review-continuation-released' THEN json_extract(event_json, '$.decisionEventId') END) VIRTUAL,
     FOREIGN KEY (review_id) REFERENCES work_task_action_reviews(review_id),
+    FOREIGN KEY (decision_event_id) REFERENCES work_task_review_events(event_id) DEFERRABLE INITIALLY DEFERRED,
     UNIQUE (task_id, sequence)
-  )`;
+  ) WITHOUT ROWID`;
   // Keep the complete event for exact replay, including revisions that can differ on invalidation.
   yield* sql.unsafe(`CREATE TRIGGER work_task_review_outcomes_validate BEFORE INSERT ON work_task_review_outcomes
     WHEN CASE WHEN json_valid(NEW.event_json) THEN NOT (
@@ -256,7 +264,7 @@ export default Effect.gen(function* () {
       AND NOT EXISTS (
         WITH RECURSIVE strings(value) AS (
           SELECT NEW.event_id UNION ALL SELECT NEW.task_id UNION ALL SELECT NEW.review_id
-          UNION ALL SELECT NEW.command_id WHERE NEW.command_id IS NOT NULL
+          UNION ALL SELECT NEW.command_id WHERE NEW.command_id IS NOT NULL AND json_extract(NEW.event_json, '$.type') = 'task.action-review-cancelled'
           UNION ALL SELECT json_extract(NEW.event_json, '$.reason')
           UNION ALL SELECT json_extract(NEW.event_json, '$.binding.ruleId')
           UNION ALL SELECT json_extract(NEW.event_json, '$.binding.runtimeRequestId')
@@ -326,6 +334,10 @@ export default Effect.gen(function* () {
   for (const operation of ["INSERT", "UPDATE"]) {
     yield* sql.unsafe(`CREATE TRIGGER work_task_review_status_${operation.toLowerCase()} BEFORE ${operation} ON work_task_review_status
       WHEN NOT EXISTS (SELECT 1 FROM work_task_action_reviews r WHERE r.review_id = NEW.review_id AND r.task_id = NEW.task_id
+        AND NEW.sequence = (SELECT max(seq) FROM (
+          SELECT r.created_sequence AS seq UNION ALL SELECT resolved_sequence FROM work_task_action_review_decisions WHERE review_id = r.review_id
+          UNION ALL SELECT sequence FROM work_task_review_outcomes WHERE review_id = r.review_id
+            AND json_extract(event_json, '$.type') IN ('task.action-review-invalidated','task.action-review-cancelled')))
         AND ((NEW.state = 'pending' AND NEW.sequence = r.created_sequence)
           OR (NEW.state IN ('approved', 'rejected', 'changes_requested') AND EXISTS (
             SELECT 1 FROM work_task_action_review_decisions d WHERE d.review_id = r.review_id
@@ -347,4 +359,118 @@ export default Effect.gen(function* () {
     BEGIN SELECT RAISE(ABORT, 'duplicate review status'); END`;
   yield* sql`CREATE INDEX work_task_review_status_page_idx ON work_task_review_status(task_id, state, sequence DESC, review_id DESC)`;
   yield* sql`CREATE INDEX work_task_reviews_history_idx ON work_task_action_reviews(task_id, created_sequence DESC, review_id DESC)`;
+  for (const table of [
+    "work_task_action_reviews",
+    "work_task_action_review_decisions",
+    "work_task_action_review_releases",
+  ]) {
+    yield* sql.unsafe(`CREATE TRIGGER ${table}_rowid_guard BEFORE INSERT ON ${table}
+      WHEN EXISTS (SELECT 1 FROM ${table} WHERE rowid = NEW.rowid)
+      BEGIN SELECT RAISE(ABORT, 'immutable review rowid'); END`);
+  }
+  for (const table of ["work_task_review_events", "work_task_review_outcomes"]) {
+    yield* sql.unsafe(`CREATE TRIGGER ${table}_context_nonblank BEFORE INSERT ON ${table}
+      WHEN length(CAST(trim(NEW.event_id, ${whitespace}) AS BLOB)) = 0
+        OR length(CAST(trim(NEW.task_id, ${whitespace}) AS BLOB)) = 0
+        OR (NEW.command_id IS NOT NULL AND length(CAST(trim(NEW.command_id, ${whitespace}) AS BLOB)) = 0)
+      BEGIN SELECT RAISE(ABORT, 'blank event identity'); END`);
+  }
+  const existingEvents = [
+    { table: "work_task_validation_replay", ids: ["event_id"], sequence: true },
+    { table: "work_task_results", ids: ["event_id"], sequence: true },
+    { table: "work_task_claims", ids: ["event_id"], sequence: true },
+    { table: "work_task_accepted_definitions", ids: ["accepted_event_id"], sequence: false },
+    { table: "work_task_thread_links", ids: ["link_event_id", "unlink_event_id"], sequence: false },
+  ];
+  for (const review of ["work_task_review_events", "work_task_review_outcomes"]) {
+    for (const source of existingEvents) {
+      const collisions = source.ids.map((id) => `p.${id} = NEW.event_id`).join(" OR ");
+      yield* sql.unsafe(`CREATE TRIGGER ${review}_${source.table}_collision BEFORE INSERT ON ${review}
+        WHEN EXISTS (SELECT 1 FROM ${source.table} p WHERE ${collisions}${source.sequence ? " OR (p.task_id = NEW.task_id AND p.sequence = NEW.sequence)" : ""})
+        BEGIN SELECT RAISE(ABORT, 'task event identity conflict'); END`);
+      for (const operation of ["INSERT", "UPDATE"]) {
+        const reverse = source.ids.map((id) => `r.event_id = NEW.${id}`).join(" OR ");
+        yield* sql.unsafe(`CREATE TRIGGER ${source.table}_${review}_${operation.toLowerCase()} BEFORE ${operation} ON ${source.table}
+          WHEN EXISTS (SELECT 1 FROM ${review} r WHERE ${reverse}${source.sequence ? " OR (r.task_id = NEW.task_id AND r.sequence = NEW.sequence)" : ""})
+          BEGIN SELECT RAISE(ABORT, 'task event identity conflict'); END`);
+      }
+    }
+  }
+  for (const fact of [
+    {
+      table: "work_task_action_reviews",
+      sequence: "created_sequence",
+      type: "task.action-review-requested",
+    },
+    {
+      table: "work_task_action_review_decisions",
+      sequence: "resolved_sequence",
+      type: "task.action-review-result-recorded",
+    },
+  ]) {
+    for (const review of ["work_task_review_events", "work_task_review_outcomes"]) {
+      const matching =
+        review === "work_task_review_events"
+          ? ` AND NOT (p.review_id = NEW.review_id AND json_extract(NEW.event_json, '$.type') = '${fact.type}')`
+          : "";
+      yield* sql.unsafe(`CREATE TRIGGER ${review}_${fact.table}_sequence BEFORE INSERT ON ${review}
+        WHEN EXISTS (SELECT 1 FROM ${fact.table} p WHERE p.task_id = NEW.task_id AND p.${fact.sequence} = NEW.sequence${matching})
+        BEGIN SELECT RAISE(ABORT, 'review fact sequence conflict'); END`);
+      const reverseMatching =
+        review === "work_task_review_events"
+          ? ` AND NOT (r.review_id = NEW.review_id AND json_extract(r.event_json, '$.type') = '${fact.type}')`
+          : "";
+      yield* sql.unsafe(`CREATE TRIGGER ${fact.table}_${review}_sequence BEFORE INSERT ON ${fact.table}
+        WHEN EXISTS (SELECT 1 FROM ${review} r WHERE r.task_id = NEW.task_id AND r.sequence = NEW.${fact.sequence}${reverseMatching})
+        BEGIN SELECT RAISE(ABORT, 'review fact sequence conflict'); END`);
+    }
+  }
+  const requestedContinuation = `trim(json_extract(event_json, '$.review.continuationId'), ${whitespace})`;
+  yield* sql.unsafe(`CREATE UNIQUE INDEX work_task_requested_continuation_idx ON work_task_review_events(${requestedContinuation})
+    WHERE json_extract(event_json, '$.type') = 'task.action-review-requested' AND json_type(event_json, '$.review.continuationId') = 'text'`);
+  yield* sql.unsafe(
+    `CREATE INDEX work_task_review_release_continuation_lookup_idx ON work_task_action_review_releases(trim(continuation_id, ${whitespace}))`,
+  );
+  yield* sql.unsafe(`CREATE TRIGGER work_task_requested_continuation_binding BEFORE INSERT ON work_task_review_events
+    WHEN json_extract(NEW.event_json, '$.type') = 'task.action-review-requested'
+      AND json_type(NEW.event_json, '$.review.continuationId') = 'text'
+      AND (EXISTS (SELECT 1 FROM work_task_review_events WHERE json_extract(event_json, '$.type') = 'task.action-review-requested' AND json_type(event_json, '$.review.continuationId') = 'text' AND ${requestedContinuation} = trim(json_extract(NEW.event_json, '$.review.continuationId'), ${whitespace}))
+        OR EXISTS (SELECT 1 FROM work_task_action_review_releases l
+          WHERE (l.review_id = NEW.review_id AND trim(l.continuation_id, ${whitespace}) IS NOT trim(json_extract(NEW.event_json, '$.review.continuationId'), ${whitespace}))
+            OR (l.review_id IS NOT NEW.review_id AND trim(l.continuation_id, ${whitespace}) = trim(json_extract(NEW.event_json, '$.review.continuationId'), ${whitespace}))))
+    BEGIN SELECT RAISE(ABORT, 'requested continuation conflict'); END`);
+  yield* sql.unsafe(`CREATE TRIGGER work_task_released_requested_binding BEFORE INSERT ON work_task_action_review_releases
+    WHEN EXISTS (SELECT 1 FROM work_task_review_events r WHERE json_extract(r.event_json, '$.type') = 'task.action-review-requested'
+      AND json_type(r.event_json, '$.review.continuationId') = 'text'
+      AND r.review_id = NEW.review_id AND ${requestedContinuation} IS NOT trim(NEW.continuation_id, ${whitespace}))
+      OR EXISTS (SELECT 1 FROM work_task_review_events r WHERE json_extract(r.event_json, '$.type') = 'task.action-review-requested'
+        AND json_type(r.event_json, '$.review.continuationId') = 'text'
+        AND r.review_id IS NOT NEW.review_id AND ${requestedContinuation} = trim(NEW.continuation_id, ${whitespace}))
+    BEGIN SELECT RAISE(ABORT, 'requested continuation conflict'); END`);
+  yield* sql`CREATE TRIGGER work_task_review_status_new_decision AFTER INSERT ON work_task_action_review_decisions
+    BEGIN DELETE FROM work_task_review_status WHERE review_id = NEW.review_id AND sequence < NEW.resolved_sequence; END`;
+  yield* sql`CREATE TRIGGER work_task_review_status_new_terminal AFTER INSERT ON work_task_review_outcomes
+    WHEN json_extract(NEW.event_json, '$.type') IN ('task.action-review-invalidated','task.action-review-cancelled')
+    BEGIN DELETE FROM work_task_review_status WHERE review_id = NEW.review_id AND sequence < NEW.sequence; END`;
+  // Parse without fractional truncation or SQLite's narrower timezone-offset support.
+  for (const table of ["work_task_review_events", "work_task_review_outcomes"]) {
+    yield* sql.unsafe(`CREATE TRIGGER ${table}_timestamp BEFORE INSERT ON ${table}
+      WHEN NOT (WITH input(kind,v) AS (
+        SELECT 0,NEW.occurred_at UNION ALL SELECT 1,json_extract(NEW.event_json,'$.review.createdAt')
+          WHERE json_extract(NEW.event_json,'$.type') = 'task.action-review-requested'
+      ), pieces AS (SELECT *, CASE WHEN substr(v,-1) = 'Z' THEN 1 ELSE 6 END AS z,
+        CAST(substr(v,1,4) AS INTEGER) AS y, CAST(substr(v,6,2) AS INTEGER) AS m, CAST(substr(v,9,2) AS INTEGER) AS d FROM input),
+      parsed AS (SELECT *, substr(v,20,length(v)-19-z) AS f,
+        unixepoch(substr(v,1,19)||'Z') - CASE WHEN z = 1 THEN 0 ELSE
+          (CASE substr(v,-6,1) WHEN '+' THEN 1 ELSE -1 END) * (CAST(substr(v,-5,2) AS INTEGER)*3600 + CAST(substr(v,-2) AS INTEGER)*60) END AS seconds FROM pieces),
+      valid AS (SELECT *, (typeof(v) = 'text' AND length(CAST(v AS BLOB)) BETWEEN 20 AND 2000 AND instr(v,char(0)) = 0
+        AND substr(v,1,19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
+        AND (z = 1 OR (substr(v,-6) GLOB '[+-][0-9][0-9]:[0-9][0-9]' AND CAST(substr(v,-5,2) AS INTEGER) <= 23 AND CAST(substr(v,-2) AS INTEGER) <= 59))
+        AND (f = '' OR (substr(f,1,1) = '.' AND length(f) > 1 AND substr(f,2) NOT GLOB '*[^0-9]*'))
+        AND m BETWEEN 1 AND 12 AND d BETWEEN 1 AND CASE WHEN m = 2 THEN 28 + (y%4=0 AND (y%100!=0 OR y%400=0)) WHEN m IN (4,6,9,11) THEN 30 ELSE 31 END
+        AND CAST(substr(v,12,2) AS INTEGER) <= 23 AND CAST(substr(v,15,2) AS INTEGER) <= 59 AND CAST(substr(v,18,2) AS INTEGER) <= 59
+        AND seconds IS NOT NULL) AS ok FROM parsed)
+      SELECT min(ok) = 1 AND (count(*) = 1 OR (SELECT count(*) FROM (SELECT seconds,rtrim(substr(f,2),'0') FROM valid GROUP BY seconds,rtrim(substr(f,2),'0'))) = 1) FROM valid) IS TRUE
+      BEGIN SELECT RAISE(ABORT, 'invalid persisted timestamp'); END`);
+  }
 });
