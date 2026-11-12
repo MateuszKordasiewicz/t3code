@@ -2517,7 +2517,11 @@ it.effect("admission replays after pause and resume advance the control generati
       admitted.value.pass,
     );
     assert.strictEqual(
-      (yield* Effect.flip(store.getPlanningPass({ passId: "missing" }))).reason,
+      (yield* Effect.flip(
+        store.getPlanningPass({
+          passId: admitted.value.pass.id.replace("one", "missing") as typeof admitted.value.pass.id,
+        }),
+      )).reason,
       "not-found",
     );
   }).pipe(Effect.provide(layer)),
