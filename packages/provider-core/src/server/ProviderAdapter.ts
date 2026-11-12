@@ -31,6 +31,7 @@ import {
   RuntimeRequestId,
   RunAttemptId,
   RunId,
+  Sha256Hex,
   ThreadId,
   TurnItemId,
 } from "@t3tools/contracts";
@@ -56,6 +57,13 @@ export const ProviderAdapterV2RuntimePolicy = Schema.Struct({
    * it; adapters use it to refuse native mode choices a user makes beside T3 Code's own.
    */
   maxRuntimeMode: Schema.optional(RuntimeMode),
+  workflowExecutionCeiling: Schema.optionalKey(
+    Schema.Struct({
+      role: Schema.Literal("reviewer"),
+      policyHash: Sha256Hex,
+      cwd: Schema.NonEmptyString,
+    }),
+  ),
 });
 export type ProviderAdapterV2RuntimePolicy = typeof ProviderAdapterV2RuntimePolicy.Type;
 
