@@ -266,6 +266,143 @@ const terminalId = Schema.decodeSync(
   PlanningPassV1.fields.native.schema.fields.terminalMessageId.schema,
 )("terminal");
 describe("DevelopmentPlanService", () => {
+  it.effect("hides plans owned by another destination across every operation", () =>
+    Effect.gen(function* () {
+      for (const owner of [
+        { environmentId: "other-env", projectId: "project" },
+        { environmentId: "env", projectId: "other-project" },
+      ]) {
+        const grants = yield* Ref.make(allGrants());
+        yield* Effect.gen(function* () {
+          yield* setup;
+          const service = yield* Service.DevelopmentPlanService;
+          const sql = yield* SqlClient.SqlClient;
+          const value = yield* fixture;
+          yield* service.create(value, context);
+          yield* service.beginPlanning(
+            { session: planningSession, command: planningCommand("begin") },
+            planningContext,
+          );
+          const pass = makePass(value, "existing");
+          yield* service.beginPass(
+            {
+              sessionId: planningSession.id,
+              expectedVersion: 0,
+              ...pass,
+              command: planningCommand("pass"),
+            },
+            planningContext,
+          );
+          yield* sql`INSERT INTO workflow_plan_identities (plan_id) VALUES ('missing')`;
+          yield* sql`INSERT INTO workflow_planning_sessions (id, plan_id, predecessor_id, status, record_version, control_generation, record_json) SELECT 'missing-session', 'missing', predecessor_id, status, record_version, control_generation, json_set(record_json, '$.id', 'missing-session', '$.planId', 'missing') FROM workflow_planning_sessions WHERE id = 'session'`;
+          yield* sql`UPDATE development_plans SET environment_id = ${owner.environmentId}, project_id = ${owner.projectId} WHERE plan_id = 'plan'`;
+          const snapshot = Effect.gen(function* () {
+            return {
+              plans: yield* sql`SELECT * FROM development_plans`,
+              revisions: yield* sql`SELECT * FROM development_plan_revisions`,
+              packets: yield* sql`SELECT * FROM development_plan_source_packets`,
+              links: yield* sql`SELECT * FROM development_plan_threads`,
+              commands: yield* sql`SELECT * FROM development_plan_commands`,
+              sessions: yield* sql`SELECT * FROM workflow_planning_sessions`,
+              passes: yield* sql`SELECT * FROM workflow_planning_passes`,
+              operations: yield* sql`SELECT * FROM workflow_operations`,
+              receipts: yield* sql`SELECT * FROM workflow_command_receipts`,
+              dispositions: yield* sql`SELECT * FROM workflow_planning_dispositions`,
+            };
+          });
+          const before = yield* snapshot;
+          const command = planningCommand("denied-owner");
+
+          const disposition = {
+            reportId: pass.pass.id,
+            findingId,
+            decision: "accept" as const,
+            rationale: "reason",
+            affectedObjectIds: [],
+          };
+          const actions = (
+            planId: string,
+            session: typeof planningSession,
+          ): ReadonlyArray<
+            readonly [string, Effect.Effect<unknown, { readonly reason: string }>]
+          > => {
+            const control = { sessionId: session.id, expectedVersion: 1, command };
+            return [
+              ["get", service.get({ planId }, context)],
+              ["getObject", service.getObject({ ...object, planId }, context)],
+              ["export", service.export({ planId }, context)],
+              ["validateCoverage", service.validateCoverage({ planId }, context)],
+              [
+                "updateDraft",
+                service.updateDraft(
+                  { ...value, planId, expectedVersion: 0, commandId: "update-owner" },
+                  context,
+                ),
+              ],
+              ["linkThread", service.linkThread({ ...link, planId, expectedVersion: 0 }, context)],
+              [
+                "unlinkThread",
+                service.unlinkThread({ ...link, planId, expectedVersion: 0 }, context),
+              ],
+              ["beginPlanning", service.beginPlanning({ session, command }, planningContext)],
+              ["getPlanning", service.getPlanning({ sessionId: session.id }, planningContext)],
+              ["pausePlanning", service.pausePlanning(control, planningContext)],
+              ["resumePlanning", service.resumePlanning(control, planningContext)],
+              ["stopPlanning", service.stopPlanning(control, planningContext)],
+              ["beginPass", service.beginPass({ ...control, ...pass }, planningContext)],
+              [
+                "recordDisposition",
+                service.recordDisposition(
+                  {
+                    ...control,
+                    reviewPassId: pass.pass.id,
+                    repairPassId: pass.pass.id,
+                    findingId: "finding",
+                    disposition,
+                  },
+                  planningContext,
+                ),
+              ],
+            ];
+          };
+          const existing = actions("plan", planningSession);
+          const missing = actions(
+            "missing",
+            decodeSession({ ...planningSession, id: "missing-session", planId: "missing" }),
+          );
+          for (let i = 0; i < existing.length; i++) {
+            const [name, action] = existing[i]!;
+            const error = yield* Effect.flip(Effect.asVoid(action));
+            expect(error.reason, name).toBe("not-found");
+            const missingError = yield* Effect.flip(Effect.asVoid(missing[i]![1]));
+            expect(error, name).toEqual(missingError);
+            expect(yield* snapshot, name).toEqual(before);
+          }
+        }).pipe(Effect.provide(layer(":memory:", grants)));
+      }
+    }),
+  );
+  it.effect("filters list owners without changing the source cursor", () =>
+    Effect.gen(function* () {
+      const grants = yield* Ref.make(allGrants());
+      yield* Effect.gen(function* () {
+        yield* setup;
+        const service = yield* Service.DevelopmentPlanService;
+        const store = yield* Store.DevelopmentPlanStore;
+        const sql = yield* SqlClient.SqlClient;
+        const value = yield* fixture;
+        yield* service.create(value, context);
+        const input = { projectId: "project", limit: 1 };
+        expect((yield* service.list(input, context)).plans).toHaveLength(1);
+        yield* sql`INSERT INTO workflow_plan_identities (plan_id) VALUES ('z-plan')`;
+        yield* sql`INSERT INTO development_plans (plan_id, environment_id, project_id, title, current_revision_id, version, created_at) VALUES ('z-plan', 'env', 'project', 'Next', NULL, 0, ${timestamp})`;
+        yield* sql`UPDATE development_plans SET environment_id = 'other-env' WHERE plan_id = 'plan'`;
+        const page = yield* store.list(input);
+        expect(page.nextCursor).toBe("plan");
+        expect(yield* service.list(input, context)).toEqual({ ...page, plans: [] });
+      }).pipe(Effect.provide(layer(":memory:", grants)));
+    }),
+  );
   it.effect("authorizes all operations and preserves receipts and conflicts", () =>
     Effect.gen(function* () {
       const grants = yield* Ref.make(allGrants());

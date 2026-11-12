@@ -455,6 +455,18 @@ const make = Effect.gen(function* () {
     authorization.check({ ...context, operation, origins });
   const precheck = (context: RequestContext, operation: Operation) =>
     check(context, operation, [context.destination]);
+  const loadOwnedPlan = Effect.fn("DevelopmentPlanService.loadOwnedPlan")(function* (
+    input: Parameters<StoreService["get"]>[0],
+    context: RequestContext,
+  ) {
+    const result = yield* store.get(input).pipe(Effect.mapError(mapStore));
+    if (
+      result.plan.environmentId !== context.destination.environmentId ||
+      result.plan.projectId !== context.destination.projectId
+    )
+      return yield* new DevelopmentPlanServiceError({ reason: "not-found" });
+    return result;
+  });
   const create = Effect.fn("DevelopmentPlanService.create")(function* (
     input: Create,
     context: RequestContext,
@@ -599,7 +611,7 @@ const make = Effect.gen(function* () {
     context: RequestContext,
   ) {
     yield* precheck(context, "read");
-    const result = yield* store.get(input).pipe(Effect.mapError(mapStore));
+    const result = yield* loadOwnedPlan(input, context);
     yield* check(
       context,
       "read",
@@ -612,7 +624,7 @@ const make = Effect.gen(function* () {
     context: RequestContext,
   ) {
     yield* precheck(context, "read");
-    const result = yield* store.get(input).pipe(Effect.mapError(mapStore));
+    const result = yield* loadOwnedPlan(input, context);
     yield* check(
       context,
       "read",
@@ -644,9 +656,10 @@ const make = Effect.gen(function* () {
     context: RequestContext,
   ) {
     yield* precheck(context, "read");
-    const result = yield* store
-      .get({ planId: input.planId, revisionId: input.revisionId })
-      .pipe(Effect.mapError(mapStore));
+    const result = yield* loadOwnedPlan(
+      { planId: input.planId, revisionId: input.revisionId },
+      context,
+    );
     yield* check(
       context,
       "read",
@@ -664,7 +677,12 @@ const make = Effect.gen(function* () {
     const page = yield* store.list(input).pipe(Effect.mapError(mapStore));
     const plans: typeof page.plans = [];
     for (const plan of page.plans) {
-      const result = yield* store.get({ planId: plan.planId }).pipe(Effect.mapError(mapStore));
+      if (
+        plan.environmentId !== context.destination.environmentId ||
+        plan.projectId !== context.destination.projectId
+      )
+        continue;
+      const result = yield* loadOwnedPlan({ planId: plan.planId }, context);
       const allowed = yield* Effect.result(
         check(
           context,
@@ -682,7 +700,7 @@ const make = Effect.gen(function* () {
     context: RequestContext,
   ) {
     yield* precheck(context, "update");
-    const existing = yield* store.get({ planId: input.planId }).pipe(Effect.mapError(mapStore));
+    const existing = yield* loadOwnedPlan({ planId: input.planId }, context);
     const origins = [
       ...originsOf(existing.revision, existing.sourcePacket, context.destination),
       ...originsOf(input.revision, input.packet, context.destination),
@@ -708,7 +726,7 @@ const make = Effect.gen(function* () {
     context: RequestContext,
   ) {
     yield* precheck(context, "link");
-    const existing = yield* store.get({ planId: input.planId }).pipe(Effect.mapError(mapStore));
+    const existing = yield* loadOwnedPlan({ planId: input.planId }, context);
     yield* check(
       context,
       "link",
@@ -721,7 +739,7 @@ const make = Effect.gen(function* () {
     context: RequestContext,
   ) {
     yield* precheck(context, "unlink");
-    const existing = yield* store.get({ planId: input.planId }).pipe(Effect.mapError(mapStore));
+    const existing = yield* loadOwnedPlan({ planId: input.planId }, context);
     yield* check(
       context,
       "unlink",
@@ -751,20 +769,21 @@ const make = Effect.gen(function* () {
   ) {
     if (
       session.environmentId !== context.destination.environmentId ||
-      session.projectId !== context.destination.projectId ||
-      session.origin.kind !== context.actor.kind ||
-      session.origin.id !== context.actor.id
+      session.projectId !== context.destination.projectId
     )
+      return yield* new DevelopmentPlanServiceError({ reason: "not-found" });
+    if (session.origin.kind !== context.actor.kind || session.origin.id !== context.actor.id)
       return yield* new DevelopmentPlanServiceError({ reason: "unauthorized" });
-    const plan = yield* store.get({ planId: session.planId }).pipe(Effect.mapError(mapStore));
+    const plan = yield* loadOwnedPlan({ planId: session.planId }, context);
     const origins = [
       ...originsOf(plan.revision, plan.sourcePacket, context.destination),
       ...session.access.origins,
     ];
     for (const pass of passes) {
-      const bound = yield* store
-        .get({ planId: pass.binding.planId, revisionId: pass.binding.revisionId })
-        .pipe(Effect.mapError(mapStore));
+      const bound = yield* loadOwnedPlan(
+        { planId: pass.binding.planId, revisionId: pass.binding.revisionId },
+        context,
+      );
       origins.push(
         ...originsOf(bound.revision, bound.sourcePacket, context.destination),
         ...pass.access.origins,
@@ -926,6 +945,7 @@ const make = Effect.gen(function* () {
   ) {
     yield* check(context, "update", []);
     const session = yield* workflows.getPlanning({ sessionId: input.sessionId });
+    yield* authorizePlanning(session, context, "update");
     const review = yield* workflows.getPlanningPass({ passId: input.reviewPassId });
     const repair = yield* workflows.getPlanningPass({ passId: input.repairPassId });
     yield* authorizePlanning(session, context, "update", [review, repair]);
