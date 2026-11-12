@@ -1,3 +1,9 @@
+import * as Digest from "effect/crypto/Digest";
+import * as DevelopmentPlanService from "../developmentPlans/DevelopmentPlanService.ts";
+import * as DevelopmentPlanAuthorization from "../developmentPlans/DevelopmentPlanAuthorization.ts";
+import * as DevelopmentPlanStore from "../developmentPlans/DevelopmentPlanStore.ts";
+import * as PlanningPassObservation from "../developmentPlans/PlanningPassObservation.ts";
+import * as WorkflowRunStore from "../workflowRuns/WorkflowRunStore.ts";
 import * as WorktreeBranchSync from "./WorktreeBranchSync.ts";
 import * as GuestShareService from "../guest/GuestShareService.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
@@ -368,7 +374,24 @@ export const layer = Layer.mergeAll(
   layerLegacyV1ThreadImporterProvided,
 );
 
+const layerDevelopmentPlans = DevelopmentPlanService.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      DevelopmentPlanStore.layer.pipe(Layer.provide(Digest.layerWebCrypto)),
+      WorkflowRunStore.layer,
+      DevelopmentPlanService.persistedPassReaderLayer,
+      DevelopmentPlanService.localAttestationLayer.pipe(Layer.provide(Digest.layerWebCrypto)),
+      PlanningPassObservation.unknownObservationLayer,
+      DevelopmentPlanAuthorization.layer.pipe(
+        Layer.provide(Layer.merge(ProjectStore.layer, ProjectionStore.layer)),
+      ),
+      Digest.layerWebCrypto,
+    ),
+  ),
+);
+
 export const layerProduction = Layer.mergeAll(
+  layerDevelopmentPlans,
   WorktreeBranchSync.layer.pipe(
     Layer.provide(Layer.merge(layerThreadManagementProvided, ProjectionStore.layer)),
   ),
