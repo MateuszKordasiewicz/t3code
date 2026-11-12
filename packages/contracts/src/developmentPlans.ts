@@ -2,6 +2,8 @@ import * as Digest from "effect/crypto/Digest";
 import * as Effect from "effect/Effect";
 import * as Base64 from "effect/encoding/Base64";
 import * as Schema from "effect/Schema";
+import { EnvironmentId, ProjectId, ThreadId } from "./baseSchemas.ts";
+import { ProviderInstanceId } from "./providerInstance.ts";
 
 const NonEmpty = Schema.NonEmptyString;
 const SourceCommon = {
@@ -235,3 +237,108 @@ export const decodeDevelopmentPlanDocumentV1 = Effect.fn("DevelopmentPlanDocumen
     return document;
   },
 );
+
+const SessionId = NonEmpty.pipe(Schema.brand("PlanningSessionId"));
+const PlanId = NonEmpty.pipe(Schema.brand("PlanId"));
+const ActorId = NonEmpty.pipe(Schema.brand("ActorId"));
+const SessionOrigin = Schema.Struct({
+  environmentId: EnvironmentId,
+  projectId: ProjectId,
+  threadId: Schema.optionalKey(ThreadId),
+});
+const SessionProvider = Schema.Struct({ providerInstanceId: ProviderInstanceId, model: NonEmpty });
+
+export const PlanningSessionV1 = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  id: SessionId,
+  environmentId: EnvironmentId,
+  projectId: ProjectId,
+  planId: PlanId,
+  predecessorSessionId: Schema.optionalKey(SessionId),
+  origin: Schema.Struct({ kind: Schema.Literals(["human", "agent", "system"]), id: ActorId }),
+  request: NonEmpty,
+  mode: Schema.Literal("ordinary"),
+  allowedRoles: Schema.Array(Schema.Literals(["author", "review", "repair", "readback"])),
+  allowedProviders: Schema.Array(SessionProvider),
+  limits: Schema.Struct({
+    maxPasses: Schema.Number,
+    maxRepairRounds: Schema.Number,
+    deadline: NonEmpty,
+  }),
+  consumed: Schema.Struct({ passes: Schema.Number, repairRounds: Schema.Number }),
+  controlGeneration: Schema.Number,
+  recordVersion: Schema.Number,
+  status: Schema.Literals([
+    "active",
+    "pausing",
+    "paused",
+    "stopping",
+    "stopped",
+    "completed",
+    "needs_attention",
+  ]),
+  createdAt: NonEmpty,
+  access: Schema.Struct({ origins: Schema.Array(SessionOrigin) }),
+});
+export type PlanningSessionV1 = typeof PlanningSessionV1.Type;
+
+export class PlanningSessionError extends Schema.TaggedError<PlanningSessionError>()(
+  "PlanningSessionError",
+  { reason: Schema.Literals(["invalid allowance", "invalid record"]) },
+) {}
+
+const decodeSessionShape = Schema.decodeUnknownEffect(PlanningSessionV1);
+const sessionFail = (reason: PlanningSessionError["reason"]) =>
+  new PlanningSessionError({ reason });
+const isUint = (value: number) => Number.isSafeInteger(value) && value >= 0;
+const timestampAfter = (a: string, b: string) => {
+  const seconds = a.slice(0, 19).localeCompare(b.slice(0, 19));
+  if (seconds !== 0) return seconds > 0;
+  const fractionA = a.slice(19, -1).replace(/^\./, "").replace(/0+$/, "");
+  const fractionB = b.slice(19, -1).replace(/^\./, "").replace(/0+$/, "");
+  return fractionA > fractionB;
+};
+
+export const decodePlanningSessionV1 = Effect.fn("PlanningSessionV1.decode")(function* (
+  input: unknown,
+) {
+  const session = yield* decodeSessionShape(input, { onExcessProperty: "error" }).pipe(
+    Effect.mapError(() => sessionFail("invalid record")),
+  );
+  const { limits, consumed } = session;
+  if (
+    ![
+      limits.maxPasses,
+      limits.maxRepairRounds,
+      consumed.passes,
+      consumed.repairRounds,
+      session.controlGeneration,
+      session.recordVersion,
+    ].every(isUint) ||
+    limits.maxPasses === 0 ||
+    !validTimestamp(limits.deadline) ||
+    !validTimestamp(session.createdAt) ||
+    timestampAfter(session.createdAt, limits.deadline) ||
+    session.allowedRoles.length === 0 ||
+    session.allowedProviders.length === 0 ||
+    duplicate(session.allowedRoles) ||
+    duplicate(
+      session.allowedProviders.map((provider) =>
+        JSON.stringify([provider.providerInstanceId, provider.model]),
+      ),
+    ) ||
+    duplicate(
+      session.access.origins.map((origin) =>
+        JSON.stringify([origin.environmentId, origin.projectId, origin.threadId]),
+      ),
+    )
+  )
+    return yield* sessionFail("invalid record");
+  if (
+    consumed.passes > limits.maxPasses ||
+    consumed.repairRounds > limits.maxRepairRounds ||
+    consumed.repairRounds > consumed.passes
+  )
+    return yield* sessionFail("invalid allowance");
+  return session;
+});

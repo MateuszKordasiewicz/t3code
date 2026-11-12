@@ -1,7 +1,12 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as Digest from "effect/crypto/Digest";
 import * as Effect from "effect/Effect";
-import { decodeDevelopmentPlanDocumentV1 } from "./developmentPlans.ts";
+import * as Schema from "effect/Schema";
+import {
+  decodeDevelopmentPlanDocumentV1,
+  decodePlanningSessionV1,
+  PlanningSessionV1,
+} from "./developmentPlans.ts";
 
 const example = () => ({
   schemaVersion: 1,
@@ -208,5 +213,150 @@ describe("development plan external document", () => {
       if (reason) expect(result).toMatchObject({ _tag: "Failure", failure: { reason } });
       else expect(result).toMatchObject({ _tag: "Success", success: input });
     }).pipe(Effect.provide(Digest.layerWebCrypto)),
+  );
+});
+
+const sessionExample = () => ({
+  schemaVersion: 1,
+  id: "session-1",
+  environmentId: "env-1",
+  projectId: "project-1",
+  planId: "plan-1",
+  origin: { kind: "human", id: "user-1" },
+  request: "Review this plan",
+  mode: "ordinary",
+  allowedRoles: ["review"],
+  allowedProviders: [{ providerInstanceId: "codex", model: "example-model" }],
+  limits: { maxPasses: 3, maxRepairRounds: 1, deadline: "2026-12-01T00:00:00Z" },
+  consumed: { passes: 1, repairRounds: 0 },
+  controlGeneration: 1,
+  recordVersion: 1,
+  status: "active",
+  createdAt: "2026-11-11T00:00:00Z",
+  access: { origins: [{ environmentId: "env-1", projectId: "project-1", threadId: "thread-1" }] },
+});
+const changedSession = (f: (session: ReturnType<typeof sessionExample>) => void) => {
+  const session = sessionExample();
+  f(session);
+  return session;
+};
+const sessionCases: { name: string; input: unknown; reason?: string }[] = [
+  { name: "example roundtrip", input: sessionExample() },
+  {
+    name: "exhausted allowance needs attention",
+    input: changedSession((s) => {
+      s.status = "needs_attention";
+      s.consumed = { passes: 3, repairRounds: 1 };
+    }),
+  },
+  {
+    name: "passes exceed limit",
+    input: changedSession((s) => {
+      s.consumed.passes = 4;
+    }),
+    reason: "invalid allowance",
+  },
+  {
+    name: "repair rounds exceed limit",
+    input: changedSession((s) => {
+      s.consumed = { passes: 2, repairRounds: 2 };
+    }),
+    reason: "invalid allowance",
+  },
+  {
+    name: "repair rounds exceed passes",
+    input: changedSession((s) => {
+      s.consumed = { passes: 0, repairRounds: 1 };
+    }),
+    reason: "invalid allowance",
+  },
+  {
+    name: "created after deadline",
+    input: changedSession((s) => {
+      s.createdAt = "2026-12-02T00:00:00Z";
+    }),
+    reason: "invalid record",
+  },
+  {
+    name: "empty roles",
+    input: changedSession((s) => {
+      s.allowedRoles = [];
+    }),
+    reason: "invalid record",
+  },
+  {
+    name: "empty providers",
+    input: changedSession((s) => {
+      s.allowedProviders = [];
+    }),
+    reason: "invalid record",
+  },
+  {
+    name: "duplicate role",
+    input: changedSession((s) => {
+      s.allowedRoles.push("review");
+    }),
+    reason: "invalid record",
+  },
+  {
+    name: "duplicate provider",
+    input: changedSession((s) => {
+      s.allowedProviders.push({ ...s.allowedProviders[0]! });
+    }),
+    reason: "invalid record",
+  },
+  {
+    name: "duplicate origin",
+    input: changedSession((s) => {
+      s.access.origins.push({ ...s.access.origins[0]! });
+    }),
+    reason: "invalid record",
+  },
+  {
+    name: "malformed deadline",
+    input: changedSession((s) => {
+      s.limits.deadline = "2026-02-30T00:00:00Z";
+    }),
+    reason: "invalid record",
+  },
+  {
+    name: "unsafe count",
+    input: changedSession((s) => {
+      s.controlGeneration = Number.MAX_SAFE_INTEGER + 1;
+    }),
+    reason: "invalid record",
+  },
+  {
+    name: "unknown status",
+    input: changedSession((s) => {
+      s.status = "unknown";
+    }),
+    reason: "invalid record",
+  },
+  { name: "extra root key", input: { ...sessionExample(), extra: true }, reason: "invalid record" },
+  {
+    name: "extra nested key",
+    input: changedSession((s) => {
+      Object.assign(s.access.origins[0]!, { extra: true });
+    }),
+    reason: "invalid record",
+  },
+];
+
+const encodePlanningSession = Schema.encodeEffect(PlanningSessionV1);
+
+describe("planning session", () => {
+  it.effect.each(sessionCases)("$name", ({ input, reason }) =>
+    Effect.gen(function* () {
+      const result = yield* Effect.result(decodePlanningSessionV1(input));
+      if (reason) expect(result).toMatchObject({ _tag: "Failure", failure: { reason } });
+      else {
+        expect(result).toMatchObject({ _tag: "Success", success: input });
+        if (result._tag === "Success") {
+          const encoded = yield* encodePlanningSession(result.success);
+          expect(encoded).toEqual(input);
+        }
+      }
+    }),
   );
 });
