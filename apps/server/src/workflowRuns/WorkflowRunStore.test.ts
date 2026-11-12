@@ -1575,6 +1575,215 @@ const admissionInput = (
   };
 };
 
+it.effect.each([
+  ["bad timestamp", "invalid"],
+  ["bad command", "invalid"],
+  ["owner mismatch", "integrity"],
+  ["role mismatch", "integrity"],
+  ["provider mismatch", "integrity"],
+  ["operation limits mismatch", "integrity"],
+  ["manifest hash mismatch", "integrity"],
+  ["wrong actor", "unauthorized"],
+  ["wrong destination", "unauthorized"],
+  ["stale version", "conflict"],
+  ["inactive session", "ineligible"],
+  ["deadline", "deadline"],
+  ["after deadline", "deadline"],
+  ["disallowed role", "ineligible"],
+  ["disallowed provider", "ineligible"],
+  ["passes exhausted", "limit"],
+  ["repair rounds exhausted", "limit"],
+  ["pending writer", "custody"],
+  ["claimed writer", "custody"],
+  ["unknown writer", "custody"],
+  ["missing revision", "integrity"],
+  ["tampered revision", "integrity"],
+  ["tampered source packet", "integrity"],
+  ["changed command fingerprint", "conflict"],
+] as const)("planning admission rejects %s without writes", ([scenario, reason]) =>
+  Effect.gen(function* () {
+    const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const repair = scenario === "disallowed role" || scenario === "repair rounds exhausted";
+    const owner = {
+      ...session,
+      allowedRoles:
+        scenario === "repair rounds exhausted"
+          ? (["author", "repair"] as const)
+          : session.allowedRoles,
+      consumed: {
+        passes:
+          scenario === "passes exhausted"
+            ? session.limits.maxPasses
+            : scenario === "repair rounds exhausted"
+              ? 1
+              : 0,
+        repairRounds: scenario === "repair rounds exhausted" ? session.limits.maxRepairRounds : 0,
+      },
+    };
+    yield* begin(store, { ...owner, consumed: session.consumed });
+    if (scenario === "passes exhausted" || scenario === "repair rounds exhausted")
+      yield* sql`UPDATE workflow_planning_sessions SET record_json = ${json(owner)} WHERE id = ${owner.id}`;
+    let input = admissionInput(binding, "test", owner);
+    if (repair || scenario === "disallowed provider") {
+      const pass = decodePassFixture({
+        ...input.pass,
+        ...(repair
+          ? { role: "repair" }
+          : { provider: { providerInstanceId: "other", model: "model" } }),
+      });
+      if (input.operation.parameters.kind !== "planning_pass")
+        throw new Error("expected planning pass");
+      const operation = decodeOperationFixture({
+        ...input.operation,
+        parameters: { ...input.operation.parameters, role: pass.role, provider: pass.provider },
+      });
+      input = {
+        ...input,
+        pass,
+        operation: { ...operation, fingerprint: WorkflowCanonicalHash.operation(operation) },
+      };
+    }
+    if (scenario === "inactive session") {
+      yield* sql`UPDATE workflow_planning_sessions SET status = 'paused', record_json = ${json({ ...owner, status: "paused" })} WHERE id = ${owner.id}`;
+    }
+    if (scenario === "missing revision") {
+      yield* sql`UPDATE development_plans SET current_revision_id = NULL WHERE plan_id = 'plan'`;
+      yield* sql`DELETE FROM development_plan_revisions WHERE plan_id = 'plan'`;
+    }
+    if (scenario === "tampered revision")
+      yield* sql`UPDATE development_plan_revisions SET revision_json = '{}' WHERE plan_id = 'plan'`;
+    if (scenario === "tampered source packet")
+      yield* sql`UPDATE development_plan_source_packets SET packet_json = '{}' WHERE plan_id = 'plan'`;
+    if (
+      scenario === "pending writer" ||
+      scenario === "claimed writer" ||
+      scenario === "unknown writer" ||
+      scenario === "changed command fingerprint"
+    ) {
+      const first = admissionInput(binding, "first", owner);
+      yield* store.admitPlanningPass(first);
+      if (scenario === "changed command fingerprint") input = { ...input, command: first.command };
+      else {
+        const status =
+          scenario === "claimed writer"
+            ? "claimed"
+            : scenario === "unknown writer"
+              ? "unknown"
+              : "pending";
+        yield* sql`UPDATE workflow_operations SET status = ${status} WHERE id = ${first.operation.id}`;
+        input = { ...input, expectedVersion: 1 };
+      }
+    }
+    if (scenario === "bad timestamp") input = { ...input, now: "bad" };
+    if (scenario === "bad command")
+      input = { ...input, command: { ...input.command, commandId: "" } };
+    if (scenario === "stale version") input = { ...input, expectedVersion: 1 };
+    if (scenario === "deadline" || scenario === "after deadline")
+      input = {
+        ...input,
+        now: scenario === "deadline" ? owner.limits.deadline : "2026-12-02T00:00:00Z",
+      };
+    if (scenario === "wrong actor" || scenario === "wrong destination") {
+      const changedContext =
+        scenario === "wrong actor"
+          ? { ...context, actor: { ...context.actor, id: "other" } }
+          : { ...context, destination: { ...context.destination, projectId: "other" } };
+      const operation = decodeOperationFixture({
+        ...input.operation,
+        origin: changedContext.actor,
+        destination: changedContext.destination,
+      });
+      input = {
+        ...input,
+        context: { actor: operation.origin, destination: operation.destination },
+        operation: { ...operation, fingerprint: WorkflowCanonicalHash.operation(operation) },
+      };
+    }
+    if (
+      [
+        "owner mismatch",
+        "role mismatch",
+        "provider mismatch",
+        "operation limits mismatch",
+        "manifest hash mismatch",
+      ].includes(scenario)
+    ) {
+      const params = input.operation.parameters;
+      const operation = decodeOperationFixture({
+        ...input.operation,
+        ...(scenario === "owner mismatch"
+          ? { owner: { kind: "planning_session", planningSessionId: "other" } }
+          : {}),
+        parameters: {
+          ...params,
+          ...(scenario === "role mismatch" ? { role: "repair" } : {}),
+          ...(scenario === "provider mismatch"
+            ? { provider: { providerInstanceId: "other", model: "model" } }
+            : {}),
+          ...(scenario === "operation limits mismatch"
+            ? { limits: { ...owner.limits, maxPasses: 9 } }
+            : {}),
+          ...(scenario === "manifest hash mismatch" ? { inputManifestHash: hash } : {}),
+        },
+      });
+      input = {
+        ...input,
+        operation: { ...operation, fingerprint: WorkflowCanonicalHash.operation(operation) },
+      };
+    }
+    const snapshot = Effect.gen(function* () {
+      return {
+        sessions: yield* sql`SELECT * FROM workflow_planning_sessions`,
+        operations: yield* sql`SELECT * FROM workflow_operations`,
+        passes: yield* sql`SELECT * FROM workflow_planning_passes`,
+        receipts: yield* sql`SELECT * FROM workflow_command_receipts`,
+      };
+    });
+    const before = yield* snapshot;
+    const error = yield* Effect.flip(store.admitPlanningPass(input));
+    assert.strictEqual(error.reason, reason);
+    if (scenario === "stale version") assert.strictEqual(error.currentVersion, 0);
+    assert.deepStrictEqual(yield* snapshot, before);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["deadline", "binding", "stale generation", "untrusted"] as const)(
+  "planning claim rejects %s without writes",
+  (scenario) =>
+    Effect.gen(function* () {
+      const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      yield* begin(store, session);
+      const input = admissionInput(binding, "claim");
+      yield* store.admitPlanningPass(input);
+      if (scenario === "binding")
+        yield* sql`UPDATE workflow_planning_passes SET record_json = ${json({ ...input.pass, binding: { ...input.pass.binding, revisionHash: hash } })} WHERE id = ${input.pass.id}`;
+      const operations = yield* sql`SELECT * FROM workflow_operations`;
+      const passes = yield* sql`SELECT * FROM workflow_planning_passes`;
+      const claim = store.claim({
+        operationId: input.operation.id,
+        expectedOwnerVersion: 1,
+        expectedGeneration: scenario === "stale generation" ? 1 : 0,
+        bootId: "boot",
+        workerId: "worker",
+        now: scenario === "deadline" ? session.limits.deadline : facts.now,
+        trustedEligibility: scenario !== "untrusted",
+      });
+      if (scenario === "binding")
+        assert.strictEqual((yield* Effect.flip(claim)).reason, "integrity");
+      else
+        assert.strictEqual(
+          (yield* claim).kind,
+          scenario === "stale generation" ? "stale" : "denied",
+        );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_operations`, operations);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_planning_passes`, passes);
+    }).pipe(Effect.provide(layer)),
+);
+
 it.effect(
   "competing independent admissions charge the last pass once and replay after reopening",
   () =>
