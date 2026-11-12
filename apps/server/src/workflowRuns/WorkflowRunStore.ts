@@ -367,36 +367,37 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     if (result.kind === "applied") yield* notify;
     return result;
   });
-  const reservePlanningNativeIntent = Effect.fn("WorkflowRunStore.reservePlanningNativeIntent")(
-    function* (input: {
-      readonly intentId: string;
-      readonly sessionId: S["id"];
-      readonly operationId: WorkflowOperationV1["id"];
-      readonly passId: P["id"];
-      readonly role: P["role"];
-      readonly environmentId: string;
-      readonly projectId: string;
-      readonly launchCommandId: string;
-      readonly threadId: string;
-      readonly messageId: string;
-      readonly generation: number;
-      readonly draft: {
-        readonly version: 1;
-        readonly kind: "planning_pass";
-        readonly operation: Omit<
-          WorkflowOperationV1,
-          "fingerprint" | "controlGeneration" | "status" | "claim" | "outcome" | "nextDueAt"
-        >;
-        readonly pass: Omit<P, "native">;
-        readonly admission: {
-          readonly sessionId: S["id"];
-          readonly expectedVersion: number;
-          readonly context: PlanningContext;
-          readonly command: PlanningCommand;
-        };
+  type PlanningNativeInput = {
+    readonly intentId: string;
+    readonly sessionId: S["id"];
+    readonly operationId: WorkflowOperationV1["id"];
+    readonly passId: P["id"];
+    readonly role: P["role"];
+    readonly environmentId: string;
+    readonly projectId: string;
+    readonly launchCommandId: string;
+    readonly threadId: string;
+    readonly messageId: string;
+    readonly generation: number;
+    readonly draft: {
+      readonly version: 1;
+      readonly kind: "planning_pass";
+      readonly operation: Omit<
+        WorkflowOperationV1,
+        "fingerprint" | "controlGeneration" | "status" | "claim" | "outcome" | "nextDueAt"
+      >;
+      readonly pass: Omit<P, "native">;
+      readonly admission: {
+        readonly sessionId: S["id"];
+        readonly expectedVersion: number;
+        readonly context: PlanningContext;
+        readonly command: PlanningCommand;
       };
-      readonly now: string;
-    }) {
+    };
+    readonly now: string;
+  };
+  const validatePlanningNativeIntent = Effect.fn("WorkflowRunStore.validatePlanningNativeIntent")(
+    function* (input: PlanningNativeInput) {
       const { draft } = input;
       const valid = yield* Effect.try({
         try: () => {
@@ -510,6 +511,53 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
         catch: () => planningError("invalid"),
       });
       const command = draft.admission.command;
+      return { pass, operation, params, context, fingerprint, command, same };
+    },
+  );
+  const validatePlanningRevision = Effect.fn("WorkflowRunStore.validatePlanningRevision")(
+    function* (pass: P) {
+      const b = pass.binding;
+      const rows = yield* sql<{
+        revision_json: string;
+        packet_json: string;
+        created_at: string;
+      }>`SELECT r.revision_json, p.packet_json, r.created_at FROM development_plan_revisions r JOIN development_plan_source_packets p ON p.plan_id = r.plan_id AND p.source_packet_hash = r.source_packet_hash JOIN workflow_revision_identities i ON i.plan_id = r.plan_id AND i.revision_id = r.revision_id AND i.revision_hash = r.revision_hash AND i.source_packet_hash = r.source_packet_hash WHERE r.plan_id = ${b.planId} AND r.revision_id = ${b.revisionId} AND r.revision_hash = ${b.revisionHash} AND r.source_packet_hash = ${b.sourcePacketHash}`;
+      const row = rows[0];
+      if (!row) return yield* planningError("integrity");
+      const content = yield* Effect.try({
+        try: () => ({
+          revision: parse(row.revision_json),
+          sourcePacket: parse(row.packet_json),
+        }),
+        catch: () => planningError("integrity"),
+      });
+      const envelope = yield* decodeDevelopmentPlanRevisionV1({
+        planId: b.planId,
+        revisionId: b.revisionId,
+        revisionHash: b.revisionHash,
+        sourcePacketHash: b.sourcePacketHash,
+        ...content,
+        createdAt: row.created_at,
+      }).pipe(
+        Effect.provide(Digest.layerWebCrypto),
+        Effect.mapError(() => planningError("integrity")),
+      );
+      const actual = yield* Effect.try({
+        try: () => ({
+          revision: DevelopmentPlanHash.revision(envelope.revision),
+          source: DevelopmentPlanHash.sourcePacket(envelope.sourcePacket),
+        }),
+        catch: () => planningError("integrity"),
+      });
+      if (actual.revision !== b.revisionHash || actual.source !== b.sourcePacketHash)
+        return yield* planningError("integrity");
+    },
+  );
+  const reservePlanningNativeIntent = Effect.fn("WorkflowRunStore.reservePlanningNativeIntent")(
+    function* (input: PlanningNativeInput) {
+      const { pass, params, context, fingerprint, command, same } =
+        yield* validatePlanningNativeIntent(input);
+      const { draft } = input;
       const result = yield* planningTransaction(
         Effect.gen(function* () {
           const receipts = yield* sql<{
@@ -675,41 +723,7 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
             )
               return yield* planningError("custody");
           }
-          const b = pass.binding;
-          const rows = yield* sql<{
-            revision_json: string;
-            packet_json: string;
-            created_at: string;
-          }>`SELECT r.revision_json, p.packet_json, r.created_at FROM development_plan_revisions r JOIN development_plan_source_packets p ON p.plan_id = r.plan_id AND p.source_packet_hash = r.source_packet_hash JOIN workflow_revision_identities i ON i.plan_id = r.plan_id AND i.revision_id = r.revision_id AND i.revision_hash = r.revision_hash AND i.source_packet_hash = r.source_packet_hash WHERE r.plan_id = ${b.planId} AND r.revision_id = ${b.revisionId} AND r.revision_hash = ${b.revisionHash} AND r.source_packet_hash = ${b.sourcePacketHash}`;
-          const row = rows[0];
-          if (!row) return yield* planningError("integrity");
-          const content = yield* Effect.try({
-            try: () => ({
-              revision: parse(row.revision_json),
-              sourcePacket: parse(row.packet_json),
-            }),
-            catch: () => planningError("integrity"),
-          });
-          const envelope = yield* decodeDevelopmentPlanRevisionV1({
-            planId: b.planId,
-            revisionId: b.revisionId,
-            revisionHash: b.revisionHash,
-            sourcePacketHash: b.sourcePacketHash,
-            ...content,
-            createdAt: row.created_at,
-          }).pipe(
-            Effect.provide(Digest.layerWebCrypto),
-            Effect.mapError(() => planningError("integrity")),
-          );
-          const actual = yield* Effect.try({
-            try: () => ({
-              revision: DevelopmentPlanHash.revision(envelope.revision),
-              source: DevelopmentPlanHash.sourcePacket(envelope.sourcePacket),
-            }),
-            catch: () => planningError("integrity"),
-          });
-          if (actual.revision !== b.revisionHash || actual.source !== b.sourcePacketHash)
-            return yield* planningError("integrity");
+          yield* validatePlanningRevision(pass);
           const updated = {
             ...current,
             recordVersion: current.recordVersion + 1,
@@ -1368,15 +1382,110 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
             return { row, operation };
           }),
         );
-        const nativeCustody = yield* sql<{
+        const nativeRows = yield* sql<{
+          intent_id: string;
+          workflow_run_id: string | null;
+          planning_session_id: string | null;
+          operation_id: WorkflowOperationV1["id"];
+          attempt_id: string | null;
+          pass_id: P["id"];
+          item_id: string | null;
+          charge_attempt: number;
+          repair: number;
+          role: P["role"];
+          environment_id: string;
+          project_id: string;
+          launch_command_id: string;
+          thread_id: string;
+          message_id: string;
+          fingerprint: string;
+          draft_json: string;
+          generation: number;
           state: string;
-        }>`SELECT state FROM workflow_native_launch_intents WHERE planning_session_id = ${value.id} AND state IN ('dispatching','unknown')`;
+          held: number;
+          boot_id: string | null;
+          worker_id: string | null;
+          native_run_id: string | null;
+          finalized_operation_id: string | null;
+        }>`SELECT * FROM workflow_native_launch_intents WHERE planning_session_id = ${value.id} AND state IN ('reserved','dispatching','unknown')`;
+        const intents = yield* Effect.forEach(nativeRows, (row) =>
+          Effect.gen(function* () {
+            if (
+              row.workflow_run_id !== null ||
+              row.planning_session_id !== value.id ||
+              row.attempt_id !== null ||
+              row.item_id !== null ||
+              row.charge_attempt !== 0 ||
+              row.repair !== (row.role === "repair" ? 1 : 0) ||
+              !Number.isSafeInteger(row.generation) ||
+              row.generation < 0 ||
+              row.generation > value.controlGeneration ||
+              (row.state === "reserved" && row.generation !== value.controlGeneration - row.held) ||
+              (row.held !== 0 && row.held !== 1) ||
+              (row.state !== "reserved" && (row.held !== 0 || !row.boot_id || !row.worker_id)) ||
+              (row.state === "reserved" &&
+                (row.boot_id !== null ||
+                  row.worker_id !== null ||
+                  row.native_run_id !== null ||
+                  row.finalized_operation_id !== null))
+            )
+              return yield* planningError("integrity");
+            const draft = yield* Effect.try({
+              try: () => parse(row.draft_json) as PlanningNativeInput["draft"],
+              catch: () => planningError("integrity"),
+            });
+            const validated = yield* validatePlanningNativeIntent({
+              intentId: row.intent_id,
+              sessionId: value.id,
+              operationId: row.operation_id,
+              passId: row.pass_id,
+              role: row.role,
+              environmentId: row.environment_id,
+              projectId: row.project_id,
+              launchCommandId: row.launch_command_id,
+              threadId: row.thread_id,
+              messageId: row.message_id,
+              generation: row.generation,
+              draft,
+              now: input.now,
+            }).pipe(Effect.mapError(() => planningError("integrity")));
+            if (validated.fingerprint !== row.fingerprint || !sameContext(value, validated.context))
+              return yield* planningError("integrity");
+            const receipts = yield* sql<{
+              command_id: string;
+              receipt_id: string;
+              intent_id: string;
+              fingerprint: string;
+              result_json: string;
+            }>`SELECT * FROM workflow_native_intent_receipts WHERE intent_id = ${row.intent_id} OR command_id = ${validated.command.commandId} OR receipt_id = ${validated.command.receiptId}`;
+            const receipt = receipts[0];
+            if (
+              receipts.length !== 1 ||
+              !receipt ||
+              receipt.command_id !== validated.command.commandId ||
+              receipt.receipt_id !== validated.command.receiptId ||
+              receipt.intent_id !== row.intent_id ||
+              receipt.fingerprint !== row.fingerprint
+            )
+              return yield* planningError("integrity");
+            const matches = yield* Effect.try({
+              try: () =>
+                validated.same(parse(receipt.result_json), {
+                  intentId: row.intent_id,
+                  fingerprint: row.fingerprint,
+                }),
+              catch: () => planningError("integrity"),
+            });
+            if (!matches) return yield* planningError("integrity");
+            return { row, ...validated };
+          }),
+        );
         const claimed =
           operations.some(({ operation }) => operation.status === "claimed") ||
-          nativeCustody.some((intent) => intent.state === "dispatching");
+          intents.some(({ row }) => row.state === "dispatching");
         const unknown =
           operations.some(({ operation }) => operation.status === "unknown") ||
-          nativeCustody.some((intent) => intent.state === "unknown");
+          intents.some(({ row }) => row.state === "unknown");
         let status: S["status"];
         if (input.action === "pause") {
           if (value.status !== "active") return yield* planningError("ineligible");
@@ -1386,7 +1495,38 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
           if (claimed || unknown) return yield* planningError("custody");
           if (!isWorkflowTimestampAfter(value.limits.deadline, input.now))
             return yield* planningError("deadline");
-          if (value.consumed.passes >= value.limits.maxPasses) return yield* planningError("limit");
+          const held = intents.filter(({ row }) => row.state === "reserved" && row.held === 1);
+          if (
+            intents.some(({ row }) => row.state === "reserved" && row.held !== 1) ||
+            value.consumed.passes < held.length ||
+            value.consumed.repairRounds < held.filter(({ pass }) => pass.role === "repair").length
+          )
+            return yield* planningError("integrity");
+          if (
+            value.consumed.passes > value.limits.maxPasses ||
+            (value.consumed.passes === value.limits.maxPasses && held.length === 0)
+          )
+            return yield* planningError("limit");
+          for (const intent of held) {
+            const { row, pass, params, same } = intent;
+            if (pass.binding.planId !== value.planId || !same(params.limits, value.limits))
+              return yield* planningError("integrity");
+            if (
+              !value.allowedRoles.includes(pass.role) ||
+              !value.allowedProviders.some(
+                (provider) =>
+                  provider.providerInstanceId === pass.provider.providerInstanceId &&
+                  provider.model === pass.provider.model,
+              )
+            )
+              return yield* planningError("ineligible");
+            if (pass.role === "author" || pass.role === "repair") {
+              const writers =
+                yield* sql`SELECT 1 FROM workflow_planning_passes p JOIN workflow_operations o ON o.id = p.operation_id WHERE p.plan_id = ${value.planId} AND o.status IN ('pending','claimed','unknown') AND json_extract(p.record_json, '$.role') IN ('author','repair') UNION ALL SELECT 1 FROM workflow_native_launch_intents i JOIN workflow_planning_sessions s ON s.id = i.planning_session_id WHERE s.plan_id = ${value.planId} AND i.intent_id <> ${row.intent_id} AND i.state IN ('reserved','dispatching','unknown') AND i.role IN ('author','repair')`;
+              if (writers.length) return yield* planningError("custody");
+            }
+            yield* validatePlanningRevision(pass);
+          }
           status = "active";
         } else {
           if (!["active", "paused", "pausing", "needs_attention"].includes(value.status))
@@ -1399,6 +1539,25 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
           recordVersion: value.recordVersion + 1,
           controlGeneration: value.controlGeneration + 1,
         };
+        yield* decodePlanningSessionV1(updated).pipe(
+          Effect.mapError(() => planningError("integrity")),
+        );
+        for (const { row } of intents) {
+          if (row.state !== "reserved") continue;
+          if (input.action === "pause" && row.held === 0) {
+            const changed =
+              yield* sql`UPDATE workflow_native_launch_intents SET held = 1 WHERE intent_id = ${row.intent_id} AND planning_session_id = ${value.id} AND state = 'reserved' AND held = 0 AND generation = ${row.generation} AND fingerprint = ${row.fingerprint} AND boot_id IS NULL AND worker_id IS NULL AND native_run_id IS NULL AND finalized_operation_id IS NULL RETURNING intent_id`;
+            if (changed.length !== 1) return yield* planningError("integrity");
+          } else if (input.action === "resume" && row.held === 1) {
+            const changed =
+              yield* sql`UPDATE workflow_native_launch_intents SET held = 0, generation = ${updated.controlGeneration} WHERE intent_id = ${row.intent_id} AND planning_session_id = ${value.id} AND state = 'reserved' AND held = 1 AND generation = ${row.generation} AND fingerprint = ${row.fingerprint} AND boot_id IS NULL AND worker_id IS NULL AND native_run_id IS NULL AND finalized_operation_id IS NULL RETURNING intent_id`;
+            if (changed.length !== 1) return yield* planningError("integrity");
+          } else if (input.action === "stop" || input.action === "expire") {
+            const changed =
+              yield* sql`UPDATE workflow_native_launch_intents SET state = 'cancelled', held = 0 WHERE intent_id = ${row.intent_id} AND planning_session_id = ${value.id} AND state = 'reserved' AND held = ${row.held} AND generation = ${row.generation} AND fingerprint = ${row.fingerprint} AND boot_id IS NULL AND worker_id IS NULL AND native_run_id IS NULL AND finalized_operation_id IS NULL RETURNING intent_id`;
+            if (changed.length !== 1) return yield* planningError("integrity");
+          }
+        }
         for (const { row, operation } of operations) {
           if (operation.status === "pending" && input.action === "pause") {
             yield* sql`UPDATE workflow_operations SET held = 1 WHERE id = ${operation.id}`;
@@ -1446,7 +1605,7 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
         }
         const changed = yield* sql<{
           id: string;
-        }>`UPDATE workflow_planning_sessions SET status = ${status}, record_version = ${updated.recordVersion}, control_generation = ${updated.controlGeneration}, record_json = ${encode(updated)} WHERE id = ${value.id} AND record_version = ${input.expectedVersion} RETURNING id`;
+        }>`UPDATE workflow_planning_sessions SET status = ${status}, record_version = ${updated.recordVersion}, control_generation = ${updated.controlGeneration}, record_json = ${encode(updated)} WHERE id = ${value.id} AND record_version = ${input.expectedVersion} AND control_generation = ${value.controlGeneration} RETURNING id`;
         if (changed.length !== 1) return yield* planningError("conflict");
         return yield* savePlanningReceipt(input.command, hash, updated);
       }),
