@@ -840,6 +840,33 @@ it.effect("constrains attributable waits and supports bounded membership keysets
     for (const [index, target] of targets.entries()) {
       yield* sql`INSERT INTO work_task_waits VALUES ('a', ${String(index)}, 1, ${target}, 'registered', 1, 't')`;
     }
+    for (const text of ["\0x", "\0"]) {
+      const target = JSON.stringify({ type: "source", sourceId: text });
+      yield* sql`INSERT INTO work_task_waits VALUES ('a', ${text}, 1, ${target}, 'registered', 1, 't')`;
+      yield* sql`UPDATE work_task_waits SET wait_id = ${text + "y"}, target_json = ${JSON.stringify({ type: "source", sourceId: text + "y" })} WHERE wait_id = ${text}`;
+    }
+    for (const whitespace of [
+      "\t",
+      "\r\n",
+      "\v\f",
+      "\u00a0",
+      "\u1680",
+      "\u2000\u200a",
+      "\u2028\u2029",
+      "\u202f",
+      "\u205f",
+      "\u3000",
+      "\ufeff",
+    ]) {
+      const target = JSON.stringify({ type: "source", sourceId: whitespace });
+      for (const statement of [
+        sql`INSERT INTO work_task_waits VALUES ('a', ${whitespace}, 1, ${targets[0]}, 'registered', 1, 't')`,
+        sql`INSERT INTO work_task_waits VALUES ('a', 'blank', 1, ${target}, 'registered', 1, 't')`,
+        sql`UPDATE work_task_waits SET wait_id = ${whitespace} WHERE wait_id = '0'`,
+        sql`UPDATE work_task_waits SET target_json = ${target} WHERE wait_id = '0'`,
+      ])
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(statement)));
+    }
     const invalid = [
       sql`INSERT INTO work_task_waits VALUES ('a', '0', 1, ${targets[0]}, 'registered', 1, 't')`,
       sql`INSERT INTO work_task_waits VALUES ('a', 'other', 2, ${targets[0]}, 'registered', 1, 't')`,

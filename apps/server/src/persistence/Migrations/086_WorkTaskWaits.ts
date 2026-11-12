@@ -26,6 +26,9 @@ export default Effect.gen(function* () {
       FOREIGN KEY (task_id, manager_generation) REFERENCES work_task_manager_bindings(task_id, generation)
     )
   `;
+  // SQLite trim needs the ECMAScript whitespace set used by the contract.
+  const whitespace =
+    "char(9,10,11,12,13,32,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288,65279)";
   // Count UTF-16 units, including NUL and supplementary characters, as in the contract.
   for (const operation of ["INSERT", "UPDATE"]) {
     yield* sql.unsafe(`CREATE TRIGGER work_task_waits_bounds_${operation.toLowerCase()} BEFORE ${operation} ON work_task_waits
@@ -39,8 +42,8 @@ export default Effect.gen(function* () {
             WHEN substr(bytes, position, 1) = 'F' THEN 2 ELSE 1 END
           FROM units WHERE position <= length(bytes) AND count <= 2000
         ) SELECT 1 FROM units WHERE count > 2000
-      ) OR length(trim(NEW.wait_id)) = 0 OR (json_valid(NEW.target_json) AND EXISTS (
-        SELECT 1 FROM json_tree(NEW.target_json) WHERE type = 'text' AND length(trim(value)) = 0
+      ) OR length(CAST(trim(NEW.wait_id, ${whitespace}) AS BLOB)) = 0 OR (json_valid(NEW.target_json) AND EXISTS (
+        SELECT 1 FROM json_tree(NEW.target_json) WHERE type = 'text' AND length(CAST(trim(value, ${whitespace}) AS BLOB)) = 0
       )) BEGIN SELECT RAISE(ABORT, 'invalid wait text'); END`);
   }
   yield* sql`CREATE INDEX work_task_waits_state_idx ON work_task_waits(task_id, state, wait_id)`;
