@@ -555,6 +555,53 @@ describe("staged task events", () => {
       decode({ ...result, findings: [result.findings[0], result.findings[0]] }),
     ).toThrow();
     expect(() => decode({ ...started, createdAt: "2026-11-12T00:00:00Z" })).toThrow();
+    const earlier = "2026-11-11T00:00:00.0001Z";
+    const later = "2026-11-11T00:00:00.0009Z";
+    for (const event of [
+      { ...started, createdAt: later, startedAt: earlier, occurredAt: earlier },
+      { ...result, createdAt: earlier, startedAt: later, finishedAt: earlier, occurredAt: earlier },
+      {
+        ...uncertain,
+        createdAt: earlier,
+        startedAt: later,
+        finishedAt: earlier,
+        occurredAt: earlier,
+      },
+    ]) {
+      expect(() => decode(event)).toThrow();
+      expect(() => persisted({ event, context: { ...context, occurredAt: earlier } })).toThrow();
+    }
+    for (const event of [result, uncertain]) {
+      const precise = {
+        ...event,
+        createdAt: earlier,
+        startedAt: earlier,
+        finishedAt: later,
+        occurredAt: later,
+      };
+      expect(decode(precise)).toEqual(precise);
+      expect(
+        persisted({ event: precise, context: { ...context, occurredAt: later } }),
+      ).toBeDefined();
+    }
+    const obsolete = {
+      ...base,
+      type: "task.validation-recorded",
+      managerThreadId: "manager",
+      managerGeneration: 1,
+      claimId: "claim",
+      evidenceId: "evidence",
+      observedWorkSequence: 1,
+      attemptId: "attempt",
+      validator: common.validator,
+      outcome: "pass",
+      findings: [],
+    };
+    expect(() => decode(obsolete)).toThrow();
+    expect(() =>
+      persisted({ event: obsolete, context: { ...context, commandId: null } }),
+    ).toThrow();
+
     for (const field of ["attemptId", "claimId", "evidenceId", "workWatermark"])
       for (const value of [" ", "x".repeat(2001)])
         expect(() => decode({ ...reserved, [field]: value })).toThrow();

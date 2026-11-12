@@ -724,6 +724,18 @@ const persistedTime = IsoDateTime.check(
   ),
 );
 
+const isAtOrBefore = (earlier: string, later: string) => {
+  const earlierMillis = Date.parse(earlier);
+  const laterMillis = Date.parse(later);
+  if (earlierMillis !== laterMillis) return earlierMillis < laterMillis;
+  // Date.parse truncates fractional precision after milliseconds.
+  const remainder = (value: string) => value.match(/\.(\d+)/)?.[1]?.slice(3) ?? "";
+  const left = remainder(earlier);
+  const right = remainder(later);
+  const width = Math.max(left.length, right.length);
+  return left.padEnd(width, "0") <= right.padEnd(width, "0");
+};
+
 const eventRevisions = {
   definitionRevision: PositiveInt,
   lifecycleRevision: PositiveInt,
@@ -1107,8 +1119,7 @@ const validationStarted = Schema.Struct({
 }).check(
   Schema.makeFilter(
     (event) =>
-      event.startedAt === event.occurredAt &&
-      Date.parse(event.createdAt) <= Date.parse(event.startedAt),
+      event.startedAt === event.occurredAt && isAtOrBefore(event.createdAt, event.startedAt),
   ),
 );
 const validationResult = Schema.Struct({
@@ -1122,8 +1133,8 @@ const validationResult = Schema.Struct({
   Schema.makeFilter(
     (event) =>
       event.finishedAt === event.occurredAt &&
-      Date.parse(event.createdAt) <= Date.parse(event.startedAt) &&
-      Date.parse(event.startedAt) <= Date.parse(event.finishedAt) &&
+      isAtOrBefore(event.createdAt, event.startedAt) &&
+      isAtOrBefore(event.startedAt, event.finishedAt) &&
       (event.outcome !== "error" || event.reason !== undefined) &&
       new Set(event.findings.map((finding) => finding.criterionId)).size ===
         event.findings.length &&
@@ -1144,8 +1155,8 @@ const validationUncertain = Schema.Struct({
   Schema.makeFilter(
     (event) =>
       event.finishedAt === event.occurredAt &&
-      Date.parse(event.createdAt) <= Date.parse(event.startedAt) &&
-      Date.parse(event.startedAt) <= Date.parse(event.finishedAt),
+      isAtOrBefore(event.createdAt, event.startedAt) &&
+      isAtOrBefore(event.startedAt, event.finishedAt),
   ),
 );
 
@@ -1245,15 +1256,6 @@ const WorkTaskNonReviewRequestedEvent = Schema.Union([
     ...completionIdentity,
     summary: shortText,
     evidence: workTaskReferenceBatch,
-  }),
-  Schema.Struct({
-    ...eventBase,
-    type: Schema.Literal("task.validation-recorded"),
-    ...completionIdentity,
-    attemptId: shortText,
-    validator: WorkTaskLaunchSelection,
-    outcome: Schema.Literals(["pass", "fail", "inconclusive", "error"]),
-    findings: Schema.Array(shortText).check(Schema.isMaxLength(64)),
   }),
   Schema.Struct({ ...eventBase, type: Schema.Literal("task.completed"), ...completionIdentity }),
   Schema.Struct({ ...eventBase, type: Schema.Literal("task.reopened") }),
