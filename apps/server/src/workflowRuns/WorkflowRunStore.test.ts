@@ -541,6 +541,7 @@ it.effect.each([
 );
 
 const decodeOperation = Schema.decodeSync(WorkflowOperationV1);
+const decodeWorkflowRunId = Schema.decodeSync(WorkflowRunV1.fields.id);
 const destination = { environmentId: "environment", projectId: "project" };
 const operationFor = (id: string, attemptId: string) => {
   const value = decodeOperation({
@@ -1504,7 +1505,11 @@ it.effect("admits, replays, blocks a concurrent attempt, and permits a repair af
     yield* setupAdmission;
     const sql = yield* SqlClient.SqlClient;
     const store = yield* Store.WorkflowRunStore;
-    const first = operationFor("op-1", "attempt-1");
+    const legacy = decodeOperation({
+      ...operationFor("op-1", "attempt-1"),
+      origin: { ...run.origin, id: "legacy-actor" },
+    });
+    const first = { ...legacy, fingerprint: WorkflowCanonicalHash.operation(legacy) };
     const input = {
       runId: run.id,
       command: admission(first, "attempt-1"),
@@ -1521,6 +1526,10 @@ it.effect("admits, replays, blocks a concurrent attempt, and permits a repair af
       [{ id: "attempt-1", operation_id: "op-1", item_id: "item", repair: 0 }],
     );
     assert.strictEqual((yield* sql`SELECT id FROM workflow_operations`).length, 1);
+    assert.deepStrictEqual(yield* store.readThreadCustody({ threadId: "thread" }), {
+      kind: "owned",
+      owner: { kind: "workflow_run", workflowRunId: run.id },
+    });
     const stored = yield* sql<{ record_json: string }>`SELECT record_json FROM workflow_runs`;
     assert.strictEqual((parse(stored[0]!.record_json) as typeof run).allowance.attemptsConsumed, 1);
     assert.deepStrictEqual(
@@ -2539,6 +2548,419 @@ const planningReservation = (admission: ReturnType<typeof admissionInput>) => {
   };
 };
 
+it.effect.each(["reserved", "dispatching", "unknown", "cancelled"] as const)(
+  "thread custody recognizes workflow intent in %s state and ignores unrelated malformed records",
+  (state) =>
+    Effect.gen(function* () {
+      yield* setupAdmission;
+      const store = yield* Store.WorkflowRunStore;
+      const sql = yield* SqlClient.SqlClient;
+      assert.deepStrictEqual(yield* store.readThreadCustody({ threadId: "unassociated" }), {
+        kind: "ordinary",
+      });
+      assert.strictEqual(
+        (yield* Effect.flip(store.readThreadCustody({ threadId: "" }))).reason,
+        "integrity",
+      );
+      const input = reservation(operationFor("custody-op", "custody-attempt"), "custody-attempt");
+      yield* store.reserveWorkflowNativeIntent(input);
+      if (state === "dispatching" || state === "unknown")
+        yield* sql`UPDATE workflow_native_launch_intents SET state = ${state}, boot_id = 'boot', worker_id = 'worker' WHERE intent_id = ${input.intentId}`;
+      if (state === "cancelled")
+        yield* sql`UPDATE workflow_native_launch_intents SET state = 'cancelled' WHERE intent_id = ${input.intentId}`;
+      yield* sql`INSERT INTO workflow_operations (id, workflow_run_id, kind, fingerprint, status, generation, record_json) VALUES ('unrelated', ${run.id}, 'stage_launch', ${hash}, 'pending', 0, '{"destination":{"projectId":"other-project"},"parameters":{"nativeThreadId":"elsewhere"}}')`;
+      assert.deepStrictEqual(yield* store.readThreadCustody({ threadId: "unassociated" }), {
+        kind: "ordinary",
+      });
+      assert.deepStrictEqual(yield* store.readThreadCustody({ threadId: input.threadId }), {
+        kind: "owned",
+        owner: { kind: "workflow_run", workflowRunId: run.id },
+      });
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  "draft",
+  "column",
+  "receipt",
+  "result",
+  "owner",
+  "state",
+  "generation",
+  "hash",
+  "receipt-id",
+] as const)("selected %s tampering fails closed before workflow reservation writes", (tamper) =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const store = yield* Store.WorkflowRunStore;
+    const sql = yield* SqlClient.SqlClient;
+    const first = reservation(operationFor("first-custody", "first-custody"), "first-custody");
+    yield* store.reserveWorkflowNativeIntent(first);
+    if (tamper === "draft")
+      yield* sql`UPDATE workflow_native_launch_intents SET draft_json = '{}' WHERE intent_id = ${first.intentId}`;
+    if (tamper === "column")
+      yield* sql`UPDATE workflow_native_launch_intents SET message_id = 'tampered' WHERE intent_id = ${first.intentId}`;
+    if (tamper === "receipt")
+      yield* sql`DELETE FROM workflow_native_intent_receipts WHERE intent_id = ${first.intentId}`;
+    if (tamper === "result")
+      yield* sql`UPDATE workflow_native_intent_receipts SET result_json = '{}' WHERE intent_id = ${first.intentId}`;
+    if (tamper === "owner")
+      yield* sql`UPDATE workflow_runs SET record_json = '{}' WHERE id = ${run.id}`;
+    if (tamper === "hash")
+      yield* sql`UPDATE workflow_native_launch_intents SET fingerprint = ${nextHash} WHERE intent_id = ${first.intentId}`;
+    if (tamper === "receipt-id")
+      yield* sql`UPDATE workflow_native_intent_receipts SET receipt_id = 'substituted' WHERE intent_id = ${first.intentId}`;
+    if (tamper === "generation") {
+      yield* sql`PRAGMA ignore_check_constraints = ON`;
+      yield* sql`UPDATE workflow_native_launch_intents SET generation = 9007199254740992 WHERE intent_id = ${first.intentId}`;
+      yield* sql`PRAGMA ignore_check_constraints = OFF`;
+    }
+    if (tamper === "state") {
+      yield* sql`PRAGMA ignore_check_constraints = ON`;
+      yield* sql`UPDATE workflow_native_launch_intents SET state = 'cancelled', boot_id = 'boot', worker_id = 'worker' WHERE intent_id = ${first.intentId}`;
+      yield* sql`PRAGMA ignore_check_constraints = OFF`;
+    }
+    const before = {
+      owner: yield* sql`SELECT * FROM workflow_runs`,
+      intents:
+        yield* sql`SELECT intent_id, workflow_run_id, planning_session_id, operation_id, attempt_id, pass_id, item_id, charge_attempt, repair, role, environment_id, project_id, launch_command_id, thread_id, message_id, fingerprint, draft_json, CAST(generation AS TEXT) AS generation, state, held, boot_id, worker_id, native_run_id, finalized_operation_id FROM workflow_native_launch_intents`,
+      receipts: yield* sql`SELECT * FROM workflow_native_intent_receipts`,
+      operations: yield* sql`SELECT * FROM workflow_operations`,
+    };
+    const next = reservation(operationFor("next-custody", "next-custody"), "next-custody");
+    assert.strictEqual(
+      (yield* Effect.flip(store.readThreadCustody({ threadId: first.threadId }))).reason,
+      "integrity",
+    );
+    assert.strictEqual(
+      (yield* Effect.flip(store.reserveWorkflowNativeIntent(next))).reason,
+      "integrity",
+    );
+    assert.deepStrictEqual(
+      {
+        owner: yield* sql`SELECT * FROM workflow_runs`,
+        intents:
+          yield* sql`SELECT intent_id, workflow_run_id, planning_session_id, operation_id, attempt_id, pass_id, item_id, charge_attempt, repair, role, environment_id, project_id, launch_command_id, thread_id, message_id, fingerprint, draft_json, CAST(generation AS TEXT) AS generation, state, held, boot_id, worker_id, native_run_id, finalized_operation_id FROM workflow_native_launch_intents`,
+        receipts: yield* sql`SELECT * FROM workflow_native_intent_receipts`,
+        operations: yield* sql`SELECT * FROM workflow_operations`,
+      },
+      before,
+    );
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("thread custody recognizes planning intents and finalized immutable links", () =>
+  Effect.gen(function* () {
+    const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+    const store = yield* Store.WorkflowRunStore;
+    const sql = yield* SqlClient.SqlClient;
+    yield* begin(store, session);
+    const admission = admissionInput(binding, "custody-planning");
+    const input = planningReservation(admission);
+    yield* store.reservePlanningNativeIntent(input);
+    const owned = {
+      kind: "owned",
+      owner: { kind: "planning_session", planningSessionId: session.id },
+    } as const;
+    for (const state of ["reserved", "dispatching", "unknown", "cancelled"] as const) {
+      if (state === "dispatching" || state === "unknown")
+        yield* sql`UPDATE workflow_native_launch_intents SET state = ${state}, boot_id = 'boot', worker_id = 'worker' WHERE intent_id = ${input.intentId}`;
+      if (state === "cancelled")
+        yield* sql`UPDATE workflow_native_launch_intents SET state = 'cancelled', boot_id = NULL, worker_id = NULL WHERE intent_id = ${input.intentId}`;
+      assert.deepStrictEqual(yield* store.readThreadCustody({ threadId: input.threadId }), owned);
+    }
+    const operation = admission.operation;
+    const pass = admission.pass;
+    yield* sql`INSERT INTO workflow_operations (id, planning_session_id, kind, fingerprint, status, generation, record_json) VALUES (${operation.id}, ${session.id}, 'planning_pass', ${operation.fingerprint}, 'pending', 0, ${json(operation)})`;
+    yield* sql`INSERT INTO workflow_planning_passes VALUES (${pass.id}, ${session.id}, ${binding.planId}, ${binding.revisionId}, ${binding.revisionHash}, ${binding.sourcePacketHash}, ${operation.id}, ${input.threadId}, ${pass.native!.runId}, ${json(pass)})`;
+    yield* sql`UPDATE workflow_native_launch_intents SET state = 'finalized', native_run_id = ${pass.native!.runId}, finalized_operation_id = ${operation.id} WHERE intent_id = ${input.intentId}`;
+    assert.deepStrictEqual(yield* store.readThreadCustody({ threadId: input.threadId }), owned);
+    const terminal = {
+      ...operation,
+      status: "cancelled",
+      outcome: { kind: "cancelled", summary: "cancelled", evidence: [] },
+    };
+    const terminalPass = { ...pass, status: "cancelled" };
+    yield* sql`UPDATE workflow_operations SET status = 'cancelled', record_json = ${json(terminal)} WHERE id = ${operation.id}`;
+    yield* sql`UPDATE workflow_planning_passes SET record_json = ${json(terminalPass)} WHERE id = ${pass.id}`;
+    assert.deepStrictEqual(yield* store.readThreadCustody({ threadId: input.threadId }), owned);
+    yield* sql`UPDATE workflow_planning_passes SET native_run_id = 'substituted' WHERE id = ${pass.id}`;
+    assert.strictEqual(
+      (yield* Effect.flip(store.readThreadCustody({ threadId: input.threadId }))).reason,
+      "integrity",
+    );
+    yield* sql`DELETE FROM workflow_planning_passes WHERE id = ${pass.id}`;
+    assert.strictEqual(
+      (yield* Effect.flip(store.readThreadCustody({ threadId: input.threadId }))).reason,
+      "integrity",
+    );
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("independent owners cannot reserve the same thread on separate connections", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const directory = yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "workflow-thread-race-")),
+        ),
+        (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
+      );
+      const filename = NodePath.join(directory, "test.sqlite");
+      const fileLayer = () =>
+        Store.layer.pipe(Layer.provideMerge(NodeSqliteClient.layer({ filename })));
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* setupAdmission;
+          const sql = yield* SqlClient.SqlClient;
+          const other = {
+            ...run,
+            id: "other-run",
+            access: { origins: [{ ...destination, threadId: "thread" }] },
+          };
+          yield* sql`INSERT INTO workflow_runs VALUES (${other.id}, 'plan', 'revision', ${hash}, ${hash}, ${hash}, 'active', 0, 0, ${json(other)})`;
+        }).pipe(Effect.provide(fileLayer())),
+      );
+      const barrier = yield* Deferred.make<void>();
+      const arrivals = yield* Ref.make(0);
+      const attempt = (id: string) =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const store = yield* Store.WorkflowRunStore;
+            const base = operationFor(`race-${id}`, `attempt-${id}`);
+            const ownerId = id === "one" ? run.id : decodeWorkflowRunId("other-run");
+            const operation = {
+              ...base,
+              owner: { kind: "workflow_run" as const, workflowRunId: ownerId },
+            };
+            const input = { ...reservation(operation, `attempt-${id}`), runId: ownerId };
+            const count = yield* Ref.updateAndGet(arrivals, (value) => value + 1);
+            if (count === 2) yield* Deferred.succeed(barrier, undefined);
+            yield* Deferred.await(barrier);
+            return yield* Effect.result(store.reserveWorkflowNativeIntent(input));
+          }).pipe(Effect.provide(fileLayer())),
+        );
+      const results = yield* Effect.all([attempt("one"), attempt("two")], { concurrency: 2 });
+      assert.strictEqual(
+        results.filter((r) => r._tag === "Success" && r.success.kind === "reserved").length,
+        1,
+      );
+      assert.strictEqual(
+        results.filter(
+          (r) =>
+            (r._tag === "Success" &&
+              r.success.kind === "rejected" &&
+              r.success.reason === "custody") ||
+            (r._tag === "Failure" && r.failure.reason === "persistence"),
+        ).length,
+        1,
+      );
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          const owners = yield* sql<{ record_json: string }>`SELECT record_json FROM workflow_runs`;
+          assert.strictEqual(
+            owners.reduce(
+              (sum, row) => sum + (parse(row.record_json) as typeof run).allowance.attemptsConsumed,
+              0,
+            ),
+            1,
+          );
+          assert.strictEqual((yield* sql`SELECT * FROM workflow_native_launch_intents`).length, 1);
+          assert.strictEqual((yield* sql`SELECT * FROM workflow_native_intent_receipts`).length, 1);
+        }).pipe(Effect.provide(fileLayer())),
+      );
+    }),
+  ),
+);
+
+it.effect(
+  "workflow legacy and finalized associations retain ownership and validate native identity",
+  () =>
+    Effect.gen(function* () {
+      yield* setupAdmission;
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      const operation = operationFor("linked-op", "linked-attempt");
+      const input = reservation(operation, "linked-attempt");
+      yield* store.reserveWorkflowNativeIntent(input);
+      yield* sql`INSERT INTO workflow_operations (id, workflow_run_id, kind, fingerprint, status, generation, record_json) VALUES (${operation.id}, ${run.id}, 'stage_launch', ${operation.fingerprint}, 'pending', 0, ${json(operation)})`;
+      yield* sql`UPDATE workflow_native_launch_intents SET state = 'finalized', native_run_id = ${operation.id}, finalized_operation_id = ${operation.id} WHERE intent_id = ${input.intentId}`;
+      const owned = {
+        kind: "owned",
+        owner: { kind: "workflow_run", workflowRunId: run.id },
+      } as const;
+      assert.deepStrictEqual(yield* store.readThreadCustody({ threadId: input.threadId }), owned);
+      const other = operationFor("same-owner-op", "same-owner-attempt");
+      yield* sql`INSERT INTO workflow_operations (id, workflow_run_id, kind, fingerprint, status, generation, record_json) VALUES (${other.id}, ${run.id}, 'stage_launch', ${other.fingerprint}, 'pending', 0, ${json(other)})`;
+      if (other.parameters.kind !== "stage_launch") throw new Error("expected stage launch");
+      const supervision = decodeOperation({
+        ...other,
+        id: "supervision-op",
+        kind: "supervision",
+        parameters: {
+          kind: "supervision",
+          context: other.parameters.context,
+          incidentId: "incident",
+          provider: other.parameters.provider,
+          nativeThreadId: input.threadId,
+          nativeRunId: "supervision-run",
+        },
+      });
+      const supervised = {
+        ...supervision,
+        fingerprint: WorkflowCanonicalHash.operation(supervision),
+      };
+      yield* sql`INSERT INTO workflow_operations (id, workflow_run_id, kind, fingerprint, status, generation, record_json) VALUES (${supervised.id}, ${run.id}, 'supervision', ${supervised.fingerprint}, 'pending', 0, ${json(supervised)})`;
+      assert.deepStrictEqual(yield* store.readThreadCustody({ threadId: input.threadId }), owned);
+      yield* sql`UPDATE workflow_native_launch_intents SET native_run_id = 'wrong-native' WHERE intent_id = ${input.intentId}`;
+      assert.strictEqual(
+        (yield* Effect.flip(store.readThreadCustody({ threadId: input.threadId }))).reason,
+        "integrity",
+      );
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect(
+  "both reservations fail closed for foreign, conflicting, and malformed selected owners",
+  () =>
+    Effect.gen(function* () {
+      yield* setupAdmission;
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      yield* begin(store, session);
+      const first = reservation(operationFor("owner-op", "owner-attempt"), "owner-attempt");
+      yield* store.reserveWorkflowNativeIntent(first);
+      const binding = {
+        planId: session.planId,
+        revisionId: "revision",
+        revisionSchemaVersion: 1 as const,
+        revisionHash: hash,
+        sourcePacketHash: hash,
+      };
+      const planning = {
+        ...planningReservation(admissionInput(binding, "foreign-owner")),
+        threadId: first.threadId,
+      };
+      const snapshot = () =>
+        Effect.gen(function* () {
+          return {
+            runs: yield* sql`SELECT * FROM workflow_runs`,
+            sessions: yield* sql`SELECT * FROM workflow_planning_sessions`,
+            intents: yield* sql`SELECT * FROM workflow_native_launch_intents`,
+            receipts: yield* sql`SELECT * FROM workflow_native_intent_receipts`,
+            operations: yield* sql`SELECT * FROM workflow_operations`,
+            passes: yield* sql`SELECT * FROM workflow_planning_passes`,
+          };
+        });
+      const before = yield* snapshot();
+      assert.strictEqual(
+        (yield* Effect.flip(store.reservePlanningNativeIntent(planning))).reason,
+        "custody",
+      );
+      assert.deepStrictEqual(yield* snapshot(), before);
+      const otherRun = {
+        ...run,
+        id: decodeWorkflowRunId("foreign-run"),
+        access: { origins: [{ ...destination, threadId: "thread" }] },
+      };
+      yield* sql`INSERT INTO workflow_runs VALUES (${otherRun.id}, 'plan', 'revision', ${hash}, ${hash}, ${hash}, 'active', 0, 0, ${json(otherRun)})`;
+      const raw = operationFor("foreign-op", "foreign-attempt");
+      const operation = {
+        ...raw,
+        owner: { kind: "workflow_run" as const, workflowRunId: otherRun.id },
+      };
+      const canonical = { ...operation, fingerprint: WorkflowCanonicalHash.operation(operation) };
+      yield* sql`INSERT INTO workflow_operations (id, workflow_run_id, kind, fingerprint, status, generation, record_json) VALUES (${canonical.id}, ${otherRun.id}, 'stage_launch', ${canonical.fingerprint}, 'pending', 0, ${json(canonical)})`;
+      const conflict = yield* snapshot();
+      assert.strictEqual(
+        (yield* Effect.flip(store.readThreadCustody({ threadId: first.threadId }))).reason,
+        "integrity",
+      );
+      assert.strictEqual(
+        (yield* Effect.flip(store.reservePlanningNativeIntent(planning))).reason,
+        "integrity",
+      );
+      const next = reservation(
+        operationFor("next-owner-op", "next-owner-attempt"),
+        "next-owner-attempt",
+      );
+      assert.strictEqual(
+        (yield* Effect.flip(store.reserveWorkflowNativeIntent(next))).reason,
+        "integrity",
+      );
+      assert.deepStrictEqual(yield* snapshot(), conflict);
+      yield* sql`DELETE FROM workflow_operations WHERE id = ${canonical.id}`;
+      yield* sql`UPDATE workflow_native_intent_receipts SET result_json = '{}' WHERE intent_id = ${first.intentId}`;
+      const corrupt = yield* snapshot();
+      assert.strictEqual(
+        (yield* Effect.flip(store.reservePlanningNativeIntent(planning))).reason,
+        "integrity",
+      );
+      assert.deepStrictEqual(yield* snapshot(), corrupt);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect("workflow reservation refuses a planning-owned thread and maps failed lookups", () =>
+  Effect.gen(function* () {
+    const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    yield* begin(store, session);
+    const planning = {
+      ...planningReservation(admissionInput(binding, "planning-owner")),
+      threadId: "thread",
+    };
+    yield* store.reservePlanningNativeIntent(planning);
+    const owner = {
+      ...run,
+      spec: { ...run.spec, plan: binding },
+      access: { origins: [{ ...destination, threadId: "thread" }] },
+    };
+    yield* sql`INSERT INTO workflow_runs VALUES (${owner.id}, ${binding.planId}, ${binding.revisionId}, ${binding.revisionHash}, ${binding.sourcePacketHash}, ${hash}, 'active', 0, 0, ${json(owner)})`;
+    const input = reservation(
+      operationFor("foreign-workflow", "foreign-workflow"),
+      "foreign-workflow",
+    );
+    const before = yield* sql`SELECT * FROM workflow_runs`;
+    assert.deepStrictEqual(yield* store.reserveWorkflowNativeIntent(input), {
+      kind: "rejected",
+      reason: "custody",
+    });
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_runs`, before);
+    yield* sql`DROP TABLE workflow_planning_passes`;
+    assert.strictEqual(
+      (yield* Effect.flip(store.readThreadCustody({ threadId: "empty" }))).reason,
+      "persistence",
+    );
+    assert.strictEqual(
+      (yield* Effect.flip(
+        store.reserveWorkflowNativeIntent({
+          ...input,
+          threadId: "empty",
+          draft: {
+            ...input.draft,
+            operation: {
+              ...input.draft.operation,
+              parameters: {
+                ...input.draft.operation.parameters,
+                nativeThreadId: decodeThreadId("empty"),
+              },
+            },
+          },
+        }),
+      )).reason,
+      "persistence",
+    );
+    const next = planningReservation(admissionInput(binding, "lookup-failure"));
+    assert.strictEqual(
+      (yield* Effect.flip(store.reservePlanningNativeIntent(next))).reason,
+      "storage",
+    );
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_runs`, before);
+  }).pipe(Effect.provide(layer)),
+);
+
 it.effect.each(["dispatching", "unknown"] as const)(
   "planning pause retains native %s custody",
   (state) =>
@@ -3196,6 +3618,13 @@ it.effect("planning reservation enforces plan-wide writer custody across session
       )).reason,
       "custody",
     );
+    yield* sql`UPDATE workflow_native_launch_intents SET state = 'cancelled' WHERE intent_id = ${firstIntent.intentId}`;
+    assert.strictEqual(
+      (yield* Effect.flip(
+        store.reservePlanningNativeIntent({ ...reviewInput, threadId: firstIntent.threadId }),
+      )).reason,
+      "custody",
+    );
     assert.strictEqual((yield* store.getPlanning({ sessionId: second.id })).consumed.passes, 0);
   }).pipe(Effect.provide(layer)),
 );
@@ -3327,6 +3756,13 @@ it.effect("planning reservation rejects an ambiguous legacy thread association",
     yield* begin(store, owner);
     const legacy = admissionInput(binding, "legacy-thread", owner);
     yield* store.admitPlanningPass(legacy);
+    assert.deepStrictEqual(
+      yield* store.readThreadCustody({ threadId: legacy.pass.native!.threadId }),
+      {
+        kind: "owned",
+        owner: { kind: "planning_session", planningSessionId: session.id },
+      },
+    );
     yield* sql`UPDATE workflow_planning_passes SET native_run_id = 'different-run' WHERE id = ${legacy.pass.id}`;
     const next = admissionInput(binding, "new-review", owner);
     if (next.operation.parameters.kind !== "planning_pass") return;
@@ -3345,7 +3781,7 @@ it.effect("planning reservation rejects an ambiguous legacy thread association",
     };
     assert.strictEqual(
       (yield* Effect.flip(store.reservePlanningNativeIntent(input))).reason,
-      "custody",
+      "integrity",
     );
     assert.strictEqual((yield* store.getPlanning({ sessionId: owner.id })).consumed.passes, 1);
   }).pipe(Effect.provide(layer)),
@@ -4682,6 +5118,10 @@ it.effect("legacy workflow reservation replays exactly but cannot authorize cont
     yield* sql`UPDATE workflow_runs SET record_version = 1, record_json = ${json(owner)}`;
     yield* sql`INSERT INTO workflow_native_launch_intents (intent_id, workflow_run_id, operation_id, attempt_id, item_id, charge_attempt, repair, role, environment_id, project_id, launch_command_id, thread_id, message_id, fingerprint, draft_json, generation, state, held) VALUES (${input.intentId}, ${input.runId}, ${input.operationId}, ${input.attemptId}, ${input.itemId}, 1, 0, 'implementation', ${input.environmentId}, ${input.projectId}, ${input.launchCommandId}, ${input.threadId}, ${input.messageId}, ${legacy}, ${json(input.draft)}, 0, 'reserved', 0)`;
     yield* sql`INSERT INTO workflow_native_intent_receipts VALUES (${input.draft.admission.command.commandId}, ${input.receiptId}, ${input.intentId}, ${legacy}, ${json({ intentId: input.intentId, fingerprint: legacy })})`;
+    assert.deepStrictEqual(yield* store.readThreadCustody({ threadId: input.threadId }), {
+      kind: "owned",
+      owner: { kind: "workflow_run", workflowRunId: run.id },
+    });
     const snapshot = {
       owner: yield* sql`SELECT * FROM workflow_runs`,
       intent: yield* sql`SELECT * FROM workflow_native_launch_intents`,
@@ -4726,6 +5166,10 @@ it.effect("legacy workflow reservation replays exactly but cannot authorize cont
     const paused = { ...owner, status: "paused", recordVersion: 2, controlGeneration: 1 };
     yield* sql`UPDATE workflow_runs SET status = 'paused', record_version = 2, control_generation = 1, record_json = ${json(paused)}`;
     yield* sql`UPDATE workflow_native_launch_intents SET held = 1`;
+    assert.deepStrictEqual(yield* store.readThreadCustody({ threadId: input.threadId }), {
+      kind: "owned",
+      owner: { kind: "workflow_run", workflowRunId: run.id },
+    });
     const held = {
       owner: yield* sql`SELECT * FROM workflow_runs`,
       intent: yield* sql`SELECT * FROM workflow_native_launch_intents`,

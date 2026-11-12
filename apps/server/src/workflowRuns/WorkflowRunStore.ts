@@ -397,7 +397,7 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     readonly now: string;
   };
   const validatePlanningNativeIntent = Effect.fn("WorkflowRunStore.validatePlanningNativeIntent")(
-    function* (input: PlanningNativeInput) {
+    function* (input: Omit<PlanningNativeInput, "now">) {
       const { draft } = input;
       const valid = yield* Effect.try({
         try: () => {
@@ -630,6 +630,17 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
               fingerprint,
             };
           }
+          const custody = yield* readThreadCustodyInTransaction(input.threadId).pipe(
+            Effect.mapError((error) =>
+              planningError(error.reason === "integrity" ? "integrity" : "storage"),
+            ),
+          );
+          if (
+            custody.kind === "owned" &&
+            (custody.owner.kind !== "planning_session" ||
+              custody.owner.planningSessionId !== input.sessionId)
+          )
+            return yield* planningError("custody");
           const collisions =
             yield* sql`SELECT 1 FROM workflow_command_receipts WHERE command_id IN (${command.commandId}, ${input.launchCommandId}, ${input.launchCommandId + ":initial-message"}) OR receipt_id = ${command.receiptId} OR operation_id = ${input.operationId} UNION ALL SELECT 1 FROM workflow_operations WHERE id = ${input.operationId} UNION ALL SELECT 1 FROM workflow_planning_passes WHERE id = ${input.passId} OR operation_id = ${input.operationId} UNION ALL SELECT 1 FROM workflow_native_launch_intents WHERE operation_id = ${input.operationId} OR pass_id = ${input.passId} OR launch_command_id IN (${command.commandId}, ${input.launchCommandId}, ${input.launchCommandId + ":initial-message"}) OR launch_command_id || ':initial-message' IN (${command.commandId}, ${input.launchCommandId}) OR (thread_id = ${input.threadId} AND message_id = ${input.messageId}) UNION ALL SELECT 1 FROM workflow_native_intent_receipts WHERE command_id IN (${command.commandId}, ${input.launchCommandId}, ${input.launchCommandId + ":initial-message"}) OR receipt_id = ${command.receiptId}`;
           if (collisions.length) return yield* planningError("conflict");
@@ -674,54 +685,6 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
             const writers =
               yield* sql`SELECT 1 FROM workflow_planning_passes p JOIN workflow_operations o ON o.id = p.operation_id WHERE p.plan_id = ${current.planId} AND o.status IN ('pending','claimed','unknown') AND json_extract(p.record_json, '$.role') IN ('author','repair') UNION ALL SELECT 1 FROM workflow_native_launch_intents i JOIN workflow_planning_sessions s ON s.id = i.planning_session_id WHERE s.plan_id = ${current.planId} AND i.state IN ('reserved','dispatching','unknown') AND i.role IN ('author','repair')`;
             if (writers.length) return yield* planningError("custody");
-          }
-          const foreign =
-            yield* sql`SELECT 1 FROM workflow_native_launch_intents WHERE thread_id = ${input.threadId} AND state <> 'cancelled' AND (planning_session_id IS NULL OR planning_session_id <> ${input.sessionId}) UNION ALL SELECT 1 FROM workflow_operations WHERE json_extract(record_json, '$.parameters.nativeThreadId') = ${input.threadId} UNION ALL SELECT 1 FROM workflow_planning_passes WHERE native_thread_id = ${input.threadId} AND (planning_session_id <> ${input.sessionId} OR planning_session_id IS NULL)`;
-          if (foreign.length) return yield* planningError("custody");
-          const ownPasses = yield* sql<{
-            record_json: string;
-            id: string;
-            operation_id: string;
-            native_run_id: string | null;
-            operation_json: string | null;
-            operation_owner: string | null;
-            workflow_owner: string | null;
-          }>`SELECT p.record_json, p.id, p.operation_id, p.native_run_id, o.record_json AS operation_json, o.planning_session_id AS operation_owner, o.workflow_run_id AS workflow_owner FROM workflow_planning_passes p LEFT JOIN workflow_operations o ON o.id = p.operation_id WHERE p.native_thread_id = ${input.threadId}`;
-          for (const row of ownPasses) {
-            const existing = yield* Effect.try({
-              try: () => parse(row.record_json),
-              catch: () => planningError("integrity"),
-            }).pipe(
-              Effect.flatMap(decodePlanningPassV1),
-              Effect.mapError(() => planningError("custody")),
-            );
-            if (
-              !row.operation_json ||
-              row.operation_owner !== input.sessionId ||
-              row.workflow_owner !== null
-            )
-              return yield* planningError("custody");
-            const existingOperation = yield* Effect.try({
-              try: () => parse(row.operation_json!),
-              catch: () => planningError("custody"),
-            }).pipe(
-              Effect.flatMap(decodeWorkflowOperationV1),
-              Effect.mapError(() => planningError("custody")),
-            );
-            if (
-              existingOperation.id !== row.operation_id ||
-              existingOperation.kind !== "planning_pass" ||
-              existingOperation.parameters.kind !== "planning_pass" ||
-              existingOperation.parameters.passId !== row.id ||
-              existingOperation.owner.kind !== "planning_session" ||
-              existingOperation.owner.planningSessionId !== input.sessionId ||
-              existing.id !== row.id ||
-              existing.operationId !== row.operation_id ||
-              existing.planningSessionId !== input.sessionId ||
-              existing.native?.threadId !== input.threadId ||
-              existing.native?.runId !== row.native_run_id
-            )
-              return yield* planningError("custody");
           }
           yield* validatePlanningRevision(pass);
           const updated = {
@@ -1447,7 +1410,6 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
               messageId: row.message_id,
               generation: row.generation,
               draft,
-              now: input.now,
             }).pipe(Effect.mapError(() => planningError("integrity")));
             if (validated.fingerprint !== row.fingerprint || !sameContext(value, validated.context))
               return yield* planningError("integrity");
@@ -1705,7 +1667,7 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     readonly externalFacts: Facts;
   };
   const validateWorkflowNativeIntent = Effect.fn("WorkflowRunStore.validateWorkflowNativeIntent")(
-    function* (input: WorkflowNativeInput) {
+    function* (input: Omit<WorkflowNativeInput, "externalFacts">) {
       const { draft } = input;
       const valid = yield* Effect.try({
         try: () => {
@@ -1829,6 +1791,413 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
       return { operation, ...fingerprints };
     },
   );
+  type CustodyOwner = WorkflowOperationV1["owner"];
+  type IntentRow = {
+    intent_id: string;
+    workflow_run_id: string | null;
+    planning_session_id: S["id"] | null;
+    operation_id: WorkflowOperationV1["id"];
+    attempt_id: string | null;
+    pass_id: P["id"] | null;
+    item_id: string | null;
+    charge_attempt: number | null;
+    repair: number | null;
+    role: string;
+    environment_id: string;
+    project_id: string;
+    launch_command_id: string;
+    thread_id: string;
+    message_id: string;
+    fingerprint: string;
+    draft_json: string;
+    generation: number | null;
+    state: string;
+    held: number | null;
+    boot_id: string | null;
+    worker_id: string | null;
+    native_run_id: string | null;
+    finalized_operation_id: string | null;
+  };
+  type OperationRow = {
+    id: string;
+    workflow_run_id: string | null;
+    planning_session_id: string | null;
+    kind: string;
+    fingerprint: string;
+    status: string;
+    generation: number | null;
+    held: number | null;
+    cancel_requested: number | null;
+    next_due_at: string | null;
+    record_json: string;
+  };
+  type PassRow = {
+    id: string;
+    planning_session_id: string;
+    plan_id: string;
+    revision_id: string;
+    revision_hash: string;
+    source_packet_hash: string;
+    operation_id: string;
+    native_thread_id: string | null;
+    native_run_id: string | null;
+    record_json: string;
+  };
+  const sameCustodyValue = (a: unknown, b: unknown) =>
+    WorkflowCanonicalHash.tagged("compare", a) === WorkflowCanonicalHash.tagged("compare", b);
+  const readThreadCustodyInTransaction = Effect.fn(
+    "WorkflowRunStore.readThreadCustodyInTransaction",
+  )(
+    function* (threadId: string) {
+      if (typeof threadId !== "string" || threadId.length === 0) return yield* integrity();
+      let owner: CustodyOwner | undefined;
+      const addOwner = Effect.fn("WorkflowRunStore.validateCustodyOwner")(function* (
+        candidate: CustodyOwner,
+        operation: WorkflowOperationV1,
+      ) {
+        const id =
+          candidate.kind === "workflow_run" ? candidate.workflowRunId : candidate.planningSessionId;
+        if (owner && !sameCustodyValue(owner, candidate)) return yield* integrity();
+        const rows =
+          candidate.kind === "workflow_run"
+            ? yield* sql<{
+                id: string;
+                record_json: string;
+                status: string;
+                record_version: number;
+                control_generation: number;
+                spec_hash: string;
+                plan_id: string;
+                revision_id: string;
+                revision_hash: string;
+                source_packet_hash: string;
+              }>`SELECT id, record_json, status, CASE WHEN typeof(record_version) = 'integer' AND record_version BETWEEN 0 AND 9007199254740991 THEN record_version ELSE NULL END AS record_version, CASE WHEN typeof(control_generation) = 'integer' AND control_generation BETWEEN 0 AND 9007199254740991 THEN control_generation ELSE NULL END AS control_generation, spec_hash, plan_id, revision_id, revision_hash, source_packet_hash FROM workflow_runs WHERE id = ${id}`
+            : yield* sql<{
+                id: string;
+                record_json: string;
+                status: string;
+                record_version: number;
+                control_generation: number;
+                plan_id: string;
+                predecessor_id: string | null;
+              }>`SELECT id, record_json, status, CASE WHEN typeof(record_version) = 'integer' AND record_version BETWEEN 0 AND 9007199254740991 THEN record_version ELSE NULL END AS record_version, CASE WHEN typeof(control_generation) = 'integer' AND control_generation BETWEEN 0 AND 9007199254740991 THEN control_generation ELSE NULL END AS control_generation, plan_id, predecessor_id FROM workflow_planning_sessions WHERE id = ${id}`;
+        const row = rows[0];
+        if (rows.length !== 1 || !row) return yield* integrity();
+        const raw = yield* Effect.try({ try: () => parse(row.record_json), catch: integrity });
+        if (candidate.kind === "workflow_run") {
+          const value = yield* decodeWorkflowRunV1(raw).pipe(Effect.mapError(integrity));
+          if (
+            value.id !== id ||
+            value.status !== row.status ||
+            value.recordVersion !== row.record_version ||
+            value.controlGeneration !== row.control_generation ||
+            !("spec_hash" in row) ||
+            value.spec.ref.sha256 !== row.spec_hash ||
+            !("revision_id" in row) ||
+            value.spec.plan.planId !== row.plan_id ||
+            value.spec.plan.revisionId !== row.revision_id ||
+            value.spec.plan.revisionHash !== row.revision_hash ||
+            value.spec.plan.sourcePacketHash !== row.source_packet_hash
+          )
+            return yield* integrity();
+        } else {
+          const value = yield* decodePlanningSessionV1(raw).pipe(Effect.mapError(integrity));
+          if (
+            value.id !== id ||
+            value.status !== row.status ||
+            value.recordVersion !== row.record_version ||
+            value.controlGeneration !== row.control_generation ||
+            !("predecessor_id" in row) ||
+            value.planId !== row.plan_id ||
+            (value.predecessorSessionId ?? null) !== row.predecessor_id ||
+            !sameContext(value, { actor: operation.origin, destination: operation.destination })
+          )
+            return yield* integrity();
+        }
+        owner = candidate;
+      });
+      const readOperation = Effect.fn("WorkflowRunStore.readCustodyOperation")(function* (
+        row: OperationRow,
+      ) {
+        const raw = yield* Effect.try({ try: () => parse(row.record_json), catch: integrity });
+        const operation = yield* decodeWorkflowOperationV1(raw).pipe(Effect.mapError(integrity));
+        const canonical = yield* Effect.try({
+          try: () => WorkflowCanonicalHash.operation(operation),
+          catch: integrity,
+        });
+        if (
+          operation.id !== row.id ||
+          operation.kind !== row.kind ||
+          operation.fingerprint !== row.fingerprint ||
+          operation.fingerprint !== canonical ||
+          operation.status !== row.status ||
+          operation.controlGeneration !== row.generation ||
+          row.generation === null ||
+          !Number.isSafeInteger(row.generation) ||
+          row.generation < 0 ||
+          row.held === null ||
+          row.cancel_requested === null ||
+          ![0, 1].includes(row.held) ||
+          ![0, 1].includes(row.cancel_requested) ||
+          (row.held === 1 && row.status !== "pending") ||
+          (operation.nextDueAt ?? null) !== row.next_due_at ||
+          (operation.owner.kind === "workflow_run"
+            ? operation.owner.workflowRunId !== row.workflow_run_id ||
+              row.planning_session_id !== null
+            : operation.owner.planningSessionId !== row.planning_session_id ||
+              row.workflow_run_id !== null)
+        )
+          return yield* integrity();
+        yield* addOwner(operation.owner, operation);
+        return operation;
+      });
+      const readPass = Effect.fn("WorkflowRunStore.readCustodyPass")(function* (row: PassRow) {
+        const raw = yield* Effect.try({ try: () => parse(row.record_json), catch: integrity });
+        const pass = yield* decodePlanningPassV1(raw).pipe(Effect.mapError(integrity));
+        const operations =
+          yield* sql<OperationRow>`SELECT id, workflow_run_id, planning_session_id, kind, fingerprint, status, CASE WHEN typeof(generation) = 'integer' AND generation BETWEEN 0 AND 9007199254740991 THEN generation ELSE NULL END AS generation, CASE WHEN typeof(held) = 'integer' AND held IN (0, 1) THEN held ELSE NULL END AS held, CASE WHEN typeof(cancel_requested) = 'integer' AND cancel_requested IN (0, 1) THEN cancel_requested ELSE NULL END AS cancel_requested, next_due_at, record_json FROM workflow_operations WHERE id = ${row.operation_id}`;
+        if (operations.length !== 1 || !operations[0]) return yield* integrity();
+        const operation = yield* readOperation(operations[0]);
+        const sessions = yield* sql<{
+          record_json: string;
+        }>`SELECT record_json FROM workflow_planning_sessions WHERE id = ${row.planning_session_id}`;
+        if (sessions.length !== 1 || !sessions[0]) return yield* integrity();
+        const sessionRaw = yield* Effect.try({
+          try: () => parse(sessions[0]!.record_json),
+          catch: integrity,
+        });
+        const session = yield* decodePlanningSessionV1(sessionRaw).pipe(Effect.mapError(integrity));
+        const params = operation.parameters;
+        const consistent = yield* Effect.try({
+          try: () =>
+            pass.id === row.id &&
+            pass.planningSessionId === row.planning_session_id &&
+            pass.operationId === row.operation_id &&
+            pass.binding.planId === row.plan_id &&
+            pass.binding.planId === session.planId &&
+            pass.binding.revisionId === row.revision_id &&
+            pass.binding.revisionHash === row.revision_hash &&
+            pass.binding.sourcePacketHash === row.source_packet_hash &&
+            pass.native?.threadId === row.native_thread_id &&
+            pass.native?.runId === row.native_run_id &&
+            row.native_thread_id === threadId &&
+            operation.owner.kind === "planning_session" &&
+            operation.owner.planningSessionId === row.planning_session_id &&
+            operation.kind === "planning_pass" &&
+            params.kind === "planning_pass" &&
+            params.passId === pass.id &&
+            params.role === pass.role &&
+            sameCustodyValue(params.binding, pass.binding) &&
+            sameCustodyValue(params.provider, pass.provider) &&
+            sameCustodyValue(params.limits, session.limits) &&
+            params.inputManifestHash ===
+              WorkflowCanonicalHash.tagged("t3.planning-input-manifest.v1", pass.inputManifest) &&
+            operation.status === pass.status,
+          catch: integrity,
+        });
+        if (!consistent) return yield* integrity();
+        return { pass, operation };
+      });
+      const intents =
+        yield* sql<IntentRow>`SELECT intent_id, workflow_run_id, planning_session_id, operation_id, attempt_id, pass_id, item_id, CASE WHEN typeof(charge_attempt) = 'integer' AND charge_attempt IN (0, 1) THEN charge_attempt ELSE NULL END AS charge_attempt, CASE WHEN typeof(repair) = 'integer' AND repair IN (0, 1) THEN repair ELSE NULL END AS repair, role, environment_id, project_id, launch_command_id, thread_id, message_id, fingerprint, draft_json, CASE WHEN typeof(generation) = 'integer' AND generation BETWEEN 0 AND 9007199254740991 THEN generation ELSE NULL END AS generation, state, CASE WHEN typeof(held) = 'integer' AND held IN (0, 1) THEN held ELSE NULL END AS held, boot_id, worker_id, native_run_id, finalized_operation_id FROM workflow_native_launch_intents WHERE thread_id = ${threadId}`;
+      for (const row of intents) {
+        if (
+          row.generation === null ||
+          !Number.isSafeInteger(row.generation) ||
+          row.generation < 0 ||
+          row.held === null ||
+          row.repair === null ||
+          row.charge_attempt === null ||
+          ![0, 1].includes(row.held) ||
+          ![0, 1].includes(row.repair) ||
+          !["reserved", "dispatching", "unknown", "finalized", "cancelled"].includes(row.state) ||
+          (row.held === 1 && row.state !== "reserved") ||
+          (row.boot_id === null) !== (row.worker_id === null) ||
+          (row.boot_id !== null && (!row.boot_id || !row.worker_id)) ||
+          (row.native_run_id !== null && !row.native_run_id) ||
+          ((row.state === "reserved" || row.state === "cancelled") &&
+            (row.boot_id !== null ||
+              row.worker_id !== null ||
+              row.native_run_id !== null ||
+              row.finalized_operation_id !== null)) ||
+          ((row.state === "dispatching" || row.state === "unknown") &&
+            (row.boot_id === null || row.finalized_operation_id !== null)) ||
+          (row.state === "finalized" &&
+            (!row.native_run_id || row.finalized_operation_id !== row.operation_id))
+        )
+          return yield* integrity();
+        const receipts = yield* sql<{
+          command_id: string;
+          receipt_id: string;
+          intent_id: string;
+          fingerprint: string;
+          result_json: string;
+        }>`SELECT * FROM workflow_native_intent_receipts WHERE intent_id = ${row.intent_id}`;
+        const receipt = receipts[0];
+        if (
+          receipts.length !== 1 ||
+          !receipt ||
+          !receipt.command_id ||
+          !receipt.receipt_id ||
+          receipt.intent_id !== row.intent_id ||
+          receipt.fingerprint !== row.fingerprint
+        )
+          return yield* integrity();
+        const draft = yield* Effect.try({ try: () => parse(row.draft_json), catch: integrity });
+        const resultValid = yield* Effect.try({
+          try: () =>
+            sameCustodyValue(parse(receipt.result_json), {
+              intentId: row.intent_id,
+              fingerprint: row.fingerprint,
+            }),
+          catch: integrity,
+        });
+        if (!resultValid) return yield* integrity();
+        let draftOperation: WorkflowOperationV1;
+        let draftPass: P | undefined;
+        if (
+          row.workflow_run_id !== null &&
+          row.planning_session_id === null &&
+          row.attempt_id !== null &&
+          row.item_id !== null &&
+          row.pass_id === null &&
+          row.charge_attempt === 1 &&
+          row.role === "implementation"
+        ) {
+          const validated = yield* validateWorkflowNativeIntent({
+            intentId: row.intent_id,
+            runId: row.workflow_run_id,
+            operationId: row.operation_id,
+            attemptId: row.attempt_id,
+            itemId: row.item_id,
+            repair: row.repair === 1,
+            environmentId: row.environment_id,
+            projectId: row.project_id,
+            launchCommandId: row.launch_command_id,
+            threadId: row.thread_id,
+            messageId: row.message_id,
+            receiptId: receipt.receipt_id,
+            generation: row.generation,
+            draft: draft as WorkflowNativeInput["draft"],
+          });
+          if (
+            (validated.fingerprint !== row.fingerprint &&
+              validated.legacyFingerprint !== row.fingerprint) ||
+            (draft as WorkflowNativeInput["draft"]).admission.command.commandId !==
+              receipt.command_id
+          )
+            return yield* integrity();
+          draftOperation = validated.operation;
+        } else if (
+          row.workflow_run_id === null &&
+          row.planning_session_id !== null &&
+          row.attempt_id === null &&
+          row.item_id === null &&
+          row.pass_id !== null &&
+          row.charge_attempt === 0
+        ) {
+          const validated = yield* validatePlanningNativeIntent({
+            intentId: row.intent_id,
+            sessionId: row.planning_session_id,
+            operationId: row.operation_id,
+            passId: row.pass_id,
+            role: row.role as P["role"],
+            environmentId: row.environment_id,
+            projectId: row.project_id,
+            launchCommandId: row.launch_command_id,
+            threadId: row.thread_id,
+            messageId: row.message_id,
+            generation: row.generation,
+            draft: draft as PlanningNativeInput["draft"],
+          }).pipe(Effect.mapError(integrity));
+          if (
+            validated.fingerprint !== row.fingerprint ||
+            validated.command.commandId !== receipt.command_id ||
+            validated.command.receiptId !== receipt.receipt_id ||
+            row.repair !== (row.role === "repair" ? 1 : 0)
+          )
+            return yield* integrity();
+          draftOperation = validated.operation;
+          draftPass = validated.pass;
+        } else return yield* integrity();
+        yield* addOwner(draftOperation.owner, draftOperation);
+        if (row.state === "finalized") {
+          const operations =
+            yield* sql<OperationRow>`SELECT id, workflow_run_id, planning_session_id, kind, fingerprint, status, CASE WHEN typeof(generation) = 'integer' AND generation BETWEEN 0 AND 9007199254740991 THEN generation ELSE NULL END AS generation, CASE WHEN typeof(held) = 'integer' AND held IN (0, 1) THEN held ELSE NULL END AS held, CASE WHEN typeof(cancel_requested) = 'integer' AND cancel_requested IN (0, 1) THEN cancel_requested ELSE NULL END AS cancel_requested, next_due_at, record_json FROM workflow_operations WHERE id = ${row.operation_id}`;
+          if (operations.length !== 1 || !operations[0]) return yield* integrity();
+          const operation = yield* readOperation(operations[0]);
+          const immutableOperation = (value: WorkflowOperationV1) => {
+            const {
+              fingerprint: _fingerprint,
+              controlGeneration: _generation,
+              status: _status,
+              claim: _claim,
+              outcome: _outcome,
+              nextDueAt: _nextDueAt,
+              ...base
+            } = value;
+            if (base.parameters.kind === "stage_launch") {
+              const { nativeRunId: _nativeRunId, ...parameters } = base.parameters;
+              return { ...base, parameters };
+            }
+            return base;
+          };
+          const matches = yield* Effect.try({
+            try: () =>
+              sameCustodyValue(immutableOperation(operation), immutableOperation(draftOperation)),
+            catch: integrity,
+          });
+          if (!matches) return yield* integrity();
+          if (
+            operation.parameters.kind === "stage_launch" &&
+            (operation.parameters.nativeThreadId !== threadId ||
+              operation.parameters.nativeRunId !== row.native_run_id)
+          )
+            return yield* integrity();
+          if (draftPass) {
+            const passes =
+              yield* sql<PassRow>`SELECT * FROM workflow_planning_passes WHERE id = ${row.pass_id}`;
+            if (passes.length !== 1 || !passes[0]) return yield* integrity();
+            const linked = yield* readPass(passes[0]);
+            const immutablePass = (value: P) => {
+              const { native: _native, status: _status, report: _report, ...base } = value;
+              return base;
+            };
+            const passMatches = yield* Effect.try({
+              try: () => sameCustodyValue(immutablePass(linked.pass), immutablePass(draftPass)),
+              catch: integrity,
+            });
+            if (!passMatches || linked.pass.native?.runId !== row.native_run_id)
+              return yield* integrity();
+          }
+        }
+      }
+      const operations =
+        yield* sql<OperationRow>`SELECT id, workflow_run_id, planning_session_id, kind, fingerprint, status, CASE WHEN typeof(generation) = 'integer' AND generation BETWEEN 0 AND 9007199254740991 THEN generation ELSE NULL END AS generation, CASE WHEN typeof(held) = 'integer' AND held IN (0, 1) THEN held ELSE NULL END AS held, CASE WHEN typeof(cancel_requested) = 'integer' AND cancel_requested IN (0, 1) THEN cancel_requested ELSE NULL END AS cancel_requested, next_due_at, record_json FROM workflow_operations WHERE CASE WHEN json_valid(record_json) THEN json_extract(record_json, '$.parameters.nativeThreadId') END = ${threadId}`;
+      for (const row of operations) {
+        const operation = yield* readOperation(row);
+        if (
+          (operation.parameters.kind !== "stage_launch" &&
+            operation.parameters.kind !== "supervision") ||
+          operation.parameters.nativeThreadId !== threadId ||
+          operation.owner.kind !== "workflow_run"
+        )
+          return yield* integrity();
+      }
+      const passes =
+        yield* sql<PassRow>`SELECT * FROM workflow_planning_passes WHERE native_thread_id = ${threadId}`;
+      for (const row of passes) yield* readPass(row);
+      return owner ? { kind: "owned" as const, owner } : { kind: "ordinary" as const };
+    },
+    Effect.mapError((error) =>
+      isStoreError(error) ? error : new WorkflowRunStoreError({ reason: "persistence" }),
+    ),
+  );
+  const readThreadCustody = Effect.fn("WorkflowRunStore.readThreadCustody")(function* (input: {
+    readonly threadId: string;
+  }) {
+    return yield* inTransaction(readThreadCustodyInTransaction(input.threadId));
+  });
   const reserveWorkflowNativeIntent = Effect.fn("WorkflowRunStore.reserveWorkflowNativeIntent")(
     function* (input: WorkflowNativeInput) {
       const work = Effect.gen(function* () {
@@ -1910,38 +2279,15 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
             fingerprint: replayFingerprint,
           };
         }
+        const custody = yield* readThreadCustodyInTransaction(input.threadId);
+        if (
+          custody.kind === "owned" &&
+          (custody.owner.kind !== "workflow_run" || custody.owner.workflowRunId !== input.runId)
+        )
+          return { kind: "rejected" as const, reason: "custody" as const };
         const collisions =
           yield* sql`SELECT 1 FROM workflow_command_receipts WHERE command_id IN (${draft.admission.command.commandId}, ${input.launchCommandId}, ${input.launchCommandId + ":initial-message"}) OR receipt_id = ${input.receiptId} OR operation_id = ${input.operationId} UNION ALL SELECT 1 FROM workflow_operations WHERE id = ${input.operationId} UNION ALL SELECT 1 FROM workflow_attempts WHERE id = ${input.attemptId} UNION ALL SELECT 1 FROM workflow_native_launch_intents WHERE operation_id = ${input.operationId} OR (charge_attempt = 1 AND attempt_id = ${input.attemptId}) OR launch_command_id IN (${input.launchCommandId}, ${draft.admission.command.commandId}, ${input.launchCommandId + ":initial-message"}) OR launch_command_id || ':initial-message' IN (${input.launchCommandId}, ${draft.admission.command.commandId}) OR (thread_id = ${input.threadId} AND message_id = ${input.messageId}) UNION ALL SELECT 1 FROM workflow_native_intent_receipts WHERE command_id IN (${input.launchCommandId}, ${input.launchCommandId + ":initial-message"})`;
         if (collisions.length) return yield* integrity();
-        const foreignIntents =
-          yield* sql`SELECT 1 FROM workflow_native_launch_intents WHERE thread_id = ${input.threadId} AND state <> 'cancelled' AND (workflow_run_id IS NULL OR workflow_run_id <> ${input.runId})`;
-        if (foreignIntents.length) return { kind: "rejected" as const, reason: "custody" as const };
-        const nativeOperations = yield* sql<{
-          id: string;
-          kind: string;
-          workflow_run_id: string | null;
-          planning_session_id: string | null;
-          record_json: string;
-        }>`SELECT id, kind, workflow_run_id, planning_session_id, record_json FROM workflow_operations WHERE json_extract(record_json, '$.parameters.nativeThreadId') = ${input.threadId}`;
-        for (const row of nativeOperations) {
-          const op = yield* Effect.try({
-            try: () => parse(row.record_json),
-            catch: integrity,
-          }).pipe(Effect.flatMap(decodeWorkflowOperationV1), Effect.mapError(integrity));
-          if (
-            row.workflow_run_id !== input.runId ||
-            row.planning_session_id !== null ||
-            op.id !== row.id ||
-            op.kind !== row.kind ||
-            (op.parameters.kind !== "stage_launch" && op.parameters.kind !== "supervision") ||
-            op.owner.kind !== "workflow_run" ||
-            op.owner.workflowRunId !== row.workflow_run_id
-          )
-            return { kind: "rejected" as const, reason: "custody" as const };
-        }
-        const passes =
-          yield* sql`SELECT 1 FROM workflow_planning_passes WHERE native_thread_id = ${input.threadId}`;
-        if (passes.length) return { kind: "rejected" as const, reason: "custody" as const };
         const rows = yield* sql<{
           record_json: string;
           record_version: number;
@@ -2448,7 +2794,6 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
             receiptId: receipt.receipt_id,
             generation: row.generation,
             draft,
-            externalFacts: input.externalFacts,
           });
           const matches = yield* Effect.try({
             try: () =>
@@ -3060,6 +3405,7 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     commitTransition,
     reserveWorkflowNativeIntent,
     reservePlanningNativeIntent,
+    readThreadCustody,
     subscribeChanges,
     listPending,
     claim,
