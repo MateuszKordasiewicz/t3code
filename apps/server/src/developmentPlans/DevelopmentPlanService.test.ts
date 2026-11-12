@@ -458,4 +458,200 @@ describe("DevelopmentPlanService", () => {
       }),
     ),
   );
+  it.effect("imports V1 bytes and round-trips V2 native data into a fresh database", () =>
+    Effect.gen(function* () {
+      const grants = yield* Ref.make(allGrants());
+      const exported = yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* setup;
+          const service = yield* Service.DevelopmentPlanService;
+          const value = yield* fixture;
+          yield* service.create(value, context);
+          const original = yield* service.export({ planId: "plan" }, context);
+          const { native: _native, ...projection } = original;
+          const v1 = { ...projection, schemaVersion: 1 };
+          const bytes = new TextEncoder().encode(JSON.stringify(v1, null, 2));
+          const mismatch = yield* Effect.flip(
+            service.import(
+              {
+                format: "v2",
+                bytes: new TextEncoder().encode(json(original)),
+                planId: "other",
+                revisionId: "revision",
+                title: "Example",
+                commandId: "mismatch",
+              },
+              context,
+            ),
+          );
+          expect(mismatch.reason).toBe("invalid");
+          return { original, v1, bytes };
+        }).pipe(Effect.provide(layer(":memory:", grants))),
+      );
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* setup;
+          const service = yield* Service.DevelopmentPlanService;
+          yield* service.import(
+            {
+              format: "v1",
+              bytes: exported.bytes,
+              planId: "plan",
+              revisionId: "revision",
+              title: "Example",
+              commandId: "v1",
+            },
+            context,
+          );
+          const v2 = yield* service.export({ planId: "plan" }, context);
+          const { native, ...projection } = v2;
+          expect({ ...projection, schemaVersion: 1 }).toEqual(exported.v1);
+          expect(native.revision.legacyDocument?.bytesBase64).toBe(
+            Buffer.from(exported.bytes).toString("base64"),
+          );
+        }).pipe(Effect.provide(layer(":memory:", grants))),
+      );
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* setup;
+          const service = yield* Service.DevelopmentPlanService;
+          yield* service.import(
+            {
+              format: "v2",
+              bytes: new TextEncoder().encode(json(exported.original)),
+              planId: "plan",
+              revisionId: "revision",
+              title: "Example",
+              commandId: "v2",
+            },
+            context,
+          );
+          const actual = yield* service.get({ planId: "plan" }, context);
+          expect({ revision: actual.revision, sourcePacket: actual.sourcePacket }).toEqual(
+            exported.original.native,
+          );
+        }).pipe(Effect.provide(layer(":memory:", grants))),
+      );
+    }),
+  );
+  it.effect(
+    "imports exact markdown and validated plan artifacts without extracting requirements",
+    () =>
+      Effect.gen(function* () {
+        const grants = yield* Ref.make(allGrants());
+        yield* Effect.gen(function* () {
+          yield* setup;
+          const service = yield* Service.DevelopmentPlanService;
+          const bytes = new TextEncoder().encode("# Hello\r\nWorld\n");
+          const input = {
+            format: "markdown" as const,
+            bytes,
+            planId: "plan",
+            revisionId: "revision",
+            title: "Title",
+            commandId: "create",
+            documentId: "doc",
+          };
+          const markdownImport = yield* service.import(input, context);
+          yield* TestClock.adjust("1 hour");
+          expect(yield* service.import(input, context)).toEqual({
+            kind: "replay",
+            plan: markdownImport.plan,
+          });
+          const result = yield* service.get({ planId: "plan" }, context);
+          expect(result.sourcePacket.sources[0]).toMatchObject({
+            documentId: "doc",
+            bytesBase64: Buffer.from(bytes).toString("base64"),
+            byteLength: bytes.length,
+            sha256: "19a70ac56edc83e42014282da204802c43f103cf775616b50a5cdb8f7dbb1a4f",
+          });
+          expect(result.revision.requirements).toEqual([]);
+          expect(result.revision.unmappedMaterial).toEqual([
+            { sourceId: "source-1", description: "Imported markdown; requirements not extracted" },
+          ]);
+          for (const raw of ["{", "{}", "\xff"]) {
+            expect(
+              (yield* Effect.flip(
+                service.import(
+                  { ...input, format: "plan-artifact", bytes: new TextEncoder().encode(raw) },
+                  context,
+                ),
+              )).reason,
+            ).toBe("invalid");
+          }
+          expect(
+            (yield* Effect.flip(
+              service.import(
+                {
+                  format: "markdown",
+                  bytes,
+                  planId: "missing",
+                  revisionId: "revision",
+                  title: "Title",
+                  commandId: "missing",
+                },
+                context,
+              ),
+            )).reason,
+          ).toBe("invalid");
+          const artifact = {
+            id: "artifact",
+            threadId: "thread",
+            runId: null,
+            nodeId: "node",
+            status: "draft",
+            kind: "proposed_plan",
+            markdown: "Plan",
+          };
+          const artifactBytes = new TextEncoder().encode(JSON.stringify(artifact, null, 2));
+          yield* service.import(
+            {
+              ...input,
+              format: "plan-artifact",
+              bytes: artifactBytes,
+              planId: "artifact-plan",
+              revisionId: "artifact-revision",
+              commandId: "artifact",
+            },
+            context,
+          );
+          const imported = yield* service.get({ planId: "artifact-plan" }, context);
+          expect(imported.sourcePacket.sources[0]?.bytesBase64).toBe(
+            Buffer.from(artifactBytes).toString("base64"),
+          );
+          expect(imported.revision.requirements).toEqual([]);
+        }).pipe(Effect.provide(layer(":memory:", grants)));
+      }),
+  );
+  it.effect("checks destination before import and export and denies export after revocation", () =>
+    Effect.gen(function* () {
+      const input = {
+        format: "markdown" as const,
+        bytes: new Uint8Array(),
+        planId: "plan",
+        revisionId: "revision",
+        title: "Title",
+        commandId: "create",
+        documentId: "doc",
+      };
+      yield* Effect.gen(function* () {
+        const service = yield* Service.DevelopmentPlanService;
+        expect((yield* Effect.flip(service.import(input, context))).reason).toBe("unauthorized");
+        expect((yield* Effect.flip(service.export({ planId: "missing" }, context))).reason).toBe(
+          "unauthorized",
+        );
+      }).pipe(Effect.provide(deniedLayer));
+      const grants = yield* Ref.make(allGrants());
+      yield* Effect.gen(function* () {
+        yield* setup;
+        const service = yield* Service.DevelopmentPlanService;
+        const value = yield* fixture;
+        yield* service.create(value, context);
+        yield* Ref.set(grants, new Set(["env|project|"]));
+        expect((yield* Effect.flip(service.export({ planId: "plan" }, context))).reason).toBe(
+          "unauthorized",
+        );
+      }).pipe(Effect.provide(layer(":memory:", grants)));
+    }),
+  );
 });

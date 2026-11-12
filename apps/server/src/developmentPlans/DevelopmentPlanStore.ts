@@ -53,6 +53,8 @@ type Create = Content & {
   readonly environmentId: string;
   readonly projectId: string;
   readonly title: string;
+  // An import is fingerprinted by its request, not by content derived at a moment in time.
+  readonly fingerprintInput?: object;
 };
 type Append = Content & { readonly expectedVersion: number };
 type Link = {
@@ -184,7 +186,7 @@ const make = Effect.gen(function* () {
     context: MutationContext,
   ) {
     const envelope = yield* validate(input);
-    const hash = yield* fingerprint("create", input, context);
+    const hash = yield* fingerprint("create", input.fingerprintInput ?? input, context);
     return yield* inTransaction(
       Effect.gen(function* () {
         const prior = yield* receipt(input.commandId, input.planId, hash);

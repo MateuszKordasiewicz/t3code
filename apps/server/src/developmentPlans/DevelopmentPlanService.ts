@@ -1,9 +1,14 @@
 // @effect-diagnostics deterministicKeys:off -- The authorization port key is fixed by the integration contract.
-import type {
+import {
+  decodeDevelopmentPlanDocumentV2,
+  upgradeDevelopmentPlanDocumentV1,
+  OrchestrationV2PlanArtifact,
   DevelopmentPlanRevisionV1,
-  PlanningPassV1,
+  type PlanningPassV1,
   RevisionEnvelope,
 } from "@t3tools/contracts";
+import * as Digest from "effect/crypto/Digest";
+import * as Base64 from "effect/encoding/Base64";
 import * as DateTime from "effect/DateTime";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -118,8 +123,25 @@ const mapStore = (error: Store.DevelopmentPlanStoreError) =>
     ...(error.currentVersion === undefined ? {} : { currentVersion: error.currentVersion }),
   });
 
+const parseBytes = (bytes: Uint8Array): unknown =>
+  JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+const decodeArtifact = Schema.decodeUnknownEffect(OrchestrationV2PlanArtifact);
+const decodeRevision = Schema.decodeUnknownEffect(DevelopmentPlanRevisionV1);
+const decodePacket = Schema.decodeUnknownEffect(RevisionEnvelope.fields.sourcePacket);
+
+type Import = {
+  readonly format: "v1" | "v2" | "markdown" | "plan-artifact";
+  readonly bytes: Uint8Array;
+  readonly planId: string;
+  readonly revisionId: string;
+  readonly title: string;
+  readonly commandId: string;
+  readonly documentId?: string;
+};
+
 const make = Effect.gen(function* () {
   const store = yield* Store.DevelopmentPlanStore;
+  const digest = yield* Digest.Digest;
   const authorization = yield* DevelopmentPlanAuthorization;
   const passReader = yield* DevelopmentPlanPassReader;
   const attestation = yield* DevelopmentPlanReviewAttestation;
@@ -137,6 +159,134 @@ const make = Effect.gen(function* () {
     return yield* store
       .create({ ...input, ...context.destination, createdAt }, context)
       .pipe(Effect.mapError(mapStore));
+  });
+  const importPlan = Effect.fn("DevelopmentPlanService.import")(function* (
+    input: Import,
+    context: RequestContext,
+  ) {
+    yield* precheck(context, "create");
+    const invalid = () => new DevelopmentPlanServiceError({ reason: "invalid" });
+    let revision: DevelopmentPlanRevisionV1;
+    let packet: RevisionEnvelope["sourcePacket"];
+    if (input.format === "v1" || input.format === "v2") {
+      const document =
+        input.format === "v1"
+          ? yield* upgradeDevelopmentPlanDocumentV1({
+              bytes: input.bytes,
+              hashSourcePacket: DevelopmentPlanHash.sourcePacket,
+            }).pipe(Effect.provideService(Digest.Digest, digest), Effect.mapError(invalid))
+          : yield* Effect.try({ try: () => parseBytes(input.bytes), catch: invalid }).pipe(
+              Effect.flatMap(decodeDevelopmentPlanDocumentV2),
+              Effect.provideService(Digest.Digest, digest),
+              Effect.mapError(invalid),
+            );
+      if (
+        document.planId !== input.planId ||
+        document.revisionId !== input.revisionId ||
+        document.native.revision.sourcePacketHash !==
+          DevelopmentPlanHash.sourcePacket(document.native.sourcePacket)
+      )
+        return yield* invalid();
+      revision = document.native.revision;
+      packet = document.native.sourcePacket;
+    } else {
+      if (input.documentId === undefined) return yield* invalid();
+      if (input.format === "plan-artifact") {
+        yield* Effect.try({ try: () => parseBytes(input.bytes), catch: invalid }).pipe(
+          Effect.flatMap((value) => decodeArtifact(value, { onExcessProperty: "error" })),
+          Effect.mapError(invalid),
+        );
+      }
+      const hash = yield* digest.digest(Digest.sha256, input.bytes).pipe(Effect.mapError(invalid));
+      packet = yield* decodePacket({
+        schemaVersion: 1,
+        sources: [
+          {
+            id: "source-1",
+            kind: "imported_document",
+            ...context.destination,
+            documentId: input.documentId,
+            capturedAt: DateTime.formatIso(yield* DateTime.now),
+            attribution: context.actor.id,
+            bytesBase64: Base64.encode(input.bytes),
+            byteLength: input.bytes.length,
+            sha256: Array.from(hash, (byte) => byte.toString(16).padStart(2, "0")).join(""),
+          },
+        ],
+        statements: [],
+        selectionLimitations: [],
+        access: { origins: [context.destination] },
+      }).pipe(Effect.mapError(invalid));
+      revision = yield* decodeRevision({
+        schemaVersion: 1,
+        planId: input.planId,
+        sourcePacketHash: DevelopmentPlanHash.sourcePacket(packet),
+        brief: input.title,
+        requirements: [],
+        decisions: [],
+        questions: [],
+        assumptions: [],
+        approach: [],
+        workItems: [],
+        access: packet.access,
+        coverageReceipts: [],
+        unmappedMaterial: [
+          {
+            sourceId: "source-1",
+            description: `Imported ${input.format === "markdown" ? "markdown" : "plan artifact"}; requirements not extracted`,
+          },
+        ],
+      }).pipe(Effect.mapError(invalid));
+    }
+    return yield* create(
+      {
+        planId: input.planId,
+        revisionId: input.revisionId,
+        title: input.title,
+        commandId: input.commandId,
+        revision,
+        packet,
+        fingerprintInput: {
+          import: input.format,
+          bytesBase64: Base64.encode(input.bytes),
+          planId: input.planId,
+          revisionId: input.revisionId,
+          title: input.title,
+          commandId: input.commandId,
+          ...(input.documentId === undefined ? {} : { documentId: input.documentId }),
+        },
+      },
+      context,
+    );
+  });
+  const exportPlan = Effect.fn("DevelopmentPlanService.export")(function* (
+    input: Parameters<StoreService["get"]>[0],
+    context: RequestContext,
+  ) {
+    const result = yield* get(input, context);
+    const { plan, revision, sourcePacket, revisionId } = result;
+    return yield* decodeDevelopmentPlanDocumentV2({
+      schemaVersion: 2,
+      planId: plan.planId,
+      revisionId,
+      environmentId: plan.environmentId,
+      projectId: plan.projectId,
+      title: plan.title,
+      linkedThreadIds: plan.linkedThreadIds,
+      brief: revision.brief,
+      sources: sourcePacket.sources,
+      sourceStatements: sourcePacket.statements,
+      requirements: revision.requirements.map(({ id, text, sourceStatementIds, criteria }) => ({
+        id,
+        text,
+        sourceStatementIds,
+        criteria: criteria.map(({ id, text }) => ({ id, text })),
+      })),
+      native: { revision, sourcePacket },
+    }).pipe(
+      Effect.provideService(Digest.Digest, digest),
+      Effect.mapError(() => new DevelopmentPlanServiceError({ reason: "integrity" })),
+    );
   });
   const get = Effect.fn("DevelopmentPlanService.get")(function* (
     input: Parameters<StoreService["get"]>[0],
@@ -273,7 +423,18 @@ const make = Effect.gen(function* () {
     );
     return yield* store.unlinkThread(input, context).pipe(Effect.mapError(mapStore));
   });
-  return { create, get, getObject, list, updateDraft, linkThread, unlinkThread, validateCoverage };
+  return {
+    create,
+    import: importPlan,
+    export: exportPlan,
+    get,
+    getObject,
+    list,
+    updateDraft,
+    linkThread,
+    unlinkThread,
+    validateCoverage,
+  };
 });
 export class DevelopmentPlanService extends Context.Service<
   DevelopmentPlanService,
