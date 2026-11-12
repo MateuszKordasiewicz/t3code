@@ -108,6 +108,8 @@ export class WorkTaskError extends Schema.TaggedError<WorkTaskError>()("WorkTask
     "not_found",
     "invalid_definition",
     "revision_conflict",
+    "invalid_page_token",
+    "stale_page_token",
     "invalid_state",
     "feature_disabled",
     "unsupported",
@@ -700,8 +702,7 @@ const completionIdentity = {
   observedWorkSequence: NonNegativeInt,
 };
 
-// Staged independently of the application event and persistence unions until atomic registration.
-export const WorkTaskEvent = Schema.Union([
+const WorkTaskNonReviewRequestedEvent = Schema.Union([
   Schema.Struct({
     ...eventBase,
     type: Schema.Literal("task.created"),
@@ -781,22 +782,6 @@ export const WorkTaskEvent = Schema.Union([
   Schema.Struct({ ...eventBase, type: Schema.Literal("task.archived"), archived: Schema.Boolean }),
   Schema.Struct({
     ...eventBase,
-    type: Schema.Literal("task.action-review-requested"),
-    attribution: Schema.Struct({ type: Schema.Literal("server") }),
-    review: WorkTaskActionReview.mapFields((fields) => ({
-      ...fields,
-      state: Schema.Struct({ type: Schema.Literal("pending") }),
-    })),
-  }).check(
-    Schema.makeFilter(
-      (event) =>
-        event.taskId === event.review.taskId &&
-        event.definitionRevision === event.review.definitionRevision &&
-        event.actionPolicyRevision === event.review.actionPolicyRevision,
-    ),
-  ),
-  Schema.Struct({
-    ...eventBase,
     type: Schema.Literal("task.action-review-result-recorded"),
     attribution: Schema.Struct({ type: Schema.Literal("server") }),
     reviewId,
@@ -810,7 +795,107 @@ export const WorkTaskEvent = Schema.Union([
     feedback: Schema.optional(shortText),
   }),
 ]);
+const WorkTaskReviewRequestedEvent = Schema.Struct({
+  ...eventBase,
+  type: Schema.Literal("task.action-review-requested"),
+  attribution: Schema.Struct({ type: Schema.Literal("server") }),
+  review: WorkTaskActionReview.mapFields((fields) => ({
+    ...fields,
+    state: Schema.Struct({ type: Schema.Literal("pending") }),
+  })),
+}).check(
+  Schema.makeFilter(
+    (event) =>
+      event.taskId === event.review.taskId &&
+      event.definitionRevision === event.review.definitionRevision &&
+      event.actionPolicyRevision === event.review.actionPolicyRevision,
+  ),
+);
+
+// Staged independently of the application event and persistence unions until atomic registration.
+export const WorkTaskEvent = Schema.Union([
+  WorkTaskNonReviewRequestedEvent,
+  WorkTaskReviewRequestedEvent,
+]);
 export type WorkTaskEvent = typeof WorkTaskEvent.Type;
+
+const persistedTime = IsoDateTime.check(
+  Schema.makeFilter(
+    (value) => {
+      const match =
+        /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(
+          value,
+        );
+      if (!match || !Number.isFinite(Date.parse(value))) return false;
+      const [, year, month, day, hour, minute, second, zone] = match;
+      if (!year || !month || !day || !hour || !minute || !second || !zone) return false;
+      const y = Number(year);
+      const m = Number(month);
+      const leap = y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0);
+      const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+      return (
+        m >= 1 &&
+        m <= 12 &&
+        Number(day) >= 1 &&
+        Number(day) <= (days[m - 1] ?? 0) &&
+        Number(hour) <= 23 &&
+        Number(minute) <= 59 &&
+        Number(second) <= 59 &&
+        (zone === "Z" || (Number(zone.slice(1, 3)) <= 23 && Number(zone.slice(4, 6)) <= 59))
+      );
+    },
+    { expected: "a valid ISO timestamp" },
+  ),
+);
+
+export const WorkTaskPersistedEventContext = Schema.Struct({
+  sequence: NonNegativeInt,
+  eventId: EventId,
+  occurredAt: persistedTime,
+  commandId: Schema.NullOr(CommandId),
+});
+export type WorkTaskPersistedEventContext = typeof WorkTaskPersistedEventContext.Type;
+
+const publishedReview = WorkTaskReviewRequestedEvent.mapFields((fields) => ({
+  ...fields,
+  review: fields.review.mapFields((reviewFields) => ({
+    ...reviewFields,
+    runtimeRequestId: shortText,
+    createdAt: persistedTime,
+  })),
+}));
+const persistedEvent = Schema.Union([
+  Schema.Struct({ event: WorkTaskNonReviewRequestedEvent, context: WorkTaskPersistedEventContext }),
+  Schema.Struct({
+    event: publishedReview,
+    context: WorkTaskPersistedEventContext.mapFields((fields) => ({
+      ...fields,
+      commandId: reviewCommandId,
+    })),
+  }),
+]);
+export const WorkTaskPersistedEvent = persistedEvent.check(
+  Schema.makeFilter(({ event, context }) => {
+    if (event.id !== context.eventId || event.occurredAt !== context.occurredAt) return false;
+    if (event.type !== "task.action-review-requested") return true;
+    return (
+      event.taskId === event.review.taskId &&
+      event.definitionRevision === event.review.definitionRevision &&
+      event.actionPolicyRevision === event.review.actionPolicyRevision &&
+      event.review.createdSequence === context.sequence &&
+      Date.parse(event.review.createdAt) === Date.parse(context.occurredAt) &&
+      (event.review.createdAt
+        .match(/\.(\d+)/)?.[1]
+        ?.slice(3)
+        .replace(/0+$/, "") ?? "") ===
+        (context.occurredAt
+          .match(/\.(\d+)/)?.[1]
+          ?.slice(3)
+          .replace(/0+$/, "") ?? "")
+    );
+  }),
+);
+export type WorkTaskPersistedEvent = typeof WorkTaskPersistedEvent.Type;
 
 export const WorkTaskReceipt = Schema.Struct({
   commandId: CommandId,
