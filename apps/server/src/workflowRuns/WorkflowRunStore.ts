@@ -632,6 +632,179 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     if (result.kind === "claimed") yield* notify;
     return result;
   });
+  const readRecovery = Effect.fn("WorkflowRunStore.readRecovery")(function* (operationId: string) {
+    return yield* inTransaction(
+      Effect.gen(function* () {
+        const rows = yield* sql<{
+          record_json: string;
+          fingerprint: string;
+          status: string;
+          generation: number;
+          workflow_run_id: string | null;
+          planning_session_id: string | null;
+        }>`SELECT record_json, fingerprint, status, generation, workflow_run_id, planning_session_id FROM workflow_operations WHERE id = ${operationId}`;
+        const row = rows[0];
+        if (!row) return undefined;
+        const operation = yield* Effect.try({
+          try: () => parse(row.record_json),
+          catch: integrity,
+        }).pipe(Effect.flatMap(decodeWorkflowOperationV1), Effect.mapError(integrity));
+        if (
+          operation.id !== operationId ||
+          operation.fingerprint !== row.fingerprint ||
+          operation.status !== row.status ||
+          operation.controlGeneration !== row.generation ||
+          (operation.owner.kind === "workflow_run"
+            ? operation.owner.workflowRunId !== row.workflow_run_id ||
+              row.planning_session_id !== null
+            : operation.owner.planningSessionId !== row.planning_session_id ||
+              row.workflow_run_id !== null)
+        )
+          return yield* integrity();
+        const owners =
+          operation.owner.kind === "workflow_run"
+            ? yield* sql<{
+                record_json: string;
+                record_version: number;
+                control_generation: number;
+                status: string;
+              }>`SELECT record_json, record_version, control_generation, status FROM workflow_runs WHERE id = ${operation.owner.workflowRunId}`
+            : yield* sql<{
+                record_json: string;
+                record_version: number;
+                control_generation: number;
+                status: string;
+              }>`SELECT record_json, record_version, control_generation, status FROM workflow_planning_sessions WHERE id = ${operation.owner.planningSessionId}`;
+        const rowOwner = owners[0];
+        if (!rowOwner) return yield* integrity();
+        const rawOwner = yield* Effect.try({
+          try: () => parse(rowOwner.record_json),
+          catch: integrity,
+        });
+        const owner =
+          operation.owner.kind === "workflow_run"
+            ? yield* decodeWorkflowRunV1(rawOwner).pipe(Effect.mapError(integrity))
+            : yield* decodePlanningSessionV1(rawOwner).pipe(Effect.mapError(integrity));
+        if (
+          owner.id !==
+            (operation.owner.kind === "workflow_run"
+              ? operation.owner.workflowRunId
+              : operation.owner.planningSessionId) ||
+          owner.recordVersion !== rowOwner.record_version ||
+          owner.controlGeneration !== rowOwner.control_generation ||
+          owner.status !== rowOwner.status
+        )
+          return yield* integrity();
+        const pass =
+          operation.owner.kind === "planning_session"
+            ? (yield* sql<{
+                native_thread_id: string | null;
+                native_run_id: string | null;
+              }>`SELECT native_thread_id, native_run_id FROM workflow_planning_passes WHERE operation_id = ${operation.id}`)[0]
+            : undefined;
+        const params = operation.parameters;
+        const native =
+          params.kind === "stage_launch" || params.kind === "supervision"
+            ? { threadId: params.nativeThreadId, runId: params.nativeRunId }
+            : pass?.native_thread_id && pass.native_run_id
+              ? { threadId: pass.native_thread_id, runId: pass.native_run_id }
+              : undefined;
+        return { operation, owner, native };
+      }),
+    );
+  });
+  const compareAndApplyRecovery = Effect.fn("WorkflowRunStore.compareAndApplyRecovery")(
+    function* (input: {
+      readonly operationId: string;
+      readonly expectedOwnerVersion: number;
+      readonly expectedGeneration: number;
+      readonly expectedFingerprint: string;
+      readonly observed: {
+        readonly operation: WorkflowOperationV1;
+        readonly ownerGeneration: number;
+        readonly native: { readonly threadId: string; readonly runId: string } | undefined;
+        readonly kind: "active" | "unknown" | "settled";
+        readonly outcome?: NonNullable<WorkflowOperationV1["outcome"]>;
+      };
+    }) {
+      const result = yield* inTransaction(
+        Effect.gen(function* () {
+          const snapshot = yield* readRecovery(input.operationId);
+          if (!snapshot) return { kind: "stale" as const };
+          const { operation, owner } = snapshot;
+          if (
+            owner.recordVersion !== input.expectedOwnerVersion ||
+            owner.controlGeneration !== input.observed.ownerGeneration ||
+            encode(snapshot.native) !== encode(input.observed.native) ||
+            operation.controlGeneration !== input.expectedGeneration ||
+            operation.fingerprint !== input.expectedFingerprint ||
+            encode(operation.owner) !== encode(input.observed.operation.owner) ||
+            encode(operation.claim) !== encode(input.observed.operation.claim) ||
+            !operation.claim ||
+            operation.claim.generation !== input.expectedGeneration ||
+            encode(operation) !== encode(input.observed.operation)
+          )
+            return { kind: "stale" as const };
+          if (operation.status !== "claimed" && operation.status !== "unknown")
+            return { kind: "replay" as const };
+          if (input.observed.kind === "active" && operation.status === "claimed")
+            return { kind: "replay" as const };
+          const outcome =
+            input.observed.kind === "unknown"
+              ? { kind: "unknown" as const, summary: "Native outcome unknown", evidence: [] }
+              : input.observed.outcome;
+          if (
+            input.observed.kind === "settled" &&
+            (!outcome ||
+              (outcome.kind !== "succeeded" &&
+                outcome.kind !== "failed" &&
+                outcome.kind !== "cancelled"))
+          )
+            return yield* integrity();
+          const { outcome: _outcome, ...base } = operation;
+          const status =
+            input.observed.kind === "active"
+              ? "claimed"
+              : input.observed.kind === "unknown"
+                ? "unknown"
+                : outcome?.kind === "cancelled"
+                  ? "cancelled"
+                  : "settled";
+          const changed = yield* decodeWorkflowOperationV1({
+            ...base,
+            status,
+            ...(outcome && status !== "claimed" ? { outcome } : {}),
+          }).pipe(Effect.mapError(integrity));
+          const ownerChange =
+            input.observed.kind === "unknown" &&
+            (owner.status === "active" || owner.status === "pausing" || owner.status === "paused");
+          if (encode(changed) === encode(operation) && !ownerChange)
+            return { kind: "replay" as const };
+          const updated = yield* sql<{
+            id: string;
+          }>`UPDATE workflow_operations SET status = ${status}, record_json = ${encode(changed)} WHERE id = ${operation.id} AND record_json = ${encode(operation)} RETURNING id`;
+          if (updated.length !== 1) return yield* stale();
+          if (ownerChange) {
+            const changedOwner = {
+              ...owner,
+              status: "needs_attention" as const,
+              recordVersion: owner.recordVersion + 1,
+            };
+            if (operation.owner.kind === "workflow_run") {
+              yield* decodeWorkflowRunV1(changedOwner).pipe(Effect.mapError(integrity));
+              yield* sql`UPDATE workflow_runs SET status = 'needs_attention', record_version = ${changedOwner.recordVersion}, record_json = ${encode(changedOwner)} WHERE id = ${owner.id} AND record_version = ${owner.recordVersion}`;
+            } else {
+              yield* decodePlanningSessionV1(changedOwner).pipe(Effect.mapError(integrity));
+              yield* sql`UPDATE workflow_planning_sessions SET status = 'needs_attention', record_version = ${changedOwner.recordVersion}, record_json = ${encode(changedOwner)} WHERE id = ${owner.id} AND record_version = ${owner.recordVersion}`;
+            }
+          }
+          return { kind: "updated" as const };
+        }),
+      );
+      if (result.kind === "updated") yield* notify;
+      return result;
+    },
+  );
   return {
     createRun,
     createPlanningSession,
@@ -640,6 +813,8 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     subscribeChanges,
     listPending,
     claim,
+    readRecovery,
+    compareAndApplyRecovery,
   };
 });
 
