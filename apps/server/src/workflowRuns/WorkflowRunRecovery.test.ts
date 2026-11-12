@@ -10,6 +10,7 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import migration from "../persistence/Migrations/081_WorkflowRuns.ts";
+import planMigration from "../persistence/Migrations/082_DevelopmentPlans.ts";
 import * as Store from "./WorkflowRunStore.ts";
 import * as Recovery from "./WorkflowRunRecovery.ts";
 import { WorkflowCanonicalHash } from "./WorkflowCanonicalHash.ts";
@@ -94,10 +95,21 @@ const withDatabase = <A, E, R>(f: (filename: string) => Effect.Effect<A, E, R>) 
       return yield* f(NodePath.join(directory, "test.sqlite"));
     }),
   );
+const seedPlan = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`INSERT INTO workflow_plan_identities VALUES ('plan')`;
+  yield* sql`INSERT INTO development_plans VALUES ('plan', 'environment', 'project', 'Plan', NULL, 0, '2026-11-01T00:00:00Z')`;
+  yield* sql`INSERT INTO development_plan_source_packets VALUES ('plan', ${hash}, '{}')`;
+  yield* sql`INSERT INTO workflow_revision_identities VALUES ('plan', 'revision', ${hash}, ${hash})`;
+  yield* sql`INSERT INTO development_plan_revisions VALUES ('plan', 'revision', ${hash}, ${hash}, '{}', '2026-11-01T00:00:00Z')`;
+  yield* sql`UPDATE development_plans SET current_revision_id = 'revision' WHERE plan_id = 'plan'`;
+});
 const seed = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   yield* sql`PRAGMA foreign_keys = ON`;
   yield* migration;
+  yield* planMigration;
+  yield* seedPlan;
   const store = yield* Store.WorkflowRunStore;
   yield* store.createRun(run);
   const op = operationFor("op", "attempt");

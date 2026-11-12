@@ -14,6 +14,7 @@ import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import migration from "../persistence/Migrations/081_WorkflowRuns.ts";
+import planMigration from "../persistence/Migrations/082_DevelopmentPlans.ts";
 import * as Store from "./WorkflowRunStore.ts";
 import { WorkflowCanonicalHash } from "./WorkflowCanonicalHash.ts";
 import { WorkflowRunPolicy } from "./WorkflowRunPolicy.ts";
@@ -94,20 +95,37 @@ const parse = (value: string): unknown => JSON.parse(value);
 const layer = Store.layer.pipe(
   Layer.provideMerge(NodeSqliteClient.layer({ filename: ":memory:" })),
 );
+const seedPlan = (level: "identity" | "plan" | "complete" = "complete") =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`INSERT INTO workflow_plan_identities VALUES ('plan')`;
+    if (level === "identity") {
+      yield* sql`INSERT INTO workflow_revision_identities VALUES ('plan', 'revision', ${hash}, ${hash})`;
+      return;
+    }
+    yield* sql`INSERT INTO development_plans VALUES ('plan', 'environment', 'project', 'Plan', NULL, 0, '2026-11-01T00:00:00Z')`;
+    if (level === "plan") return;
+    yield* sql`INSERT INTO development_plan_source_packets VALUES ('plan', ${hash}, '{}')`;
+    yield* sql`INSERT INTO workflow_revision_identities VALUES ('plan', 'revision', ${hash}, ${hash})`;
+    yield* sql`INSERT INTO development_plan_revisions VALUES ('plan', 'revision', ${hash}, ${hash}, '{}', '2026-11-01T00:00:00Z')`;
+    yield* sql`UPDATE development_plans SET current_revision_id = 'revision' WHERE plan_id = 'plan'`;
+  });
 const setup = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   yield* sql`PRAGMA foreign_keys = ON`;
   yield* migration;
-  yield* sql`INSERT INTO workflow_plan_identities VALUES ('plan')`;
-  yield* sql`INSERT INTO workflow_revision_identities VALUES ('plan', 'revision', ${hash}, ${hash})`;
+  yield* planMigration;
+  yield* seedPlan();
   yield* sql`INSERT INTO workflow_runs VALUES ('run', 'plan', 'revision', ${hash}, ${hash}, ${hash}, 'active', 0, 0, ${json(run)})`;
 });
 
-it.effect("creates runs and planning sessions with their identities", () =>
+it.effect("creates runs and planning sessions with existing plan payloads", () =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     yield* sql`PRAGMA foreign_keys = ON`;
     yield* migration;
+    yield* planMigration;
+    yield* seedPlan();
     const store = yield* Store.WorkflowRunStore;
     assert.deepStrictEqual(yield* store.createRun(run), run);
     assert.deepStrictEqual(yield* store.createPlanningSession(session), session);
@@ -145,6 +163,48 @@ it.effect("creates runs and planning sessions with their identities", () =>
   }).pipe(Effect.provide(layer)),
 );
 
+it.effect("preserves an admitted run's plan binding after reopening", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const directory = yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "workflow-admission-")),
+        ),
+        (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
+      );
+      const filename = NodePath.join(directory, "test.sqlite");
+      const fileLayer = Store.layer.pipe(Layer.provideMerge(NodeSqliteClient.layer({ filename })));
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`PRAGMA foreign_keys = ON`;
+          yield* migration;
+          yield* planMigration;
+          yield* seedPlan();
+          const store = yield* Store.WorkflowRunStore;
+          yield* store.createRun(run);
+        }).pipe(Effect.provide(fileLayer)),
+      );
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          assert.deepStrictEqual(
+            yield* sql`SELECT plan_id, revision_id, revision_hash, source_packet_hash FROM workflow_runs`,
+            [
+              {
+                plan_id: "plan",
+                revision_id: "revision",
+                revision_hash: hash,
+                source_packet_hash: hash,
+              },
+            ],
+          );
+        }).pipe(Effect.provide(fileLayer)),
+      );
+    }),
+  ),
+);
+
 it.effect.each([
   ["run status", "run", { ...run, status: "paused" }],
   ["run version", "run", { ...run, recordVersion: 1 }],
@@ -169,6 +229,7 @@ it.effect.each([
     const sql = yield* SqlClient.SqlClient;
     yield* sql`PRAGMA foreign_keys = ON`;
     yield* migration;
+    yield* planMigration;
     const store = yield* Store.WorkflowRunStore;
     const error = yield* kind === "run"
       ? Effect.flip(store.createRun(record))
@@ -178,6 +239,59 @@ it.effect.each([
     assert.strictEqual((yield* sql`SELECT * FROM workflow_revision_identities`).length, 0);
     assert.strictEqual((yield* sql`SELECT * FROM workflow_runs`).length, 0);
     assert.strictEqual((yield* sql`SELECT * FROM workflow_planning_sessions`).length, 0);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  ["missing plan", "none", run],
+  ["missing payload", "identity", run],
+  [
+    "revision hash mismatch",
+    "complete",
+    { ...run, spec: { ...run.spec, plan: { ...run.spec.plan, revisionHash: nextHash } } },
+  ],
+  [
+    "source packet hash mismatch",
+    "complete",
+    { ...run, spec: { ...run.spec, plan: { ...run.spec.plan, sourcePacketHash: nextHash } } },
+  ],
+] as const)("rejects run with %s without writes or hints", ([_name, fixture, record]) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`PRAGMA foreign_keys = ON`;
+    yield* migration;
+    yield* planMigration;
+    if (fixture !== "none") yield* seedPlan(fixture);
+    const identities = yield* sql`SELECT * FROM workflow_plan_identities`;
+    const revisions = yield* sql`SELECT * FROM workflow_revision_identities`;
+    const store = yield* Store.WorkflowRunStore;
+    const subscription = yield* store.subscribeChanges;
+    assert.strictEqual((yield* Effect.flip(store.createRun(record))).reason, "integrity");
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_plan_identities`, identities);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_revision_identities`, revisions);
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_runs`).length, 0);
+    assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("rejects a planning session without a current payload without writes or hints", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`PRAGMA foreign_keys = ON`;
+    yield* migration;
+    yield* planMigration;
+    yield* seedPlan("plan");
+    const store = yield* Store.WorkflowRunStore;
+    const subscription = yield* store.subscribeChanges;
+    assert.strictEqual(
+      (yield* Effect.flip(store.createPlanningSession(session))).reason,
+      "integrity",
+    );
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_plan_identities`, [
+      { plan_id: "plan" },
+    ]);
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_planning_sessions`).length, 0);
+    assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
   }).pipe(Effect.provide(layer)),
 );
 
@@ -218,6 +332,8 @@ it.effect(
       const sql = yield* SqlClient.SqlClient;
       yield* sql`PRAGMA foreign_keys = ON`;
       yield* migration;
+      yield* planMigration;
+      yield* seedPlan();
       const store = yield* Store.WorkflowRunStore;
       yield* store.createPlanningSession(session);
       assert.strictEqual(

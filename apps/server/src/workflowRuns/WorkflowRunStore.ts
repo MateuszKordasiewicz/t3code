@@ -87,17 +87,10 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
       return yield* integrity();
     const work = Effect.gen(function* () {
       const plan = run.spec.plan;
-      yield* sql`INSERT OR IGNORE INTO workflow_plan_identities (plan_id) VALUES (${plan.planId})`;
-      yield* sql`INSERT OR IGNORE INTO workflow_revision_identities (plan_id, revision_id, revision_hash, source_packet_hash) VALUES (${plan.planId}, ${plan.revisionId}, ${plan.revisionHash}, ${plan.sourcePacketHash})`;
       const revisions = yield* sql<{
-        revision_hash: string;
-        source_packet_hash: string;
-      }>`SELECT revision_hash, source_packet_hash FROM workflow_revision_identities WHERE plan_id = ${plan.planId} AND revision_id = ${plan.revisionId}`;
-      if (
-        revisions[0]?.revision_hash !== plan.revisionHash ||
-        revisions[0]?.source_packet_hash !== plan.sourcePacketHash
-      )
-        return yield* integrity();
+        revision_id: string;
+      }>`SELECT r.revision_id FROM development_plan_revisions r JOIN workflow_revision_identities i ON i.plan_id = r.plan_id AND i.revision_id = r.revision_id AND i.revision_hash = r.revision_hash AND i.source_packet_hash = r.source_packet_hash WHERE r.plan_id = ${plan.planId} AND r.revision_id = ${plan.revisionId} AND r.revision_hash = ${plan.revisionHash} AND r.source_packet_hash = ${plan.sourcePacketHash}`;
+      if (revisions.length !== 1) return yield* integrity();
       const inserted = yield* sql<{
         id: string;
       }>`INSERT INTO workflow_runs (id, plan_id, revision_id, revision_hash, source_packet_hash, spec_hash, status, record_version, control_generation, record_json) VALUES (${run.id}, ${plan.planId}, ${plan.revisionId}, ${plan.revisionHash}, ${plan.sourcePacketHash}, ${run.spec.ref.sha256}, ${run.status}, ${run.recordVersion}, ${run.controlGeneration}, ${encode(run)}) ON CONFLICT DO NOTHING RETURNING id`;
@@ -121,7 +114,10 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     )
       return yield* integrity();
     const work = Effect.gen(function* () {
-      yield* sql`INSERT OR IGNORE INTO workflow_plan_identities (plan_id) VALUES (${session.planId})`;
+      const revisions = yield* sql<{
+        revision_id: string;
+      }>`SELECT r.revision_id FROM development_plans p JOIN development_plan_revisions r ON r.plan_id = p.plan_id AND r.revision_id = p.current_revision_id WHERE p.plan_id = ${session.planId}`;
+      if (revisions.length !== 1) return yield* integrity();
       const inserted = yield* sql<{
         id: string;
       }>`INSERT INTO workflow_planning_sessions (id, plan_id, predecessor_id, status, record_version, control_generation, record_json) VALUES (${session.id}, ${session.planId}, ${session.predecessorSessionId ?? null}, ${session.status}, ${session.recordVersion}, ${session.controlGeneration}, ${encode(session)}) ON CONFLICT DO NOTHING RETURNING id`;
