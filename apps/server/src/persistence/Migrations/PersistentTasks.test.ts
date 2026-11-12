@@ -20,6 +20,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
     assert.deepInclude(migrations, [86, "WorkTaskWaits"]);
     assert.deepInclude(migrations, [87, "WorkTaskResults"]);
     assert.deepInclude(migrations, [88, "WorkTaskClaims"]);
+    assert.deepInclude(migrations, [89, "WorkTaskValidationIdentity"]);
     const tables = yield* sql<{ readonly name: string }>`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'work_task_%' ORDER BY name
     `;
@@ -38,6 +39,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
         "work_task_results",
         "work_task_thread_links",
         "work_task_validation_attempts",
+        "work_task_validation_identity",
         "work_task_view_fence",
         "work_task_waits",
         "work_task_wake_reservations",
@@ -74,6 +76,7 @@ it.effect("upgrades predecessor rows and events without changing their bytes or 
       [86, "WorkTaskWaits"],
       [87, "WorkTaskResults"],
       [88, "WorkTaskClaims"],
+      [89, "WorkTaskValidationIdentity"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM projection_projects ORDER BY project_id`,
@@ -112,6 +115,7 @@ it.effect("rolls back a failed migration and succeeds on rerun", () =>
       [86, "WorkTaskWaits"],
       [87, "WorkTaskResults"],
       [88, "WorkTaskClaims"],
+      [89, "WorkTaskValidationIdentity"],
     ]);
     assert.deepStrictEqual(yield* runMigrations(), []);
   }).pipe(Effect.provide(db)),
@@ -231,6 +235,7 @@ it.effect(
         [86, "WorkTaskWaits"],
         [87, "WorkTaskResults"],
         [88, "WorkTaskClaims"],
+        [89, "WorkTaskValidationIdentity"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -392,6 +397,7 @@ it.effect("preserves task custody through validation upgrade and rolls back migr
       [86, "WorkTaskWaits"],
       [87, "WorkTaskResults"],
       [88, "WorkTaskClaims"],
+      [89, "WorkTaskValidationIdentity"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -526,6 +532,7 @@ it.effect("upgrades validation data atomically to action reviews and preserves p
       [86, "WorkTaskWaits"],
       [87, "WorkTaskResults"],
       [88, "WorkTaskClaims"],
+      [89, "WorkTaskValidationIdentity"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -736,6 +743,7 @@ it.effect("upgrades existing tasks without inventing state and rolls back migrat
       [86, "WorkTaskWaits"],
       [87, "WorkTaskResults"],
       [88, "WorkTaskClaims"],
+      [89, "WorkTaskValidationIdentity"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -831,6 +839,7 @@ it.effect("upgrades waits atomically while preserving task state and link proven
       [86, "WorkTaskWaits"],
       [87, "WorkTaskResults"],
       [88, "WorkTaskClaims"],
+      [89, "WorkTaskValidationIdentity"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM work_task_thread_links ORDER BY link_event_id`,
@@ -953,6 +962,7 @@ it.effect("upgrades result history atomically without changing predecessor data"
     assert.deepStrictEqual(yield* runMigrations(), [
       [87, "WorkTaskResults"],
       [88, "WorkTaskClaims"],
+      [89, "WorkTaskValidationIdentity"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_current_state`, state);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_thread_links`, links);
@@ -1089,7 +1099,10 @@ it.effect("upgrades claim history atomically and preserves prior task and ordina
       [],
     );
     yield* sql`DROP INDEX work_task_claims_history_idx`;
-    assert.deepStrictEqual(yield* runMigrations(), [[88, "WorkTaskClaims"]]);
+    assert.deepStrictEqual(yield* runMigrations(), [
+      [88, "WorkTaskClaims"],
+      [89, "WorkTaskValidationIdentity"],
+    ]);
     assert.deepStrictEqual(
       yield* Effect.forEach(tables, (name) => sql.unsafe(`SELECT * FROM ${name}`)),
       before,
@@ -1175,5 +1188,201 @@ it.effect("constrains claim identity, evidence, bindings and indexed history", (
     }>`EXPLAIN QUERY PLAN SELECT claim_id FROM work_task_claims WHERE task_id = 'a' AND (sequence, event_id) < (6, 'z') ORDER BY sequence DESC, event_id DESC LIMIT 50`;
     assert.isTrue(plan.some((row) => row.detail.includes("work_task_claims_history_idx")));
     assert.isFalse(plan.some((row) => row.detail.includes("TEMP B-TREE")));
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect(
+  "preserves predecessor attempts and rolls back validation identity upgrade before retry",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: 88 });
+      yield* sql`INSERT INTO work_task_projections VALUES ('a', NULL, 1, 1, 1, 1, '{}', 't', 't')`;
+      yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('a', 1, 1, '{}', '{}', 'def', 't')`;
+      yield* sql`INSERT INTO work_task_manager_bindings VALUES ('a', 1, 'manager', 't', NULL)`;
+      yield* sql`INSERT INTO work_task_validation_attempts VALUES
+      ('reserved', 'a', 1, 1, 1, 'e', 'w', '{}', NULL, 'reserved', NULL, '1', NULL, NULL),
+      ('started', 'a', 1, 1, 1, 'e', 'w', '{}', 'r1', 'started', NULL, '2', '2', NULL),
+      ('result', 'a', 1, 1, 1, 'e', 'w', '{}', 'r2', 'result', '{}', '3', '3', '3'),
+      ('uncertain', 'a', 1, 1, 1, 'e', 'w', '{}', 'r3', 'uncertain', NULL, '4', '4', '4')`;
+      const attempts = yield* sql`SELECT * FROM work_task_validation_attempts ORDER BY attempt_id`;
+      yield* sql`CREATE INDEX work_task_validation_state_history_idx ON work_task_projections(task_id)`;
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(runMigrations())));
+      assert.deepStrictEqual(
+        yield* sql`SELECT name FROM sqlite_master WHERE name = 'work_task_validation_identity'`,
+        [],
+      );
+      assert.deepStrictEqual(
+        yield* sql`SELECT migration_id FROM effect_sql_migrations WHERE migration_id = 89`,
+        [],
+      );
+      assert.deepStrictEqual(
+        yield* sql`SELECT * FROM work_task_validation_attempts ORDER BY attempt_id`,
+        attempts,
+      );
+      yield* sql`DROP INDEX work_task_validation_state_history_idx`;
+      assert.deepStrictEqual(yield* runMigrations(), [[89, "WorkTaskValidationIdentity"]]);
+      assert.deepStrictEqual(
+        yield* sql`SELECT * FROM work_task_validation_attempts ORDER BY attempt_id`,
+        attempts,
+      );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_identity`, []);
+      assert.deepStrictEqual(yield* runMigrations(), []);
+    }).pipe(Effect.provide(db)),
+);
+
+it.effect(
+  "binds validation identity to matching attempts and claims and indexes state history",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      yield* sql`PRAGMA foreign_keys = ON`;
+      yield* sql`INSERT INTO work_task_projections VALUES ('a', NULL, 1, 1, 1, 1, '{}', 't', 't'), ('b', NULL, 1, 1, 1, 1, '{}', 't', 't')`;
+      yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('a', 1, 1, '{}', '{}', 'd1', 't'), ('a', 2, 1, '{}', '{}', 'd2', 't'), ('b', 1, 1, '{}', '{}', 'd3', 't')`;
+      yield* sql`INSERT INTO work_task_allowances VALUES ('a', 5, 0), ('b', 5, 0)`;
+      yield* sql`INSERT INTO work_task_manager_bindings VALUES ('a', 1, 'm1', 't', 't'), ('a', 2, 'm2', 't', NULL), ('b', 1, 'mb', 't', NULL)`;
+      yield* sql`INSERT INTO work_task_claims VALUES
+      ('c1', 'a', 'claim', 'e', 'm1', 1, 1, 1, 0, '{"type":"server"}', 's', '[{"type":"run","threadId":"t","runId":"r"}]', 1, 't'),
+      ('c2', 'a', 'other', 'other-e', 'm2', 2, 2, 2, 0, '{"type":"server"}', 's', '[{"type":"run","threadId":"t","runId":"r"}]', 2, 't'),
+      ('c3', 'b', 'claim', 'e', 'mb', 1, 1, 1, 0, '{"type":"server"}', 's', '[{"type":"run","threadId":"t","runId":"r"}]', 1, 't')`;
+      yield* sql`INSERT INTO work_task_validation_attempts VALUES
+      ('v1', 'a', 1, 1, 1, 'e', 'w', '{}', NULL, 'reserved', NULL, '1', NULL, NULL),
+      ('v2', 'a', 1, 1, 1, 'e', 'w', '{}', NULL, 'reserved', NULL, '2', NULL, NULL),
+      ('v3', 'a', 2, 2, 2, 'other-e', 'w', '{}', NULL, 'reserved', NULL, '2', NULL, NULL),
+      ('vb', 'b', 1, 1, 1, 'e', 'w', '{}', NULL, 'reserved', NULL, '2', NULL, NULL)`;
+      yield* sql`DELETE FROM work_task_allowances WHERE task_id = 'b'`;
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`INSERT INTO work_task_validation_identity VALUES ('vb', 'b', 'claim', 1)`,
+          ),
+        ),
+      );
+      yield* sql`INSERT INTO work_task_allowances VALUES ('b', 5, 0)`;
+      yield* sql`INSERT INTO work_task_validation_identity VALUES ('v1', 'a', 'claim', 1), ('v3', 'a', 'other', 9007199254740991), ('vb', 'b', 'claim', 1)`;
+      const invalid = [
+        sql`INSERT INTO work_task_validation_identity VALUES (NULL, 'a', 'claim', 2)`,
+        sql`INSERT INTO work_task_validation_identity VALUES ('v2', NULL, 'claim', 2)`,
+        sql`INSERT INTO work_task_validation_identity VALUES ('v2', 'a', NULL, 2)`,
+        sql`INSERT INTO work_task_validation_identity VALUES ('missing', 'a', 'claim', 2)`,
+        sql`INSERT INTO work_task_validation_identity VALUES ('v2', 'a', 'missing', 2)`,
+        sql`INSERT INTO work_task_validation_identity VALUES ('v2', 'b', 'claim', 2)`,
+        sql`INSERT INTO work_task_validation_identity VALUES ('v2', 'a', 'other', 2)`,
+        sql`INSERT INTO work_task_validation_identity VALUES ('v2', 'a', 'claim', 1)`,
+        sql`INSERT INTO work_task_validation_identity VALUES ('v2', 'a', 'claim', 0)`,
+        sql`INSERT INTO work_task_validation_identity VALUES ('v2', 'a', 'claim', 1.5)`,
+        sql`INSERT INTO work_task_validation_identity VALUES ('v2', 'a', 'claim', 9007199254740992)`,
+        sql`INSERT INTO work_task_validation_identity VALUES ('v2', 'a', 'claim', NULL)`,
+        sql`UPDATE work_task_validation_identity SET claim_id = 'other' WHERE attempt_id = 'v1'`,
+        sql`UPDATE work_task_validation_identity SET attempt_id = 'missing' WHERE attempt_id = 'v1'`,
+        sql`UPDATE work_task_validation_identity SET allowance_unit = 0 WHERE attempt_id = 'v1'`,
+        sql`UPDATE work_task_validation_attempts SET attempt_id = 'new' WHERE attempt_id = 'v1'`,
+        sql`UPDATE work_task_validation_attempts SET task_id = 'b' WHERE attempt_id = 'v1'`,
+        sql`UPDATE work_task_validation_attempts SET definition_revision = 2 WHERE attempt_id = 'v1'`,
+        sql`UPDATE work_task_validation_attempts SET manager_generation = 2 WHERE attempt_id = 'v1'`,
+        sql`UPDATE work_task_validation_attempts SET completion_policy_revision = 2 WHERE attempt_id = 'v1'`,
+        sql`UPDATE work_task_validation_attempts SET evidence_id = 'other-e' WHERE attempt_id = 'v1'`,
+        sql`UPDATE work_task_validation_attempts SET work_watermark = 'new' WHERE attempt_id = 'v1'`,
+        sql`UPDATE work_task_claims SET task_id = 'b' WHERE event_id = 'c1'`,
+        sql`UPDATE work_task_claims SET claim_id = 'new' WHERE event_id = 'c1'`,
+        sql`UPDATE work_task_claims SET evidence_id = 'new' WHERE event_id = 'c1'`,
+        sql`UPDATE work_task_claims SET definition_revision = 2 WHERE event_id = 'c1'`,
+        sql`UPDATE work_task_claims SET manager_generation = 2, manager_thread_id = 'm2' WHERE event_id = 'c1'`,
+        sql`UPDATE work_task_claims SET completion_policy_revision = 2 WHERE event_id = 'c1'`,
+        sql`UPDATE work_task_manager_bindings SET thread_id = 'new' WHERE task_id = 'a' AND generation = 1`,
+        sql`DELETE FROM work_task_validation_attempts WHERE attempt_id = 'v1'`,
+        sql`DELETE FROM work_task_claims WHERE event_id = 'c1'`,
+        sql`DELETE FROM work_task_allowances WHERE task_id = 'a'`,
+      ];
+      for (const statement of invalid) assert.isTrue(Exit.isFailure(yield* Effect.exit(statement)));
+      for (const [column, value] of [
+        ["definition_revision", 2],
+        ["manager_generation", 2],
+        ["completion_policy_revision", 2],
+        ["evidence_id", "other-e"],
+      ] as const) {
+        yield* sql.unsafe(
+          `UPDATE work_task_validation_attempts SET ${column} = ? WHERE attempt_id = 'v2'`,
+          [value],
+        );
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              sql`INSERT INTO work_task_validation_identity VALUES ('v2', 'a', 'claim', 2)`,
+            ),
+          ),
+        );
+        yield* sql.unsafe(
+          `UPDATE work_task_validation_attempts SET ${column} = ? WHERE attempt_id = 'v2'`,
+          [column === "evidence_id" ? "e" : 1],
+        );
+      }
+      yield* sql`UPDATE work_task_validation_attempts SET state = 'started', started_at = 't', run_id = 'r' WHERE attempt_id = 'v1'`;
+      yield* sql`UPDATE work_task_claims SET summary = 'updated' WHERE event_id = 'c1'`;
+      yield* sql`INSERT INTO work_task_validation_identity VALUES ('v2', 'a', 'claim', 2)`;
+      const rows = yield* sql<{
+        attempt_id: string;
+      }>`SELECT attempt_id FROM work_task_validation_attempts WHERE task_id = 'a' AND state = 'reserved' AND (created_at, attempt_id) < ('3', 'z') ORDER BY created_at DESC, attempt_id DESC LIMIT 50`;
+      assert.deepStrictEqual(
+        rows.map((row) => row.attempt_id),
+        ["v3", "v2"],
+      );
+      const plan = yield* sql<{
+        detail: string;
+      }>`EXPLAIN QUERY PLAN SELECT attempt_id FROM work_task_validation_attempts WHERE task_id = 'a' AND state = 'reserved' AND (created_at, attempt_id) < ('3', 'z') ORDER BY created_at DESC, attempt_id DESC LIMIT 50`;
+      assert.isTrue(
+        plan.some((row) => row.detail.includes("work_task_validation_state_history_idx")),
+      );
+      assert.isFalse(plan.some((row) => row.detail.includes("TEMP B-TREE")));
+    }).pipe(Effect.provide(db)),
+);
+
+it.effect("applies validation identity contract bounds without truncating NUL or UTF-16 text", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations();
+    yield* sql`PRAGMA foreign_keys = ON`;
+    yield* sql`INSERT INTO work_task_projections VALUES ('a', NULL, 1, 1, 1, 1, '{}', 't', 't')`;
+    yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('a', 1, 1, '{}', '{}', 'd', 't')`;
+    yield* sql`INSERT INTO work_task_allowances VALUES ('a', 5, 0)`;
+    yield* sql`INSERT INTO work_task_manager_bindings VALUES ('a', 1, 'm', 't', NULL)`;
+    yield* sql`INSERT INTO work_task_claims VALUES ('c', 'a', 'claim', 'e', 'm', 1, 1, 1, 0, '{"type":"server"}', 's', '[{"type":"run","threadId":"t","runId":"r"}]', 1, 't')`;
+    for (const [attempt, watermark, valid] of [
+      ["max", "😀".repeat(1000), true],
+      ["nul", " \0 ", true],
+      ["padded-max", " " + "x".repeat(2000) + " ", true],
+      ["over-utf16", "😀".repeat(1001), false],
+      ["over-nul", "x\0" + "x".repeat(1999), false],
+      ["blank", "\t\u00a0\u1680\u2000\u200a\u2028\u2029\u202f\u205f\u3000\ufeff", false],
+      ["😀".repeat(1001), "w", false],
+      ["\u3000", "w", false],
+      [" \0 ", "w", true],
+    ] as const) {
+      yield* sql`INSERT INTO work_task_validation_attempts VALUES (${attempt}, 'a', 1, 1, 1, 'e', ${watermark}, '{}', NULL, 'reserved', NULL, 't', NULL, NULL)`;
+      const result = yield* Effect.exit(
+        sql`INSERT INTO work_task_validation_identity VALUES (${attempt}, 'a', 'claim', ${valid ? (attempt === "max" ? 1 : attempt === "nul" ? 2 : attempt === "padded-max" ? 3 : 4) : 5})`,
+      );
+      assert.strictEqual(Exit.isSuccess(result), valid);
+    }
+    yield* sql`INSERT INTO work_task_validation_attempts VALUES ('numeric', 'a', 1, 1, 1, 'e', 'w', '{}', NULL, 'reserved', NULL, 't', NULL, NULL)`;
+    for (const statement of [
+      sql`UPDATE work_task_validation_attempts SET definition_revision = 9007199254740992 WHERE attempt_id = 'numeric'`,
+      sql`UPDATE work_task_validation_attempts SET completion_policy_revision = 9007199254740992 WHERE attempt_id = 'numeric'`,
+      sql`UPDATE work_task_validation_attempts SET manager_generation = 9007199254740992 WHERE attempt_id = 'numeric'`,
+    ]) {
+      // Parent constraints may reject the update before the companion is inserted.
+      const updated = yield* Effect.exit(statement);
+      if (Exit.isSuccess(updated)) {
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              sql`INSERT INTO work_task_validation_identity VALUES ('numeric', 'a', 'claim', 6)`,
+            ),
+          ),
+        );
+        yield* sql`UPDATE work_task_validation_attempts SET definition_revision = 1, completion_policy_revision = 1, manager_generation = 1 WHERE attempt_id = 'numeric'`;
+      }
+    }
   }).pipe(Effect.provide(db)),
 );
