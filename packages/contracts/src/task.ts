@@ -1042,7 +1042,118 @@ const wakeAcknowledged = Schema.Struct({
   ),
 );
 
+export class WorkTaskValidationReplayConflict extends Schema.TaggedError<WorkTaskValidationReplayConflict>()(
+  "WorkTaskValidationReplayConflict",
+  {
+    code: Schema.Literals([
+      "attempt_identity_conflict",
+      "run_identity_conflict",
+      "allowance_unit_conflict",
+      "binding_conflict",
+      "attempt_not_found",
+      "phase_conflict",
+      "result_conflict",
+    ]),
+    taskId: WorkTaskId.check(Schema.isMaxLength(2_000)),
+    attemptId: shortText,
+  },
+) {}
+
+const validationBase = {
+  ...allowanceEventBase,
+  attribution: Schema.Struct({ type: Schema.Literal("server") }),
+  definitionRevision: allowancePositive,
+  completionPolicyRevision: allowancePositive,
+  attemptId: shortText,
+  managerGeneration: allowancePositive,
+  claimId: shortText,
+  evidenceId: shortText,
+  workWatermark: shortText,
+  validator: WorkTaskLaunchSelection.check(
+    Schema.makeFilter((selection) => utf8.encode(JSON.stringify(selection)).byteLength <= 16_000),
+  ),
+  allowanceUnit: allowancePositive,
+  createdAt: persistedTime,
+};
+const validationFinding = Schema.Struct({
+  criterionId: WorkTaskCriterionId.check(Schema.isMaxLength(2_000)),
+  outcome: Schema.Literals(["pass", "fail", "inconclusive"]),
+  reason: shortText,
+  evidence: Schema.Array(WorkTaskResultReference).check(Schema.isMaxLength(32)),
+});
+const forbidden = Schema.optionalKey(Schema.Never);
+const validationReserved = Schema.Struct({
+  ...validationBase,
+  type: Schema.Literal("task.validation-reserved"),
+  runId: forbidden,
+  startedAt: forbidden,
+  finishedAt: forbidden,
+  outcome: forbidden,
+  findings: forbidden,
+  reason: forbidden,
+}).check(Schema.makeFilter((event) => event.createdAt === event.occurredAt));
+const validationStartedBase = {
+  ...validationBase,
+  runId: referenceRunId,
+  startedAt: persistedTime,
+};
+const validationStarted = Schema.Struct({
+  ...validationStartedBase,
+  type: Schema.Literal("task.validation-started"),
+  finishedAt: forbidden,
+  outcome: forbidden,
+  findings: forbidden,
+  reason: forbidden,
+}).check(
+  Schema.makeFilter(
+    (event) =>
+      event.startedAt === event.occurredAt &&
+      Date.parse(event.createdAt) <= Date.parse(event.startedAt),
+  ),
+);
+const validationResult = Schema.Struct({
+  ...validationStartedBase,
+  type: Schema.Literal("task.validation-result"),
+  finishedAt: persistedTime,
+  outcome: Schema.Literals(["pass", "fail", "inconclusive", "error"]),
+  findings: Schema.Array(validationFinding).check(Schema.isMaxLength(64)),
+  reason: Schema.optional(shortText),
+}).check(
+  Schema.makeFilter(
+    (event) =>
+      event.finishedAt === event.occurredAt &&
+      Date.parse(event.createdAt) <= Date.parse(event.startedAt) &&
+      Date.parse(event.startedAt) <= Date.parse(event.finishedAt) &&
+      (event.outcome !== "error" || event.reason !== undefined) &&
+      new Set(event.findings.map((finding) => finding.criterionId)).size ===
+        event.findings.length &&
+      (event.outcome !== "pass" ||
+        (event.findings.length > 0 &&
+          event.findings.every((finding) => finding.outcome === "pass"))) &&
+      (event.outcome !== "fail" || event.findings.some((finding) => finding.outcome === "fail")),
+  ),
+);
+const validationUncertain = Schema.Struct({
+  ...validationStartedBase,
+  type: Schema.Literal("task.validation-uncertain"),
+  finishedAt: persistedTime,
+  reason: shortText,
+  outcome: forbidden,
+  findings: forbidden,
+}).check(
+  Schema.makeFilter(
+    (event) =>
+      event.finishedAt === event.occurredAt &&
+      Date.parse(event.createdAt) <= Date.parse(event.startedAt) &&
+      Date.parse(event.startedAt) <= Date.parse(event.finishedAt),
+  ),
+);
+
 const WorkTaskNonReviewRequestedEvent = Schema.Union([
+  validationReserved,
+  validationStarted,
+  validationResult,
+  validationUncertain,
   wakeSourceRecorded,
   wakeReserved,
   wakeClaimed,
@@ -1216,6 +1327,10 @@ export const WorkTaskPersistedEvent = persistedEvent.check(
   Schema.makeFilter(({ event, context }) => {
     if (event.id !== context.eventId || event.occurredAt !== context.occurredAt) return false;
     if (
+      event.type === "task.validation-reserved" ||
+      event.type === "task.validation-started" ||
+      event.type === "task.validation-result" ||
+      event.type === "task.validation-uncertain" ||
       event.type === "task.wake-source-recorded" ||
       event.type === "task.wake-reserved" ||
       event.type === "task.wake-claimed" ||

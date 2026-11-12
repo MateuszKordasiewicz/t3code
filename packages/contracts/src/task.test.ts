@@ -459,6 +459,146 @@ describe("staged task events", () => {
     ).toBeDefined();
   });
 
+  it("records reserved, started, result and uncertain validation attempts with replay bindings", () => {
+    const persisted = Schema.decodeUnknownSync(task.WorkTaskPersistedEvent);
+    const common = {
+      ...base,
+      commandId: "command",
+      attemptId: "attempt",
+      managerGeneration: 1,
+      claimId: "claim",
+      evidenceId: "evidence",
+      workWatermark: "watermark",
+      validator: {
+        projectId: "project",
+        modelSelection: { instanceId: "codex", model: "model" },
+        workspace: { type: "root" },
+      },
+      allowanceUnit: 1,
+      createdAt: base.occurredAt,
+    };
+    const reserved = { ...common, type: "task.validation-reserved" };
+    const started = {
+      ...common,
+      type: "task.validation-started",
+      runId: "run",
+      startedAt: base.occurredAt,
+    };
+    const result = {
+      ...started,
+      type: "task.validation-result",
+      finishedAt: base.occurredAt,
+      outcome: "pass",
+      findings: [
+        {
+          criterionId: "criterion-1",
+          outcome: "pass",
+          reason: "verified",
+          evidence: [{ type: "artifact", uri: "file", hash: "hash" }],
+        },
+      ],
+    };
+    const uncertain = {
+      ...started,
+      type: "task.validation-uncertain",
+      finishedAt: base.occurredAt,
+      reason: "process lost",
+    };
+    const context = {
+      sequence: 8,
+      eventId: "event",
+      occurredAt: base.occurredAt,
+      commandId: "command",
+    };
+    for (const event of [reserved, started, result, uncertain]) {
+      expect(decode(event)).toEqual(event);
+      expect(persisted({ event, context })).toEqual({ event, context });
+      expect(() => persisted({ event, context: { ...context, commandId: "other" } })).toThrow();
+      for (const field of [
+        "attemptId",
+        "taskId",
+        "definitionRevision",
+        "managerGeneration",
+        "completionPolicyRevision",
+        "claimId",
+        "evidenceId",
+        "workWatermark",
+        "validator",
+        "allowanceUnit",
+        "createdAt",
+      ])
+        expect(() => decode({ ...event, [field]: undefined })).toThrow();
+    }
+    for (const field of ["runId", "startedAt"])
+      expect(() => decode({ ...started, [field]: undefined })).toThrow();
+    for (const field of ["finishedAt", "outcome", "findings"])
+      expect(() => decode({ ...result, [field]: undefined })).toThrow();
+    for (const field of ["finishedAt", "reason"])
+      expect(() => decode({ ...uncertain, [field]: undefined })).toThrow();
+    for (const change of [
+      { runId: "run" },
+      { startedAt: base.occurredAt },
+      { outcome: "pass" },
+      { reason: "x" },
+    ])
+      expect(() => decode({ ...reserved, ...change })).toThrow();
+    for (const change of [{ outcome: "pass" }, { finishedAt: base.occurredAt }, { reason: "x" }])
+      expect(() => decode({ ...started, ...change })).toThrow();
+    expect(() => decode({ ...uncertain, outcome: "pass" })).toThrow();
+    expect(
+      decode({ ...result, outcome: "error", findings: [], reason: "provider failed" }),
+    ).toBeDefined();
+    expect(() => decode({ ...result, outcome: "error", findings: [] })).toThrow();
+    expect(() => decode({ ...result, findings: [] })).toThrow();
+    expect(() => decode({ ...result, outcome: "fail" })).toThrow();
+    expect(() =>
+      decode({ ...result, findings: [result.findings[0], result.findings[0]] }),
+    ).toThrow();
+    expect(() => decode({ ...started, createdAt: "2026-11-12T00:00:00Z" })).toThrow();
+    for (const field of ["attemptId", "claimId", "evidenceId", "workWatermark"])
+      for (const value of [" ", "x".repeat(2001)])
+        expect(() => decode({ ...reserved, [field]: value })).toThrow();
+    for (const field of [
+      "managerGeneration",
+      "definitionRevision",
+      "completionPolicyRevision",
+      "allowanceUnit",
+    ])
+      for (const value of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])
+        expect(() => decode({ ...reserved, [field]: value })).toThrow();
+    expect(() => decode({ ...result, findings: Array(65).fill(result.findings[0]) })).toThrow();
+    expect(() =>
+      decode({ ...result, findings: [{ ...result.findings[0], outcome: "error" }] }),
+    ).toThrow();
+    expect(() => decode({ ...uncertain, reason: " " })).toThrow();
+    expect(() => decode({ ...started, startedAt: "invalid" })).toThrow();
+    expect(() =>
+      decode({
+        ...reserved,
+        attribution: {
+          type: "manager",
+          threadId: "t",
+          providerSessionId: "p",
+          runId: "r",
+          generation: 1,
+        },
+      }),
+    ).toThrow();
+  });
+
+  it("provides typed validation replay conflicts", () => {
+    const decodeConflict = Schema.decodeUnknownSync(task.WorkTaskValidationReplayConflict);
+    const value = {
+      _tag: "WorkTaskValidationReplayConflict",
+      code: "attempt_identity_conflict",
+      taskId: "task",
+      attemptId: "attempt",
+    };
+    expect(decodeConflict(value).code).toBe(value.code);
+    expect(() => decodeConflict({ ...value, code: "other" })).toThrow();
+    expect(() => decodeConflict({ ...value, attemptId: " " })).toThrow();
+  });
+
   it("provides typed wake replay conflicts", () => {
     const conflict = Schema.decodeUnknownSync(task.WorkTaskWakeReplayConflict);
     const value = {
