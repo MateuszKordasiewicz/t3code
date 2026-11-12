@@ -70,6 +70,21 @@ const session = Schema.decodeSync(PlanningSessionV1)({
   createdAt: "2026-11-01T00:00:00Z",
   access: { origins: [] },
 });
+const context = {
+  actor: session.origin,
+  destination: { environmentId: session.environmentId, projectId: session.projectId },
+};
+const begin = (store: Store.WorkflowRunStore["Service"], record: unknown) => {
+  const id = json(record);
+  return store
+    .beginPlanning({
+      session: record as typeof session,
+      now: "2026-11-12T00:00:00Z",
+      context,
+      command: { commandId: id, receiptId: id },
+    })
+    .pipe(Effect.map((result) => result.value));
+};
 type Input = Parameters<typeof WorkflowRunPolicy.decide>[0];
 const facts: Input["facts"] = {
   now: "2026-11-12T00:00:00Z",
@@ -128,7 +143,7 @@ it.effect("creates runs and planning sessions with existing plan payloads", () =
     yield* seedPlan();
     const store = yield* Store.WorkflowRunStore;
     assert.deepStrictEqual(yield* store.createRun(run), run);
-    assert.deepStrictEqual(yield* store.createPlanningSession(session), session);
+    assert.deepStrictEqual(yield* begin(store, session), session);
     assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_plan_identities`, [
       { plan_id: "plan" },
     ]);
@@ -233,8 +248,8 @@ it.effect.each([
     const store = yield* Store.WorkflowRunStore;
     const error = yield* kind === "run"
       ? Effect.flip(store.createRun(record))
-      : Effect.flip(store.createPlanningSession(record));
-    assert.strictEqual(error.reason, "integrity");
+      : Effect.flip(begin(store, record));
+    assert.strictEqual(error.reason, kind === "run" ? "integrity" : "invalid");
     assert.strictEqual((yield* sql`SELECT * FROM workflow_plan_identities`).length, 0);
     assert.strictEqual((yield* sql`SELECT * FROM workflow_revision_identities`).length, 0);
     assert.strictEqual((yield* sql`SELECT * FROM workflow_runs`).length, 0);
@@ -283,10 +298,7 @@ it.effect("rejects a planning session without a current payload without writes o
     yield* seedPlan("plan");
     const store = yield* Store.WorkflowRunStore;
     const subscription = yield* store.subscribeChanges;
-    assert.strictEqual(
-      (yield* Effect.flip(store.createPlanningSession(session))).reason,
-      "integrity",
-    );
+    assert.strictEqual((yield* Effect.flip(begin(store, session))).reason, "integrity");
     assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_plan_identities`, [
       { plan_id: "plan" },
     ]);
@@ -335,22 +347,21 @@ it.effect(
       yield* planMigration;
       yield* seedPlan();
       const store = yield* Store.WorkflowRunStore;
-      yield* store.createPlanningSession(session);
+      yield* begin(store, session);
       assert.strictEqual(
-        (yield* Effect.flip(store.createPlanningSession({ ...session, id: "other" }))).reason,
-        "integrity",
+        (yield* Effect.flip(begin(store, { ...session, id: "other" }))).reason,
+        "custody",
       );
       assert.strictEqual(
-        (yield* Effect.flip(store.createPlanningSession({ ...session, planId: "new-plan" })))
-          .reason,
-        "integrity",
+        (yield* Effect.flip(begin(store, { ...session, planId: "new-plan" }))).reason,
+        "not-found",
       );
       assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_plan_identities`, [
         { plan_id: "plan" },
       ]);
-      yield* sql`UPDATE workflow_planning_sessions SET status = 'stopped' WHERE id = ${session.id}`;
+      yield* sql`UPDATE workflow_planning_sessions SET status = 'stopped', record_json = ${json({ ...session, status: "stopped" })} WHERE id = ${session.id}`;
       const successor = { ...session, id: "other", predecessorSessionId: session.id };
-      assert.deepStrictEqual<unknown>(yield* store.createPlanningSession(successor), successor);
+      assert.deepStrictEqual<unknown>(yield* begin(store, successor), successor);
       assert.deepStrictEqual(
         yield* sql`SELECT id, predecessor_id, status FROM workflow_planning_sessions ORDER BY id`,
         [
@@ -1220,4 +1231,222 @@ it.effect("claim loses to a committed pause of its owner", () =>
       assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_operations`, before);
     }),
   ).pipe(Effect.provide(layer)),
+);
+
+it.effect(
+  "planning controls replay and preserve pending reservations through pause, resume and stop",
+  () =>
+    Effect.gen(function* () {
+      yield* setup;
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      const created = yield* store.beginPlanning({
+        session,
+        now: facts.now,
+        context,
+        command: { commandId: "begin", receiptId: "begin-receipt" },
+      });
+      const binding = {
+        planId: session.planId,
+        revisionId: "revision",
+        revisionSchemaVersion: 1 as const,
+        revisionHash: hash,
+        sourcePacketHash: hash,
+      };
+      const pass = {
+        schemaVersion: 1,
+        id: "pass",
+        planningSessionId: session.id,
+        role: "author",
+        provider: session.allowedProviders[0],
+        binding,
+        operationId: "planning-op",
+        inputManifest: {
+          sources: [{ kind: "source", id: "source", sha256: hash }],
+          references: [],
+          additionalContext: [],
+          access: { origins: [] },
+        },
+        status: "pending",
+        access: { origins: [] },
+      };
+      const operation = decodeOperation({
+        schemaVersion: 1,
+        id: "planning-op",
+        owner: { kind: "planning_session", planningSessionId: session.id },
+        kind: "planning_pass",
+        parameters: {
+          kind: "planning_pass",
+          passId: "pass",
+          binding,
+          role: "author",
+          provider: session.allowedProviders[0]!,
+          limits: session.limits,
+          inputManifestHash: hash,
+        },
+        fingerprint: hash,
+        origin: session.origin,
+        destination: context.destination,
+        controlGeneration: 0,
+        status: "pending",
+        access: { origins: [] },
+      });
+      yield* sql`INSERT INTO workflow_operations (id, planning_session_id, kind, fingerprint, status, generation, record_json) VALUES (${operation.id}, ${session.id}, 'planning_pass', ${hash}, 'pending', 0, ${json(operation)})`;
+      yield* sql`INSERT INTO workflow_planning_passes VALUES ('pass', ${session.id}, ${session.planId}, 'revision', ${hash}, ${hash}, ${operation.id}, NULL, NULL, ${json(pass)})`;
+      const pause = {
+        sessionId: session.id,
+        action: "pause" as const,
+        expectedVersion: 0,
+        now: facts.now,
+        context,
+        command: { commandId: "pause-planning", receiptId: "pause-receipt" },
+      };
+      const paused = yield* store.controlPlanning(pause);
+      assert.strictEqual(paused.value.status, "paused");
+      assert.deepStrictEqual(yield* sql`SELECT held, generation FROM workflow_operations`, [
+        { held: 1, generation: 0 },
+      ]);
+      const resumed = yield* store.controlPlanning({
+        ...pause,
+        action: "resume",
+        expectedVersion: 1,
+        command: { commandId: "resume-planning", receiptId: "resume-receipt" },
+      });
+      assert.strictEqual(resumed.value.status, "active");
+      assert.deepStrictEqual(resumed.value.consumed, session.consumed);
+      assert.deepStrictEqual(yield* sql`SELECT held, generation FROM workflow_operations`, [
+        { held: 0, generation: 2 },
+      ]);
+      assert.deepStrictEqual(
+        yield* store.controlPlanning({ ...pause, now: "2027-01-01T00:00:00Z" }),
+        { ...paused, kind: "replay" },
+      );
+      assert.deepStrictEqual(
+        yield* store.beginPlanning({
+          session,
+          now: "2027-01-01T00:00:00Z",
+          context,
+          command: { commandId: "begin", receiptId: "other" },
+        }),
+        { ...created, kind: "replay" },
+      );
+      assert.strictEqual(
+        (yield* Effect.flip(store.controlPlanning({ ...pause, expectedVersion: 1 }))).reason,
+        "conflict",
+      );
+      const stopped = yield* store.controlPlanning({
+        ...pause,
+        action: "stop",
+        expectedVersion: 2,
+        command: { commandId: "stop-planning", receiptId: "stop-receipt" },
+      });
+      assert.strictEqual(stopped.value.status, "stopped");
+      assert.deepStrictEqual(
+        yield* sql`SELECT status, held, cancel_requested FROM workflow_operations`,
+        [{ status: "cancelled", held: 0, cancel_requested: 1 }],
+      );
+      const records = yield* sql<{
+        record_json: string;
+      }>`SELECT record_json FROM workflow_planning_passes`;
+      assert.strictEqual(
+        (parse(records[0]!.record_json) as { status: string }).status,
+        "cancelled",
+      );
+      assert.strictEqual(
+        (yield* Effect.flip(
+          store.controlPlanning({
+            ...pause,
+            action: "resume",
+            expectedVersion: 3,
+            command: { commandId: "bad-resume", receiptId: "bad-resume" },
+          }),
+        )).reason,
+        "ineligible",
+      );
+      assert.strictEqual((yield* store.getPlanning({ sessionId: session.id })).status, "stopped");
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  ["stale", "paused", 0, "2026-11-12T00:00:00Z", 1, "conflict"],
+  ["deadline", "paused", 0, "2026-12-01T00:00:00Z", 0, "deadline"],
+  ["limit", "paused", 2, "2026-11-12T00:00:00Z", 0, "limit"],
+  ["pausing", "pausing", 0, "2026-11-12T00:00:00Z", 0, "ineligible"],
+] as const)(
+  "planning resume rejects %s without writes",
+  ([_name, status, passes, now, version, reason]) =>
+    Effect.gen(function* () {
+      yield* setup;
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      yield* begin(store, session);
+      const current = { ...session, status, consumed: { ...session.consumed, passes } };
+      yield* sql`UPDATE workflow_planning_sessions SET status = ${status}, record_json = ${json(current)} WHERE id = ${session.id}`;
+      const before = yield* sql`SELECT * FROM workflow_planning_sessions`;
+      const error = yield* Effect.flip(
+        store.controlPlanning({
+          sessionId: session.id,
+          action: "resume",
+          expectedVersion: version,
+          now,
+          context,
+          command: { commandId: "resume", receiptId: "resume" },
+        }),
+      );
+      assert.strictEqual(error.reason, reason);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_planning_sessions`, before);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect("planning receipts survive database reopen and corruption is rejected", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const directory = yield* Effect.acquireRelease(
+        Effect.sync(() => NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "planning-store-"))),
+        (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
+      );
+      const filename = NodePath.join(directory, "test.sqlite");
+      const fileLayer = Store.layer.pipe(Layer.provideMerge(NodeSqliteClient.layer({ filename })));
+      const input = {
+        session,
+        now: facts.now,
+        context,
+        command: { commandId: "begin", receiptId: "receipt" },
+      };
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`PRAGMA foreign_keys = ON`;
+          yield* migration;
+          yield* planMigration;
+          yield* seedPlan();
+          const store = yield* Store.WorkflowRunStore;
+          yield* store.beginPlanning(input);
+          yield* store.controlPlanning({
+            sessionId: session.id,
+            action: "pause",
+            expectedVersion: 0,
+            now: facts.now,
+            context,
+            command: { commandId: "pause", receiptId: "pause" },
+          });
+        }).pipe(Effect.provide(fileLayer)),
+      );
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          const store = yield* Store.WorkflowRunStore;
+          assert.deepStrictEqual(
+            yield* store.beginPlanning({ ...input, now: "2027-01-01T00:00:00Z" }),
+            { kind: "replay", receiptId: "receipt", value: session },
+          );
+          yield* sql`UPDATE workflow_planning_sessions SET control_generation = 9 WHERE id = ${session.id}`;
+          assert.strictEqual(
+            (yield* Effect.flip(store.getPlanning({ sessionId: session.id }))).reason,
+            "integrity",
+          );
+        }).pipe(Effect.provide(fileLayer)),
+      );
+    }),
+  ),
 );

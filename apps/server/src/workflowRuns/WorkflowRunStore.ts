@@ -1,5 +1,9 @@
 import {
+  PlanningSessionV1,
   decodePlanningSessionV1,
+  decodePlanningPassV1,
+  isWorkflowTimestamp,
+  isWorkflowTimestampAfter,
   decodeWorkflowOperationV1,
   decodeWorkflowRoleResultV1,
   decodeWorkflowRunV1,
@@ -11,6 +15,7 @@ import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import { DevelopmentPlanHash } from "../developmentPlans/DevelopmentPlanHash.ts";
 import { WorkflowCanonicalHash } from "./WorkflowCanonicalHash.ts";
 import { WorkflowRunPolicy } from "./WorkflowRunPolicy.ts";
 
@@ -55,6 +60,54 @@ export class WorkflowRunStoreError extends Schema.TaggedError<WorkflowRunStoreEr
 const isStoreError = Schema.is(WorkflowRunStoreError);
 const integrity = () => new WorkflowRunStoreError({ reason: "integrity" });
 const stale = () => new WorkflowRunStoreError({ reason: "stale" });
+
+export class PlanningControlError extends Schema.TaggedError<PlanningControlError>()(
+  "PlanningControlError",
+  {
+    reason: Schema.Literals([
+      "not-found",
+      "conflict",
+      "invalid",
+      "integrity",
+      "storage",
+      "unauthorized",
+      "limit",
+      "deadline",
+      "custody",
+      "ineligible",
+      "observation-unknown",
+    ]),
+    currentVersion: Schema.optionalKey(Schema.Number),
+  },
+) {
+  override get message() {
+    return "Planning session operation failed.";
+  }
+}
+type S = PlanningSessionV1;
+type PlanningContext = {
+  readonly actor: S["origin"];
+  readonly destination: {
+    readonly environmentId: S["environmentId"];
+    readonly projectId: S["projectId"];
+  };
+};
+type PlanningCommand = { readonly commandId: string; readonly receiptId: string };
+const planningError = (reason: PlanningControlError["reason"]) =>
+  new PlanningControlError({ reason });
+const isPlanningError = Schema.is(PlanningControlError);
+const isPlanningContext = Schema.is(
+  Schema.Struct({
+    actor: PlanningSessionV1.fields.origin,
+    destination: Schema.Struct({
+      environmentId: PlanningSessionV1.fields.environmentId,
+      projectId: PlanningSessionV1.fields.projectId,
+    }),
+  }),
+);
+const isPlanningCommand = Schema.is(
+  Schema.Struct({ commandId: Schema.String, receiptId: Schema.String }),
+);
 
 const make = Effect.fn("WorkflowRunStore.make")(function* (
   beforePublish: Effect.Effect<void> = Effect.void,
@@ -101,31 +154,311 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     yield* notify;
     return result;
   });
-  const createPlanningSession = Effect.fn("WorkflowRunStore.createPlanningSession")(function* (
-    record: unknown,
-  ) {
-    const session = yield* decodePlanningSessionV1(record).pipe(Effect.mapError(integrity));
-    if (
-      session.status !== "active" ||
-      session.recordVersion !== 0 ||
-      session.controlGeneration !== 0 ||
-      session.consumed.passes !== 0 ||
-      session.consumed.repairRounds !== 0
-    )
-      return yield* integrity();
-    const work = Effect.gen(function* () {
-      const revisions = yield* sql<{
-        revision_id: string;
-      }>`SELECT r.revision_id FROM development_plans p JOIN development_plan_revisions r ON r.plan_id = p.plan_id AND r.revision_id = p.current_revision_id WHERE p.plan_id = ${session.planId}`;
-      if (revisions.length !== 1) return yield* integrity();
-      const inserted = yield* sql<{
-        id: string;
-      }>`INSERT INTO workflow_planning_sessions (id, plan_id, predecessor_id, status, record_version, control_generation, record_json) VALUES (${session.id}, ${session.planId}, ${session.predecessorSessionId ?? null}, ${session.status}, ${session.recordVersion}, ${session.controlGeneration}, ${encode(session)}) ON CONFLICT DO NOTHING RETURNING id`;
-      if (inserted.length !== 1) return yield* integrity();
-      return session;
+  const planningTransaction = <A, E, R>(work: Effect.Effect<A, E, R>) =>
+    sql
+      .withTransaction(work)
+      .pipe(
+        Effect.mapError((error) => (isPlanningError(error) ? error : planningError("storage"))),
+      );
+  const readSession = Effect.fn("WorkflowRunStore.readPlanningSession")(function* (id: S["id"]) {
+    const rows = yield* sql<{
+      id: string;
+      plan_id: string;
+      predecessor_id: string | null;
+      status: string;
+      record_version: number;
+      control_generation: number;
+      record_json: string;
+    }>`SELECT * FROM workflow_planning_sessions WHERE id = ${id}`;
+    const row = rows[0];
+    if (!row) return yield* planningError("not-found");
+    const raw = yield* Effect.try({
+      try: () => parse(row.record_json),
+      catch: () => planningError("integrity"),
     });
-    const result = yield* inTransaction(work);
-    yield* notify;
+    const value = yield* decodePlanningSessionV1(raw).pipe(
+      Effect.mapError(() => planningError("integrity")),
+    );
+    if (
+      value.id !== row.id ||
+      value.planId !== row.plan_id ||
+      (value.predecessorSessionId ?? null) !== row.predecessor_id ||
+      value.status !== row.status ||
+      value.recordVersion !== row.record_version ||
+      value.controlGeneration !== row.control_generation
+    )
+      return yield* planningError("integrity");
+    return value;
+  });
+  const fingerprint = (context: PlanningContext, method: string, input: object) =>
+    Effect.try({
+      try: () => DevelopmentPlanHash.command({ ...context, method, input }),
+      catch: () => planningError("invalid"),
+    });
+  const checkReceipt = Effect.fn("WorkflowRunStore.planningReceipt")(function* (
+    command: PlanningCommand,
+    owner: S["id"],
+    hash: string,
+  ) {
+    const rows = yield* sql<{
+      planning_session_id: string | null;
+      fingerprint: string;
+      receipt_id: string;
+      result_json: string;
+    }>`SELECT planning_session_id, fingerprint, receipt_id, result_json FROM workflow_command_receipts WHERE command_id = ${command.commandId}`;
+    const row = rows[0];
+    if (!row) return undefined;
+    if (row.planning_session_id !== owner || row.fingerprint !== hash)
+      return yield* planningError("conflict");
+    const raw = yield* Effect.try({
+      try: () => parse(row.result_json),
+      catch: () => planningError("integrity"),
+    });
+    const value = yield* decodePlanningSessionV1(raw).pipe(
+      Effect.mapError(() => planningError("integrity")),
+    );
+    return { kind: "replay" as const, receiptId: row.receipt_id, value };
+  });
+  const savePlanningReceipt = Effect.fn("WorkflowRunStore.savePlanningReceipt")(function* (
+    command: PlanningCommand,
+    hash: string,
+    value: S,
+  ) {
+    const rows = yield* sql<{
+      receipt_id: string;
+    }>`INSERT INTO workflow_command_receipts (command_id, planning_session_id, fingerprint, receipt_id, result_json) VALUES (${command.commandId}, ${value.id}, ${hash}, ${command.receiptId}, ${encode(value)}) ON CONFLICT DO NOTHING RETURNING receipt_id`;
+    if (rows.length !== 1) return yield* planningError("conflict");
+    return { kind: "applied" as const, receiptId: command.receiptId, value };
+  });
+  const validCommand = (command: PlanningCommand) =>
+    isPlanningCommand(command) &&
+    typeof command.commandId === "string" &&
+    command.commandId.length > 0 &&
+    typeof command.receiptId === "string" &&
+    command.receiptId.length > 0;
+  const sameContext = (value: S, context: PlanningContext) =>
+    value.environmentId === context.destination.environmentId &&
+    value.projectId === context.destination.projectId &&
+    value.origin.kind === context.actor.kind &&
+    value.origin.id === context.actor.id;
+  const beginPlanning = Effect.fn("WorkflowRunStore.beginPlanning")(function* (input: {
+    readonly session: S;
+    readonly now: string;
+    readonly context: PlanningContext;
+    readonly command: PlanningCommand;
+  }) {
+    const value = yield* decodePlanningSessionV1(input.session).pipe(
+      Effect.mapError(() => planningError("invalid")),
+    );
+    if (
+      !validCommand(input.command) ||
+      !isPlanningContext(input.context) ||
+      typeof input.now !== "string" ||
+      !isWorkflowTimestamp(input.now) ||
+      !sameContext(value, input.context) ||
+      value.status !== "active" ||
+      value.recordVersion !== 0 ||
+      value.controlGeneration !== 0 ||
+      value.consumed.passes !== 0 ||
+      value.consumed.repairRounds !== 0
+    )
+      return yield* planningError("invalid");
+    const { createdAt: _createdAt, ...stable } = value;
+    const hash = yield* fingerprint(input.context, "beginPlanning", { session: stable });
+    const result = yield* planningTransaction(
+      Effect.gen(function* () {
+        const prior = yield* checkReceipt(input.command, value.id, hash);
+        if (prior) return prior;
+        if (!isWorkflowTimestampAfter(value.limits.deadline, input.now))
+          return yield* planningError("deadline");
+        const plans = yield* sql<{
+          environment_id: string;
+          project_id: string;
+          current_revision_id: string | null;
+        }>`UPDATE development_plans SET version = version WHERE plan_id = ${value.planId} RETURNING environment_id, project_id, current_revision_id`;
+        const plan = plans[0];
+        if (!plan) return yield* planningError("not-found");
+        if (plan.environment_id !== value.environmentId || plan.project_id !== value.projectId)
+          return yield* planningError("unauthorized");
+        if (!plan.current_revision_id) return yield* planningError("integrity");
+        const revisions =
+          yield* sql`SELECT revision_id FROM development_plan_revisions WHERE plan_id = ${value.planId} AND revision_id = ${plan.current_revision_id}`;
+        if (revisions.length !== 1) return yield* planningError("integrity");
+        const sessions = yield* sql<{
+          id: string;
+          status: string;
+        }>`SELECT id, status FROM workflow_planning_sessions WHERE plan_id = ${value.planId} ORDER BY rowid DESC`;
+        if (sessions.some((s) => s.status !== "stopped" && s.status !== "completed"))
+          return yield* planningError("custody");
+        const latest = sessions[0];
+        if ((latest?.id ?? null) !== (value.predecessorSessionId ?? null))
+          return yield* planningError("custody");
+        if (latest) {
+          yield* readSession(latest.id as S["id"]);
+          const custody =
+            yield* sql`SELECT id FROM workflow_operations WHERE planning_session_id = ${latest.id} AND status IN ('claimed','unknown')`;
+          if (custody.length) return yield* planningError("custody");
+        }
+        const inserted = yield* sql<{
+          id: string;
+        }>`INSERT INTO workflow_planning_sessions (id, plan_id, predecessor_id, status, record_version, control_generation, record_json) VALUES (${value.id}, ${value.planId}, ${value.predecessorSessionId ?? null}, ${value.status}, ${value.recordVersion}, ${value.controlGeneration}, ${encode(value)}) ON CONFLICT DO NOTHING RETURNING id`;
+        if (inserted.length !== 1) return yield* planningError("conflict");
+        return yield* savePlanningReceipt(input.command, hash, value);
+      }),
+    );
+    if (result.kind === "applied") yield* notify;
+    return result;
+  });
+  const getPlanning = Effect.fn("WorkflowRunStore.getPlanning")(function* (input: {
+    readonly sessionId: S["id"];
+  }) {
+    if (typeof input.sessionId !== "string" || !input.sessionId)
+      return yield* planningError("invalid");
+    return yield* readSession(input.sessionId).pipe(
+      Effect.mapError((error) => (isPlanningError(error) ? error : planningError("storage"))),
+    );
+  });
+  const controlPlanning = Effect.fn("WorkflowRunStore.controlPlanning")(function* (input: {
+    readonly sessionId: S["id"];
+    readonly action: "pause" | "resume" | "stop" | "expire";
+    readonly expectedVersion: number;
+    readonly now: string;
+    readonly context: PlanningContext;
+    readonly command: PlanningCommand;
+  }) {
+    if (
+      !input.sessionId ||
+      !validCommand(input.command) ||
+      !isPlanningContext(input.context) ||
+      typeof input.now !== "string" ||
+      !isWorkflowTimestamp(input.now) ||
+      !Number.isSafeInteger(input.expectedVersion) ||
+      input.expectedVersion < 0 ||
+      !["pause", "resume", "stop", "expire"].includes(input.action)
+    )
+      return yield* planningError("invalid");
+    const hash = yield* fingerprint(input.context, "controlPlanning", {
+      sessionId: input.sessionId,
+      action: input.action,
+      expectedVersion: input.expectedVersion,
+    });
+    const result = yield* planningTransaction(
+      Effect.gen(function* () {
+        const prior = yield* checkReceipt(input.command, input.sessionId, hash);
+        if (prior) return prior;
+        const value = yield* readSession(input.sessionId);
+        if (!sameContext(value, input.context)) return yield* planningError("unauthorized");
+        if (value.recordVersion !== input.expectedVersion)
+          return yield* new PlanningControlError({
+            reason: "conflict",
+            currentVersion: value.recordVersion,
+          });
+        const rows = yield* sql<{
+          id: string;
+          status: string;
+          held: number;
+          generation: number;
+          fingerprint: string;
+          record_json: string;
+        }>`SELECT id, status, held, generation, fingerprint, record_json FROM workflow_operations WHERE planning_session_id = ${value.id}`;
+        const operations = yield* Effect.forEach(rows, (row) =>
+          Effect.gen(function* () {
+            const raw = yield* Effect.try({
+              try: () => parse(row.record_json),
+              catch: () => planningError("integrity"),
+            });
+            const operation = yield* decodeWorkflowOperationV1(raw).pipe(
+              Effect.mapError(() => planningError("integrity")),
+            );
+            if (
+              operation.id !== row.id ||
+              operation.status !== row.status ||
+              operation.controlGeneration !== row.generation ||
+              operation.fingerprint !== row.fingerprint ||
+              operation.owner.kind !== "planning_session" ||
+              operation.owner.planningSessionId !== value.id
+            )
+              return yield* planningError("integrity");
+            return { row, operation };
+          }),
+        );
+        const claimed = operations.some(({ operation }) => operation.status === "claimed");
+        const unknown = operations.some(({ operation }) => operation.status === "unknown");
+        let status: S["status"];
+        if (input.action === "pause") {
+          if (value.status !== "active") return yield* planningError("ineligible");
+          status = unknown ? "needs_attention" : claimed ? "pausing" : "paused";
+        } else if (input.action === "resume") {
+          if (value.status !== "paused") return yield* planningError("ineligible");
+          if (claimed || unknown) return yield* planningError("custody");
+          if (!isWorkflowTimestampAfter(value.limits.deadline, input.now))
+            return yield* planningError("deadline");
+          if (value.consumed.passes >= value.limits.maxPasses) return yield* planningError("limit");
+          status = "active";
+        } else {
+          if (!["active", "paused", "pausing", "needs_attention"].includes(value.status))
+            return yield* planningError("ineligible");
+          status = claimed || unknown ? "stopping" : "stopped";
+        }
+        const updated = {
+          ...value,
+          status,
+          recordVersion: value.recordVersion + 1,
+          controlGeneration: value.controlGeneration + 1,
+        };
+        for (const { row, operation } of operations) {
+          if (operation.status === "pending" && input.action === "pause") {
+            yield* sql`UPDATE workflow_operations SET held = 1 WHERE id = ${operation.id}`;
+          } else if (
+            operation.status === "pending" &&
+            input.action === "resume" &&
+            row.held === 1
+          ) {
+            const next = { ...operation, controlGeneration: updated.controlGeneration };
+            yield* sql`UPDATE workflow_operations SET held = 0, generation = ${updated.controlGeneration}, record_json = ${encode(next)} WHERE id = ${operation.id}`;
+          } else if (
+            operation.status === "pending" &&
+            (input.action === "stop" || input.action === "expire")
+          ) {
+            const next = {
+              ...operation,
+              status: "cancelled" as const,
+              outcome: { kind: "cancelled" as const, summary: "Cancelled", evidence: [] },
+            };
+            yield* sql`UPDATE workflow_operations SET status = 'cancelled', held = 0, cancel_requested = 1, record_json = ${encode(next)} WHERE id = ${operation.id}`;
+            const passes = yield* sql<{
+              record_json: string;
+            }>`SELECT record_json FROM workflow_planning_passes WHERE operation_id = ${operation.id}`;
+            if (passes.length !== 1) return yield* planningError("integrity");
+            const raw = yield* Effect.try({
+              try: () => parse(passes[0]!.record_json),
+              catch: () => planningError("integrity"),
+            });
+            const pass = yield* decodePlanningPassV1(raw).pipe(
+              Effect.mapError(() => planningError("integrity")),
+            );
+            if (
+              pass.operationId !== operation.id ||
+              pass.planningSessionId !== value.id ||
+              pass.status !== "pending"
+            )
+              return yield* planningError("integrity");
+            yield* sql`UPDATE workflow_planning_passes SET record_json = ${encode({ ...pass, status: "cancelled" })} WHERE operation_id = ${operation.id}`;
+          } else if (
+            (operation.status === "claimed" || operation.status === "unknown") &&
+            (input.action === "stop" || input.action === "expire")
+          ) {
+            yield* sql`UPDATE workflow_operations SET cancel_requested = 1 WHERE id = ${operation.id}`;
+          }
+        }
+        const changed = yield* sql<{
+          id: string;
+        }>`UPDATE workflow_planning_sessions SET status = ${status}, record_version = ${updated.recordVersion}, control_generation = ${updated.controlGeneration}, record_json = ${encode(updated)} WHERE id = ${value.id} AND record_version = ${input.expectedVersion} RETURNING id`;
+        if (changed.length !== 1) return yield* planningError("conflict");
+        return yield* savePlanningReceipt(input.command, hash, updated);
+      }),
+    );
+    if (result.kind === "applied") yield* notify;
     return result;
   });
   const recordRoleResult = Effect.fn("WorkflowRunStore.recordRoleResult")(function* (input: {
@@ -803,7 +1136,9 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
   );
   return {
     createRun,
-    createPlanningSession,
+    beginPlanning,
+    getPlanning,
+    controlPlanning,
     recordRoleResult,
     commitTransition,
     subscribeChanges,
