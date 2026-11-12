@@ -236,6 +236,139 @@ describe("staged task events", () => {
     expect(() => decodeConflict({ ...conflict, managerGeneration: 0 })).toThrow();
   });
 
+  it("records allowance configuration, top-up and debit with consistent replay state", () => {
+    const persisted = Schema.decodeUnknownSync(task.WorkTaskPersistedEvent);
+    const context = {
+      sequence: 8,
+      eventId: "event",
+      occurredAt: base.occurredAt,
+      commandId: "command",
+    };
+    const human = { type: "user", subject: "human", sessionId: "session" };
+    const prior = { type: "configured", cap: 3, consumed: 1 };
+    const configured = {
+      ...base,
+      type: "task.allowance-configured",
+      commandId: "command",
+      attribution: human,
+      previous: { type: "unconfigured", consumed: 1 },
+      resulting: prior,
+    };
+    const topup = {
+      ...configured,
+      type: "task.allowance-topped-up",
+      previous: prior,
+      resulting: { ...prior, cap: 5 },
+    };
+    const debit = {
+      ...configured,
+      type: "task.allowance-debited",
+      attribution: { type: "server" },
+      previous: prior,
+      resulting: { ...prior, consumed: 2 },
+      allowanceUnit: 2,
+    };
+    for (const event of [configured, topup, debit]) {
+      expect(decode(event)).toEqual(event);
+      expect(persisted({ event, context })).toEqual({ event, context });
+      for (const field of [
+        "id",
+        "taskId",
+        "occurredAt",
+        "attribution",
+        "commandId",
+        "previous",
+        "resulting",
+        "definitionRevision",
+        "lifecycleRevision",
+        "completionPolicyRevision",
+        "actionPolicyRevision",
+      ])
+        expect(() => decode({ ...event, [field]: undefined })).toThrow();
+      for (const field of ["id", "taskId", "commandId"])
+        for (const value of [" ", "x".repeat(2_001)])
+          expect(() => decode({ ...event, [field]: value })).toThrow();
+      expect(() => persisted({ event, context: { ...context, commandId: "other" } })).toThrow();
+      expect(() => persisted({ event, context: { ...context, eventId: "other" } })).toThrow();
+      expect(() =>
+        persisted({ event, context: { ...context, occurredAt: "2026-11-12T00:00:00Z" } }),
+      ).toThrow();
+      expect(() => decode({ ...event, occurredAt: "2026-02-30T00:00:00Z" })).toThrow();
+    }
+    expect(decode({ ...configured, previous: prior })).toBeDefined();
+    expect(decode({ ...configured, attribution: { type: "server" } })).toBeDefined();
+    for (const change of [
+      { previous: { type: "unconfigured", consumed: 2 } },
+      { resulting: { ...prior, cap: 0 } },
+      { resulting: { ...prior, cap: 1, consumed: 2 } },
+      {
+        attribution: {
+          type: "manager",
+          threadId: "thread",
+          providerSessionId: "session",
+          runId: "run",
+          generation: 1,
+        },
+      },
+    ])
+      expect(() => decode({ ...configured, ...change })).toThrow();
+    for (const change of [
+      { previous: { type: "unconfigured", consumed: 1 } },
+      { resulting: { ...prior, cap: 3 } },
+      { resulting: { ...prior, cap: 5, consumed: 0 } },
+      { attribution: { type: "server" } },
+    ])
+      expect(() => decode({ ...topup, ...change })).toThrow();
+    for (const change of [
+      { allowanceUnit: undefined },
+      { allowanceUnit: 1 },
+      { resulting: { ...prior, consumed: 1 } },
+      { resulting: { cap: 4, consumed: 2, type: "configured" } },
+      { attribution: human },
+    ])
+      expect(() => decode({ ...debit, ...change })).toThrow();
+    for (const value of [-1, 1.5, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() =>
+        decode({ ...configured, previous: { type: "unconfigured", consumed: value } }),
+      ).toThrow();
+      expect(() => decode({ ...configured, resulting: { ...prior, cap: value } })).toThrow();
+      expect(() => decode({ ...debit, allowanceUnit: value })).toThrow();
+    }
+    expect(() => decode({ ...debit, allowanceUnit: 0 })).toThrow();
+    expect(
+      decode({
+        ...debit,
+        previous: { ...prior, cap: Number.MAX_SAFE_INTEGER, consumed: Number.MAX_SAFE_INTEGER - 1 },
+        resulting: { ...prior, cap: Number.MAX_SAFE_INTEGER, consumed: Number.MAX_SAFE_INTEGER },
+        allowanceUnit: Number.MAX_SAFE_INTEGER,
+      }),
+    ).toBeDefined();
+  });
+
+  it("provides typed allowance replay conflicts bound to task and command", () => {
+    const decodeConflict = Schema.decodeUnknownSync(task.WorkTaskAllowanceReplayConflict);
+    const conflict = {
+      _tag: "WorkTaskAllowanceReplayConflict",
+      taskId: "task",
+      commandId: "command",
+    };
+    for (const code of [
+      "prior_state_mismatch",
+      "allowance_not_configured",
+      "cap_below_consumed",
+      "allowance_exhausted",
+      "unit_identity_conflict",
+      "command_identity_conflict",
+    ])
+      expect(decodeConflict({ ...conflict, code }).code).toBe(code);
+    expect(() => decodeConflict({ ...conflict, code: "other" })).toThrow();
+    for (const field of ["taskId", "commandId"])
+      for (const value of [undefined, " ", "x".repeat(2_001)])
+        expect(() =>
+          decodeConflict({ ...conflict, code: "prior_state_mismatch", [field]: value }),
+        ).toThrow();
+  });
+
   it("records terminal review evidence and purpose-bound continuations in persisted context", () => {
     const binding = {
       taskId: "task",
