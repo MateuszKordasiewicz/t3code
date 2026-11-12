@@ -932,7 +932,122 @@ const allowanceDebit = Schema.Struct({
   ),
 );
 
+export class WorkTaskWakeReplayConflict extends Schema.TaggedError<WorkTaskWakeReplayConflict>()(
+  "WorkTaskWakeReplayConflict",
+  {
+    code: Schema.Literals([
+      "source_identity_conflict",
+      "reservation_identity_conflict",
+      "command_identity_conflict",
+      "allowance_unit_conflict",
+      "pending_reservation_conflict",
+      "reservation_not_found",
+      "claim_identity_conflict",
+      "generation_conflict",
+      "acknowledgement_conflict",
+    ]),
+    taskId: WorkTaskId.check(Schema.isMaxLength(2_000)),
+    reservationId: Schema.NullOr(shortText),
+  },
+) {}
+
+const wakeSource = Schema.Struct({
+  kind: shortText,
+  sourceId: shortText,
+  resultRef: Schema.NullOr(shortText),
+});
+const wakeBatch = Schema.Struct({
+  sources: Schema.Array(wakeSource).check(
+    Schema.isMaxLength(32),
+    Schema.makeFilter(
+      (sources) =>
+        new Set(sources.map((source) => JSON.stringify([source.kind, source.sourceId]))).size ===
+        sources.length,
+    ),
+  ),
+  // A non-null watermark requires authoritative reconciliation of sources beyond the batch.
+  overflowThroughGeneration: Schema.NullOr(allowancePositive),
+});
+const wakeEventBase = {
+  ...allowanceEventBase,
+  attribution: Schema.Struct({ type: Schema.Literal("server") }),
+  reservationId: shortText,
+  managerGeneration: allowancePositive,
+  reservationCommandId: CommandId.check(Schema.isMaxLength(2_000)),
+  allowanceUnit: allowancePositive,
+};
+const wakeGenerations = {
+  dirtyGeneration: allowancePositive,
+  acknowledgedGeneration: allowanceCount,
+};
+const wakeGenerationsValid = Schema.makeFilter(
+  (event: { readonly dirtyGeneration: number; readonly acknowledgedGeneration: number }) =>
+    event.acknowledgedGeneration <= event.dirtyGeneration,
+);
+const wakeSourceRecorded = Schema.Struct({
+  ...allowanceEventBase,
+  type: Schema.Literal("task.wake-source-recorded"),
+  attribution: Schema.Struct({ type: Schema.Literal("server") }),
+  source: wakeSource,
+  reservationId: Schema.NullOr(shortText),
+  dirtyGeneration: allowancePositive,
+});
+const wakeReserved = Schema.Struct({
+  ...wakeEventBase,
+  type: Schema.Literal("task.wake-reserved"),
+  ...wakeGenerations,
+  pending: wakeBatch,
+}).check(
+  wakeGenerationsValid,
+  Schema.makeFilter(
+    (event) =>
+      event.pending.overflowThroughGeneration === null ||
+      event.pending.overflowThroughGeneration <= event.dirtyGeneration,
+  ),
+);
+const wakeClaimed = Schema.Struct({
+  ...wakeEventBase,
+  type: Schema.Literal("task.wake-claimed"),
+  ...wakeGenerations,
+  messageId: MessageId.check(Schema.isMaxLength(2_000)),
+  runId: referenceRunId,
+  pending: wakeBatch,
+}).check(
+  wakeGenerationsValid,
+  Schema.makeFilter(
+    (event) =>
+      event.pending.overflowThroughGeneration === null ||
+      event.pending.overflowThroughGeneration <= event.dirtyGeneration,
+  ),
+);
+const wakeClaimUncertain = Schema.Struct({
+  ...wakeEventBase,
+  type: Schema.Literal("task.wake-claim-uncertain"),
+  ...wakeGenerations,
+  reason: shortText,
+}).check(wakeGenerationsValid);
+const wakeAcknowledged = Schema.Struct({
+  ...wakeEventBase,
+  type: Schema.Literal("task.wake-acknowledged"),
+  ...wakeGenerations,
+  observedDirtyGeneration: allowancePositive,
+  previousAcknowledgedGeneration: allowanceCount,
+}).check(
+  wakeGenerationsValid,
+  Schema.makeFilter(
+    (event) =>
+      event.previousAcknowledgedGeneration <= event.acknowledgedGeneration &&
+      event.acknowledgedGeneration <= event.observedDirtyGeneration &&
+      event.observedDirtyGeneration <= event.dirtyGeneration,
+  ),
+);
+
 const WorkTaskNonReviewRequestedEvent = Schema.Union([
+  wakeSourceRecorded,
+  wakeReserved,
+  wakeClaimed,
+  wakeClaimUncertain,
+  wakeAcknowledged,
   allowanceConfiguration,
   allowanceTopUp,
   allowanceDebit,
@@ -1101,6 +1216,11 @@ export const WorkTaskPersistedEvent = persistedEvent.check(
   Schema.makeFilter(({ event, context }) => {
     if (event.id !== context.eventId || event.occurredAt !== context.occurredAt) return false;
     if (
+      event.type === "task.wake-source-recorded" ||
+      event.type === "task.wake-reserved" ||
+      event.type === "task.wake-claimed" ||
+      event.type === "task.wake-claim-uncertain" ||
+      event.type === "task.wake-acknowledged" ||
       event.type === "task.allowance-configured" ||
       event.type === "task.allowance-topped-up" ||
       event.type === "task.allowance-debited"

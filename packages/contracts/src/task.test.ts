@@ -345,6 +345,145 @@ describe("staged task events", () => {
     ).toBeDefined();
   });
 
+  it("stages wake sources, reservations, claims and observed acknowledgements for replay", () => {
+    const persisted = Schema.decodeUnknownSync(task.WorkTaskPersistedEvent);
+    const context = {
+      sequence: 8,
+      eventId: "event",
+      occurredAt: base.occurredAt,
+      commandId: "change",
+    };
+    const source = { kind: "run", sourceId: "source", resultRef: "result" };
+    const recorded = {
+      ...base,
+      type: "task.wake-source-recorded",
+      commandId: "change",
+      source,
+      reservationId: null,
+      dirtyGeneration: 1,
+    };
+    const common = {
+      ...base,
+      commandId: "change",
+      reservationId: "reservation",
+      reservationCommandId: "wake-command",
+      managerGeneration: 1,
+      allowanceUnit: 2,
+      dirtyGeneration: 3,
+      acknowledgedGeneration: 1,
+    };
+    const pending = {
+      sources: [source, { kind: "check", sourceId: "other", resultRef: null }],
+      overflowThroughGeneration: 3,
+    };
+    const reserved = { ...common, type: "task.wake-reserved", pending };
+    const claimed = {
+      ...common,
+      type: "task.wake-claimed",
+      messageId: "message",
+      runId: "run",
+      pending,
+    };
+    const uncertain = { ...common, type: "task.wake-claim-uncertain", reason: "outcome unknown" };
+    const acknowledged = {
+      ...common,
+      type: "task.wake-acknowledged",
+      observedDirtyGeneration: 2,
+      previousAcknowledgedGeneration: 0,
+      acknowledgedGeneration: 2,
+    };
+    for (const event of [recorded, reserved, claimed, uncertain, acknowledged]) {
+      expect(decode(event)).toEqual(event);
+      expect(persisted({ event, context })).toEqual({ event, context });
+      for (const field of ["id", "taskId", "occurredAt", "commandId", "attribution"]) {
+        expect(() => decode({ ...event, [field]: undefined })).toThrow();
+      }
+      for (const change of [
+        { commandId: null },
+        { commandId: "other" },
+        { eventId: "other" },
+        { occurredAt: "2026-11-12T00:00:00Z" },
+      ]) {
+        expect(() => persisted({ event, context: { ...context, ...change } })).toThrow();
+      }
+    }
+    for (const field of [
+      "reservationId",
+      "reservationCommandId",
+      "managerGeneration",
+      "allowanceUnit",
+      "dirtyGeneration",
+      "acknowledgedGeneration",
+      "pending",
+    ]) {
+      expect(() => decode({ ...reserved, [field]: undefined })).toThrow();
+    }
+    for (const field of ["messageId", "runId"])
+      expect(() => decode({ ...claimed, [field]: undefined })).toThrow();
+    expect(() => decode({ ...uncertain, reason: undefined })).toThrow();
+    for (const field of ["observedDirtyGeneration", "previousAcknowledgedGeneration"])
+      expect(() => decode({ ...acknowledged, [field]: undefined })).toThrow();
+    for (const field of ["reservationId", "reservationCommandId", "taskId"])
+      for (const value of [" ", "x".repeat(2001)])
+        expect(() => decode({ ...reserved, [field]: value })).toThrow();
+    for (const field of ["managerGeneration", "allowanceUnit", "dirtyGeneration"])
+      for (const value of [0, -1, 1.5, Infinity, Number.MAX_SAFE_INTEGER + 1])
+        expect(() => decode({ ...reserved, [field]: value })).toThrow();
+    for (const change of [
+      { acknowledgedGeneration: 4 },
+      { acknowledgedGeneration: -1 },
+      { observedDirtyGeneration: 1 },
+      { observedDirtyGeneration: 4 },
+      { previousAcknowledgedGeneration: 3 },
+    ])
+      expect(() => decode({ ...acknowledged, ...change })).toThrow();
+    expect(() =>
+      decode({ ...reserved, pending: { ...pending, overflowThroughGeneration: 4 } }),
+    ).toThrow();
+    expect(() =>
+      decode({ ...reserved, pending: { ...pending, sources: [source, source] } }),
+    ).toThrow();
+    expect(() =>
+      decode({
+        ...reserved,
+        pending: {
+          ...pending,
+          sources: Array.from({ length: 33 }, (_, i) => ({ ...source, sourceId: String(i) })),
+        },
+      }),
+    ).toThrow();
+    expect(() => decode({ ...recorded, source: { ...source, sourceId: " " } })).toThrow();
+    expect(decode({ ...recorded, reservationId: "reservation" })).toBeDefined();
+    expect(
+      decode({ ...reserved, pending: { sources: [], overflowThroughGeneration: null } }),
+    ).toBeDefined();
+  });
+
+  it("provides typed wake replay conflicts", () => {
+    const conflict = Schema.decodeUnknownSync(task.WorkTaskWakeReplayConflict);
+    const value = {
+      _tag: "WorkTaskWakeReplayConflict",
+      taskId: "task",
+      reservationId: "reservation",
+      code: "source_identity_conflict",
+    };
+    for (const code of [
+      "source_identity_conflict",
+      "reservation_identity_conflict",
+      "command_identity_conflict",
+      "allowance_unit_conflict",
+      "pending_reservation_conflict",
+      "reservation_not_found",
+      "claim_identity_conflict",
+      "generation_conflict",
+      "acknowledgement_conflict",
+    ])
+      expect(conflict({ ...value, code }).code).toBe(code);
+    expect(conflict({ ...value, reservationId: null }).reservationId).toBeNull();
+    expect(() => conflict({ ...value, code: "other" })).toThrow();
+    expect(() => conflict({ ...value, reservationId: " " })).toThrow();
+  });
+
   it("provides typed allowance replay conflicts bound to task and command", () => {
     const decodeConflict = Schema.decodeUnknownSync(task.WorkTaskAllowanceReplayConflict);
     const conflict = {
