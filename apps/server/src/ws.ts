@@ -94,6 +94,8 @@ import {
   PersistChatAttachmentsError,
   RpcClientId,
   EnvironmentAuthorizationError,
+  DevelopmentPlanRpcError,
+  PlanningSessionV1,
   type ProjectId,
   type ProviderDriverKind,
   type ProviderInstanceId,
@@ -125,6 +127,7 @@ import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts"
 import * as ThreadMessageIntake from "./orchestration-v2/ThreadMessageIntake.ts";
 import * as DocumentText from "./provider/DocumentText.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import * as DevelopmentPlans from "./developmentPlans/DevelopmentPlanService.ts";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
 import * as GuestShareService from "./guest/GuestShareService.ts";
@@ -1394,6 +1397,8 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
   },
 );
 
+const decodePlanActor = Schema.decodeEffect(PlanningSessionV1.fields.origin);
+
 export const layerWsRpc = (
   currentSession: EnvironmentAuth.AuthenticatedSession,
   clientAnalyticsProps: Readonly<Record<string, unknown>>,
@@ -1447,6 +1452,7 @@ export const layerWsRpc = (
       const commandOutputHub = yield* CommandOutputHub.CommandOutputHub;
       const providerSessionManager = yield* ProviderSessionManager.ProviderSessionManagerV2;
       const scheduledTasks = yield* ScheduledTasks.ScheduledTaskService;
+      const developmentPlans = yield* DevelopmentPlans.DevelopmentPlanService;
       const secretRequests = yield* SecretRequests.SecretRequests;
       const guestShares = yield* GuestShareService.GuestShareService;
       const pullRequests = yield* PullRequestService.PullRequestService;
@@ -2050,6 +2056,27 @@ export const layerWsRpc = (
         return yield* mutateProjectWithClone(projectService, projectCloneTracker, mutation);
       });
 
+      const planContext = (projectId: ProjectId) =>
+        serverEnvironment.getEnvironmentId.pipe(
+          Effect.flatMap((environmentId) =>
+            decodePlanActor({
+              kind: "human",
+              id: currentSession.subject,
+            }).pipe(
+              Effect.map((actor) => ({ actor, destination: { environmentId, projectId } })),
+              Effect.mapError(() => new DevelopmentPlanRpcError({ reason: "invalid" })),
+            ),
+          ),
+        );
+      const planError = (error: {
+        readonly reason: DevelopmentPlanRpcError["reason"];
+        readonly currentVersion?: number;
+      }) =>
+        new DevelopmentPlanRpcError({
+          reason: error.reason,
+          ...(error.currentVersion === undefined ? {} : { currentVersion: error.currentVersion }),
+        });
+
       const handlers = ServerWsRpcGroup.of({
         [ORCHESTRATION_V2_WS_METHODS.dispatchCommand]: (command) =>
           Effect.annotateCurrentSpan({
@@ -2350,6 +2377,122 @@ export const layerWsRpc = (
           ),
         [ORCHESTRATION_V2_WS_METHODS.subscribePromptSuggestion]: (input) =>
           providerSessionManager.subscribePromptSuggestion(input.threadId),
+        [WS_METHODS.developmentPlansCreate]: ({ projectId, ...input }) =>
+          planContext(projectId).pipe(
+            Effect.flatMap((context) =>
+              developmentPlans.create(input, context).pipe(Effect.mapError(planError)),
+            ),
+          ),
+        [WS_METHODS.developmentPlansImport]: ({ projectId, bytesBase64, ...input }) => {
+          const bytes = Buffer.from(bytesBase64, "base64");
+          if (bytes.toString("base64") !== bytesBase64)
+            return Effect.fail(new DevelopmentPlanRpcError({ reason: "invalid" }));
+          return planContext(projectId).pipe(
+            Effect.flatMap((context) =>
+              developmentPlans
+                .import({ ...input, bytes }, context)
+                .pipe(Effect.mapError(planError)),
+            ),
+          );
+        },
+        [WS_METHODS.developmentPlansExport]: ({ projectId, ...input }) =>
+          planContext(projectId).pipe(
+            Effect.flatMap((context) =>
+              developmentPlans.export(input, context).pipe(Effect.mapError(planError)),
+            ),
+          ),
+        [WS_METHODS.developmentPlansGet]: ({ projectId, ...input }) =>
+          planContext(projectId).pipe(
+            Effect.flatMap((context) =>
+              developmentPlans.get(input, context).pipe(Effect.mapError(planError)),
+            ),
+          ),
+        [WS_METHODS.developmentPlansGetObject]: ({ projectId, ...input }) =>
+          planContext(projectId).pipe(
+            Effect.flatMap((context) =>
+              developmentPlans.getObject(input, context).pipe(Effect.mapError(planError)),
+            ),
+          ),
+        [WS_METHODS.developmentPlansList]: (input) =>
+          planContext(input.projectId).pipe(
+            Effect.flatMap((context) =>
+              developmentPlans.list(input, context).pipe(Effect.mapError(planError)),
+            ),
+          ),
+        [WS_METHODS.developmentPlansUpdateDraft]: ({ projectId, ...input }) =>
+          planContext(projectId).pipe(
+            Effect.flatMap((context) =>
+              developmentPlans.updateDraft(input, context).pipe(Effect.mapError(planError)),
+            ),
+          ),
+        [WS_METHODS.developmentPlansLinkThread]: ({ projectId, ...input }) =>
+          planContext(projectId).pipe(
+            Effect.flatMap((context) =>
+              developmentPlans.linkThread(input, context).pipe(Effect.mapError(planError)),
+            ),
+          ),
+        [WS_METHODS.developmentPlansUnlinkThread]: ({ projectId, ...input }) =>
+          planContext(projectId).pipe(
+            Effect.flatMap((context) =>
+              developmentPlans.unlinkThread(input, context).pipe(Effect.mapError(planError)),
+            ),
+          ),
+        [WS_METHODS.developmentPlansValidateCoverage]: ({ projectId, ...input }) =>
+          planContext(projectId).pipe(
+            Effect.flatMap((context) =>
+              developmentPlans.validateCoverage(input, context).pipe(Effect.mapError(planError)),
+            ),
+          ),
+        [WS_METHODS.developmentPlansBeginPlanning]: ({ projectId, session, ...input }) =>
+          planContext(projectId).pipe(
+            Effect.flatMap((context) =>
+              developmentPlans
+                .beginPlanning(
+                  {
+                    ...input,
+                    session: { ...session, origin: context.actor, ...context.destination },
+                  },
+                  context,
+                )
+                .pipe(Effect.mapError(planError)),
+            ),
+          ),
+        [WS_METHODS.developmentPlansGetPlanning]: ({ projectId, ...input }) =>
+          planContext(projectId).pipe(
+            Effect.flatMap((context) =>
+              developmentPlans.getPlanning(input, context).pipe(Effect.mapError(planError)),
+            ),
+          ),
+        [WS_METHODS.developmentPlansPausePlanning]: ({ projectId, ...input }) =>
+          planContext(projectId).pipe(
+            Effect.flatMap((context) =>
+              developmentPlans.pausePlanning(input, context).pipe(Effect.mapError(planError)),
+            ),
+          ),
+        [WS_METHODS.developmentPlansResumePlanning]: ({ projectId, ...input }) =>
+          planContext(projectId).pipe(
+            Effect.flatMap((context) =>
+              developmentPlans.resumePlanning(input, context).pipe(Effect.mapError(planError)),
+            ),
+          ),
+        [WS_METHODS.developmentPlansStopPlanning]: ({ projectId, ...input }) =>
+          planContext(projectId).pipe(
+            Effect.flatMap((context) =>
+              developmentPlans.stopPlanning(input, context).pipe(Effect.mapError(planError)),
+            ),
+          ),
+        [WS_METHODS.developmentPlansBeginPass]: ({ projectId, ...input }) =>
+          planContext(projectId).pipe(
+            Effect.flatMap((context) =>
+              developmentPlans.beginPass(input, context).pipe(Effect.mapError(planError)),
+            ),
+          ),
+        [WS_METHODS.developmentPlansRecordDisposition]: ({ projectId, ...input }) =>
+          planContext(projectId).pipe(
+            Effect.flatMap((context) =>
+              developmentPlans.recordDisposition(input, context).pipe(Effect.mapError(planError)),
+            ),
+          ),
         [WS_METHODS.scheduledTasksSubscribe]: (_input) =>
           scheduledTasks.subscribeList().pipe(Stream.map(withVisibleWebhookUrls)),
         [WS_METHODS.scheduledTasksUpsert]: (input) => scheduledTasks.upsert(input),

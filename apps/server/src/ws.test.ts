@@ -4,6 +4,10 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   AuthSessionId,
+  AuthOrchestrationReadScope,
+  AuthOrchestrationOperateScope,
+  PlanningSessionV1,
+  upgradeDevelopmentPlanDocumentV1,
   AuthSourceControlWriteScope,
   EnvironmentId,
   EventId,
@@ -28,6 +32,9 @@ import {
 import * as Deferred from "effect/Deferred";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Digest from "effect/crypto/Digest";
+import * as Schema from "effect/Schema";
+import * as RpcTest from "effect/rpc/RpcTest";
 import * as Exit from "effect/Exit";
 import * as Cause from "effect/Cause";
 import * as Fiber from "effect/Fiber";
@@ -62,6 +69,11 @@ import * as CodexInstallation from "./provider/CodexInstallation.ts";
 import * as DeviceService from "./device/DeviceService.ts";
 import * as DocumentText from "./provider/DocumentText.ts";
 import * as DevelopmentPlanService from "./developmentPlans/DevelopmentPlanService.ts";
+import * as DevelopmentPlanAuthorization from "./developmentPlans/DevelopmentPlanAuthorization.ts";
+import * as DevelopmentPlanStore from "./developmentPlans/DevelopmentPlanStore.ts";
+import * as WorkflowRunStore from "./workflowRuns/WorkflowRunStore.ts";
+import * as PlanningPassObservation from "./developmentPlans/PlanningPassObservation.ts";
+import { DevelopmentPlanHash } from "./developmentPlans/DevelopmentPlanHash.ts";
 import * as DirectEndpoints from "./environment/DirectEndpoints.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import * as EnvironmentTheme from "./environmentTheme.ts";
@@ -153,6 +165,14 @@ import {
   WS_RPC_SERVER_OPTIONS,
   withLateConfigDiscovery,
 } from "./ws.ts";
+
+const decodePlanningSession = Schema.decodeSync(PlanningSessionV1);
+const getPlanRpc = WsRpcGroup.requests.get(WS_METHODS.developmentPlansGet)!;
+const beginPlanRpc = WsRpcGroup.requests.get(WS_METHODS.developmentPlansBeginPlanning)!;
+const decodePlanResult = Schema.decodeUnknownSync(getPlanRpc.successSchema);
+const encodePlanResult = Schema.encodeUnknownSync(getPlanRpc.successSchema);
+const decodePlanningResult = Schema.decodeUnknownSync(beginPlanRpc.successSchema);
+const encodePlanningResult = Schema.encodeUnknownSync(beginPlanRpc.successSchema);
 
 const snapshotConfig = (fields: Partial<ServerConfig>) =>
   ({ availableEditors: [], settings: {}, ...fields }) as unknown as ServerConfig;
@@ -1809,4 +1829,283 @@ it.effect("thread resume at its own high-water below the pruned boundary skips t
     // A snapshot load dies with "snapshot", so success means the resume replayed nothing.
     assert.isTrue(Exit.isSuccess(exit));
   }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.effect("enforces development plan authority and persists typed RPC results", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const projectId = ProjectId.make("project");
+    const timestamp = "2026-11-10T00:00:00.000Z";
+    const { native } = yield* upgradeDevelopmentPlanDocumentV1({
+      bytes: new TextEncoder().encode(
+        JSON.stringify({
+          schemaVersion: 1,
+          planId: "plan",
+          revisionId: "revision",
+          environmentId: "env",
+          projectId,
+          title: "Example",
+          brief: "Outcome",
+          linkedThreadIds: [],
+          sources: [
+            {
+              id: "source",
+              kind: "thread_message",
+              environmentId: "env",
+              projectId,
+              threadId: "thread",
+              messageId: "message",
+              capturedAt: timestamp,
+              attribution: "user",
+              bytesBase64: "WA==",
+              byteLength: 1,
+              sha256: "4b68ab3847feda7d6c62c1fbcbeebfa35eab7351ed5e78f4ddadea5df64b8015",
+            },
+          ],
+          sourceStatements: [
+            { id: "statement", sourceId: "source", startByte: 0, endByte: 1, text: "X" },
+          ],
+          requirements: [
+            {
+              id: "requirement",
+              text: "Outcome",
+              sourceStatementIds: ["statement"],
+              criteria: [{ id: "criterion", text: "Observable" }],
+            },
+          ],
+        }),
+      ),
+      hashSourcePacket: DevelopmentPlanHash.sourcePacket,
+    });
+    const environment = Layer.mock(ServerEnvironment.ServerEnvironment)({
+      getEnvironmentId: Effect.succeed(EnvironmentId.make("env")),
+    });
+    const resources = Layer.mergeAll(
+      environment,
+      Layer.mock(ProjectStore.ProjectStoreV2)({
+        get: (id) => Effect.succeedSome({ projectId: id, deletedAt: null } as never),
+      }),
+      Layer.mock(ProjectionStore.ProjectionStoreV2)({
+        getThreadShell: (id) =>
+          Effect.succeed(id === "thread" ? ({ id, projectId, deletedAt: null } as never) : null),
+      }),
+    );
+    const serviceLayer = DevelopmentPlanService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          DevelopmentPlanStore.layer,
+          WorkflowRunStore.layer,
+          PlanningPassObservation.unknownObservationLayer,
+          DevelopmentPlanAuthorization.layer.pipe(Layer.provide(resources)),
+          DevelopmentPlanService.emptyPassReaderLayer,
+          DevelopmentPlanService.denyAttestationLayer,
+        ),
+      ),
+    );
+    const service = yield* DevelopmentPlanService.DevelopmentPlanService.pipe(
+      Effect.provide(serviceLayer),
+    );
+    const services = Layer.mergeAll(
+      layerUnusedConfigRpcServices,
+      resources,
+      Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+      Layer.succeed(DevelopmentPlanService.DevelopmentPlanService, service),
+      Layer.mock(UsageLimitSources.UsageLimitSources)({ current: Effect.succeed([]) }),
+      Layer.mock(ExternalLauncher.ExternalLauncher)({}),
+      Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({}),
+      Layer.mock(DirectEndpoints.DirectEndpoints)({}),
+      Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+        scratchRoot: Effect.succeedNone,
+        namedProjectsRoot: process.cwd(),
+      }),
+      Layer.mock(ScratchThreadPromotion.ScratchThreadPromotion)({}),
+      Layer.mock(EnvironmentAuth.EnvironmentAuth)({}),
+    );
+    const browser = yield* ServerBrowser.ServerBrowser;
+    const clientFor = (
+      subject: string,
+      scopes: ReadonlyArray<
+        typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope
+      >,
+    ) =>
+      RpcTest.makeClient(WsRpcGroup).pipe(
+        Effect.provide(
+          Layer.merge(
+            layerWsRpc(
+              {
+                sessionId: AuthSessionId.make(subject),
+                subject,
+                method: "browser-session-cookie",
+                scopes,
+              },
+              {},
+              browser,
+              () => Effect.void,
+              { secretReferences: true },
+            ).pipe(Layer.provide(services)),
+            RpcAuthorization.layer(scopes),
+          ),
+        ),
+      );
+    const reader = yield* clientFor("actor", [AuthOrchestrationReadScope]);
+    const client = yield* clientFor("actor", [
+      AuthOrchestrationReadScope,
+      AuthOrchestrationOperateScope,
+    ]);
+    const other = yield* clientFor("other", [
+      AuthOrchestrationReadScope,
+      AuthOrchestrationOperateScope,
+    ]);
+    const create = {
+      projectId,
+      planId: "plan",
+      revisionId: "revision",
+      title: "Example",
+      commandId: "create",
+      revision: native.revision,
+      packet: native.sourcePacket,
+    };
+    assert.strictEqual(
+      (yield* Effect.flip(reader[WS_METHODS.developmentPlansCreate](create)))._tag,
+      "EnvironmentAuthorizationError",
+    );
+    assert.strictEqual((yield* sql`SELECT * FROM development_plans`).length, 0);
+    const applied = yield* client[WS_METHODS.developmentPlansCreate](create);
+    assert.strictEqual(applied.kind, "applied");
+    assert.strictEqual((yield* client[WS_METHODS.developmentPlansCreate](create)).kind, "replay");
+    const fetched = yield* client[WS_METHODS.developmentPlansGet]({ projectId, planId: "plan" });
+    assert.deepEqual(fetched.revision, native.revision);
+    assert.deepEqual(fetched.sourcePacket, native.sourcePacket);
+    assert.deepEqual(decodePlanResult(encodePlanResult(fetched)), fetched);
+    const conflict = yield* Effect.flip(
+      client[WS_METHODS.developmentPlansUpdateDraft]({
+        ...create,
+        revisionId: "revision-2",
+        commandId: "update",
+        expectedVersion: 9,
+      }),
+    );
+    assert.deepInclude(conflict, {
+      _tag: "DevelopmentPlanRpcError",
+      reason: "conflict",
+      currentVersion: 0,
+    });
+    const foreign = {
+      ...create,
+      planId: "foreign",
+      commandId: "foreign",
+      packet: {
+        ...create.packet,
+        access: { origins: [{ environmentId: EnvironmentId.make("other-env"), projectId }] },
+      },
+    };
+    assert.deepInclude(yield* Effect.flip(client[WS_METHODS.developmentPlansCreate](foreign)), {
+      _tag: "DevelopmentPlanRpcError",
+      reason: "unauthorized",
+    });
+    assert.deepInclude(
+      yield* Effect.flip(
+        client[WS_METHODS.developmentPlansGet]({
+          projectId: ProjectId.make("other"),
+          planId: "plan",
+        }),
+      ),
+      { reason: "not-found" },
+    );
+    assert.deepInclude(
+      yield* Effect.flip(
+        client[WS_METHODS.developmentPlansImport]({
+          projectId,
+          format: "v1",
+          bytesBase64: "!",
+          planId: "bad",
+          revisionId: "bad",
+          title: "Bad",
+          commandId: "bad",
+        }),
+      ),
+      { reason: "invalid" },
+    );
+    const session = decodePlanningSession({
+      schemaVersion: 1,
+      id: "session",
+      environmentId: "forged",
+      projectId: "forged",
+      planId: "plan",
+      origin: { kind: "human", id: "forged" },
+      request: "Plan",
+      mode: "ordinary",
+      allowedRoles: ["author"],
+      allowedProviders: [{ providerInstanceId: "provider", model: "model" }],
+      limits: { maxPasses: 4, maxRepairRounds: 2, deadline: "2026-12-01T00:00:00Z" },
+      consumed: { passes: 0, repairRounds: 0 },
+      controlGeneration: 0,
+      recordVersion: 0,
+      status: "active",
+      createdAt: timestamp,
+      access: { origins: [] },
+    });
+    const begin = {
+      projectId,
+      session,
+      command: { commandId: "begin", receiptId: "receipt-begin" },
+    };
+    const started = yield* client[WS_METHODS.developmentPlansBeginPlanning](begin);
+    assert.strictEqual(started.value.environmentId, "env");
+    assert.strictEqual(started.value.projectId, projectId);
+    assert.strictEqual(started.value.origin.kind, "human");
+    assert.strictEqual(started.value.origin.id, "actor");
+    assert.deepEqual(decodePlanningResult(encodePlanningResult(started)), started);
+    assert.strictEqual(
+      (yield* client[WS_METHODS.developmentPlansBeginPlanning](begin)).kind,
+      "replay",
+    );
+    assert.deepEqual(
+      yield* client[WS_METHODS.developmentPlansGetPlanning]({ projectId, sessionId: session.id }),
+      started.value,
+    );
+    assert.deepInclude(
+      yield* Effect.flip(
+        other[WS_METHODS.developmentPlansPausePlanning]({
+          projectId,
+          sessionId: session.id,
+          expectedVersion: 0,
+          command: { commandId: "pause", receiptId: "receipt-pause" },
+        }),
+      ),
+      { reason: "unauthorized" },
+    );
+    assert.strictEqual((yield* sql`SELECT * FROM development_plans`).length, 1);
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_command_receipts`).length, 1);
+    const imported = {
+      projectId,
+      format: "markdown" as const,
+      bytesBase64: "WA==",
+      planId: "imported",
+      revisionId: "imported-revision",
+      title: "Imported",
+      commandId: "import",
+      documentId: "document",
+    };
+    assert.strictEqual(
+      (yield* client[WS_METHODS.developmentPlansImport](imported)).kind,
+      "applied",
+    );
+    assert.strictEqual((yield* client[WS_METHODS.developmentPlansImport](imported)).kind, "replay");
+    const exported = yield* reader[WS_METHODS.developmentPlansExport]({
+      projectId,
+      planId: "imported",
+    });
+    assert.strictEqual(exported.native.sourcePacket.sources[0]?.bytesBase64, "WA==");
+    assert.strictEqual((yield* sql`SELECT * FROM development_plans`).length, 2);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(
+      Layer.mergeAll(
+        Layer.fresh(layerConfigSources),
+        Digest.layerWebCrypto,
+        Layer.mock(ServerBrowser.ServerBrowser)({}),
+      ),
+    ),
+  ),
 );

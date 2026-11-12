@@ -3,9 +3,40 @@ import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
 
 import { ORCHESTRATION_V2_WS_METHODS } from "./orchestrationV2.ts";
-import { WS_METHODS, WsRpcGroup } from "./rpc.ts";
+import { DevelopmentPlanRpcError, WS_METHODS, WsRpcGroup } from "./rpc.ts";
+
+const importRpc = WsRpcGroup.requests.get(WS_METHODS.developmentPlansImport)!;
+const decodeImport = Schema.decodeUnknownSync(importRpc.payloadSchema);
+const encodeImport = Schema.encodeUnknownSync(importRpc.payloadSchema);
+const encodePlanError = Schema.encodeUnknownSync(DevelopmentPlanRpcError);
+const decodePlanError = Schema.decodeUnknownSync(DevelopmentPlanRpcError);
 
 describe("WebSocket RPC contracts", () => {
+  it("round-trips imported bytes and typed conflict errors", () => {
+    const value = {
+      projectId: "project",
+      format: "v1",
+      bytesBase64: "WA==",
+      planId: "plan",
+      revisionId: "revision",
+      title: "Example",
+      commandId: "import",
+    };
+    const decoded = decodeImport(value);
+    expect(encodeImport(decoded)).toEqual(value);
+    const error = new DevelopmentPlanRpcError({ reason: "conflict", currentVersion: 3 });
+    const encoded = encodePlanError(error);
+    expect(decodePlanError(encoded)).toMatchObject({
+      _tag: "DevelopmentPlanRpcError",
+      reason: "conflict",
+      currentVersion: 3,
+    });
+  });
+
+  it("does not expose planning pass settlement", () => {
+    expect(WsRpcGroup.requests.has("developmentPlans.settlePass" as never)).toBe(false);
+  });
+
   it("rejects server-internal commands sent to dispatchCommand", () => {
     const dispatchCommand = WsRpcGroup.requests.get(ORCHESTRATION_V2_WS_METHODS.dispatchCommand);
     if (dispatchCommand === undefined) throw new Error("dispatchCommand is not registered");

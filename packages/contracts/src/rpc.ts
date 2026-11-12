@@ -37,7 +37,15 @@ import * as Schema from "effect/Schema";
 import * as Rpc from "effect/rpc/Rpc";
 import * as RpcGroup from "effect/rpc/RpcGroup";
 import * as RpcMiddleware from "effect/rpc/RpcMiddleware";
-import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { NonNegativeInt, TrimmedNonEmptyString, ProjectId } from "./baseSchemas.ts";
+import {
+  DevelopmentPlanRevisionV1,
+  RevisionEnvelope,
+  DevelopmentPlanDocumentV2,
+  PlanningSessionV1,
+  PlanningPassV1,
+} from "./developmentPlans.ts";
+import { WorkflowOperationV1 } from "./workflowRuns.ts";
 import {
   ProviderAuthCancelInput,
   ProviderAuthCompleteInput,
@@ -548,6 +556,23 @@ export const WS_METHODS = {
   serverGetUsageSummary: "server.getUsageSummary",
   serverRefreshUsageRates: "server.refreshUsageRates",
 
+  developmentPlansCreate: "developmentPlans.create",
+  developmentPlansImport: "developmentPlans.import",
+  developmentPlansExport: "developmentPlans.export",
+  developmentPlansGet: "developmentPlans.get",
+  developmentPlansGetObject: "developmentPlans.getObject",
+  developmentPlansList: "developmentPlans.list",
+  developmentPlansUpdateDraft: "developmentPlans.updateDraft",
+  developmentPlansLinkThread: "developmentPlans.linkThread",
+  developmentPlansUnlinkThread: "developmentPlans.unlinkThread",
+  developmentPlansValidateCoverage: "developmentPlans.validateCoverage",
+  developmentPlansBeginPlanning: "developmentPlans.beginPlanning",
+  developmentPlansGetPlanning: "developmentPlans.getPlanning",
+  developmentPlansPausePlanning: "developmentPlans.pausePlanning",
+  developmentPlansResumePlanning: "developmentPlans.resumePlanning",
+  developmentPlansStopPlanning: "developmentPlans.stopPlanning",
+  developmentPlansBeginPass: "developmentPlans.beginPass",
+  developmentPlansRecordDisposition: "developmentPlans.recordDisposition",
   scheduledTasksSubscribe: "scheduledTasks.subscribe",
   scheduledTasksUpsert: "scheduledTasks.upsert",
   scheduledTasksSetEnabled: "scheduledTasks.setEnabled",
@@ -1976,6 +2001,257 @@ const WsSubscribeServerLifecycleRpc = Rpc.make(WS_METHODS.subscribeServerLifecyc
   stream: true,
 });
 
+export class DevelopmentPlanRpcError extends Schema.TaggedError<DevelopmentPlanRpcError>()(
+  "DevelopmentPlanRpcError",
+  {
+    reason: Schema.Literals([
+      "not-found",
+      "conflict",
+      "invalid",
+      "integrity",
+      "storage",
+      "unauthorized",
+      "limit",
+      "deadline",
+      "custody",
+      "ineligible",
+      "observation-unknown",
+    ]),
+    currentVersion: Schema.optionalKey(Schema.Number),
+  },
+) {}
+const DevelopmentPlanError = Schema.Union([DevelopmentPlanRpcError, EnvironmentAuthorizationError]);
+const PlanSummary = Schema.Struct({
+  planId: Schema.String,
+  environmentId: Schema.String,
+  projectId: Schema.String,
+  title: Schema.String,
+  currentRevisionId: Schema.String,
+  version: Schema.Number,
+  createdAt: Schema.String,
+  linkedThreadIds: Schema.Array(Schema.String),
+});
+const PlanReceipt = Schema.Struct({
+  kind: Schema.Literals(["applied", "replay"]),
+  plan: PlanSummary,
+});
+const PlanningReceipt = <S extends Schema.Top>(value: S) =>
+  Schema.Struct({ kind: Schema.Literals(["applied", "replay"]), receiptId: Schema.String, value });
+const PlanCommand = Schema.Struct({ commandId: Schema.String, receiptId: Schema.String });
+const PlanControl = {
+  sessionId: PlanningSessionV1.fields.id,
+  expectedVersion: Schema.Number,
+  command: PlanCommand,
+};
+const PlanLookup = { planId: Schema.String, revisionId: Schema.optionalKey(Schema.String) };
+const PlanContent = {
+  planId: Schema.String,
+  revisionId: Schema.String,
+  commandId: Schema.String,
+  revision: DevelopmentPlanRevisionV1,
+  packet: RevisionEnvelope.fields.sourcePacket,
+};
+const PlanLink = {
+  planId: Schema.String,
+  expectedVersion: Schema.Number,
+  threadId: Schema.String,
+  commandId: Schema.String,
+};
+const Disposition = PlanningPassV1.fields.report.schema.members[1].fields.dispositions.value;
+const PlanBlocker = Schema.Struct({
+  code: Schema.Literals([
+    "requirement-without-criterion",
+    "criterion-without-work-item",
+    "criterion-without-verification",
+    "open-blocking-question",
+    "review-missing",
+    "review-not-review",
+    "review-unsettled",
+    "review-stale",
+    "review-not-passing",
+    "anchored-omission",
+    "blocking-finding",
+    "invalid-reference",
+    "dependency-cycle",
+    "invalid-record",
+  ]),
+  objectId: Schema.optionalKey(Schema.String),
+});
+const WsDevelopmentPlansCreateRpc = Rpc.make(WS_METHODS.developmentPlansCreate, {
+  payload: Schema.Struct({ projectId: ProjectId, ...PlanContent, title: Schema.String }),
+  success: PlanReceipt,
+  error: DevelopmentPlanError,
+});
+const WsDevelopmentPlansImportRpc = Rpc.make(WS_METHODS.developmentPlansImport, {
+  payload: Schema.Struct({
+    projectId: ProjectId,
+
+    format: Schema.Literals(["v1", "v2", "markdown", "plan-artifact"]),
+    bytesBase64: Schema.String,
+    planId: Schema.String,
+    revisionId: Schema.String,
+    title: Schema.String,
+    commandId: Schema.String,
+    documentId: Schema.optionalKey(Schema.String),
+  }),
+  success: PlanReceipt,
+  error: DevelopmentPlanError,
+});
+const WsDevelopmentPlansExportRpc = Rpc.make(WS_METHODS.developmentPlansExport, {
+  payload: Schema.Struct({ projectId: ProjectId, ...PlanLookup }),
+  success: DevelopmentPlanDocumentV2,
+  error: DevelopmentPlanError,
+});
+const WsDevelopmentPlansGetRpc = Rpc.make(WS_METHODS.developmentPlansGet, {
+  payload: Schema.Struct({ projectId: ProjectId, ...PlanLookup }),
+  success: Schema.Struct({
+    plan: PlanSummary,
+    revisionId: Schema.String,
+    revisionHash: Schema.String,
+    revision: DevelopmentPlanRevisionV1,
+    sourcePacket: RevisionEnvelope.fields.sourcePacket,
+    createdAt: Schema.String,
+  }),
+  error: DevelopmentPlanError,
+});
+const WsDevelopmentPlansGetObjectRpc = Rpc.make(WS_METHODS.developmentPlansGetObject, {
+  payload: Schema.Struct({
+    projectId: ProjectId,
+
+    planId: Schema.String,
+    revisionId: Schema.String,
+    family: Schema.Literals([
+      "requirements",
+      "decisions",
+      "questions",
+      "assumptions",
+      "approach",
+      "workItems",
+    ]),
+    id: Schema.String,
+  }),
+  success: Schema.Union([
+    DevelopmentPlanRevisionV1.fields.requirements.value,
+    DevelopmentPlanRevisionV1.fields.decisions.value,
+    DevelopmentPlanRevisionV1.fields.questions.value,
+    DevelopmentPlanRevisionV1.fields.assumptions.value,
+    DevelopmentPlanRevisionV1.fields.approach.value,
+    DevelopmentPlanRevisionV1.fields.workItems.value,
+  ]),
+  error: DevelopmentPlanError,
+});
+const WsDevelopmentPlansListRpc = Rpc.make(WS_METHODS.developmentPlansList, {
+  payload: Schema.Struct({
+    projectId: ProjectId,
+    cursor: Schema.optionalKey(Schema.String),
+    limit: Schema.Number,
+  }),
+  success: Schema.Struct({
+    plans: Schema.Array(PlanSummary),
+    nextCursor: Schema.optionalKey(Schema.String),
+  }),
+  error: DevelopmentPlanError,
+});
+const WsDevelopmentPlansUpdateDraftRpc = Rpc.make(WS_METHODS.developmentPlansUpdateDraft, {
+  payload: Schema.Struct({
+    projectId: ProjectId,
+    ...PlanContent,
+    expectedVersion: Schema.Number,
+  }),
+  success: PlanReceipt,
+  error: DevelopmentPlanError,
+});
+const WsDevelopmentPlansLinkThreadRpc = Rpc.make(WS_METHODS.developmentPlansLinkThread, {
+  payload: Schema.Struct({ projectId: ProjectId, ...PlanLink }),
+  success: PlanReceipt,
+  error: DevelopmentPlanError,
+});
+const WsDevelopmentPlansUnlinkThreadRpc = Rpc.make(WS_METHODS.developmentPlansUnlinkThread, {
+  payload: Schema.Struct({ projectId: ProjectId, ...PlanLink }),
+  success: PlanReceipt,
+  error: DevelopmentPlanError,
+});
+const WsDevelopmentPlansValidateCoverageRpc = Rpc.make(
+  WS_METHODS.developmentPlansValidateCoverage,
+  {
+    payload: Schema.Struct({ projectId: ProjectId, ...PlanLookup }),
+    success: Schema.Struct({
+      revisionId: Schema.String,
+      coverage: Schema.Struct({
+        revisionHash: Schema.String,
+        sourcePacketHash: Schema.String,
+        structuralBlockers: Schema.Array(PlanBlocker),
+        reviewBlockers: Schema.Array(PlanBlocker),
+      }),
+      reviewReady: Schema.Boolean,
+    }),
+    error: DevelopmentPlanError,
+  },
+);
+const WsDevelopmentPlansBeginPlanningRpc = Rpc.make(WS_METHODS.developmentPlansBeginPlanning, {
+  payload: Schema.Struct({
+    projectId: ProjectId,
+    session: PlanningSessionV1,
+    command: PlanCommand,
+  }),
+  success: PlanningReceipt(PlanningSessionV1),
+  error: DevelopmentPlanError,
+});
+const WsDevelopmentPlansGetPlanningRpc = Rpc.make(WS_METHODS.developmentPlansGetPlanning, {
+  payload: Schema.Struct({ projectId: ProjectId, sessionId: PlanningSessionV1.fields.id }),
+  success: PlanningSessionV1,
+  error: DevelopmentPlanError,
+});
+const WsDevelopmentPlansPausePlanningRpc = Rpc.make(WS_METHODS.developmentPlansPausePlanning, {
+  payload: Schema.Struct({ projectId: ProjectId, ...PlanControl }),
+  success: PlanningReceipt(PlanningSessionV1),
+  error: DevelopmentPlanError,
+});
+const WsDevelopmentPlansResumePlanningRpc = Rpc.make(WS_METHODS.developmentPlansResumePlanning, {
+  payload: Schema.Struct({ projectId: ProjectId, ...PlanControl }),
+  success: PlanningReceipt(PlanningSessionV1),
+  error: DevelopmentPlanError,
+});
+const WsDevelopmentPlansStopPlanningRpc = Rpc.make(WS_METHODS.developmentPlansStopPlanning, {
+  payload: Schema.Struct({ projectId: ProjectId, ...PlanControl }),
+  success: PlanningReceipt(PlanningSessionV1),
+  error: DevelopmentPlanError,
+});
+const WsDevelopmentPlansBeginPassRpc = Rpc.make(WS_METHODS.developmentPlansBeginPass, {
+  payload: Schema.Struct({
+    projectId: ProjectId,
+    ...PlanControl,
+    pass: PlanningPassV1,
+    operation: WorkflowOperationV1,
+  }),
+  success: PlanningReceipt(
+    Schema.Struct({
+      session: PlanningSessionV1,
+      pass: PlanningPassV1,
+      operation: WorkflowOperationV1,
+    }),
+  ),
+  error: DevelopmentPlanError,
+});
+const WsDevelopmentPlansRecordDispositionRpc = Rpc.make(
+  WS_METHODS.developmentPlansRecordDisposition,
+  {
+    payload: Schema.Struct({
+      projectId: ProjectId,
+
+      ...PlanControl,
+      reviewPassId: PlanningPassV1.fields.id,
+      findingId: Schema.String,
+      repairPassId: PlanningPassV1.fields.id,
+      disposition: Disposition,
+    }),
+    success: PlanningReceipt(
+      Schema.Struct({ session: PlanningSessionV1, disposition: Disposition }),
+    ),
+    error: DevelopmentPlanError,
+  },
+);
+
 const WsScheduledTasksSubscribeRpc = Rpc.make(WS_METHODS.scheduledTasksSubscribe, {
   payload: ScheduledTaskListInput,
   success: ScheduledTaskListResult,
@@ -2124,6 +2400,23 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerGetUsageSummaryRpc,
   WsServerRefreshUsageRatesRpc,
   WsServerSignalProcessRpc,
+  WsDevelopmentPlansCreateRpc,
+  WsDevelopmentPlansImportRpc,
+  WsDevelopmentPlansExportRpc,
+  WsDevelopmentPlansGetRpc,
+  WsDevelopmentPlansGetObjectRpc,
+  WsDevelopmentPlansListRpc,
+  WsDevelopmentPlansUpdateDraftRpc,
+  WsDevelopmentPlansLinkThreadRpc,
+  WsDevelopmentPlansUnlinkThreadRpc,
+  WsDevelopmentPlansValidateCoverageRpc,
+  WsDevelopmentPlansBeginPlanningRpc,
+  WsDevelopmentPlansGetPlanningRpc,
+  WsDevelopmentPlansPausePlanningRpc,
+  WsDevelopmentPlansResumePlanningRpc,
+  WsDevelopmentPlansStopPlanningRpc,
+  WsDevelopmentPlansBeginPassRpc,
+  WsDevelopmentPlansRecordDispositionRpc,
   WsScheduledTasksSubscribeRpc,
   WsScheduledTasksUpsertRpc,
   WsScheduledTasksSetEnabledRpc,

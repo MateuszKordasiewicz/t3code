@@ -74,6 +74,32 @@ describe("RPC authorization scopes", () => {
     }
   });
 
+  it("separates development plan reads from mutations", () => {
+    for (const method of [
+      WS_METHODS.developmentPlansExport,
+      WS_METHODS.developmentPlansGet,
+      WS_METHODS.developmentPlansGetObject,
+      WS_METHODS.developmentPlansList,
+      WS_METHODS.developmentPlansValidateCoverage,
+      WS_METHODS.developmentPlansGetPlanning,
+    ])
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationReadScope);
+    for (const method of [
+      WS_METHODS.developmentPlansCreate,
+      WS_METHODS.developmentPlansImport,
+      WS_METHODS.developmentPlansUpdateDraft,
+      WS_METHODS.developmentPlansLinkThread,
+      WS_METHODS.developmentPlansUnlinkThread,
+      WS_METHODS.developmentPlansBeginPlanning,
+      WS_METHODS.developmentPlansPausePlanning,
+      WS_METHODS.developmentPlansResumePlanning,
+      WS_METHODS.developmentPlansStopPlanning,
+      WS_METHODS.developmentPlansBeginPass,
+      WS_METHODS.developmentPlansRecordDisposition,
+    ])
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
+  });
+
   it("rejects unknown RPC method names", () => {
     for (const method of ["server.notRegistered", "toString", "constructor"]) {
       expect(() => requiredScopeForRpcMethod(method)).toThrow(
