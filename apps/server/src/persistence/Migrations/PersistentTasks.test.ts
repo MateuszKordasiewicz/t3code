@@ -5,6 +5,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import type { SqlError } from "effect/sql/SqlError";
 
 import { runMigrations } from "../Migrations.ts";
 
@@ -25,6 +26,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
     assert.deepInclude(migrations, [88, "WorkTaskClaims"]);
     assert.deepInclude(migrations, [89, "WorkTaskValidationIdentity"]);
     assert.deepInclude(migrations, [90, "WorkTaskValidationReplay"]);
+    assert.deepInclude(migrations, [91, "WorkTaskReviewOutcomes"]);
     const tables = yield* sql<{ readonly name: string }>`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'work_task_%' ORDER BY name
     `;
@@ -41,6 +43,10 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
         "work_task_manager_bindings",
         "work_task_projections",
         "work_task_results",
+        "work_task_review_events",
+        "work_task_review_outcomes",
+        "work_task_review_rowids",
+        "work_task_review_status",
         "work_task_thread_links",
         "work_task_validation_attempts",
         "work_task_validation_identity",
@@ -84,6 +90,7 @@ it.effect("upgrades predecessor rows and events without changing their bytes or 
       [88, "WorkTaskClaims"],
       [89, "WorkTaskValidationIdentity"],
       [90, "WorkTaskValidationReplay"],
+      [91, "WorkTaskReviewOutcomes"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM projection_projects ORDER BY project_id`,
@@ -124,6 +131,7 @@ it.effect("rolls back a failed migration and succeeds on rerun", () =>
       [88, "WorkTaskClaims"],
       [89, "WorkTaskValidationIdentity"],
       [90, "WorkTaskValidationReplay"],
+      [91, "WorkTaskReviewOutcomes"],
     ]);
     assert.deepStrictEqual(yield* runMigrations(), []);
   }).pipe(Effect.provide(db)),
@@ -245,6 +253,7 @@ it.effect(
         [88, "WorkTaskClaims"],
         [89, "WorkTaskValidationIdentity"],
         [90, "WorkTaskValidationReplay"],
+        [91, "WorkTaskReviewOutcomes"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -408,6 +417,7 @@ it.effect("preserves task custody through validation upgrade and rolls back migr
       [88, "WorkTaskClaims"],
       [89, "WorkTaskValidationIdentity"],
       [90, "WorkTaskValidationReplay"],
+      [91, "WorkTaskReviewOutcomes"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -544,6 +554,7 @@ it.effect("upgrades validation data atomically to action reviews and preserves p
       [88, "WorkTaskClaims"],
       [89, "WorkTaskValidationIdentity"],
       [90, "WorkTaskValidationReplay"],
+      [91, "WorkTaskReviewOutcomes"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -756,6 +767,7 @@ it.effect("upgrades existing tasks without inventing state and rolls back migrat
       [88, "WorkTaskClaims"],
       [89, "WorkTaskValidationIdentity"],
       [90, "WorkTaskValidationReplay"],
+      [91, "WorkTaskReviewOutcomes"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -853,6 +865,7 @@ it.effect("upgrades waits atomically while preserving task state and link proven
       [88, "WorkTaskClaims"],
       [89, "WorkTaskValidationIdentity"],
       [90, "WorkTaskValidationReplay"],
+      [91, "WorkTaskReviewOutcomes"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM work_task_thread_links ORDER BY link_event_id`,
@@ -977,6 +990,7 @@ it.effect("upgrades result history atomically without changing predecessor data"
       [88, "WorkTaskClaims"],
       [89, "WorkTaskValidationIdentity"],
       [90, "WorkTaskValidationReplay"],
+      [91, "WorkTaskReviewOutcomes"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_current_state`, state);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_thread_links`, links);
@@ -1117,6 +1131,7 @@ it.effect("upgrades claim history atomically and preserves prior task and ordina
       [88, "WorkTaskClaims"],
       [89, "WorkTaskValidationIdentity"],
       [90, "WorkTaskValidationReplay"],
+      [91, "WorkTaskReviewOutcomes"],
     ]);
     assert.deepStrictEqual(
       yield* Effect.forEach(tables, (name) => sql.unsafe(`SELECT * FROM ${name}`)),
@@ -1451,7 +1466,10 @@ it.effect("preserves legacy validation rows and rolls replay migration back befo
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_claims`, claims);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_identity`, identities);
     yield* sql`DROP INDEX work_task_validation_chronological_idx`;
-    assert.deepStrictEqual(yield* runMigrations(), [[90, "WorkTaskValidationReplay"]]);
+    assert.deepStrictEqual(yield* runMigrations(), [
+      [90, "WorkTaskValidationReplay"],
+      [91, "WorkTaskReviewOutcomes"],
+    ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_attempts`, before);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_claims`, claims);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_identity`, identities);
@@ -1892,5 +1910,645 @@ it.effect("stores validation phases and indexes sequence and lossless chronologi
       ),
       ["started"],
     );
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect("preserves review evidence on upgrade and binds append-only outcomes and status", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const reject = Effect.fn("PersistentTasks.reject")(function* (
+      statement: Effect.Effect<unknown, SqlError>,
+    ) {
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(statement)));
+    });
+    yield* runMigrations({ toMigrationInclusive: 90 });
+    yield* sql`PRAGMA foreign_keys = ON`;
+    yield* sql`INSERT INTO work_task_projections VALUES ('a', NULL, 1, 1, 1, 1, '{}', 't', 't')`;
+    yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('a', 1, 1, '{}', '{}', 'def', 't')`;
+    yield* sql`INSERT INTO work_task_manager_bindings VALUES ('a', 1, 'manager', 't', NULL)`;
+    yield* sql`INSERT INTO work_task_action_reviews (rowid,review_id,task_id,revision,manager_generation,manager_thread_id,provider_session_id,run_id,command_id,runtime_request_id,rule_id,definition_revision,action_policy_revision,action,label,target,preview_json,fingerprint,created_sequence,created_at) VALUES
+      (-1,'review', 'a', 1, 1, 'manager', 'session', 'run', 'command', 'request', 'rule', 1, 1,
+       'send', 'label', 'target', '{"content":"payload","artifacts":[]}', 'fingerprint', 1, '2026-11-12T00:00:00Z')`;
+    yield* sql`INSERT INTO work_task_action_review_decisions (rowid,review_id,task_id,review_revision,action_policy_revision,fingerprint,manager_generation,decision,human_subject,human_session_id,feedback,resolved_sequence,resolved_at) VALUES (-1,'review', 'a', 1, 1, 'fingerprint', 1, 'reject', 'human', 'session', 'feedback', 2, 't')`;
+    yield* sql`INSERT INTO work_task_action_review_releases (rowid,review_id,task_id,review_revision,action_policy_revision,fingerprint,manager_generation,continuation_id,created_at) VALUES (-1,'review', 'a', 1, 1, 'fingerprint', 1, 'continuation', 't')`;
+    const reviews = yield* sql`SELECT * FROM work_task_action_reviews`;
+    const decisions = yield* sql`SELECT * FROM work_task_action_review_decisions`;
+    const releases = yield* sql`SELECT * FROM work_task_action_review_releases`;
+    yield* sql`CREATE INDEX work_task_reviews_history_idx ON work_task_projections(task_id)`;
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(runMigrations())));
+    assert.deepStrictEqual(
+      yield* sql`SELECT name FROM sqlite_master WHERE name = 'work_task_review_outcomes'`,
+      [],
+    );
+    assert.deepStrictEqual(
+      yield* sql`SELECT migration_id FROM effect_sql_migrations WHERE migration_id = 91`,
+      [],
+    );
+    yield* sql`DROP INDEX work_task_reviews_history_idx`;
+    assert.deepStrictEqual(yield* runMigrations(), [[91, "WorkTaskReviewOutcomes"]]);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_action_reviews`, reviews);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_action_review_decisions`, decisions);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_action_review_releases`, releases);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_review_outcomes`, []);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_review_status`, []);
+    const binding = {
+      taskId: "a",
+      reviewId: "review",
+      reviewRevision: 1,
+      definitionRevision: 1,
+      actionPolicyRevision: 1,
+      managerGeneration: 1,
+      managerThreadId: "manager",
+      providerSessionId: "session",
+      runtimeRequestId: "request",
+      runId: "run",
+      ruleId: "rule",
+      payloadIdentity: { action: "send", target: "target", fingerprint: "fingerprint" },
+    };
+    const base = {
+      id: "event",
+      taskId: "a",
+      occurredAt: "2026-11-12T00:00:00Z",
+      attribution: { type: "server" },
+      definitionRevision: 2,
+      actionPolicyRevision: 2,
+      lifecycleRevision: 1,
+      completionPolicyRevision: 1,
+      type: "task.action-review-invalidated",
+      cause: "policy_changed",
+      reason: "changed",
+      binding,
+    };
+    const event = JSON.stringify(base);
+    const decisionCollision = JSON.stringify({ ...base, id: "decision-sequence-collision" });
+    yield* reject(
+      sql`INSERT INTO work_task_review_outcomes VALUES ('decision-sequence-collision','a','review',2,'2026-11-12T00:00:00Z',NULL,${decisionCollision})`,
+    );
+
+    assert.isDefined(
+      decodePersistedEvent({
+        event: base,
+        context: {
+          sequence: 3,
+          eventId: "event",
+          occurredAt: "2026-11-12T00:00:00Z",
+          commandId: null,
+        },
+      }),
+    );
+    yield* sql`INSERT INTO work_task_review_outcomes VALUES ('event', 'a', 'review', 3, '2026-11-12T00:00:00Z', NULL, ${event})`;
+    yield* reject(
+      sql`INSERT OR REPLACE INTO work_task_review_outcomes (rowid,event_id,task_id,review_id,sequence,occurred_at,command_id,event_json) SELECT rowid,'rowid-replacement',task_id,review_id,4,occurred_at,command_id,json_set(event_json,'$.id','rowid-replacement') FROM work_task_review_outcomes WHERE event_id = 'event'`,
+    );
+    yield* reject(
+      sql`INSERT OR REPLACE INTO work_task_review_outcomes SELECT * FROM work_task_review_outcomes`,
+    );
+    yield* reject(sql`UPDATE work_task_review_outcomes SET sequence = 4`);
+    yield* reject(sql`DELETE FROM work_task_review_outcomes`);
+    for (const invalid of [
+      { ...base, id: "bad", binding: { ...binding, runtimeRequestId: "other" } },
+      {
+        ...base,
+        id: "bad",
+        binding: {
+          ...binding,
+          payloadIdentity: { ...binding.payloadIdentity, fingerprint: "other" },
+        },
+      },
+      { ...base, id: "bad", reason: "\u00a0\ufeff" },
+      { ...base, id: "bad", reason: "😀".repeat(1001) },
+      { ...base, id: "bad", reason: "\u0000" + "x".repeat(2000) },
+      { ...base, id: "bad", binding: { ...binding, reviewRevision: "1" } },
+      { ...base, id: "bad", binding: { ...binding, runtimeRequestId: 123 } },
+      { ...base, id: "bad", cause: "timeout" },
+    ]) {
+      const value = JSON.stringify(invalid);
+      yield* reject(
+        sql`INSERT INTO work_task_review_outcomes VALUES ('bad', 'a', 'review', 4, '2026-11-12T00:00:00Z', NULL, ${value})`,
+      );
+    }
+    const requested = JSON.stringify({
+      id: "requested",
+      taskId: "a",
+      occurredAt: "2026-11-12T00:00:00Z",
+      attribution: { type: "server" },
+      type: "task.action-review-requested",
+      definitionRevision: 1,
+      actionPolicyRevision: 1,
+      lifecycleRevision: 1,
+      completionPolicyRevision: 1,
+      review: {
+        taskId: "a",
+        reviewId: "review",
+        runtimeRequestId: "request",
+        continuationId: "continuation",
+        createdSequence: 1,
+        createdAt: "2026-11-12T00:00:00Z",
+        revision: 1,
+        managerGeneration: 1,
+        managerThreadId: "manager",
+        providerSessionId: "session",
+        runId: "run",
+        ruleId: "rule",
+        definitionRevision: 1,
+        actionPolicyRevision: 1,
+        action: "send",
+        label: "label",
+        target: "target",
+        fingerprint: "fingerprint",
+        state: { type: "pending" },
+        preview: { content: "payload", artifacts: [] },
+      },
+    });
+    assert.isDefined(
+      decodePersistedEvent({
+        event: JSON.parse(requested),
+        context: {
+          sequence: 1,
+          eventId: "requested",
+          occurredAt: "2026-11-12T00:00:00Z",
+          commandId: "command",
+        },
+      }),
+    );
+    for (const occurredAt of ["not-a-timestamp", "\0", "2026-11-13T00:00:00Z"]) {
+      const badTime = { ...JSON.parse(requested), occurredAt };
+      assert.throws(() =>
+        decodePersistedEvent({
+          event: badTime,
+          context: { sequence: 1, eventId: "requested", occurredAt, commandId: "command" },
+        }),
+      );
+      yield* reject(
+        sql`INSERT INTO work_task_review_events VALUES ('requested','a','review',1,${occurredAt},'command',${JSON.stringify(badTime)})`,
+      );
+    }
+    const wrongContinuation = JSON.stringify({
+      ...JSON.parse(requested),
+      review: { ...JSON.parse(requested).review, continuationId: "reserved-other" },
+    });
+    yield* reject(
+      sql`INSERT INTO work_task_review_events VALUES ('requested','a','review',1,'2026-11-12T00:00:00Z','command',${wrongContinuation})`,
+    );
+    yield* sql`INSERT INTO work_task_allowances VALUES ('a', 10, 0)`;
+    yield* sql`INSERT INTO work_task_claims VALUES ('validation-claim', 'a', 'validation-claim', 'evidence', 'manager', 1, 1, 1, 0, '{"type":"server"}', 's', '[{"type":"run","threadId":"t","runId":"r"}]', 100, 't')`;
+    const validator = {
+      projectId: "p",
+      modelSelection: { instanceId: "codex", model: "m" },
+      workspace: { type: "root" },
+    };
+    yield* sql`INSERT INTO work_task_validation_attempts VALUES ('validation','a',1,1,1,'evidence','w',${JSON.stringify(validator)},NULL,'reserved',NULL,'2026-11-12T00:00:00Z',NULL,NULL)`;
+    yield* sql`INSERT INTO work_task_validation_identity VALUES ('validation','a','validation-claim',1)`;
+    const validation = decodePersistedEvent({
+      event: {
+        taskId: "a",
+        occurredAt: base.occurredAt,
+        attribution: { type: "server" },
+        lifecycleRevision: 1,
+        completionPolicyRevision: 1,
+        id: "requested",
+        type: "task.validation-reserved",
+        definitionRevision: 1,
+        actionPolicyRevision: 1,
+        attemptId: "validation",
+        commandId: "validation-command",
+        managerGeneration: 1,
+        claimId: "validation-claim",
+        evidenceId: "evidence",
+        workWatermark: "w",
+        validator,
+        allowanceUnit: 1,
+        createdAt: base.occurredAt,
+      },
+      context: {
+        sequence: 1,
+        eventId: "requested",
+        occurredAt: base.occurredAt,
+        commandId: "validation-command",
+      },
+    }).event;
+    yield* sql`INSERT INTO work_task_validation_replay VALUES ('requested','validation','a',1,'validation-command',${base.occurredAt},${JSON.stringify(validation)})`;
+    yield* reject(
+      sql`INSERT INTO work_task_review_events VALUES ('requested','a','review',1,${base.occurredAt},'command',${requested})`,
+    );
+    yield* sql`DELETE FROM work_task_validation_replay WHERE event_id = 'requested'`;
+    yield* sql`INSERT INTO work_task_review_events VALUES ('requested', 'a', 'review', 1, '2026-11-12T00:00:00Z', 'command', ${requested})`;
+    yield* reject(
+      sql`INSERT INTO work_task_validation_replay VALUES ('requested','validation','a',1,'validation-command',${base.occurredAt},${JSON.stringify(validation)})`,
+    );
+    const otherValidation = JSON.stringify({ ...validation, id: "validation-other" });
+    yield* sql`INSERT INTO work_task_validation_replay VALUES ('validation-other','validation','a',99,'validation-command',${base.occurredAt},${otherValidation})`;
+    yield* reject(
+      sql`UPDATE work_task_validation_replay SET event_id='requested',sequence=1,event_json=${JSON.stringify(validation)} WHERE event_id='validation-other'`,
+    );
+
+    const decided = JSON.stringify({
+      id: "decision-event",
+      taskId: "a",
+      occurredAt: "2026-11-12T00:00:00Z",
+      attribution: { type: "server" },
+      type: "task.action-review-result-recorded",
+      reviewId: "review",
+      reviewRevision: 1,
+      managerGeneration: 1,
+      managerThreadId: "manager",
+      runId: "run",
+      definitionRevision: 1,
+      actionPolicyRevision: 1,
+      lifecycleRevision: 1,
+      completionPolicyRevision: 1,
+      payloadIdentity: binding.payloadIdentity,
+      decision: "reject",
+      human: { subject: "human", sessionId: "session" },
+      feedback: "feedback",
+    });
+    assert.isDefined(
+      decodePersistedEvent({
+        event: JSON.parse(decided),
+        context: {
+          sequence: 2,
+          eventId: "decision-event",
+          occurredAt: "2026-11-12T00:00:00Z",
+          commandId: null,
+        },
+      }),
+    );
+    yield* sql`INSERT INTO work_task_review_events VALUES ('decision-event', 'a', 'review', 2, '2026-11-12T00:00:00Z', ${"c".repeat(2001)}, ${decided})`;
+    yield* reject(
+      sql`INSERT OR REPLACE INTO work_task_review_events SELECT * FROM work_task_review_events WHERE event_id = 'requested'`,
+    );
+    yield* reject(sql`UPDATE work_task_review_events SET command_id = 'other'`);
+    yield* reject(sql`DELETE FROM work_task_review_events`);
+    const collision = JSON.stringify({ ...base, id: "requested" });
+    yield* reject(
+      sql`INSERT OR REPLACE INTO work_task_review_outcomes VALUES ('requested', 'a', 'review', 6, '2026-11-12T00:00:00Z', NULL, ${collision})`,
+    );
+    for (const [index, reason] of ["😀".repeat(1000), "a\u0000b"].entries()) {
+      const id = `valid-bound-${index}`;
+      const value = JSON.stringify({ ...base, id, reason });
+      yield* sql`INSERT INTO work_task_review_outcomes VALUES (${id}, 'a', 'review', ${10 + index}, '2026-11-12T00:00:00Z', NULL, ${value})`;
+    }
+    for (const [sequence, id, expectedHex] of [
+      [12, "id\u0000tail", "6964007461696C"],
+      [13, "\ud800", "EDA080"],
+    ] as const) {
+      const value = JSON.stringify({ ...base, id });
+      yield* sql`INSERT INTO work_task_review_outcomes SELECT json_extract(${value}, '$.id'), 'a', 'review', ${sequence}, '2026-11-12T00:00:00Z', NULL, ${value}`;
+      assert.strictEqual(
+        (yield* sql<{
+          readonly id: string;
+        }>`SELECT hex(event_id) AS id FROM work_task_review_outcomes WHERE sequence = ${sequence}`)[0]
+          ?.id,
+        expectedHex,
+      );
+    }
+    const wrongDecisionEvent = JSON.stringify({
+      ...base,
+      id: "wrong-decision",
+      definitionRevision: 1,
+      actionPolicyRevision: 1,
+      type: "task.action-review-continuation-released",
+      purpose: "feedback",
+      decision: "reject",
+      continuationId: "continuation",
+      decisionEventId: "other-decision",
+    });
+    yield* reject(
+      sql`INSERT INTO work_task_review_outcomes VALUES ('wrong-decision', 'a', 'review', 9, '2026-11-12T00:00:00Z', NULL, ${wrongDecisionEvent})`,
+    );
+    const release = JSON.stringify({
+      ...base,
+      id: "release-event",
+      definitionRevision: 1,
+      actionPolicyRevision: 1,
+      type: "task.action-review-continuation-released",
+      purpose: "feedback",
+      decision: "reject",
+      continuationId: "continuation",
+      decisionEventId: "decision-event",
+    });
+    assert.isDefined(
+      decodePersistedEvent({
+        event: JSON.parse(release),
+        context: {
+          sequence: 4,
+          eventId: "release-event",
+          occurredAt: "2026-11-12T00:00:00Z",
+          commandId: null,
+        },
+      }),
+    );
+    yield* sql`INSERT INTO work_task_review_outcomes VALUES ('release-event', 'a', 'review', 4, '2026-11-12T00:00:00Z', NULL, ${release})`;
+    const duplicateRelease = JSON.stringify({ ...JSON.parse(release), id: "duplicate-release" });
+    yield* reject(
+      sql`INSERT OR REPLACE INTO work_task_review_outcomes VALUES ('duplicate-release', 'a', 'review', 15, '2026-11-12T00:00:00Z', NULL, ${duplicateRelease})`,
+    );
+    const wrongPurpose = JSON.stringify({
+      ...JSON.parse(release),
+      id: "wrong",
+      purpose: "approved_action",
+    });
+    yield* reject(
+      sql`INSERT INTO work_task_review_outcomes VALUES ('wrong', 'a', 'review', 5, '2026-11-12T00:00:00Z', NULL, ${wrongPurpose})`,
+    );
+    const cancelled = JSON.stringify({
+      ...base,
+      id: "cancel",
+      definitionRevision: 1,
+      actionPolicyRevision: 1,
+      type: "task.action-review-cancelled",
+      source: {
+        type: "task.archive",
+        commandId: "archive",
+        human: { subject: "human", sessionId: "session" },
+      },
+    });
+    yield* reject(
+      sql`INSERT INTO work_task_review_outcomes VALUES ('cancel', 'a', 'review', 5, '2026-11-12T00:00:00Z', NULL, ${cancelled})`,
+    );
+    assert.isDefined(
+      decodePersistedEvent({
+        event: JSON.parse(cancelled),
+        context: {
+          sequence: 5,
+          eventId: "cancel",
+          occurredAt: "2026-11-12T00:00:00Z",
+          commandId: "archive",
+        },
+      }),
+    );
+    yield* sql`INSERT INTO work_task_review_outcomes VALUES ('cancel', 'a', 'review', 5, '2026-11-12T00:00:00Z', 'archive', ${cancelled})`;
+    yield* sql`INSERT INTO work_task_action_reviews SELECT 'review2', task_id, revision, manager_generation,
+      manager_thread_id, provider_session_id, run_id, 'command2', '123', rule_id,
+      definition_revision, action_policy_revision, action, label, target, preview_json, fingerprint, 20, created_at
+      FROM work_task_action_reviews WHERE review_id = 'review'`;
+    for (const [command, request] of [
+      ["command", "new-request"],
+      ["new-command", "request"],
+    ] as const) {
+      yield* reject(sql`INSERT OR REPLACE INTO work_task_action_reviews SELECT 'review3', task_id, revision, manager_generation,
+        manager_thread_id, provider_session_id, run_id, ${command}, ${request}, rule_id, definition_revision,
+        action_policy_revision, action, label, target, preview_json, fingerprint, 23, created_at
+        FROM work_task_action_reviews WHERE review_id = 'review'`);
+    }
+    yield* reject(
+      sql`INSERT OR REPLACE INTO work_task_action_reviews (rowid,review_id,task_id,revision,manager_generation,manager_thread_id,provider_session_id,run_id,command_id,runtime_request_id,rule_id,definition_revision,action_policy_revision,action,label,target,preview_json,fingerprint,created_sequence,created_at) SELECT rowid,'rowid-review',task_id,revision,manager_generation,manager_thread_id,provider_session_id,run_id,'rowid-command','rowid-request',rule_id,definition_revision,action_policy_revision,action,label,target,preview_json,fingerprint,60,created_at FROM work_task_action_reviews WHERE review_id='review2'`,
+    );
+    const duplicateRequested = JSON.stringify({
+      ...JSON.parse(requested),
+      id: "requested2",
+      review: {
+        ...JSON.parse(requested).review,
+        reviewId: "review2",
+        runtimeRequestId: "123",
+        createdSequence: 20,
+      },
+    });
+    yield* reject(
+      sql`INSERT INTO work_task_review_events VALUES ('requested2','a','review2',20,${base.occurredAt},'command2',${duplicateRequested})`,
+    );
+    yield* reject(
+      sql`INSERT OR REPLACE INTO work_task_action_review_decisions (rowid,review_id,task_id,review_revision,action_policy_revision,fingerprint,manager_generation,decision,human_subject,human_session_id,feedback,resolved_sequence,resolved_at) SELECT rowid,'review2',task_id,review_revision,action_policy_revision,fingerprint,manager_generation,'approve',human_subject,human_session_id,NULL,21,resolved_at FROM work_task_action_review_decisions WHERE review_id='review'`,
+    );
+    yield* sql`INSERT INTO work_task_action_review_decisions VALUES ('review2', 'a', 1, 1, 'fingerprint', 1, 'approve', 'human', 'session', NULL, 21, 't')`;
+    yield* reject(
+      sql`INSERT OR REPLACE INTO work_task_action_review_releases VALUES ('review2', 'a', 1, 1, 'fingerprint', 1, 'continuation', 't')`,
+    );
+    yield* reject(
+      sql`INSERT OR REPLACE INTO work_task_action_review_releases (rowid,review_id,task_id,review_revision,action_policy_revision,fingerprint,manager_generation,continuation_id,created_at) SELECT rowid,'review2',task_id,review_revision,action_policy_revision,fingerprint,manager_generation,'fresh-continuation',created_at FROM work_task_action_review_releases WHERE review_id='review'`,
+    );
+    yield* sql`INSERT INTO work_task_action_review_releases VALUES ('review2', 'a', 1, 1, 'fingerprint', 1, 'continuation2', 't')`;
+    const coerced = JSON.stringify({
+      ...base,
+      id: "coerced",
+      binding: { ...binding, reviewId: "review2", runtimeRequestId: 123 },
+    });
+    yield* reject(
+      sql`INSERT INTO work_task_review_outcomes VALUES ('coerced', 'a', 'review2', 26, '2026-11-12T00:00:00Z', NULL, ${coerced})`,
+    );
+    const approved = JSON.stringify({
+      ...base,
+      id: "approved-event",
+      definitionRevision: 1,
+      actionPolicyRevision: 1,
+      binding: { ...binding, reviewId: "review2", runtimeRequestId: "123" },
+      type: "task.action-review-continuation-released",
+      purpose: "approved_action",
+      decision: "approve",
+      continuationId: "continuation2",
+      decisionEventId: "actual-decision",
+    });
+    assert.isDefined(
+      decodePersistedEvent({
+        event: JSON.parse(approved),
+        context: {
+          sequence: 22,
+          eventId: "approved-event",
+          occurredAt: "2026-11-12T00:00:00Z",
+          commandId: null,
+        },
+      }),
+    );
+    const absentDecision = JSON.stringify({
+      ...JSON.parse(approved),
+      decisionEventId: "nonexistent",
+    });
+    yield* reject(
+      sql`INSERT INTO work_task_review_outcomes VALUES ('approved-event','a','review2',22,${base.occurredAt},NULL,${absentDecision})`,
+    );
+    const borrowedDecision = JSON.stringify({
+      ...JSON.parse(approved),
+      id: "borrowed",
+      decisionEventId: "decision-event",
+    });
+    yield* reject(
+      sql`INSERT OR REPLACE INTO work_task_review_outcomes VALUES ('borrowed', 'a', 'review2', 24, '2026-11-12T00:00:00Z', NULL, ${borrowedDecision})`,
+    );
+    const approvedAsFeedback = JSON.stringify({
+      ...JSON.parse(approved),
+      id: "bad-purpose",
+      purpose: "feedback",
+    });
+    yield* reject(
+      sql`INSERT INTO work_task_review_outcomes VALUES ('bad-purpose', 'a', 'review2', 24, '2026-11-12T00:00:00Z', NULL, ${approvedAsFeedback})`,
+    );
+    yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* sql`INSERT INTO work_task_review_outcomes VALUES ('approved-event', 'a', 'review2', 22, '2026-11-12T00:00:00Z', NULL, ${approved})`;
+        const actualDecision = JSON.stringify({
+          ...JSON.parse(decided),
+          id: "actual-decision",
+          reviewId: "review2",
+          decision: "approve",
+          feedback: undefined,
+        });
+        yield* sql`INSERT INTO work_task_review_events VALUES ('actual-decision', 'a', 'review2', 21, '2026-11-12T00:00:00Z', NULL, ${actualDecision})`;
+        yield* sql`INSERT INTO work_task_review_status VALUES ('review2', 'a', 'approved', 21)`;
+      }),
+    );
+    const stolenDecision = JSON.stringify({ ...base, id: "actual-decision" });
+    yield* reject(
+      sql`INSERT OR REPLACE INTO work_task_review_outcomes VALUES ('actual-decision', 'a', 'review', 25, '2026-11-12T00:00:00Z', NULL, ${stolenDecision})`,
+    );
+    yield* reject(sql`INSERT INTO work_task_review_status VALUES ('missing', 'a', 'pending', 1)`);
+    yield* reject(sql`INSERT INTO work_task_review_status VALUES ('review', 'a', 'pending', 1)`);
+    yield* sql`INSERT INTO work_task_review_status VALUES ('review', 'a', 'invalidated', 13)`;
+    const latest = JSON.stringify({ ...base, id: "latest" });
+    yield* sql`INSERT INTO work_task_review_outcomes VALUES ('latest','a','review',14,${base.occurredAt},${"c".repeat(2001)},${latest})`;
+    assert.deepStrictEqual(
+      yield* sql`SELECT * FROM work_task_review_status WHERE review_id='review'`,
+      [],
+    );
+    yield* sql`INSERT INTO work_task_review_status VALUES ('review','a','invalidated',14)`;
+
+    yield* reject(
+      sql`UPDATE OR REPLACE work_task_review_status SET review_id = 'review2' WHERE review_id = 'review'`,
+    );
+    assert.strictEqual((yield* sql`SELECT * FROM work_task_review_status`).length, 2);
+    yield* reject(
+      sql`UPDATE work_task_review_status SET state = 'rejected', sequence = 2 WHERE review_id = 'review'`,
+    );
+    yield* reject(sql`UPDATE work_task_review_status SET state = 'approved', sequence = 2`);
+    yield* reject(
+      sql`UPDATE work_task_review_status SET state = 'invalidated', sequence = 3 WHERE review_id = 'review'`,
+    );
+    yield* reject(
+      sql`UPDATE work_task_review_status SET state = 'cancelled', sequence = 5 WHERE review_id = 'review'`,
+    );
+    yield* reject(
+      sql`INSERT OR REPLACE INTO work_task_review_status VALUES ('review', 'a', 'pending', 1)`,
+    );
+    yield* reject(sql`UPDATE work_task_review_status SET task_id = 'other'`);
+    yield* sql`INSERT INTO work_task_action_reviews SELECT 'review-changes', task_id, revision, manager_generation,
+      manager_thread_id, provider_session_id, run_id, 'command-changes', 'request-changes', rule_id,
+      definition_revision, action_policy_revision, action, label, target, preview_json, fingerprint, 30, created_at
+      FROM work_task_action_reviews WHERE review_id = 'review'`;
+    yield* sql`INSERT INTO work_task_action_review_decisions VALUES ('review-changes', 'a', 1, 1, 'fingerprint', 1, 'request_changes', 'human', 'session', NULL, 31, 't')`;
+    yield* sql`INSERT INTO work_task_action_review_releases VALUES ('review-changes', 'a', 1, 1, 'fingerprint', 1, 'continuation-changes', 't')`;
+    const changes = JSON.stringify({
+      ...base,
+      id: "changes-event",
+      definitionRevision: 1,
+      actionPolicyRevision: 1,
+      binding: { ...binding, reviewId: "review-changes", runtimeRequestId: "request-changes" },
+      type: "task.action-review-continuation-released",
+      purpose: "feedback",
+      decision: "request_changes",
+      continuationId: "continuation-changes",
+      decisionEventId: "changes-decision",
+    });
+    const changesDecision = JSON.stringify({
+      ...JSON.parse(decided),
+      id: "changes-decision",
+      reviewId: "review-changes",
+      decision: "request_changes",
+      feedback: undefined,
+    });
+    yield* sql`INSERT INTO work_task_review_events VALUES ('changes-decision', 'a', 'review-changes', 31, '2026-11-12T00:00:00Z', NULL, ${changesDecision})`;
+    yield* sql`INSERT INTO work_task_review_outcomes VALUES ('changes-event', 'a', 'review-changes', 32, '2026-11-12T00:00:00Z', NULL, ${changes})`;
+    yield* sql`INSERT INTO work_task_review_status VALUES ('review-changes', 'a', 'changes_requested', 31)`;
+    assert.deepStrictEqual(
+      yield* sql`SELECT * FROM work_task_action_review_decisions WHERE review_id = 'review'`,
+      decisions,
+    );
+    const longId = "e".repeat(2001);
+    yield* sql`INSERT INTO work_task_action_reviews SELECT 'long-review',task_id,revision,manager_generation,manager_thread_id,provider_session_id,run_id,'long-command','long-request',rule_id,definition_revision,action_policy_revision,action,label,target,preview_json,fingerprint,40,created_at FROM work_task_action_reviews WHERE review_id='review'`;
+    const longRequested = {
+      ...JSON.parse(requested),
+      id: longId,
+      occurredAt: "2026-11-12T01:00:00.0000000+01:00",
+      review: {
+        ...JSON.parse(requested).review,
+        reviewId: "long-review",
+        runtimeRequestId: "long-request",
+        createdSequence: 40,
+        continuationId: undefined,
+      },
+    };
+    assert.isDefined(
+      decodePersistedEvent({
+        event: longRequested,
+        context: {
+          sequence: 40,
+          eventId: longId,
+          occurredAt: longRequested.occurredAt,
+          commandId: "long-command",
+        },
+      }),
+    );
+    yield* sql`INSERT INTO work_task_review_events VALUES (${longId},'a','long-review',40,${longRequested.occurredAt},'long-command',${JSON.stringify(longRequested)})`;
+    for (const [index, preview] of [
+      { content: "\u00a0\ufeff", artifacts: [] },
+      { content: "valid", artifacts: [{ uri: "\t\ufeff", hash: "hash" }] },
+    ].entries()) {
+      const reviewId = `blank-${index}`;
+      const command = `blank-command-${index}`;
+      const request = `blank-request-${index}`;
+      yield* sql`INSERT INTO work_task_action_reviews SELECT ${reviewId},task_id,revision,manager_generation,manager_thread_id,provider_session_id,run_id,${command},${request},rule_id,definition_revision,action_policy_revision,action,label,target,${JSON.stringify(preview)},fingerprint,${50 + index},created_at FROM work_task_action_reviews WHERE review_id='review'`;
+      const badPreview = {
+        ...JSON.parse(requested),
+        id: reviewId,
+        review: {
+          ...JSON.parse(requested).review,
+          reviewId,
+          runtimeRequestId: request,
+          createdSequence: 50 + index,
+          continuationId: undefined,
+          preview,
+        },
+      };
+      assert.throws(() =>
+        decodePersistedEvent({
+          event: badPreview,
+          context: {
+            sequence: 50 + index,
+            eventId: reviewId,
+            occurredAt: base.occurredAt,
+            commandId: command,
+          },
+        }),
+      );
+      yield* reject(
+        sql`INSERT INTO work_task_review_events VALUES (${reviewId},'a',${reviewId},${50 + index},${base.occurredAt},${command},${JSON.stringify(badPreview)})`,
+      );
+    }
+    const latestPlan = yield* sql<{ detail: string }>`EXPLAIN QUERY PLAN SELECT max(seq) FROM (
+      SELECT created_sequence AS seq FROM work_task_action_reviews WHERE review_id = 'review'
+      UNION ALL SELECT resolved_sequence FROM work_task_action_review_decisions WHERE review_id = 'review'
+      UNION ALL SELECT sequence FROM work_task_review_outcomes WHERE review_id = 'review' AND json_extract(event_json,'$.type') IN ('task.action-review-invalidated','task.action-review-cancelled'))`;
+    assert.isTrue(
+      latestPlan.some((row) =>
+        row.detail.includes(
+          "SEARCH work_task_review_outcomes USING INDEX work_task_review_outcomes_review_idx",
+        ),
+      ),
+    );
+    assert.isFalse(latestPlan.some((row) => row.detail.includes("SCAN work_task_review_outcomes")));
+    const terminalPlan = yield* sql<{
+      detail: string;
+    }>`EXPLAIN QUERY PLAN SELECT 1 FROM work_task_review_outcomes WHERE review_id = 'review' AND sequence = 14 AND json_extract(event_json,'$.type') = 'task.action-review-invalidated'`;
+    assert.isTrue(
+      terminalPlan.some((row) =>
+        row.detail.includes(
+          "SEARCH work_task_review_outcomes USING INDEX work_task_review_outcomes_review_idx",
+        ),
+      ),
+    );
+    const statusPlan = yield* sql<{
+      readonly detail: string;
+    }>`EXPLAIN QUERY PLAN SELECT * FROM work_task_review_status WHERE task_id = 'a' AND state = 'cancelled' ORDER BY sequence DESC, review_id DESC LIMIT 10`;
+    assert.isTrue(
+      statusPlan.some((row) => row.detail.includes("work_task_review_status_page_idx")),
+    );
+    const reviewsPlan = yield* sql<{
+      readonly detail: string;
+    }>`EXPLAIN QUERY PLAN SELECT * FROM work_task_action_reviews WHERE task_id = 'a' ORDER BY created_sequence DESC, review_id DESC LIMIT 10`;
+    assert.isTrue(reviewsPlan.some((row) => row.detail.includes("work_task_reviews_history_idx")));
+    const historyPlan = yield* sql<{
+      readonly detail: string;
+    }>`EXPLAIN QUERY PLAN SELECT * FROM work_task_review_outcomes WHERE task_id = 'a' ORDER BY sequence DESC, review_id DESC LIMIT 10`;
+    assert.isTrue(historyPlan.some((row) => row.detail.includes("INDEX")));
+    assert.isFalse(historyPlan.some((row) => row.detail.includes("TEMP B-TREE")));
+    assert.deepStrictEqual(yield* runMigrations(), []);
   }).pipe(Effect.provide(db)),
 );
