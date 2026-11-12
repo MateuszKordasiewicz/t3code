@@ -90,6 +90,80 @@ describe("staged task events", () => {
     }
   });
 
+  it("records explicit human acceptance of a complete definition with persisted identity", () => {
+    const accepted = {
+      ...base,
+      type: "task.definition-accepted",
+      attribution: { type: "user", subject: "human", sessionId: "session" },
+      definition,
+    };
+    const persisted = Schema.decodeUnknownSync(task.WorkTaskPersistedEvent);
+    const context = {
+      sequence: 2,
+      eventId: "event",
+      occurredAt: base.occurredAt,
+      commandId: "command",
+    };
+    expect(persisted({ event: accepted, context })).toMatchObject({ event: accepted, context });
+    for (const type of ["task.created", "task.definition-updated"]) {
+      const draft = { ...accepted, type, definition: { ...definition, objective: "" } };
+      expect(decode(draft).type).toBe(type);
+      expect(decode(draft).type).not.toBe("task.definition-accepted");
+    }
+    for (const change of [
+      { definition: { ...definition, title: "" } },
+      { definition: { ...definition, objective: " " } },
+      { definition: { ...definition, criteria: [] } },
+      { definition: { ...definition, criteria: [{ ...criterion, verification: "" }] } },
+      { definition: { ...definition, revision: 2 } },
+      { definitionRevision: 0 },
+      { actionPolicyRevision: 0 },
+      { id: "" },
+      { id: "x".repeat(2_001) },
+      { taskId: "x".repeat(2_001) },
+      { attribution: { type: "server" } },
+      { attribution: { type: "user", subject: "human" } },
+      { attribution: { type: "user", subject: "x".repeat(2_001), sessionId: "session" } },
+    ])
+      expect(() => decode({ ...accepted, ...change })).toThrow();
+    for (const change of [
+      { eventId: "other" },
+      { commandId: null },
+      { commandId: "x".repeat(2_001) },
+    ])
+      expect(() => persisted({ event: accepted, context: { ...context, ...change } })).toThrow();
+    expect(decode({ ...accepted, id: "e".repeat(2_000), taskId: "t".repeat(2_000) })).toBeDefined();
+  });
+
+  it("preserves result attribution and an optional actual contributor thread", () => {
+    const result = {
+      ...base,
+      type: "task.result-recorded",
+      sourceId: "source",
+      summary: "Result",
+      results: [{ type: "artifact", uri: "artifact", hash: "hash" }],
+    };
+    const persisted = Schema.decodeUnknownSync(task.WorkTaskPersistedEvent);
+    const context = { sequence: 3, eventId: "event", occurredAt: base.occurredAt, commandId: null };
+    expect(persisted({ event: result, context }).event).toEqual(result);
+    expect(decode({ ...result, contributorThreadId: "thread" })).toMatchObject({
+      contributorThreadId: "thread",
+    });
+    for (const contributorThreadId of ["", "x".repeat(2_001)])
+      expect(() => decode({ ...result, contributorThreadId })).toThrow();
+    expect(() => decode({ ...result, attribution: undefined })).toThrow();
+    expect(() =>
+      decode({
+        ...result,
+        attribution: { type: "user", subject: "human", sessionId: "x".repeat(2_001) },
+      }),
+    ).toThrow();
+    expect(() => decode({ ...result, results: [] })).toThrow();
+    expect(() =>
+      decode({ ...result, results: Array.from({ length: 33 }, () => result.results[0]) }),
+    ).toThrow();
+  });
+
   it("records terminal review evidence and purpose-bound continuations in persisted context", () => {
     const binding = {
       taskId: "task",
@@ -620,6 +694,7 @@ describe("bounded task reads", () => {
   const contribution = {
     id: "result",
     threadId: "thread",
+    attribution: { type: "server" },
     sequence: 3,
     summary: "Result",
     results: [reference],
@@ -724,6 +799,21 @@ describe("bounded task reads", () => {
 
   it("bounds contribution batches and validates concrete reference variants", () => {
     const decode = Schema.decodeUnknownSync(task.WorkTaskContribution);
+    const { threadId: _threadId, ...unattributed } = contribution;
+    expect(decode(unattributed)).toEqual(unattributed);
+    expect(() => decode({ ...contribution, attribution: undefined })).toThrow();
+    expect(() =>
+      decode({
+        ...contribution,
+        attribution: {
+          type: "agent",
+          threadId: "thread",
+          providerSessionId: "session",
+          runId: "x".repeat(2_001),
+        },
+      }),
+    ).toThrow();
+    expect(() => decode({ ...contribution, threadId: "x".repeat(2_001) })).toThrow();
     const references = [
       reference,
       { type: "artifact", uri: "file", hash: "sha256:abc" },
