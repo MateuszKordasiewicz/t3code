@@ -589,3 +589,194 @@ export const decodeWorkflowOperationV1 = Effect.fn("WorkflowOperationV1.decode")
   }
   return operation;
 });
+
+const WorkflowResultId = NonEmpty.pipe(Schema.brand("WorkflowResultId"));
+const ReviewFindingId = NonEmpty.pipe(Schema.brand("ReviewFindingId"));
+const RoleOutput = Schema.Struct({
+  ref: OperationReference,
+  byteLength: Schema.Number,
+  availability: Schema.Literals(["available", "expired", "truncated"]),
+  access: WorkflowAccess,
+});
+const RoleResult = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("check"),
+    checkId: WorkflowCheckId,
+    argv: Schema.Array(Schema.String),
+    cwd: NonEmpty,
+    exit: Schema.Union([
+      Schema.Struct({ kind: Schema.Literal("exited"), code: Schema.Number }),
+      Schema.Struct({ kind: Schema.Literal("cancelled") }),
+      Schema.Struct({ kind: Schema.Literal("unknown") }),
+    ]),
+    truncated: Schema.Boolean,
+    stdoutStderr: RoleOutput,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("code_review"),
+    verdict: Schema.Literals(["pass", "changes_requested", "inconclusive"]),
+    findings: Schema.Array(
+      Schema.Struct({
+        id: ReviewFindingId,
+        severity: Schema.Literals(["blocking", "nonblocking"]),
+        description: NonEmpty,
+        evidence: Schema.Array(OperationReference),
+        requiredRepair: Schema.optionalKey(NonEmpty),
+      }),
+    ),
+    output: RoleOutput,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("semantic_review"),
+    criteria: Schema.Array(
+      Schema.Struct({
+        requirementId: RequirementId,
+        criterionId: CriterionId,
+        verdict: Schema.Literals(["met", "unmet", "inconclusive"]),
+        evidence: Schema.Array(OperationReference),
+      }),
+    ),
+    output: RoleOutput,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("rollup"),
+    verdict: Schema.Literals(["accepted", "rejected", "inconclusive"]),
+    resultRefs: Schema.Array(OperationReference),
+    summary: NonEmpty,
+  }),
+]);
+export const WorkflowRoleResultV1 = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  id: WorkflowResultId,
+  workflowRunId: WorkflowRunId,
+  operationId: WorkflowOperationId,
+  binding: Schema.Struct({
+    specHash: Sha256Hex,
+    candidateHash: Sha256Hex,
+    configurationHash: Sha256Hex,
+    policyHash: Sha256Hex,
+    itemId: Schema.optionalKey(WorkflowItemId),
+    attemptId: Schema.optionalKey(WorkflowAttemptId),
+  }),
+  result: RoleResult,
+  access: WorkflowAccess,
+});
+export type WorkflowRoleResultV1 = typeof WorkflowRoleResultV1.Type;
+
+export class WorkflowRoleResultError extends Schema.TaggedError<WorkflowRoleResultError>()(
+  "WorkflowRoleResultError",
+  {
+    reason: Schema.Literals([
+      "invalid evidence identity",
+      "invalid verdict",
+      "malformed result",
+      "invalid record",
+    ]),
+  },
+) {}
+const roleFail = (reason: WorkflowRoleResultError["reason"]) =>
+  new WorkflowRoleResultError({ reason });
+const decodeRoleShape = Schema.decodeUnknownEffect(WorkflowRoleResultV1);
+const originKey = (origin: (typeof WorkflowAccess.Type.origins)[number]) =>
+  JSON.stringify([origin.environmentId, origin.projectId, origin.threadId]);
+const duplicateRoleRefs = (refs: readonly (typeof OperationReference.Type)[]) =>
+  hasWorkflowDuplicates(refs.map((ref) => JSON.stringify([ref.kind, ref.id])));
+
+const conflictingRefIdentities = (
+  refs: readonly { kind: string; id: string; sha256: string }[],
+) => {
+  const identities = new Map<string, string>();
+  for (const ref of refs) {
+    const key = JSON.stringify([ref.kind, ref.id]);
+    if (identities.has(key) && identities.get(key) !== ref.sha256) return true;
+    identities.set(key, ref.sha256);
+  }
+  return false;
+};
+
+export const decodeWorkflowRoleResultV1 = Effect.fn("WorkflowRoleResultV1.decode")(function* (
+  input: unknown,
+) {
+  if (record(input) && record(input.binding) && !("candidateHash" in input.binding))
+    return yield* roleFail("invalid evidence identity");
+  if (
+    record(input) &&
+    record(input.result) &&
+    input.result.kind === "check" &&
+    record(input.result.exit)
+  ) {
+    const exit = input.result.exit;
+    if (exit.kind !== "exited" && "code" in exit) return yield* roleFail("malformed result");
+  }
+  const value = yield* decodeRoleShape(input, { onExcessProperty: "error" }).pipe(
+    Effect.mapError(() => roleFail("invalid record")),
+  );
+  const { binding, result, access } = value;
+  if ((binding.itemId === undefined) !== (binding.attemptId === undefined))
+    return yield* roleFail("malformed result");
+  if (hasWorkflowDuplicates(access.origins.map(originKey)))
+    return yield* roleFail("malformed result");
+  const output =
+    result.kind === "check"
+      ? result.stdoutStderr
+      : result.kind === "rollup"
+        ? undefined
+        : result.output;
+  if (
+    output &&
+    (!isWorkflowUint(output.byteLength) ||
+      hasWorkflowDuplicates(output.access.origins.map(originKey)) ||
+      access.origins.some(
+        (origin) =>
+          !output.access.origins.some((candidate) => originKey(candidate) === originKey(origin)),
+      ))
+  )
+    return yield* roleFail("malformed result");
+  if (result.kind === "check") {
+    if (
+      result.argv.length === 0 ||
+      !result.argv[0] ||
+      (result.exit.kind === "exited" && !isWorkflowUint(result.exit.code))
+    )
+      return yield* roleFail("malformed result");
+  } else if (result.kind === "code_review") {
+    if (
+      hasWorkflowDuplicates(result.findings.map((finding) => finding.id)) ||
+      result.findings.some((finding) => duplicateRoleRefs(finding.evidence))
+    )
+      return yield* roleFail("malformed result");
+    if (
+      result.findings.some(
+        (finding) =>
+          finding.severity === "blocking" &&
+          (finding.requiredRepair === undefined || result.verdict === "pass"),
+      )
+    )
+      return yield* roleFail("invalid verdict");
+  } else if (result.kind === "semantic_review") {
+    if (
+      hasWorkflowDuplicates(result.criteria.map((criterion) => criterion.criterionId)) ||
+      result.criteria.some((criterion) => duplicateRoleRefs(criterion.evidence))
+    )
+      return yield* roleFail("malformed result");
+    if (
+      result.criteria.some(
+        (criterion) => criterion.verdict === "met" && criterion.evidence.length === 0,
+      )
+    )
+      return yield* roleFail("invalid verdict");
+  } else if (duplicateRoleRefs(result.resultRefs)) return yield* roleFail("malformed result");
+  const refs =
+    result.kind === "check"
+      ? [result.stdoutStderr.ref]
+      : result.kind === "rollup"
+        ? result.resultRefs
+        : [
+            result.output.ref,
+            ...(result.kind === "code_review"
+              ? result.findings.flatMap((finding) => finding.evidence)
+              : result.criteria.flatMap((criterion) => criterion.evidence)),
+          ];
+  if (conflictingRefIdentities(refs)) return yield* roleFail("invalid evidence identity");
+  return value;
+});

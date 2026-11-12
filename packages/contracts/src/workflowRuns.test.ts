@@ -3,6 +3,8 @@ import * as Digest from "effect/crypto/Digest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import {
+  decodeWorkflowRoleResultV1,
+  WorkflowRoleResultV1,
   decodeWorkflowOperationV1,
   WorkflowOperationV1,
   decodeWorkflowRunSpecV1,
@@ -720,6 +722,236 @@ describe("workflow operation", () => {
         expect(result).toMatchObject({ _tag: "Success", success: input });
         if (result._tag === "Success")
           expect(yield* encodeWorkflowOperation(result.success)).toEqual(input);
+      }
+    }),
+  );
+});
+
+const roleOutput = {
+  ref: { kind: "artifact", id: "artifact-1", sha256: operationHash },
+  byteLength: 25,
+  availability: "expired",
+  access: { origins: [{ environmentId: "env-1", projectId: "project-1", threadId: "thread-1" }] },
+};
+const roleExample = () => ({
+  schemaVersion: 1,
+  id: "result-1",
+  workflowRunId: "workflow-1",
+  operationId: "op-2",
+  binding: { ...context },
+  result: {
+    kind: "code_review",
+    verdict: "inconclusive",
+    findings: [] as unknown[],
+    output: roleOutput,
+  },
+  access: roleOutput.access,
+});
+const roleWith = (result: unknown) => ({ ...roleExample(), result });
+const finding = {
+  id: "finding-1",
+  severity: "blocking",
+  description: "Problem",
+  evidence: [] as unknown[],
+  requiredRepair: "Fix",
+};
+const criterion = {
+  requirementId: "req-1",
+  criterionId: "criterion-1",
+  verdict: "met",
+  evidence: [reference],
+};
+const roleCases: { name: string; input: unknown; reason?: string }[] = [
+  { name: "inconclusive review with expired output", input: roleExample() },
+  {
+    name: "nonzero check exit",
+    input: roleWith({
+      kind: "check",
+      checkId: "check-1",
+      argv: ["cmd", ""],
+      cwd: ".",
+      exit: { kind: "exited", code: 1 },
+      truncated: false,
+      stdoutStderr: roleOutput,
+    }),
+  },
+  ...["cancelled", "unknown"].map((kind) => ({
+    name: `check ${kind}`,
+    input: roleWith({
+      kind: "check",
+      checkId: "check-1",
+      argv: ["cmd"],
+      cwd: ".",
+      exit: { kind },
+      truncated: true,
+      stdoutStderr: roleOutput,
+    }),
+  })),
+  {
+    name: "semantic review",
+    input: roleWith({ kind: "semantic_review", criteria: [criterion], output: roleOutput }),
+  },
+  {
+    name: "rollup combined head",
+    input: {
+      ...roleWith({
+        kind: "rollup",
+        verdict: "accepted",
+        resultRefs: [reference],
+        summary: "Done",
+      }),
+      binding: {
+        specHash: operationHash,
+        candidateHash: operationHash,
+        configurationHash: operationHash,
+        policyHash: operationHash,
+      },
+    },
+  },
+  {
+    name: "missing candidate hash",
+    input: {
+      ...roleExample(),
+      binding: {
+        specHash: operationHash,
+        policyHash: operationHash,
+        configurationHash: operationHash,
+      },
+    },
+    reason: "invalid evidence identity",
+  },
+  {
+    name: "conflicting report identity",
+    input: roleWith({
+      kind: "rollup",
+      verdict: "accepted",
+      resultRefs: [reference, { ...reference, sha256: "b".repeat(64) }],
+      summary: "Done",
+    }),
+    reason: "malformed result",
+  },
+  {
+    name: "pass with blocking finding",
+    input: roleWith({
+      kind: "code_review",
+      verdict: "pass",
+      findings: [finding],
+      output: roleOutput,
+    }),
+    reason: "invalid verdict",
+  },
+  {
+    name: "blocking finding without repair",
+    input: roleWith({
+      kind: "code_review",
+      verdict: "changes_requested",
+      findings: [
+        {
+          id: finding.id,
+          severity: finding.severity,
+          description: finding.description,
+          evidence: finding.evidence,
+        },
+      ],
+      output: roleOutput,
+    }),
+    reason: "invalid verdict",
+  },
+  {
+    name: "met without evidence",
+    input: roleWith({
+      kind: "semantic_review",
+      criteria: [{ ...criterion, evidence: [] }],
+      output: roleOutput,
+    }),
+    reason: "invalid verdict",
+  },
+  {
+    name: "duplicate criterion",
+    input: roleWith({
+      kind: "semantic_review",
+      criteria: [criterion, criterion],
+      output: roleOutput,
+    }),
+    reason: "malformed result",
+  },
+  {
+    name: "mixed exit variants",
+    input: roleWith({
+      kind: "check",
+      checkId: "check-1",
+      argv: ["cmd"],
+      cwd: ".",
+      exit: { kind: "cancelled", code: 0 },
+      truncated: false,
+      stdoutStderr: roleOutput,
+    }),
+    reason: "malformed result",
+  },
+  {
+    name: "one item binding",
+    input: {
+      ...roleExample(),
+      binding: {
+        specHash: operationHash,
+        candidateHash: operationHash,
+        configurationHash: operationHash,
+        policyHash: operationHash,
+        itemId: "item-1",
+      },
+    },
+    reason: "malformed result",
+  },
+  {
+    name: "empty argv",
+    input: roleWith({
+      kind: "check",
+      checkId: "check-1",
+      argv: [],
+      cwd: ".",
+      exit: { kind: "unknown" },
+      truncated: false,
+      stdoutStderr: roleOutput,
+    }),
+    reason: "malformed result",
+  },
+  {
+    name: "unsafe length",
+    input: roleWith({
+      ...roleExample().result,
+      output: { ...roleOutput, byteLength: Number.MAX_SAFE_INTEGER + 1 },
+    }),
+    reason: "malformed result",
+  },
+  {
+    name: "missing output origin",
+    input: roleWith({
+      ...roleExample().result,
+      output: { ...roleOutput, access: { origins: [] } },
+    }),
+    reason: "malformed result",
+  },
+  {
+    name: "duplicate evidence",
+    input: roleWith({
+      kind: "semantic_review",
+      criteria: [{ ...criterion, evidence: [reference, reference] }],
+      output: roleOutput,
+    }),
+    reason: "malformed result",
+  },
+  { name: "extra field", input: { ...roleExample(), extra: true }, reason: "invalid record" },
+];
+const encodeWorkflowRoleResult = Schema.encodeEffect(WorkflowRoleResultV1);
+describe("workflow role result", () => {
+  it.effect.each(roleCases)("$name", ({ input, reason }) =>
+    Effect.gen(function* () {
+      const result = yield* Effect.result(decodeWorkflowRoleResultV1(input));
+      if (reason) expect(result).toMatchObject({ _tag: "Failure", failure: { reason } });
+      else {
+        expect(result).toMatchObject({ _tag: "Success", success: input });
+        if (result._tag === "Success")
+          expect(yield* encodeWorkflowRoleResult(result.success)).toEqual(input);
       }
     }),
   );
