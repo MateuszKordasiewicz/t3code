@@ -114,6 +114,108 @@ describe("staged task events", () => {
       },
     };
     expect(decode(request)).toBeDefined();
+    const decodePersisted = Schema.decodeUnknownSync(task.WorkTaskPersistedEvent);
+    const context = {
+      sequence: 1,
+      eventId: "event",
+      occurredAt: base.occurredAt,
+      commandId: "command",
+    };
+    const published = {
+      event: { ...request, review: { ...request.review, runtimeRequestId: "runtime" } },
+      context,
+    };
+    expect(decodePersisted(published)).toBeDefined();
+    const preciseTime = "2026-11-11T00:00:00.123456Z";
+    const precise = {
+      event: {
+        ...published.event,
+        occurredAt: preciseTime,
+        review: { ...published.event.review, createdAt: preciseTime },
+      },
+      context: { ...context, occurredAt: preciseTime },
+    };
+    expect(decodePersisted(precise)).toBeDefined();
+    for (const length of [2_000, 2_001]) {
+      const timestamp = `2026-11-11T00:00:00.${"0".repeat(length - 21)}Z`;
+      const bounded = {
+        event: {
+          ...published.event,
+          occurredAt: timestamp,
+          review: { ...published.event.review, createdAt: timestamp },
+        },
+        context: { ...context, occurredAt: timestamp },
+      };
+      if (length === 2_000) expect(decodePersisted(bounded)).toBeDefined();
+      else expect(() => decodePersisted(bounded)).toThrow();
+    }
+
+    expect(() =>
+      decodePersisted({
+        ...precise,
+        event: {
+          ...precise.event,
+          review: { ...precise.event.review, createdAt: "2026-11-11T00:00:00.123457Z" },
+        },
+      }),
+    ).toThrow();
+    const ordinary = {
+      event: { ...base, type: "task.reopened" },
+      context: { ...context, commandId: null },
+    };
+    expect(decodePersisted(ordinary)).toBeDefined();
+    for (const invalidContext of [
+      undefined,
+      { ...context, sequence: undefined },
+      { ...context, sequence: -1 },
+      { ...context, sequence: 1.5 },
+      { ...context, eventId: undefined },
+      { ...context, eventId: "other" },
+      { ...context, occurredAt: undefined },
+      { ...context, occurredAt: "invalid" },
+      { ...context, occurredAt: "2026-02-30T00:00:00Z" },
+      { ...context, occurredAt: "2026-11-12T00:00:00.000Z" },
+      { ...context, commandId: undefined },
+      { ...context, commandId: null },
+      { ...context, commandId: " " },
+      { ...context, commandId: "x".repeat(2_001) },
+    ])
+      expect(() => decodePersisted({ ...published, context: invalidContext })).toThrow();
+    for (const review of [
+      { ...published.event.review, runtimeRequestId: undefined },
+      { ...published.event.review, runtimeRequestId: " " },
+      { ...published.event.review, runtimeRequestId: "x".repeat(2_001) },
+      { ...published.event.review, taskId: "other" },
+      { ...published.event.review, definitionRevision: 2 },
+      { ...published.event.review, actionPolicyRevision: 5 },
+      { ...published.event.review, managerGeneration: 0 },
+      { ...published.event.review, fingerprint: " " },
+      { ...published.event.review, createdSequence: 2 },
+      { ...published.event.review, createdAt: "invalid" },
+      { ...published.event.review, createdAt: "2026-11-12T00:00:00Z" },
+    ])
+      expect(() =>
+        decodePersisted({ ...published, event: { ...published.event, review } }),
+      ).toThrow();
+    expect(
+      decodePersisted({
+        ...published,
+        event: {
+          ...published.event,
+          review: { ...published.event.review, runtimeRequestId: "r".repeat(2_000) },
+        },
+      }),
+    ).toBeDefined();
+    expect(() =>
+      decodePersisted({ ...ordinary, context: { ...ordinary.context, commandId: undefined } }),
+    ).toThrow();
+    expect(() =>
+      decodePersisted({
+        ...ordinary,
+        event: { ...ordinary.event, occurredAt: "invalid" },
+        context: { ...ordinary.context, occurredAt: "invalid" },
+      }),
+    ).toThrow();
     expect(() => decode({ ...request, taskId: "other" })).toThrow();
     expect(() => decode({ ...request, actionPolicyRevision: 5 })).toThrow();
     expect(() =>
@@ -245,7 +347,13 @@ describe("work task definitions", () => {
         taskId: "task-1",
       }).code,
     ).toBe("revision_conflict");
-    for (const code of ["feature_disabled", "unsupported", "unavailable"]) {
+    for (const code of [
+      "feature_disabled",
+      "unsupported",
+      "unavailable",
+      "invalid_page_token",
+      "stale_page_token",
+    ]) {
       expect(
         decode({ _tag: "WorkTaskError", code, message: "unavailable", snapshot: definition }),
       ).not.toHaveProperty("snapshot");
