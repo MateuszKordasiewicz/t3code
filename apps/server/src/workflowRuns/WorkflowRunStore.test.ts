@@ -36,6 +36,7 @@ import intentMigration from "../persistence/Migrations/084_WorkflowNativeLaunchI
 import { runMigrations } from "../persistence/Migrations.ts";
 import * as EffectOutbox from "../orchestration-v2/EffectOutbox.ts";
 import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
+import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import { DevelopmentPlanHash } from "../developmentPlans/DevelopmentPlanHash.ts";
 import * as Store from "./WorkflowRunStore.ts";
 import * as Recovery from "./WorkflowRunRecovery.ts";
@@ -3558,6 +3559,117 @@ it.effect.each([
     ),
 );
 
+it.effect("recovery custody reads all selected associations without changing state", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const store = yield* Store.WorkflowRunStore;
+    const sql = yield* SqlClient.SqlClient;
+    const input = reservation(
+      operationFor("recovery-custody", "recovery-custody"),
+      "recovery-custody",
+    );
+    yield* store.reserveWorkflowNativeIntent(input);
+    yield* sql`UPDATE workflow_native_launch_intents SET state = 'cancelled' WHERE intent_id = ${input.intentId}`;
+    const payload = json({
+      id: "shared",
+      driver: "codex",
+      providerInstanceId: "provider",
+      status: "running",
+      cwd: "/workspace",
+      model: "model",
+      capabilities: CodexProviderCapabilitiesV2,
+      createdAt: "2026-11-01T00:00:00Z",
+      updatedAt: "2026-11-01T00:00:00Z",
+      lastError: null,
+    });
+    yield* sql`INSERT INTO orchestration_v2_projection_provider_sessions (provider_session_id, thread_id, provider, driver, provider_instance_id, status, updated_at, payload_json) VALUES ('shared', NULL, 'provider', 'codex', 'provider', 'running', '2026-11-01T00:00:00Z', ${payload})`;
+    yield* sql`INSERT INTO orchestration_v2_projection_provider_session_bindings VALUES ('shared', 'ordinary'), ('shared', ${input.threadId})`;
+    const subscription = yield* store.subscribeChanges;
+    const snapshot = Effect.gen(function* () {
+      return {
+        workflow: yield* rawReservationState,
+        nativeSessions: yield* sql`SELECT * FROM orchestration_v2_projection_provider_sessions`,
+        bindings: yield* sql`SELECT * FROM orchestration_v2_projection_provider_session_bindings`,
+        events: yield* sql`SELECT * FROM orchestration_v2_events`,
+      };
+    });
+    const before = yield* snapshot;
+    const read = (threadId: string, providerSessionIds: readonly string[]) =>
+      sql.withTransaction(store.readRecoveryCustodyInTransaction({ threadId, providerSessionIds }));
+    assert.deepStrictEqual(yield* read("unrelated", []), { kind: "ordinary" });
+    assert.deepStrictEqual(yield* read(input.threadId, []), { kind: "owned" });
+    assert.deepStrictEqual(yield* read("ordinary", []), { kind: "owned" });
+    assert.deepStrictEqual(yield* read("unrelated", ["shared", "shared"]), { kind: "owned" });
+    assert.deepStrictEqual(yield* snapshot, before);
+    assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+
+    yield* sql`DELETE FROM orchestration_v2_projection_provider_session_bindings WHERE thread_id = 'ordinary'`;
+    yield* sql`UPDATE orchestration_v2_projection_provider_sessions SET thread_id = 'ordinary' WHERE provider_session_id = 'shared'`;
+    assert.deepStrictEqual(yield* read("ordinary", []), { kind: "owned" });
+    yield* sql`INSERT INTO orchestration_v2_projection_provider_session_bindings VALUES ('shared', 'ordinary')`;
+    yield* sql`DELETE FROM orchestration_v2_projection_provider_session_bindings WHERE thread_id = ${input.threadId}`;
+    yield* sql`UPDATE orchestration_v2_projection_provider_sessions SET thread_id = ${input.threadId} WHERE provider_session_id = 'shared'`;
+    assert.deepStrictEqual(yield* read("ordinary", []), { kind: "owned" });
+    assert.deepStrictEqual(yield* read(input.threadId, []), { kind: "owned" });
+    yield* sql`UPDATE orchestration_v2_projection_provider_sessions SET thread_id = NULL WHERE provider_session_id = 'shared'`;
+    assert.deepStrictEqual(yield* read("ordinary", []), { kind: "ordinary" });
+    yield* sql`UPDATE orchestration_v2_projection_provider_sessions SET thread_id = ${input.threadId} WHERE provider_session_id = 'shared'`;
+    yield* sql`INSERT INTO workflow_operations (id, workflow_run_id, kind, fingerprint, status, generation, record_json) VALUES ('malformed-peer', ${run.id}, 'stage_launch', ${hash}, 'pending', 0, '{"parameters":{"nativeThreadId":"ordinary"}}')`;
+    assert.strictEqual((yield* Effect.flip(read(input.threadId, []))).reason, "integrity");
+    yield* sql`DELETE FROM workflow_operations WHERE id = 'malformed-peer'`;
+    yield* sql`UPDATE workflow_native_launch_intents SET state = 'cancelled', fingerprint = ${nextHash} WHERE intent_id = ${input.intentId}`;
+    const malformedBefore = yield* snapshot;
+    assert.strictEqual((yield* Effect.flip(read("ordinary", []))).reason, "integrity");
+    assert.deepStrictEqual(yield* read("unrelated", []), { kind: "ordinary" });
+    assert.deepStrictEqual(yield* snapshot, malformedBefore);
+    assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect(
+  "recovery custody requires its captured transaction and fails closed on invalid associations",
+  () =>
+    Effect.gen(function* () {
+      yield* setupAdmission;
+      const store = yield* Store.WorkflowRunStore;
+      const sql = yield* SqlClient.SqlClient;
+      const read = (threadId: string, providerSessionIds: readonly string[]) =>
+        sql.withTransaction(
+          store.readRecoveryCustodyInTransaction({ threadId, providerSessionIds }),
+        );
+      assert.strictEqual(
+        (yield* Effect.flip(
+          store.readRecoveryCustodyInTransaction({ threadId: "thread", providerSessionIds: [] }),
+        )).reason,
+        "integrity",
+      );
+      assert.strictEqual((yield* Effect.flip(read("", []))).reason, "integrity");
+      assert.strictEqual((yield* Effect.flip(read("thread", [""]))).reason, "integrity");
+      assert.strictEqual((yield* Effect.flip(read("thread", ["missing"]))).reason, "integrity");
+      yield* sql`INSERT INTO orchestration_v2_projection_provider_session_bindings VALUES ('missing', 'thread')`;
+      assert.strictEqual((yield* Effect.flip(read("thread", []))).reason, "integrity");
+      yield* sql`DELETE FROM orchestration_v2_projection_provider_session_bindings`;
+      yield* sql`INSERT INTO orchestration_v2_projection_provider_session_bindings VALUES ('', 'thread')`;
+      assert.strictEqual((yield* Effect.flip(read("thread", []))).reason, "integrity");
+      yield* sql`DELETE FROM orchestration_v2_projection_provider_session_bindings`;
+      yield* sql`INSERT INTO orchestration_v2_projection_provider_sessions (provider_session_id, thread_id, provider, status, updated_at, payload_json) VALUES ('bad-peer', NULL, 'provider', 'running', '2026-11-01T00:00:00Z', '{}')`;
+      yield* sql`INSERT INTO orchestration_v2_projection_provider_session_bindings VALUES ('bad-peer', '')`;
+      assert.strictEqual((yield* Effect.flip(read("thread", ["bad-peer"]))).reason, "integrity");
+      yield* sql`DELETE FROM orchestration_v2_projection_provider_session_bindings`;
+      yield* sql`DROP TABLE orchestration_v2_projection_provider_session_bindings`;
+      const wrongClient = yield* Effect.gen(function* () {
+        const other = yield* SqlClient.SqlClient;
+        return yield* Effect.flip(
+          other.withTransaction(
+            store.readRecoveryCustodyInTransaction({ threadId: "thread", providerSessionIds: [] }),
+          ),
+        );
+      }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" })));
+      assert.strictEqual(wrongClient.reason, "integrity");
+      assert.strictEqual((yield* Effect.flip(read("thread", []))).reason, "persistence");
+    }).pipe(Effect.provide(layer)),
+);
+
 it.effect.each(["reserved", "dispatching", "unknown", "cancelled"] as const)(
   "thread custody recognizes workflow intent in %s state and ignores unrelated malformed records",
   (state) =>
@@ -3678,6 +3790,15 @@ it.effect("thread custody recognizes planning intents and finalized immutable li
       if (state === "cancelled")
         yield* sql`UPDATE workflow_native_launch_intents SET state = 'cancelled', boot_id = NULL, worker_id = NULL WHERE intent_id = ${input.intentId}`;
       assert.deepStrictEqual(yield* store.readThreadCustody({ threadId: input.threadId }), owned);
+      assert.deepStrictEqual(
+        yield* sql.withTransaction(
+          store.readRecoveryCustodyInTransaction({
+            threadId: input.threadId,
+            providerSessionIds: [],
+          }),
+        ),
+        { kind: "owned" },
+      );
     }
     const operation = admission.operation;
     const pass = admission.pass;

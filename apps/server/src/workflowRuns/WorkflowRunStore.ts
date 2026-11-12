@@ -15,6 +15,7 @@ import * as Context from "effect/Context";
 import * as Digest from "effect/crypto/Digest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -2219,6 +2220,59 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
   }) {
     return yield* inTransaction(readThreadCustodyInTransaction(input.threadId));
   });
+  const readRecoveryCustodyInTransaction = Effect.fn(
+    "WorkflowRunStore.readRecoveryCustodyInTransaction",
+  )(
+    function* (input: {
+      readonly threadId: string;
+      readonly providerSessionIds: readonly string[];
+    }) {
+      if (Option.isNone(yield* Effect.serviceOption(sql.transactionService)))
+        return yield* integrity();
+      const validId = (id: unknown): id is string => typeof id === "string" && id.length > 0;
+      if (!validId(input.threadId) || !input.providerSessionIds.every(validId))
+        return yield* integrity();
+      const sessionIds = new Set(input.providerSessionIds);
+      const threads = new Set([input.threadId]);
+      const bindings = yield* sql<{
+        provider_session_id: string;
+      }>`SELECT provider_session_id FROM orchestration_v2_projection_provider_session_bindings WHERE thread_id = ${input.threadId}`;
+      const direct = yield* sql<{
+        provider_session_id: string;
+      }>`SELECT provider_session_id FROM orchestration_v2_projection_provider_sessions WHERE thread_id = ${input.threadId}`;
+      for (const row of [...bindings, ...direct]) {
+        if (!validId(row.provider_session_id)) return yield* integrity();
+        sessionIds.add(row.provider_session_id);
+      }
+      for (const id of sessionIds) {
+        const sessions = yield* sql<{
+          thread_id: string | null;
+        }>`SELECT thread_id FROM orchestration_v2_projection_provider_sessions WHERE provider_session_id = ${id}`;
+        if (sessions.length !== 1 || !sessions[0]) return yield* integrity();
+        const threadId = sessions[0].thread_id;
+        if (threadId !== null) {
+          if (!validId(threadId)) return yield* integrity();
+          threads.add(threadId);
+        }
+        const peers = yield* sql<{
+          thread_id: string;
+        }>`SELECT thread_id FROM orchestration_v2_projection_provider_session_bindings WHERE provider_session_id = ${id}`;
+        for (const peer of peers) {
+          if (!validId(peer.thread_id)) return yield* integrity();
+          threads.add(peer.thread_id);
+        }
+      }
+      let owned = false;
+      for (const threadId of threads) {
+        const custody = yield* readThreadCustodyInTransaction(threadId);
+        if (custody.kind === "owned") owned = true;
+      }
+      return owned ? { kind: "owned" as const } : { kind: "ordinary" as const };
+    },
+    Effect.mapError((error) =>
+      isStoreError(error) ? error : new WorkflowRunStoreError({ reason: "persistence" }),
+    ),
+  );
   const reserveWorkflowNativeIntent = Effect.fn("WorkflowRunStore.reserveWorkflowNativeIntent")(
     function* (input: WorkflowNativeInput) {
       const work = Effect.gen(function* () {
@@ -3557,6 +3611,7 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     reserveWorkflowNativeIntent,
     reservePlanningNativeIntent,
     readThreadCustody,
+    readRecoveryCustodyInTransaction,
     subscribeChanges,
     listPending,
     claim,
