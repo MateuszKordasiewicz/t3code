@@ -1116,8 +1116,8 @@ it.effect("constrains claim identity, evidence, bindings and indexed history", (
       uri: "😀".repeat(1000),
       hash: "x".repeat(2000),
     }));
-    yield* sql`INSERT INTO work_task_claims VALUES ('event1', 'a', 'claim1', 'evidence1', 'manager', 1, 1, 1, 0, '{"type":"server"}', ${"😀".repeat(1000)}, ${JSON.stringify(batch)}, 5, 't')`;
-    yield* sql`INSERT INTO work_task_claims VALUES ('event2', 'a', 'claim2', 'evidence2', 'manager', 1, 1, 1, 2, '{"type":"manager","threadId":"manager","providerSessionId":"s","runId":"r","generation":1}', ${" \0 "}, ${JSON.stringify(references)}, 5, 't')`;
+    yield* sql`INSERT INTO work_task_claims VALUES ('event1', 'a', 'claim-z', 'evidence1', 'manager', 1, 1, 1, 0, '{"type":"server"}', ${"😀".repeat(1000)}, ${JSON.stringify(batch)}, 5, 't')`;
+    yield* sql`INSERT INTO work_task_claims VALUES ('event2', 'a', 'claim-a', 'evidence2', 'manager', 1, 1, 1, 2, '{"type":"manager","threadId":"manager","providerSessionId":"s","runId":"r","generation":1}', ${" \0 "}, ${JSON.stringify(references)}, 5, 't')`;
     yield* sql`INSERT INTO work_task_claims VALUES ('event-b', 'b', 'claim1', 'evidence1', 'other', 1, 1, 1, 0, '{"type":"server"}', 'summary', ${JSON.stringify(references)}, 1, 't')`;
     const invalid = [
       sql`INSERT INTO work_task_claims SELECT event_id, task_id, 'new', 'new', manager_thread_id, manager_generation, definition_revision, completion_policy_revision, observed_work_sequence, attribution_json, summary, evidence_json, sequence, recorded_at FROM work_task_claims WHERE event_id = 'event1'`,
@@ -1165,14 +1165,14 @@ it.effect("constrains claim identity, evidence, bindings and indexed history", (
     yield* sql`UPDATE work_task_claims SET evidence_json = ${JSON.stringify([{ type: "run", threadId: " \0 ", runId: "r" }])} WHERE event_id = 'event2'`;
     const rows = yield* sql<{
       claim_id: string;
-    }>`SELECT claim_id FROM work_task_claims WHERE task_id = 'a' AND (sequence, claim_id) < (6, 'z') ORDER BY sequence DESC, claim_id DESC LIMIT 50`;
+    }>`SELECT claim_id FROM work_task_claims WHERE task_id = 'a' AND (sequence, event_id) < (6, 'z') ORDER BY sequence DESC, event_id DESC LIMIT 50`;
     assert.deepStrictEqual(
       rows.map((row) => row.claim_id),
-      ["claim2", "claim1"],
+      ["claim-a", "claim-z"],
     );
     const plan = yield* sql<{
       detail: string;
-    }>`EXPLAIN QUERY PLAN SELECT claim_id FROM work_task_claims WHERE task_id = 'a' AND (sequence, claim_id) < (6, 'z') ORDER BY sequence DESC, claim_id DESC LIMIT 50`;
+    }>`EXPLAIN QUERY PLAN SELECT claim_id FROM work_task_claims WHERE task_id = 'a' AND (sequence, event_id) < (6, 'z') ORDER BY sequence DESC, event_id DESC LIMIT 50`;
     assert.isTrue(plan.some((row) => row.detail.includes("work_task_claims_history_idx")));
     assert.isFalse(plan.some((row) => row.detail.includes("TEMP B-TREE")));
   }).pipe(Effect.provide(db)),

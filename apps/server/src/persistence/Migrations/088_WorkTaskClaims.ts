@@ -61,5 +61,5 @@ export default Effect.gen(function* () {
           WHERE length(CAST(trim(value, ${whitespace}) AS BLOB)) = 0
         ) OR length(CAST(trim(NEW.event_id, ${whitespace}) AS BLOB)) = 0 OR NOT EXISTS (SELECT 1 FROM work_task_manager_bindings WHERE task_id = NEW.task_id AND generation = NEW.manager_generation AND thread_id = NEW.manager_thread_id) ELSE 0 END BEGIN SELECT RAISE(ABORT, 'invalid claim'); END`);
   }
-  yield* sql`CREATE INDEX work_task_claims_history_idx ON work_task_claims(task_id, sequence DESC, claim_id DESC)`;
+  yield* sql`CREATE INDEX work_task_claims_history_idx ON work_task_claims(task_id, sequence DESC, event_id DESC)`;
 });
