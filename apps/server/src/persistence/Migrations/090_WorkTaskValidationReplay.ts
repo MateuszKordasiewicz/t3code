@@ -16,6 +16,7 @@ export default Effect.gen(function* () {
       UNIQUE (task_id, sequence)
     )
   `;
+  // Terminal outcome_json stores { outcome, findings, reason? } matching its result event.
   // SQLite trim needs the ECMAScript whitespace set used by the contract.
   const whitespace =
     "char(9,10,11,12,13,32,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288,65279)";
@@ -46,6 +47,9 @@ export default Effect.gen(function* () {
         AND json_type(NEW.event_json, '$.validator.projectId') IS 'text'
         AND json_type(NEW.event_json, '$.validator.modelSelection') IS 'object'
         AND json_type(NEW.event_json, '$.validator.modelSelection.instanceId') IS 'text'
+        AND length(CAST(trim(json_extract(NEW.event_json, '$.validator.modelSelection.instanceId'), ${whitespace}) AS BLOB)) BETWEEN 1 AND 64
+        AND trim(json_extract(NEW.event_json, '$.validator.modelSelection.instanceId'), ${whitespace}) GLOB '[a-zA-Z]*' AND trim(json_extract(NEW.event_json, '$.validator.modelSelection.instanceId'), ${whitespace}) NOT GLOB '*[^a-zA-Z0-9_-]*'
+        AND instr(trim(json_extract(NEW.event_json, '$.validator.modelSelection.instanceId'), ${whitespace}), char(0)) = 0
         AND json_type(NEW.event_json, '$.validator.modelSelection.model') IS 'text'
         AND json_type(NEW.event_json, '$.validator.workspace') IS 'object'
         AND (json_extract(NEW.event_json, '$.validator.workspace.type') = 'root'
@@ -70,6 +74,18 @@ export default Effect.gen(function* () {
             (json_extract(NEW.event_json, '$.runId') IS a.run_id AND json_extract(NEW.event_json, '$.startedAt') IS a.started_at))
           AND (json_extract(NEW.event_json, '$.type') NOT IN ('task.validation-result', 'task.validation-uncertain') OR
             json_extract(NEW.event_json, '$.finishedAt') IS a.finished_at)
+          AND (json_extract(NEW.event_json, '$.type') != 'task.validation-result' OR
+            CASE WHEN json_valid(a.outcome_json) THEN
+              json_type(a.outcome_json) IS 'object'
+              AND json_extract(a.outcome_json, '$.outcome') IS json_extract(NEW.event_json, '$.outcome')
+              AND json_type(a.outcome_json, '$.findings') IS 'array'
+              AND json_type(a.outcome_json, '$.reason') IS json_type(NEW.event_json, '$.reason')
+              AND json_extract(a.outcome_json, '$.reason') IS json_extract(NEW.event_json, '$.reason')
+              AND NOT EXISTS (SELECT fullkey, type, atom FROM json_tree(NEW.event_json, '$.findings')
+                EXCEPT SELECT fullkey, type, atom FROM json_tree(a.outcome_json, '$.findings'))
+              AND NOT EXISTS (SELECT fullkey, type, atom FROM json_tree(a.outcome_json, '$.findings')
+                EXCEPT SELECT fullkey, type, atom FROM json_tree(NEW.event_json, '$.findings'))
+            ELSE 0 END)
           AND CASE WHEN json_valid(a.validator_json) THEN
             NOT EXISTS (SELECT 1 FROM json_tree(NEW.event_json, '$.validator') AS supplied
               LEFT JOIN json_tree(a.validator_json) AS stored ON ('$' || substr(supplied.fullkey, 12)) = stored.fullkey
@@ -109,7 +125,7 @@ export default Effect.gen(function* () {
             (json_extract(r.value, '$.type') = 'source_revision' AND json_type(r.value, '$.repository') IS 'text' AND json_type(r.value, '$.revision') IS 'text')
           ) IS TRUE ELSE 1 END)
         ) IS TRUE ELSE 1 END)
-        AND NOT EXISTS (SELECT 1 FROM json_each(NEW.event_json, '$.findings') GROUP BY json_extract(value, '$.criterionId') HAVING count(*) > 1)
+        AND NOT EXISTS (SELECT 1 FROM json_each(NEW.event_json, '$.findings') GROUP BY trim(json_extract(value, '$.criterionId'), ${whitespace}) HAVING count(*) > 1)
         AND NOT EXISTS (
           WITH RECURSIVE strings(value) AS (
             SELECT NEW.event_id UNION ALL SELECT NEW.command_id
@@ -146,6 +162,7 @@ export default Effect.gen(function* () {
     CREATE TRIGGER work_task_validation_replay_attempt_update BEFORE UPDATE ON work_task_validation_attempts
     WHEN EXISTS (SELECT 1 FROM work_task_validation_replay WHERE attempt_id = OLD.attempt_id)
       AND (NEW.created_at IS NOT OLD.created_at OR NEW.validator_json IS NOT OLD.validator_json
+        OR (NEW.outcome_json IS NOT OLD.outcome_json AND EXISTS (SELECT 1 FROM work_task_validation_replay r WHERE r.attempt_id = OLD.attempt_id AND json_extract(r.event_json, '$.type') = 'task.validation-result'))
         OR EXISTS (SELECT 1 FROM work_task_validation_replay r WHERE r.attempt_id = OLD.attempt_id
           AND json_type(r.event_json, '$.runId') IS 'text'
           AND (NEW.run_id IS NOT OLD.run_id OR NEW.started_at IS NOT OLD.started_at))
@@ -185,5 +202,27 @@ export default Effect.gen(function* () {
         WHERE a.attempt_id = NEW.attempt_id AND a.task_id = NEW.task_id AND a.state = NEW.state)
       BEGIN SELECT RAISE(ABORT, 'invalid validation instant binding'); END`);
   }
+  // Derived ordering is repopulated atomically by the store after parent changes.
+  yield* sql`
+    CREATE TRIGGER work_task_validation_instant_parent_update AFTER UPDATE ON work_task_validation_attempts
+    WHEN NEW.attempt_id IS NOT OLD.attempt_id OR NEW.task_id IS NOT OLD.task_id
+      OR NEW.state IS NOT OLD.state OR NEW.created_at IS NOT OLD.created_at
+    BEGIN DELETE FROM work_task_validation_instant WHERE attempt_id = OLD.attempt_id; END
+  `;
+  yield* sql`
+    CREATE TRIGGER work_task_validation_instant_parent_insert BEFORE INSERT ON work_task_validation_attempts
+    WHEN EXISTS (SELECT 1 FROM work_task_validation_instant i
+      JOIN work_task_validation_attempts a ON a.attempt_id = i.attempt_id
+      WHERE a.attempt_id = NEW.attempt_id OR (a.run_id IS NOT NULL AND a.run_id = NEW.run_id))
+    BEGIN SELECT RAISE(ABORT, 'validation instant in use'); END
+  `;
+  yield* sql`
+    CREATE TRIGGER work_task_validation_instant_parent_collision BEFORE UPDATE ON work_task_validation_attempts
+    WHEN EXISTS (SELECT 1 FROM work_task_validation_instant i
+      JOIN work_task_validation_attempts a ON a.attempt_id = i.attempt_id
+      WHERE a.attempt_id IS NOT OLD.attempt_id
+        AND (a.attempt_id = NEW.attempt_id OR (a.run_id IS NOT NULL AND a.run_id = NEW.run_id)))
+    BEGIN SELECT RAISE(ABORT, 'validation instant in use'); END
+  `;
   yield* sql`CREATE INDEX work_task_validation_chronological_idx ON work_task_validation_instant(task_id, state, utc_seconds DESC, fraction DESC, attempt_id DESC)`;
 });
