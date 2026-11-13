@@ -1239,6 +1239,9 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     beforeEmitInbound?: CodexReplay.CodexAppServerReplayDriver["beforeEmitInbound"],
     onUsageLimits?: CodexAdapterV2.CodexAdapterV2Options["onUsageLimits"],
     promptSuggestions: Effect.Effect<boolean> = Effect.succeed(false),
+    decorateClient?: (
+      client: CodexClient.CodexAppServerClient["Service"],
+    ) => CodexClient.CodexAppServerClient["Service"],
   ) =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -1286,6 +1289,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                       },
                     }) satisfies CodexClient.CodexAppServerClient["Service"],
                 ),
+                Effect.map((client) => decorateClient?.(client) ?? client),
                 Effect.provide(context),
               ),
             ),
@@ -1374,6 +1378,460 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         awaitTerminal: (count: number) => changes.until(() => terminalEvents().length >= count),
       };
     });
+
+  it.effect.each(
+    (["turn/start", "thread/compact/start"] as const).flatMap((method) =>
+      (["unknown", "submitted"] as const).flatMap((outcome) =>
+        (["early", "late"] as const).map((timing) => ({ method, outcome, timing })),
+      ),
+    ),
+  )(
+    "retains $method $outcome identity through $timing evidence without replacing it",
+    ({ method, outcome, timing }) =>
+      Effect.gen(function* () {
+        const nativeThreadId = "uncertain-original";
+        const nativeTurnId = "uncertain-turn";
+        const sharedNative = "uncertain-shared";
+        const sharedTurn = "shared-turn";
+        const preamble = codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "work" });
+        const shared = codexReplayPreamble({
+          nativeThreadId: sharedNative,
+          nativeTurnId: sharedTurn,
+          prompt: "work",
+        });
+        const completion = (
+          threadId: string,
+          id: string,
+        ): CodexReplay.CodexAppServerReplayEntry => ({
+          type: "emit_inbound",
+          frame: {
+            method: "turn/completed",
+            params: {
+              threadId,
+              turn: makeCodexReplayTurn({ id, status: "completed" }),
+            },
+          },
+        });
+        const registered = yield* Deferred.make<void>();
+        let attempted = 0;
+        const harness = yield* makeCodexReplayHarness(
+          makeCodexReplayTranscript({
+            scenario: `uncertain-${method}-${outcome}`,
+            entries: [
+              ...preamble.slice(0, 5),
+              method === "turn/start"
+                ? preamble[5]!
+                : {
+                    type: "expect_outbound",
+                    frame: { id: 3, method, params: { threadId: nativeThreadId } },
+                  },
+              ...(timing === "early" ? [preamble[7]!] : []),
+              method === "turn/start"
+                ? preamble[6]!
+                : { type: "emit_inbound", frame: { id: 3, result: {} } },
+              ...shared.slice(5, 7).map((entry) => withReplayRequestId(entry, 4)),
+              preamble[7]!,
+              completion(nativeThreadId, nativeTurnId),
+              shared[7]!,
+              completion(sharedNative, sharedTurn),
+            ],
+          }),
+          (event) =>
+            event.type === "provider_turn.updated" &&
+            event.providerTurn.nativeTurnRef?.nativeId === nativeTurnId
+              ? Deferred.succeed(registered, undefined)
+              : Effect.void,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          (client) => ({
+            ...client,
+            request: (requestMethod, params) => {
+              if (
+                requestMethod === method &&
+                Predicate.hasProperty(params, "threadId") &&
+                params.threadId === nativeThreadId
+              ) {
+                attempted++;
+                return client.request(requestMethod, params).pipe(
+                  Effect.andThen(timing === "early" ? Deferred.await(registered) : Effect.void),
+                  Effect.andThen(
+                    Effect.fail(
+                      new CodexError.CodexAppServerFrameSubmissionError({
+                        outcome,
+                        reason: "wrapper",
+                      }),
+                    ),
+                  ),
+                );
+              }
+              return client.request(requestMethod, params);
+            },
+          }),
+        );
+        const original = makeCodexTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("uncertain-original"),
+          text: "work",
+        });
+        const invoke = (input: ProviderAdapter.ProviderAdapterV2TurnInput) =>
+          method === "turn/start"
+            ? harness.runtime.startTurn(input)
+            : harness.runtime.compactThread!(input);
+        const error = yield* invoke(original).pipe(Effect.flip);
+        assert.strictEqual(error._tag, "ProviderAdapterTurnStartError");
+        if (error._tag === "ProviderAdapterTurnStartError") {
+          assert.strictEqual(error.submissionState, "unknown");
+          assert.strictEqual(error.threadId, original.threadId);
+          assert.strictEqual(error.runId, original.runId);
+          assert.strictEqual(error.providerThreadId, original.providerThread.id);
+        }
+        if (timing === "late") {
+          assert.isTrue(yield* harness.hasPendingBackgroundWork);
+          assert.isTrue(
+            yield* harness.runtime.hasPendingBackgroundWorkForThread!(harness.providerThread),
+          );
+          const repeated = yield* invoke({ ...original }).pipe(Effect.flip);
+          assert.strictEqual(repeated._tag, "ProviderAdapterTurnStartError");
+          if (repeated._tag === "ProviderAdapterTurnStartError")
+            assert.strictEqual(repeated.submissionState, "unknown");
+          assert.isTrue(yield* harness.hasPendingBackgroundWork);
+          const replacement = {
+            ...original,
+            runId: RunId.make("replacement"),
+            attemptId: RunAttemptId.make("replacement"),
+            runOrdinal: 2,
+          };
+          const refused = yield* invoke(replacement).pipe(Effect.flip);
+          assert.strictEqual(refused._tag, "ProviderAdapterTurnStartError");
+          if (refused._tag === "ProviderAdapterTurnStartError")
+            assert.isUndefined(refused.submissionState);
+          assert.strictEqual(attempted, 1);
+        }
+        const otherThread: OrchestrationV2ProviderThread = {
+          ...harness.providerThread,
+          id: ProviderThreadId.make("shared-provider-thread"),
+          appThreadId: ThreadId.make("shared-app-thread"),
+          nativeThreadRef: {
+            driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+            nativeId: sharedNative,
+            strength: "strong",
+          },
+        };
+        assert.isFalse(yield* harness.runtime.hasPendingBackgroundWorkForThread!(otherThread));
+        yield* harness.runtime.startTurn({
+          ...makeCodexTestTurnInput({
+            threadId: ThreadId.make("shared-app-thread"),
+            providerThread: otherThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("shared-attempt"),
+            text: "work",
+          }),
+          runOrdinal: 3,
+        });
+        yield* harness.awaitTerminal(2);
+        assert.deepEqual(
+          harness
+            .terminalEvents()
+            .map((event) => [event.providerThreadId, event.runOrdinal, event.status]),
+          [
+            [original.providerThread.id, 1, "completed"],
+            [otherThread.id, 3, "completed"],
+          ],
+        );
+        const originalUpdate = harness.events.find(
+          (event) =>
+            event.type === "provider_turn.updated" &&
+            event.providerTurn.nativeTurnRef?.nativeId === nativeTurnId,
+        );
+        assert.strictEqual(originalUpdate?.type, "provider_turn.updated");
+        if (originalUpdate?.type === "provider_turn.updated") {
+          assert.strictEqual(originalUpdate.providerTurn.runAttemptId, original.attemptId);
+          assert.strictEqual(originalUpdate.providerTurn.nodeId, original.rootNodeId);
+        }
+        assert.isFalse(yield* harness.hasPendingBackgroundWork);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+  );
+
+  it.effect.each([
+    { method: "turn/start", kind: "not_submitted" },
+    { method: "thread/compact/start", kind: "not_submitted" },
+    { method: "turn/start", kind: "nested" },
+    { method: "thread/compact/start", kind: "nested" },
+    { method: "turn/start", kind: "unclassified" },
+    { method: "thread/compact/start", kind: "unclassified" },
+    { method: "turn/start", kind: "malformed" },
+    { method: "thread/goal/get", kind: "unrelated" },
+  ] as const)("does not infer uncertain starts from $method $kind failures", ({ method, kind }) =>
+    Effect.gen(function* () {
+      const nativeThreadId = "known-failure-thread";
+      const nativeTurnId = "known-retry-turn";
+      const preamble = codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "work" });
+      const uncertain = new CodexError.CodexAppServerFrameSubmissionError({
+        outcome: "unknown",
+        reason: "wrapper",
+      });
+      const failure =
+        kind === "not_submitted"
+          ? new CodexError.CodexAppServerFrameSubmissionError({
+              outcome: "not_submitted",
+              reason: "wrapper",
+            })
+          : kind === "nested"
+            ? CodexError.CodexAppServerRequestError.internalError("nested", undefined, {
+                cause: uncertain,
+              })
+            : kind === "unclassified"
+              ? new CodexError.CodexAppServerTransportError({
+                  operation: "read-input-stream",
+                  cause: uncertain,
+                })
+              : kind === "malformed"
+                ? Object.assign(
+                    new CodexError.CodexAppServerFrameSubmissionError({
+                      outcome: "unknown",
+                      reason: "wrapper",
+                    }),
+                    { outcome: "invalid" },
+                  )
+                : uncertain;
+      let failed = false;
+      const compact = method === "thread/compact/start";
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: `known-${method}-${kind}`,
+          entries: [
+            ...preamble.slice(0, 5),
+            ...(compact
+              ? [
+                  {
+                    type: "expect_outbound" as const,
+                    frame: { id: 3, method, params: { threadId: nativeThreadId } },
+                  },
+                  { type: "emit_inbound" as const, frame: { id: 3, result: {} } },
+                ]
+              : preamble.slice(5, 7)),
+            preamble[7]!,
+            {
+              type: "emit_inbound",
+              frame: {
+                method: "turn/completed",
+                params: {
+                  threadId: nativeThreadId,
+                  turn: makeCodexReplayTurn({ id: nativeTurnId, status: "completed" }),
+                },
+              },
+            },
+          ],
+        }),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        (client) => ({
+          ...client,
+          request: (requestMethod, params) => {
+            if (requestMethod === method && !failed) {
+              failed = true;
+              return Effect.fail(failure);
+            }
+            return client.request(requestMethod, params);
+          },
+        }),
+      );
+      const original = makeCodexTestTurnInput({
+        threadId: harness.threadId,
+        providerThread: harness.providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("known-first"),
+        text: kind === "unrelated" ? "/goal" : "work",
+      });
+      const error = yield* (
+        compact ? harness.runtime.compactThread!(original) : harness.runtime.startTurn(original)
+      ).pipe(Effect.flip);
+      assert.strictEqual(error._tag, "ProviderAdapterTurnStartError");
+      if (error._tag === "ProviderAdapterTurnStartError") assert.isUndefined(error.submissionState);
+      assert.isFalse(yield* harness.hasPendingBackgroundWork);
+      assert.isFalse(
+        yield* harness.runtime.hasPendingBackgroundWorkForThread!(harness.providerThread),
+      );
+      const next = {
+        ...original,
+        runId: RunId.make("known-next"),
+        attemptId: RunAttemptId.make("known-next"),
+        rootNodeId: NodeId.make("known-next"),
+        runOrdinal: 2,
+        providerTurnOrdinal: 2,
+        message: { ...original.message, text: "work" },
+      };
+      yield* compact ? harness.runtime.compactThread!(next) : harness.runtime.startTurn(next);
+      yield* harness.firstTerminal;
+      assert.strictEqual(harness.terminalEvents()[0]?.runOrdinal, 2);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+        ),
+      ),
+    ),
+  );
+
+  it.effect("does not adopt a known settled native turn into an uncertain new run", () =>
+    Effect.gen(function* () {
+      const nativeThreadId = "settled-identity-thread";
+      const oldId = "settled-old-turn";
+      const newId = "uncertain-new-turn";
+      const old = codexReplayPreamble({ nativeThreadId, nativeTurnId: oldId, prompt: "work" });
+      const next = codexReplayPreamble({ nativeThreadId, nativeTurnId: newId, prompt: "work" });
+      const completed = (id: string): CodexReplay.CodexAppServerReplayEntry => ({
+        type: "emit_inbound",
+        frame: {
+          method: "turn/completed",
+          params: {
+            threadId: nativeThreadId,
+            turn: makeCodexReplayTurn({ id, status: "completed" }),
+          },
+        },
+      });
+      const item = (
+        method: "item/started" | "item/completed",
+      ): CodexReplay.CodexAppServerReplayEntry => ({
+        type: "emit_inbound",
+        frame: {
+          method,
+          params: {
+            threadId: nativeThreadId,
+            turnId: oldId,
+            item: backgroundCommandItem(method === "item/started" ? "inProgress" : "completed"),
+          },
+        },
+      });
+      let starts = 0;
+      let release: Effect.Effect<unknown, CodexError.CodexAppServerError> | undefined;
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: "settled-identity-uncertainty",
+          entries: [
+            ...old,
+            item("item/started"),
+            completed(oldId),
+            ...next.slice(5, 7).map((entry) => withReplayRequestId(entry, 4)),
+            { type: "expect_outbound", frame: { id: 5, method: "account/read", params: {} } },
+            { type: "emit_inbound", frame: { id: 5, result: {} } },
+            old[7]!,
+            completed(oldId),
+            next[7]!,
+            completed(newId),
+            item("item/completed"),
+          ],
+        }),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        (client) => {
+          release = client.raw.request("account/read", {});
+          return {
+            ...client,
+            request: (method, params) => {
+              const uncertain = method === "turn/start" && ++starts === 2;
+              return client.request(method, params).pipe(
+                Effect.filterOrFail(
+                  () => !uncertain,
+                  () =>
+                    new CodexError.CodexAppServerFrameSubmissionError({
+                      outcome: "unknown",
+                      reason: "wrapper",
+                    }),
+                ),
+              );
+            },
+          };
+        },
+      );
+      const original = makeCodexTestTurnInput({
+        threadId: harness.threadId,
+        providerThread: harness.providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("settled-original"),
+        text: "work",
+      });
+      yield* harness.runtime.startTurn(original);
+      yield* harness.firstTerminal;
+      assert.isTrue(yield* harness.hasPendingBackgroundWork);
+      const current = {
+        ...original,
+        runId: RunId.make("uncertain-next"),
+        attemptId: RunAttemptId.make("uncertain-next"),
+        rootNodeId: NodeId.make("uncertain-next"),
+        runOrdinal: 2,
+        providerTurnOrdinal: 2,
+      };
+      const failure = yield* harness.runtime.startTurn(current).pipe(Effect.flip);
+      assert.strictEqual(failure._tag, "ProviderAdapterTurnStartError");
+      if (failure._tag === "ProviderAdapterTurnStartError")
+        assert.strictEqual(failure.submissionState, "unknown");
+      assert.isDefined(release);
+      yield* release!;
+      yield* harness.awaitTerminal(2);
+      const updates = harness.events.filter((event) => event.type === "provider_turn.updated");
+      assert.isFalse(
+        updates.some(
+          (event) =>
+            event.type === "provider_turn.updated" &&
+            event.providerTurn.nativeTurnRef?.nativeId === oldId &&
+            event.providerTurn.runAttemptId === current.attemptId,
+        ),
+      );
+      assert.isTrue(
+        updates.some(
+          (event) =>
+            event.type === "provider_turn.updated" &&
+            event.providerTurn.nativeTurnRef?.nativeId === newId &&
+            event.providerTurn.runAttemptId === current.attemptId,
+        ),
+      );
+      assert.deepEqual(
+        harness.terminalEvents().map((event) => [event.runOrdinal, event.status]),
+        [
+          [1, "completed"],
+          [2, "completed"],
+        ],
+      );
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+        ),
+      ),
+    ),
+  );
 
   it.effect.each(["before", "after"] as const)(
     "rejects a previous run's native turn when it completes %s the new start response",
@@ -3106,9 +3564,13 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     "new-run",
     "steer",
     "start-fails",
+    "unknown-start",
+    "submitted-start",
   ] as const)("handles terminal Codex capacity failures when retries %s", (outcome) =>
     Effect.scoped(
       Effect.gen(function* () {
+        const uncertainStart = outcome === "unknown-start" || outcome === "submitted-start";
+        const releaseLateStart = yield* Deferred.make<void>();
         const scenario = `capacity-${outcome}`;
         const nativeThreadId = `native-${scenario}`;
         const nativeTurnId = (attempt: number) => `${nativeThreadId}-${attempt}`;
@@ -3266,8 +3728,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
               },
             });
           }
-          if (outcome === "stop-continued" || outcome === "steer") {
-            const steering = outcome === "steer";
+          if (outcome === "stop-continued" || outcome === "steer" || uncertainStart) {
+            const steering = outcome === "steer" || uncertainStart;
             entries.push(
               {
                 type: "expect_outbound",
@@ -3322,6 +3784,34 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                 if (starts.length === 2) yield* Deferred.succeed(retryStarted, undefined);
               }
             }),
+          undefined,
+          (entry) =>
+            uncertainStart &&
+            entry.label === "turn/started" &&
+            Predicate.hasProperty(entry.frame, "params") &&
+            Predicate.hasProperty(entry.frame.params, "turn") &&
+            Predicate.hasProperty(entry.frame.params.turn, "id") &&
+            entry.frame.params.turn.id === nativeTurnId(1)
+              ? Deferred.await(releaseLateStart)
+              : Effect.void,
+          undefined,
+          undefined,
+          uncertainStart
+            ? (client) => ({
+                ...client,
+                request: (method, params) =>
+                  client.request(method, params).pipe(
+                    Effect.filterOrFail(
+                      () => method !== "turn/start" || starts.length !== 2,
+                      () =>
+                        new CodexError.CodexAppServerFrameSubmissionError({
+                          outcome: outcome === "unknown-start" ? "unknown" : "submitted",
+                          reason: "wrapper",
+                        }),
+                    ),
+                  ),
+              })
+            : undefined,
         );
         const turnInput = makeCodexTestTurnInput({
           threadId: harness.threadId,
@@ -3351,7 +3841,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             });
           }
           const steering =
-            outcome === "steer"
+            outcome === "steer" || uncertainStart
               ? yield* harness.runtime
                   .steerTurn({
                     ...turnInput,
@@ -3368,6 +3858,15 @@ describe("CodexAdapterV2 post-settle continuation", () => {
               .pipe(Effect.forkScoped);
             yield* TestClock.adjust("1 second");
             yield* Fiber.join(stopping);
+          }
+          if (uncertainStart) {
+            yield* Deferred.await(retryStarted);
+            assert.isEmpty(harness.terminalEvents());
+            assert.isTrue(yield* harness.hasPendingBackgroundWork);
+            assert.isTrue(
+              yield* harness.runtime.hasPendingBackgroundWorkForThread!(harness.providerThread),
+            );
+            yield* Deferred.succeed(releaseLateStart, undefined);
           }
           if (steering !== undefined) yield* Fiber.join(steering);
           if (outcome === "stop-continued") {
@@ -3402,6 +3901,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         assert.equal(
           terminal?.status,
           outcome === "recover" ||
+            uncertainStart ||
             outcome === "completion-only" ||
             outcome === "steer" ||
             outcome === "started-first" ||
