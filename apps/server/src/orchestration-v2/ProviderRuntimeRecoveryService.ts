@@ -23,6 +23,7 @@ import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as WorkflowRunStore from "../workflowRuns/WorkflowRunStore.ts";
 import { restartContinuationRun } from "./RestartContinuation.ts";
 import { isBufferedProviderNotification } from "./NotificationMailbox.ts";
 import { queuedRunsInDeliveryOrder } from "./QueuedRunOrder.ts";
@@ -188,6 +189,53 @@ export const make = Effect.gen(function* () {
   const eventSink = yield* EventSink.EventSinkV2;
   const ids = yield* IdAllocator.IdAllocatorV2;
   const outbox = yield* EffectOutbox.EffectOutboxV2;
+  const workflowRuns = yield* WorkflowRunStore.WorkflowRunStore;
+
+  const isOwned = Effect.fn("ProviderRuntimeRecoveryService.isOwned")(function* (
+    projection: ProjectionStore.ProjectionRuntimeRecoveryState,
+  ) {
+    const sessionIds = [
+      ...new Set([
+        ...projection.providerSessions.map((session) => session.id),
+        ...projection.providerThreads.flatMap((thread) =>
+          thread.providerSessionId === null ? [] : [thread.providerSessionId],
+        ),
+      ]),
+    ];
+    const threadIds = new Set<string>([
+      projection.thread.id,
+      ...[
+        projection.runs,
+        projection.attempts,
+        projection.nodes,
+        projection.subagents,
+        projection.providerTurns,
+        projection.runtimeRequests,
+        projection.messages,
+        projection.turnItems,
+      ].flatMap((rows) => (rows ?? []).flatMap((row) => ("threadId" in row ? [row.threadId] : []))),
+      ...projection.providerThreads.flatMap((thread) =>
+        thread.appThreadId === null ? [] : [thread.appThreadId],
+      ),
+    ]);
+    let owned = false;
+    for (const threadId of threadIds) {
+      const custody = yield* workflowRuns
+        .readRecoveryCustodyInTransaction({ threadId, providerSessionIds: sessionIds })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderRuntimeRecoveryError({
+                operation: "reconcile",
+                threadId: projection.thread.id,
+                cause,
+              }),
+          ),
+        );
+      if (custody.kind === "owned") owned = true;
+    }
+    return owned;
+  });
   type RecoverySession = ProjectionStore.ProjectionRuntimeRecoveryState["providerSessions"][number];
   /** Shared sessions stop on their first recovered thread; later threads still decide wakes from pre-recovery liveness. */
   const sessionsLiveAtStart = (
@@ -899,6 +947,11 @@ export const make = Effect.gen(function* () {
     const groupSize = grouped ? 32 : 1;
     for (let offset = 0; offset < threadIds.length; offset += groupSize) {
       const cancelledEffectIds: string[] = [];
+      const groupStopped = new Map(stoppedThisPass);
+      let groupRuns = 0,
+        groupSessions = 0,
+        groupRequests = 0,
+        groupEffects = 0;
       // Read and decide on the writer so shared sessions see earlier updates in this group.
       const reconcileGroup = Effect.gen(function* () {
         for (const threadId of threadIds.slice(offset, offset + groupSize)) {
@@ -912,30 +965,38 @@ export const make = Effect.gen(function* () {
                 }),
             ),
           );
+          if (yield* isOwned(projection)) continue;
           const enabled =
             continueAfterRestart !== null &&
             resolveProjectSettings(continueAfterRestart, projection.thread.projectId).settings
               .continueThreadsAfterServerUpdate;
-          const result = yield* reconcileProjection(projection, trigger, enabled, stoppedThisPass);
+          const result = yield* reconcileProjection(projection, trigger, enabled, groupStopped);
           for (const session of projection.providerSessions) {
             if (session.status !== "stopped" && session.status !== "error") {
-              stoppedThisPass.set(session.id, session);
+              groupStopped.set(session.id, session);
             }
           }
           cancelledEffectIds.push(...result.cancelledEffectIds);
-          terminalizedRuns += result.terminalizedRuns;
-          stoppedSessions += result.stoppedSessions;
-          closedRequests += result.closedRequests;
-          retiredEffects += result.retiredEffects;
+          groupRuns += result.terminalizedRuns;
+          groupSessions += result.stoppedSessions;
+          groupRequests += result.closedRequests;
+          groupEffects += result.retiredEffects;
         }
       });
-      yield* (grouped ? eventSink.withProviderBatch(reconcileGroup) : reconcileGroup).pipe(
-        Effect.mapError((cause) =>
-          isProviderRuntimeRecoveryError(cause)
-            ? cause
-            : new ProviderRuntimeRecoveryError({ operation: "reconcile", cause }),
-        ),
-      );
+      yield* eventSink
+        .withProviderBatch(reconcileGroup)
+        .pipe(
+          Effect.mapError((cause) =>
+            isProviderRuntimeRecoveryError(cause)
+              ? cause
+              : new ProviderRuntimeRecoveryError({ operation: "reconcile", cause }),
+          ),
+        );
+      for (const [id, session] of groupStopped) stoppedThisPass.set(id, session);
+      terminalizedRuns += groupRuns;
+      stoppedSessions += groupSessions;
+      closedRequests += groupRequests;
+      retiredEffects += groupEffects;
       // Eventless outbox cancellations also wait for the group's durable commit.
       if (cancelledEffectIds.length > 0) yield* outbox.signalCancellations(cancelledEffectIds);
     }
@@ -972,35 +1033,40 @@ export const make = Effect.gen(function* () {
     yield* Effect.forEach(
       threadIds,
       (threadId) =>
-        Effect.gen(function* () {
-          const projection = yield* projections.getRuntimeRecoveryProjection(threadId);
-          if (
-            !resolveProjectSettings(enabled, projection.thread.projectId).settings
-              .continueThreadsAfterServerUpdate
-          )
-            return;
-          const run = restartContinuationRun(projection, yield* DateTime.now);
-          if (!run) return;
-          const commandId = CommandId.make(`command:restart-prepare:${run.id}`);
-          yield* eventSink.writeWithEffects({
-            commandId,
-            events: [],
-            effects: [
-              {
-                id: `effect:restart-continuation:${run.id}`,
+        eventSink
+          .withProviderBatch(
+            Effect.gen(function* () {
+              const projection = yield* projections.getRuntimeRecoveryProjection(threadId);
+              if (yield* isOwned(projection)) return;
+              if (
+                !resolveProjectSettings(enabled, projection.thread.projectId).settings
+                  .continueThreadsAfterServerUpdate
+              )
+                return;
+              const run = restartContinuationRun(projection, yield* DateTime.now);
+              if (!run) return;
+              const commandId = CommandId.make(`command:restart-prepare:${run.id}`);
+              yield* eventSink.writeWithEffects({
                 commandId,
-                threadId,
-                request: { type: "provider-runtime.continue", sourceRunId: run.id },
-              },
-            ],
-          });
-        }).pipe(
-          Effect.catchCauseIf(
-            (cause) => !Cause.hasInterruptsOnly(cause),
-            (cause) =>
-              Effect.logWarning("Failed to prepare a restart continuation", { threadId, cause }),
+                events: [],
+                effects: [
+                  {
+                    id: `effect:restart-continuation:${run.id}`,
+                    commandId,
+                    threadId,
+                    request: { type: "provider-runtime.continue", sourceRunId: run.id },
+                  },
+                ],
+              });
+            }),
+          )
+          .pipe(
+            Effect.catchCauseIf(
+              (cause) => !Cause.hasInterruptsOnly(cause),
+              (cause) =>
+                Effect.logWarning("Failed to prepare a restart continuation", { threadId, cause }),
+            ),
           ),
-        ),
       // Leave room in the four-reader pool for other shutdown reads.
       { concurrency: 2, discard: true },
     );

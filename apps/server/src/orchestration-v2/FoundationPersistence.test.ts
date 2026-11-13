@@ -27,6 +27,8 @@ import {
   RuntimeRequestId,
   ThreadId,
   TurnItemId,
+  WorkflowRunV1,
+  WorkflowOperationV1,
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -60,6 +62,7 @@ import * as ServerConfig from "../config.ts";
 import * as DatabaseStorage from "../persistence/DatabaseStorage.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as WorkflowRunStore from "../workflowRuns/WorkflowRunStore.ts";
+import { WorkflowCanonicalHash } from "../workflowRuns/WorkflowCanonicalHash.ts";
 import { LIVE_STREAM_MAX_ITEMS, LiveStreamBufferError } from "./LiveStreamBudget.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
@@ -144,6 +147,80 @@ const seedWorkflowAssociation = Effect.fn("test.seedWorkflowAssociation")(functi
       yield* sql`INSERT INTO workflow_native_launch_intents (intent_id, workflow_run_id, operation_id, charge_attempt, repair, role, environment_id, project_id, launch_command_id, thread_id, message_id, fingerprint, draft_json, generation, state, boot_id, worker_id, native_run_id, finalized_operation_id) VALUES (${`intent:${key}`}, ${run}, ${operation}, 0, 0, 'implementation', 'environment', 'project', ${`launch:${key}`}, ${threadId}, ${`message:${key}`}, ${hash}, '{}', 0, ${state}, ${boot}, ${worker}, ${nativeRun}, ${finalized})`;
     }
   }
+});
+
+const decodeRecoveryWorkflowRun = Schema.decodeEffect(WorkflowRunV1);
+const decodeRecoveryWorkflowOperation = Schema.decodeEffect(WorkflowOperationV1);
+
+const seedValidWorkflowOperation = Effect.fn("test.seedValidWorkflowOperation")(function* (
+  threadId: ThreadId,
+  nativeRunId: RunId,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const hash = "a".repeat(64);
+  const run = yield* decodeRecoveryWorkflowRun({
+    schemaVersion: 1,
+    id: `workflow:${threadId}`,
+    spec: {
+      ref: { kind: "configuration", id: "spec", sha256: hash },
+      plan: {
+        planId: `plan:${threadId}`,
+        revisionId: "revision",
+        revisionSchemaVersion: 1,
+        revisionHash: hash,
+        sourcePacketHash: hash,
+      },
+    },
+    mode: "ordinary",
+    origin: { kind: "human", id: "human" },
+    status: "active",
+    controlGeneration: 0,
+    recordVersion: 0,
+    allowance: {
+      maxAttempts: 2,
+      maxRepairRounds: 1,
+      maxActiveWriters: 1,
+      attemptsConsumed: 0,
+      repairRoundsConsumed: 0,
+      deadline: "2026-12-01T00:00:00Z",
+    },
+    amendmentSequence: 0,
+    createdAt: "2026-11-01T00:00:00Z",
+    access: { origins: [{ environmentId: "environment", projectId: "project", threadId }] },
+  });
+  const draft = yield* decodeRecoveryWorkflowOperation({
+    schemaVersion: 1,
+    id: `operation:${threadId}`,
+    owner: { kind: "workflow_run", workflowRunId: run.id },
+    kind: "stage_launch",
+    parameters: {
+      kind: "stage_launch",
+      stage: "implementation",
+      context: {
+        specHash: hash,
+        policyHash: hash,
+        itemId: "item",
+        attemptId: "attempt",
+        candidateHash: hash,
+        configurationHash: hash,
+      },
+      provider: { providerInstanceId: "provider", model: "model" },
+      nativeThreadId: threadId,
+      nativeRunId,
+    },
+    fingerprint: hash,
+    origin: run.origin,
+    destination: { environmentId: "environment", projectId: "project" },
+    controlGeneration: 0,
+    status: "pending",
+    access: { origins: [] },
+  });
+  const operation = { ...draft, fingerprint: WorkflowCanonicalHash.operation(draft) };
+  yield* sql`INSERT INTO workflow_plan_identities VALUES (${run.spec.plan.planId})`;
+  yield* sql`INSERT INTO workflow_revision_identities VALUES (${run.spec.plan.planId}, 'revision', ${hash}, ${hash})`;
+  yield* sql`INSERT INTO workflow_runs VALUES (${run.id}, ${run.spec.plan.planId}, 'revision', ${hash}, ${hash}, ${hash}, 'active', 0, 0, ${JSON.stringify(run)})`;
+  yield* sql`INSERT INTO workflow_operations (id, workflow_run_id, kind, fingerprint, status, generation, record_json) VALUES (${operation.id}, ${run.id}, 'stage_launch', ${operation.fingerprint}, 'pending', 0, ${JSON.stringify(operation)})`;
+  return { run, operation };
 });
 
 const providerInstanceId = ProviderInstanceId.make("codex");
@@ -601,6 +678,204 @@ it.effect.each(
       ),
     );
   },
+);
+
+it.effect.each(["association", "recovery"] as const)(
+  "orders recovery with a second association writer when %s commits first",
+  (winner) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped({ prefix: "recovery-writer-order-" });
+        const filename = path.join(directory, "state.sqlite");
+        const fileLayer = () => {
+          const database = SqlitePersistence.layerFromPath(filename);
+          const stores = Layer.mergeAll(
+            EventStore.layer,
+            ProjectionStore.layer,
+            EffectOutbox.layer,
+            WorkflowRunStore.layer,
+          ).pipe(Layer.provideMerge(database));
+          return Layer.mergeAll(
+            stores,
+            EventSink.layer.pipe(Layer.provide(stores)),
+            IdAllocator.layer,
+            ServerSettings.layerTest(),
+          );
+        };
+        const first = yield* Layer.build(fileLayer());
+        const second = yield* Layer.build(fileLayer());
+        const threadId = ThreadId.make(`order:${winner}`);
+        const runId = RunId.make(`run:order:${winner}`);
+        const seeded = yield* Effect.gen(function* () {
+          const sink = yield* EventSink.EventSinkV2;
+          const sql = yield* SqlClient.SqlClient;
+          const now = yield* DateTime.now;
+          yield* sink.write({
+            events: [
+              threadCreatedEvent({
+                id: `create:${threadId}`,
+                thread: makeThread(threadId, now),
+                now,
+              }),
+              {
+                id: EventId.make(`create:${runId}`),
+                type: "run.created",
+                threadId,
+                runId,
+                providerInstanceId,
+                occurredAt: now,
+                payload: {
+                  id: runId,
+                  threadId,
+                  ordinal: 1,
+                  providerInstanceId,
+                  modelSelection,
+                  providerThreadId: null,
+                  userMessageId: MessageId.make(`message:${runId}`),
+                  rootNodeId: null,
+                  activeAttemptId: null,
+                  status: "running",
+                  queuePosition: null,
+                  requestedAt: now,
+                  startedAt: now,
+                  completedAt: null,
+                  checkpointId: null,
+                  contextHandoffId: null,
+                },
+              },
+            ],
+          });
+          const fixture = yield* seedValidWorkflowOperation(threadId, runId);
+          yield* sql`DELETE FROM workflow_operations WHERE id = ${fixture.operation.id}`;
+          return fixture;
+        }).pipe(Effect.provide(first));
+        const held = yield* Deferred.make<void>();
+        const attempted = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const committed = yield* Deferred.make<void>();
+        const association = Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          const store = yield* WorkflowRunStore.WorkflowRunStore;
+          if (winner === "association") {
+            yield* sql.withTransaction(
+              Effect.gen(function* () {
+                const operation = seeded.operation;
+                yield* sql`INSERT INTO workflow_operations (id, workflow_run_id, kind, fingerprint, status, generation, record_json) VALUES (${operation.id}, ${seeded.run.id}, 'stage_launch', ${operation.fingerprint}, 'pending', 0, ${JSON.stringify(operation)})`;
+                yield* Deferred.succeed(held, undefined);
+                yield* Deferred.await(release);
+              }),
+            );
+            yield* Deferred.succeed(committed, undefined);
+            return { kind: "associated" as const };
+          }
+          yield* Deferred.await(held);
+          yield* Deferred.succeed(attempted, undefined);
+          yield* Deferred.await(committed);
+          const {
+            fingerprint: _fp,
+            controlGeneration: _generation,
+            status: _status,
+            ...rest
+          } = seeded.operation;
+          if (rest.parameters.kind !== "stage_launch") throw new Error("expected stage launch");
+          const { nativeRunId: _nativeRunId, ...parameters } = rest.parameters;
+          const admission = yield* store.reserveWorkflowNativeIntent({
+            intentId: "order-intent",
+            runId: seeded.run.id,
+            operationId: seeded.operation.id,
+            attemptId: "attempt",
+            itemId: "item",
+            repair: false,
+            environmentId: "environment",
+            projectId: "project",
+            launchCommandId: "order-launch",
+            threadId,
+            messageId: "order-message",
+            receiptId: "order-receipt",
+            generation: 0,
+            draft: {
+              version: 1,
+              kind: "stage_launch",
+              operation: { ...rest, parameters },
+              admission: {
+                command: {
+                  kind: "admitAttempt",
+                  commandId: "order-admission",
+                  expectedVersion: 0,
+                  expectedGeneration: 0,
+                  expectedSpecHash: "a".repeat(64),
+                  operationId: seeded.operation.id,
+                  attemptId: "attempt",
+                  itemId: "item",
+                  repair: false,
+                },
+              },
+            },
+            externalFacts: {
+              now: "2026-11-12T00:00:00Z",
+              authority: true,
+              custody: "none",
+              activeWriterCount: 0,
+              heldOperations: [],
+              capabilitiesCurrent: true,
+              compatibilityCurrent: true,
+              fingerprintCurrent: true,
+              originGrantCurrent: true,
+              orderedItemIds: ["item"],
+            },
+          });
+          const projections = yield* ProjectionStore.ProjectionStoreV2;
+          return {
+            kind: admission.kind,
+            status: (yield* projections.getThreadProjection(threadId)).runs[0]?.status,
+          };
+        }).pipe(Effect.provide(second));
+        const recovering = Effect.gen(function* () {
+          const sink = yield* EventSink.EventSinkV2;
+          const service = yield* ProviderRuntimeRecovery.make.pipe(
+            Effect.provideService(EventSink.EventSinkV2, {
+              ...sink,
+              withProviderBatch: (work) =>
+                sink.withProviderBatch(
+                  Effect.gen(function* () {
+                    const result = yield* work;
+                    if (winner === "recovery") {
+                      yield* Deferred.succeed(held, undefined);
+                      yield* Deferred.await(release);
+                    }
+                    return result;
+                  }),
+                ),
+            }),
+          );
+          if (winner === "association") {
+            yield* Deferred.await(held);
+            yield* Deferred.succeed(attempted, undefined);
+            yield* Deferred.await(committed);
+          }
+          const result = yield* service.reconcile("startup");
+          if (winner === "recovery") yield* Deferred.succeed(committed, undefined);
+          return result;
+        }).pipe(Effect.provide(first));
+        const associationFiber = yield* association.pipe(
+          Effect.forkScoped({ startImmediately: true }),
+        );
+        const recoveryFiber = yield* recovering.pipe(Effect.forkScoped({ startImmediately: true }));
+        yield* Deferred.await(attempted);
+        yield* Deferred.succeed(release, undefined);
+        const associated = yield* Fiber.join(associationFiber);
+        const recovered = yield* Fiber.join(recoveryFiber);
+        if (winner === "association") {
+          assert.equal(recovered.terminalizedRuns, 0);
+        } else {
+          assert.equal(recovered.terminalizedRuns, 1);
+          assert.equal(associated.kind, "reserved");
+          assert.equal("status" in associated ? associated.status : undefined, "cancelled");
+        }
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
 );
 
 it.effect.each([false, true])("groups shutdown commits with rollback=%s", (fail) => {
@@ -3660,6 +3935,535 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
           yield* outbox.succeed({ effectId: reclaimed.value.id, workerId: "recovery-worker" });
         }
       }),
+  );
+
+  it.effect.each(["startup", "shutdown"] as const)(
+    "preserves valid workflow-owned native recovery on %s",
+    (trigger) =>
+      Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const outbox = yield* EffectOutbox.EffectOutboxV2;
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make(`thread:foundation-process-loss:${trigger}`);
+        const runId = RunId.make(`run:foundation-process-loss:${trigger}`);
+        const commandId = CommandId.make(`command:foundation-process-loss:${trigger}`);
+        const thread = makeThread(threadId, now);
+        yield* eventSink.commitCommand({
+          commandId,
+          threadId,
+          commandType: "foundation.process-loss",
+          acceptedAt: now,
+          events: [
+            threadCreatedEvent({
+              id: `event:foundation-process-loss:thread:${trigger}`,
+              thread,
+              now,
+            }),
+            {
+              id: EventId.make(`event:foundation-process-loss:run:${trigger}`),
+              type: "run.created",
+              threadId,
+              runId,
+              providerInstanceId,
+              occurredAt: now,
+              payload: {
+                id: runId,
+                threadId,
+                ordinal: 1,
+                providerInstanceId,
+                modelSelection,
+                providerThreadId: null,
+                userMessageId: MessageId.make("message:foundation-process-loss"),
+                rootNodeId: null,
+                activeAttemptId: null,
+                status: "starting",
+                queuePosition: null,
+                requestedAt: now,
+                startedAt: null,
+                completedAt: null,
+                checkpointId: null,
+                contextHandoffId: null,
+              },
+            },
+          ],
+          effects: [
+            {
+              id: `effect:foundation-process-loss:${trigger}`,
+              commandId,
+              threadId,
+              request: { type: "provider-turn.start", runId },
+            },
+          ],
+        });
+        assert.isTrue(Option.isSome(yield* outbox.claimNext({ workerId: "crashed-worker" })));
+
+        const recovery = yield* ProviderRuntimeRecovery.make.pipe(
+          Effect.provide(ServerSettings.layerTest()),
+          Effect.provideService(
+            EffectWorker.OrchestrationEffectWorkerV2,
+            EffectWorker.OrchestrationEffectWorkerV2.of({
+              awaitWork: Effect.void,
+              runRecoveryOnce: Effect.succeed(false),
+              runOnce: Effect.succeed(false),
+              nextClaimableAt: Effect.succeedNone,
+              drain: () => Effect.succeed(0),
+            }),
+          ),
+        );
+        yield* seedValidWorkflowOperation(threadId, runId);
+        const sql = yield* SqlClient.SqlClient;
+        const journal = yield* sql`SELECT * FROM workflow_operations`;
+        const receipts =
+          yield* sql`SELECT * FROM orchestration_command_receipts WHERE aggregate_id = ${threadId}`;
+        const continuations =
+          yield* sql`SELECT * FROM orchestration_v2_effect_outbox WHERE thread_id = ${threadId} AND effect_id LIKE 'effect:restart-continuation:%'`;
+        const before = yield* eventSink.latestSequence();
+        const result = yield* recovery.reconcile(trigger);
+        assert.equal(result.terminalizedRuns, 0);
+        assert.deepEqual(yield* sql`SELECT * FROM workflow_operations`, journal);
+        assert.deepEqual(
+          yield* sql`SELECT * FROM orchestration_command_receipts WHERE aggregate_id = ${threadId}`,
+          receipts,
+        );
+        assert.deepEqual(
+          yield* sql`SELECT * FROM orchestration_v2_effect_outbox WHERE thread_id = ${threadId} AND effect_id LIKE 'effect:restart-continuation:%'`,
+          continuations,
+        );
+        assert.equal(yield* eventSink.latestSequence(), before);
+        assert.equal(
+          (yield* projectionStore.getThreadProjection(threadId)).runs[0]?.status,
+          "starting",
+        );
+      }).pipe(Effect.provide(Layer.fresh(layerTest))),
+  );
+
+  it.effect.each(["shared-session", "foreign-provider-thread"] as const)(
+    "preserves an ordinary projection that reaches an owned %s",
+    (relationship) =>
+      Effect.gen(function* () {
+        const sink = yield* EventSink.EventSinkV2;
+        const projections = yield* ProjectionStore.ProjectionStoreV2;
+        const sql = yield* SqlClient.SqlClient;
+        const now = yield* DateTime.now;
+        const ordinary = ThreadId.make(`ordinary:${relationship}`);
+        const owned = ThreadId.make(`owned:${relationship}`);
+        const ordinaryRun = RunId.make(`run:ordinary:${relationship}`);
+        const ownedRun = RunId.make(`run:owned:${relationship}`);
+        const ownerNode = NodeId.make(`node:ordinary:${relationship}`);
+        const sessionId = ProviderSessionId.make(`session:${relationship}`);
+        const providerThreadId = ProviderThreadId.make(`provider:${relationship}`);
+        const runEvent = (threadId: ThreadId, runId: RunId): OrchestrationV2DomainEvent => ({
+          id: EventId.make(`event:${runId}`),
+          type: "run.created",
+          threadId,
+          runId,
+          occurredAt: now,
+          providerInstanceId,
+          payload: {
+            id: runId,
+            threadId,
+            ordinal: 1,
+            providerInstanceId,
+            modelSelection,
+            providerThreadId: null,
+            userMessageId: MessageId.make(`message:${runId}`),
+            rootNodeId: null,
+            activeAttemptId: null,
+            status: "running",
+            queuePosition: null,
+            requestedAt: now,
+            startedAt: now,
+            completedAt: null,
+            checkpointId: null,
+            contextHandoffId: null,
+          },
+        });
+        yield* sink.write({
+          events: [
+            threadCreatedEvent({
+              id: `create:${ordinary}`,
+              thread: makeThread(ordinary, now),
+              now,
+            }),
+            threadCreatedEvent({ id: `create:${owned}`, thread: makeThread(owned, now), now }),
+            runEvent(ordinary, ordinaryRun),
+            runEvent(owned, ownedRun),
+            {
+              id: EventId.make(`event:${ownerNode}`),
+              type: "node.updated",
+              threadId: ordinary,
+              nodeId: ownerNode,
+              occurredAt: now,
+              payload: {
+                id: ownerNode,
+                threadId: ordinary,
+                runId: ordinaryRun,
+                parentNodeId: null,
+                rootNodeId: ownerNode,
+                kind: "root_turn",
+                status: "running",
+                countsForRun: false,
+                providerThreadId: null,
+                providerTurnId: null,
+                nativeItemRef: null,
+                runtimeRequestId: null,
+                checkpointScopeId: null,
+                startedAt: now,
+                completedAt: null,
+              },
+            },
+            ...(relationship === "shared-session"
+              ? [ordinary, owned].map((threadId): OrchestrationV2DomainEvent => ({
+                  id: EventId.make(`attach:${threadId}`),
+                  type: "provider-session.attached",
+                  threadId,
+                  occurredAt: now,
+                  payload: {
+                    id: sessionId,
+                    driver: providerDriver,
+                    providerInstanceId,
+                    status: "ready",
+                    cwd: process.cwd(),
+                    model: modelSelection.model,
+                    capabilities: CodexProviderCapabilitiesV2,
+                    createdAt: now,
+                    updatedAt: now,
+                    lastError: null,
+                  },
+                }))
+              : []),
+            {
+              id: EventId.make(`event:${providerThreadId}`),
+              type: "provider-thread.updated",
+              threadId: relationship === "shared-session" ? ordinary : owned,
+              occurredAt: now,
+              payload: {
+                id: providerThreadId,
+                driver: providerDriver,
+                providerInstanceId,
+                providerSessionId: relationship === "shared-session" ? sessionId : null,
+                appThreadId: relationship === "shared-session" ? ordinary : owned,
+                ownerNodeId: relationship === "shared-session" ? null : ownerNode,
+                nativeThreadRef: null,
+                nativeConversationHeadRef: null,
+                status: "active",
+                firstRunOrdinal: null,
+                lastRunOrdinal: null,
+                handoffIds: [],
+                forkedFrom: null,
+                createdAt: now,
+                updatedAt: now,
+              },
+            },
+          ],
+        });
+        yield* seedValidWorkflowOperation(owned, ownedRun);
+        const projection = yield* projections.getRuntimeRecoveryProjection(ordinary);
+        assert.include(
+          projection.providerThreads.map((thread) => thread.id),
+          providerThreadId,
+        );
+        const before = yield* sink.latestSequence();
+        const journal = yield* sql`SELECT * FROM workflow_operations`;
+        const recovery = yield* ProviderRuntimeRecovery.make.pipe(
+          Effect.provide(ServerSettings.layerTest()),
+        );
+        const summary = yield* recovery.reconcile("shutdown");
+        assert.equal(summary.terminalizedRuns, 0);
+        assert.equal(yield* sink.latestSequence(), before);
+        assert.equal((yield* projections.getThreadProjection(ordinary)).runs[0]?.status, "running");
+        assert.deepEqual(yield* sql`SELECT * FROM workflow_operations`, journal);
+      }).pipe(Effect.provide(Layer.fresh(layerTest))),
+  );
+
+  it.effect("prepares continuation only for an ordinary eligible thread", () =>
+    Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const sql = yield* SqlClient.SqlClient;
+      const now = yield* DateTime.now;
+      const threads = [ThreadId.make("prepare:ordinary"), ThreadId.make("prepare:owned")];
+      const runs = threads.map((id) => RunId.make(`run:${id}`));
+      yield* sink.write({
+        events: threads.flatMap((threadId, i): OrchestrationV2DomainEvent[] => {
+          const runId = runs[i]!;
+          const sessionId = ProviderSessionId.make(`session:${threadId}`);
+          const providerThreadId = ProviderThreadId.make(`provider:${threadId}`);
+          return [
+            threadCreatedEvent({
+              id: `create:${threadId}`,
+              thread: makeThread(threadId, now),
+              now,
+            }),
+            {
+              id: EventId.make(`session:${threadId}`),
+              type: "provider-session.attached",
+              threadId,
+              occurredAt: now,
+              payload: {
+                id: sessionId,
+                driver: providerDriver,
+                providerInstanceId,
+                status: "ready",
+                cwd: process.cwd(),
+                model: modelSelection.model,
+                capabilities: CodexProviderCapabilitiesV2,
+                createdAt: now,
+                updatedAt: now,
+                lastError: null,
+              },
+            },
+            {
+              id: EventId.make(`provider:${threadId}`),
+              type: "provider-thread.updated",
+              threadId,
+              occurredAt: now,
+              payload: {
+                id: providerThreadId,
+                driver: providerDriver,
+                providerInstanceId,
+                providerSessionId: sessionId,
+                appThreadId: threadId,
+                ownerNodeId: null,
+                nativeThreadRef: {
+                  driver: providerDriver,
+                  nativeId: `native:${threadId}`,
+                  strength: "strong",
+                },
+                nativeConversationHeadRef: null,
+                status: "idle",
+                firstRunOrdinal: 1,
+                lastRunOrdinal: 1,
+                handoffIds: [],
+                forkedFrom: null,
+                createdAt: now,
+                updatedAt: now,
+                pendingBackgroundTasks: [
+                  { taskId: "shell", description: "work", kind: "command", awaited: true },
+                ],
+              },
+            },
+            {
+              id: EventId.make(`event:${runId}`),
+              type: "run.created",
+              threadId,
+              runId,
+              occurredAt: now,
+              providerInstanceId,
+              payload: {
+                id: runId,
+                threadId,
+                ordinal: 1,
+                providerInstanceId,
+                modelSelection,
+                providerThreadId,
+                userMessageId: MessageId.make(`message:${runId}`),
+                rootNodeId: null,
+                activeAttemptId: null,
+                status: "completed",
+                queuePosition: null,
+                requestedAt: now,
+                startedAt: now,
+                completedAt: now,
+                checkpointId: null,
+                contextHandoffId: null,
+              },
+            },
+          ];
+        }),
+      });
+      yield* seedValidWorkflowOperation(threads[1]!, runs[1]!);
+      const journal = yield* sql`SELECT * FROM workflow_operations`;
+      const recovery = yield* ProviderRuntimeRecovery.make.pipe(
+        Effect.provide(ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true })),
+      );
+      yield* recovery.prepareForShutdown;
+      yield* recovery.prepareForShutdown;
+      assert.isTrue(Option.isSome(yield* outbox.get(`effect:restart-continuation:${runs[0]}`)));
+      assert.isTrue(Option.isNone(yield* outbox.get(`effect:restart-continuation:${runs[1]}`)));
+      assert.deepEqual(yield* sql`SELECT * FROM workflow_operations`, journal);
+    }).pipe(Effect.provide(Layer.fresh(layerTest))),
+  );
+
+  it.effect("rolls back a shutdown group when a later custody read is malformed", () =>
+    Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const sql = yield* SqlClient.SqlClient;
+      const now = yield* DateTime.now;
+      const threads = [ThreadId.make("rollback:01"), ThreadId.make("rollback:02")];
+      yield* sink.write({
+        events: threads.flatMap((threadId) => [
+          threadCreatedEvent({ id: `create:${threadId}`, thread: makeThread(threadId, now), now }),
+          {
+            id: EventId.make(`provider:${threadId}`),
+            type: "provider-thread.updated" as const,
+            threadId,
+            occurredAt: now,
+            payload: {
+              id: ProviderThreadId.make(`provider:${threadId}`),
+              driver: providerDriver,
+              providerInstanceId,
+              providerSessionId: null,
+              appThreadId: threadId,
+              ownerNodeId: null,
+              nativeThreadRef: null,
+              nativeConversationHeadRef: null,
+              status: "active" as const,
+              firstRunOrdinal: null,
+              lastRunOrdinal: null,
+              handoffIds: [],
+              forkedFrom: null,
+              createdAt: now,
+              updatedAt: now,
+            },
+          },
+        ]),
+      });
+      yield* outbox.enqueue([
+        {
+          id: "rollback-effect",
+          commandId: CommandId.make("rollback-command"),
+          threadId: threads[0]!,
+          request: { type: "provider-turn.start", runId: RunId.make("rollback-run") },
+        },
+      ]);
+      yield* seedWorkflowAssociation("rollback-malformed", threads[1]!, "operation");
+      const highWater = yield* sink.latestSequence();
+      const published = yield* Deferred.make<void>();
+      yield* sink.stream({ afterSequence: highWater }).pipe(
+        Stream.tap(() => Deferred.succeed(published, undefined)),
+        Stream.runDrain,
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      let signals = 0;
+      const recovery = yield* ProviderRuntimeRecovery.make.pipe(
+        Effect.provide(ServerSettings.layerTest()),
+        Effect.provideService(EffectOutbox.EffectOutboxV2, {
+          ...outbox,
+          signalCancellations: (ids) =>
+            Effect.sync(() => {
+              signals += ids.length;
+            }).pipe(Effect.andThen(outbox.signalCancellations(ids))),
+        }),
+      );
+      const failure = yield* recovery.reconcile("shutdown").pipe(Effect.flip);
+      assert.equal(failure.operation, "reconcile");
+      assert.equal(failure.threadId, threads[1]);
+      assert.equal(yield* sink.latestSequence(), highWater);
+      assert.isFalse(yield* Deferred.isDone(published));
+      assert.equal(signals, 0);
+      assert.equal(
+        (yield* projections.getThreadProjection(threads[0]!)).providerThreads[0]?.status,
+        "active",
+      );
+      assert.equal(Option.getOrThrow(yield* outbox.get("rollback-effect")).status, "pending");
+      assert.isEmpty(
+        yield* sql`SELECT * FROM orchestration_command_receipts WHERE command_type = 'provider-runtime.reconcile'`,
+      );
+      yield* sql`DELETE FROM workflow_operations WHERE id = 'operation:rollback-malformed'`;
+      const repaired = yield* recovery.reconcile("shutdown");
+      assert.equal(repaired.retiredEffects, 1);
+      assert.equal(
+        (yield* projections.getThreadProjection(threads[0]!)).providerThreads[0]?.status,
+        "idle",
+      );
+    }).pipe(Effect.scoped, Effect.provide(Layer.fresh(layerTest))),
+  );
+
+  it.effect.each(["malformed", "sql"] as const)(
+    "fails closed on %s recovery custody before native writes",
+    (failure) =>
+      Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const outbox = yield* EffectOutbox.EffectOutboxV2;
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make("thread:foundation-process-loss");
+        const runId = RunId.make("run:foundation-process-loss");
+        const commandId = CommandId.make("command:foundation-process-loss");
+        const thread = makeThread(threadId, now);
+        yield* eventSink.commitCommand({
+          commandId,
+          threadId,
+          commandType: "foundation.process-loss",
+          acceptedAt: now,
+          events: [
+            threadCreatedEvent({ id: "event:foundation-process-loss:thread", thread, now }),
+            {
+              id: EventId.make("event:foundation-process-loss:run"),
+              type: "run.created",
+              threadId,
+              runId,
+              providerInstanceId,
+              occurredAt: now,
+              payload: {
+                id: runId,
+                threadId,
+                ordinal: 1,
+                providerInstanceId,
+                modelSelection,
+                providerThreadId: null,
+                userMessageId: MessageId.make("message:foundation-process-loss"),
+                rootNodeId: null,
+                activeAttemptId: null,
+                status: "starting",
+                queuePosition: null,
+                requestedAt: now,
+                startedAt: null,
+                completedAt: null,
+                checkpointId: null,
+                contextHandoffId: null,
+              },
+            },
+          ],
+          effects: [
+            {
+              id: "effect:foundation-process-loss",
+              commandId,
+              threadId,
+              request: { type: "provider-turn.start", runId },
+            },
+          ],
+        });
+        assert.isTrue(Option.isSome(yield* outbox.claimNext({ workerId: "crashed-worker" })));
+
+        const recovery = yield* ProviderRuntimeRecovery.make.pipe(
+          Effect.provide(ServerSettings.layerTest()),
+          Effect.provideService(
+            EffectWorker.OrchestrationEffectWorkerV2,
+            EffectWorker.OrchestrationEffectWorkerV2.of({
+              awaitWork: Effect.void,
+              runRecoveryOnce: Effect.succeed(false),
+              runOnce: Effect.succeed(false),
+              nextClaimableAt: Effect.succeedNone,
+              drain: () => Effect.succeed(0),
+            }),
+          ),
+        );
+        if (failure === "malformed") {
+          yield* seedWorkflowAssociation("recovery-malformed", threadId);
+        } else {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`DROP TABLE workflow_operations`;
+        }
+        const before = yield* eventSink.latestSequence();
+        const result = yield* recovery.recover.pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(result));
+        if (Exit.isFailure(result)) {
+          const error = Cause.squash(result.cause);
+          assert.instanceOf(error, ProviderRuntimeRecovery.ProviderRuntimeRecoveryError);
+          assert.equal(error.operation, "reconcile");
+          assert.equal(error.threadId, threadId);
+        }
+        assert.equal(yield* eventSink.latestSequence(), before);
+        assert.equal(
+          (yield* projectionStore.getThreadProjection(threadId)).runs[0]?.status,
+          "starting",
+        );
+      }).pipe(Effect.provide(Layer.fresh(layerTest))),
   );
 
   it.effect("atomically cancels stale runs and their process-bound effects", () =>

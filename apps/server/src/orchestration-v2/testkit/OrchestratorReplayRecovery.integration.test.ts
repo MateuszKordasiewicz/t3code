@@ -2,6 +2,7 @@ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as DateTime from "effect/DateTime";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -10,8 +11,18 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as CodexReplay from "effect-codex-app-server/replay";
 import {
   type OrchestrationV2ThreadProjection,
+  type OrchestrationV2AppThread,
+  type OrchestrationV2DomainEvent,
+  CommandId,
+  EventId,
+  MessageId,
+  ProjectId,
+  ProviderInstanceId,
+  RunId,
+  ThreadId,
+  WorkflowRunV1,
+  WorkflowOperationV1,
   ProviderDriverKind,
-  type ThreadId,
 } from "@t3tools/contracts";
 
 import {
@@ -28,6 +39,8 @@ import {
 import * as CursorAdapterV2Testkit from "../Adapters/CursorAdapterV2.testkit.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as EffectWorker from "../EffectWorker.ts";
+import * as EventSink from "../EventSink.ts";
+import { WorkflowCanonicalHash } from "../../workflowRuns/WorkflowCanonicalHash.ts";
 import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import { provideDeterministicTestRuntime } from "./DeterministicRuntime.ts";
 import {
@@ -63,6 +76,112 @@ import {
   materializeReplayTranscriptWorkspace,
   readProviderReplayTranscript,
 } from "@t3tools/provider-testing/replayTranscript";
+
+const decodeRecoveryWorkflowRun = Schema.decodeEffect(WorkflowRunV1);
+const decodeRecoveryWorkflowOperation = Schema.decodeEffect(WorkflowOperationV1);
+
+const seedValidWorkflowOperation = Effect.fn("test.seedValidWorkflowOperation")(function* (
+  threadId: ThreadId,
+  nativeRunId: RunId,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const hash = "a".repeat(64);
+  const run = yield* decodeRecoveryWorkflowRun({
+    schemaVersion: 1,
+    id: `workflow:${threadId}`,
+    spec: {
+      ref: { kind: "configuration", id: "spec", sha256: hash },
+      plan: {
+        planId: `plan:${threadId}`,
+        revisionId: "revision",
+        revisionSchemaVersion: 1,
+        revisionHash: hash,
+        sourcePacketHash: hash,
+      },
+    },
+    mode: "ordinary",
+    origin: { kind: "human", id: "human" },
+    status: "active",
+    controlGeneration: 0,
+    recordVersion: 0,
+    allowance: {
+      maxAttempts: 2,
+      maxRepairRounds: 1,
+      maxActiveWriters: 1,
+      attemptsConsumed: 0,
+      repairRoundsConsumed: 0,
+      deadline: "2026-12-01T00:00:00Z",
+    },
+    amendmentSequence: 0,
+    createdAt: "2026-11-01T00:00:00Z",
+    access: { origins: [] },
+  });
+  const draft = yield* decodeRecoveryWorkflowOperation({
+    schemaVersion: 1,
+    id: `operation:${threadId}`,
+    owner: { kind: "workflow_run", workflowRunId: run.id },
+    kind: "stage_launch",
+    parameters: {
+      kind: "stage_launch",
+      stage: "implementation",
+      context: {
+        specHash: hash,
+        policyHash: hash,
+        itemId: "item",
+        attemptId: "attempt",
+        candidateHash: hash,
+        configurationHash: hash,
+      },
+      provider: { providerInstanceId: "provider", model: "model" },
+      nativeThreadId: threadId,
+      nativeRunId,
+    },
+    fingerprint: hash,
+    origin: run.origin,
+    destination: { environmentId: "environment", projectId: "project" },
+    controlGeneration: 0,
+    status: "pending",
+    access: { origins: [] },
+  });
+  const operation = { ...draft, fingerprint: WorkflowCanonicalHash.operation(draft) };
+  yield* sql`INSERT INTO workflow_plan_identities VALUES (${run.spec.plan.planId})`;
+  yield* sql`INSERT INTO workflow_revision_identities VALUES (${run.spec.plan.planId}, 'revision', ${hash}, ${hash})`;
+  yield* sql`INSERT INTO workflow_runs VALUES (${run.id}, ${run.spec.plan.planId}, 'revision', ${hash}, ${hash}, ${hash}, 'active', 0, 0, ${JSON.stringify(run)})`;
+  yield* sql`INSERT INTO workflow_operations (id, workflow_run_id, kind, fingerprint, status, generation, record_json) VALUES (${operation.id}, ${run.id}, 'stage_launch', ${operation.fingerprint}, 'pending', 0, ${JSON.stringify(operation)})`;
+});
+
+const providerInstanceId = ProviderInstanceId.make("codex");
+const modelSelection = CODEX_MODEL_SELECTION;
+
+function makeThread(threadId: ThreadId, now: DateTime.Utc): OrchestrationV2AppThread {
+  return {
+    createdBy: "user",
+    creationSource: "web",
+    id: threadId,
+    projectId: ProjectId.make(`project:${threadId}`),
+    title: `Thread ${threadId}`,
+    providerInstanceId,
+    modelSelection,
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    branch: null,
+    worktreePath: null,
+    activeProviderThreadId: null,
+    lineage: {
+      parentThreadId: null,
+      relationshipToParent: null,
+      rootThreadId: threadId,
+    },
+    forkedFrom: null,
+    createdAt: now,
+    updatedAt: now,
+    archivedAt: null,
+    settledOverride: null,
+    settledAt: null,
+    lastVisitedAt: null,
+    deletedAt: null,
+  };
+}
 
 const FIRST_FINAL = "provider thread resume fixture first turn complete";
 const SECOND_FINAL = "provider thread resume fixture second turn complete";
@@ -272,6 +391,159 @@ const runCursorRecovery = Effect.fn("runCursorRecovery")(function* (input: {
 });
 
 describe("orchestrator replay recovery", () => {
+  it.effect(
+    "startup replay preserves workflow-owned native work while recovering ordinary work",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const workspace = yield* checkpointWorkspace("provider_thread_resume");
+          const transcript = yield* readCodexTranscript(workspace);
+          const driver = yield* CodexReplay.makeReplayDriver(transcript);
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-owned-recovery-" });
+          const databaseLayer = SqlitePersistence.layerFromPath(
+            path.join(dir, "state.sqlite"),
+          ).pipe(Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)));
+          const harness = {
+            ...CodexOrchestratorReplayHarness,
+            makeProviderAdapterRegistryLayer: () =>
+              CodexAdapterV2Testkit.layer({ transcript, driver }),
+          };
+          const owned = ThreadId.make("thread:replay-owned");
+          const ordinary = ThreadId.make("thread:replay-ordinary");
+          const ownedRun = RunId.make("run:replay-owned");
+          const ordinaryRun = RunId.make("run:replay-ordinary");
+          const scenario = {
+            name: "workflow-owned-recovery",
+            transcript,
+            commands: [],
+            steps: [],
+            projectionThreadIds: [owned, ordinary],
+            runtimePolicyOverride: { cwd: workspace },
+          };
+          const before = yield* Effect.scoped(
+            Effect.gen(function* () {
+              const sink = yield* EventSink.EventSinkV2;
+              const sql = yield* SqlClient.SqlClient;
+              const now = yield* DateTime.now;
+              yield* sink.write({
+                events: [
+                  [owned, ownedRun],
+                  [ordinary, ordinaryRun],
+                ].flatMap(([id, run]) => {
+                  const threadId = id as ThreadId;
+                  const runId = run as RunId;
+                  return [
+                    {
+                      id: EventId.make(`create:${threadId}`),
+                      type: "thread.created",
+                      threadId,
+                      occurredAt: now,
+                      payload: makeThread(threadId, now),
+                    },
+                    {
+                      id: EventId.make(`create:${runId}`),
+                      type: "run.created",
+                      threadId,
+                      runId,
+                      providerInstanceId,
+                      occurredAt: now,
+                      payload: {
+                        id: runId,
+                        threadId,
+                        ordinal: 1,
+                        providerInstanceId,
+                        modelSelection,
+                        providerThreadId: null,
+                        userMessageId: MessageId.make(`message:${runId}`),
+                        rootNodeId: null,
+                        activeAttemptId: null,
+                        status: "running",
+                        queuePosition: null,
+                        requestedAt: now,
+                        startedAt: now,
+                        completedAt: null,
+                        checkpointId: null,
+                        contextHandoffId: null,
+                      },
+                    },
+                  ] satisfies OrchestrationV2DomainEvent[];
+                }),
+              });
+              yield* seedValidWorkflowOperation(owned, ownedRun);
+              const commandId = CommandId.make("command:owned-existing-continuation");
+              yield* sink.writeWithEffects({
+                commandId,
+                events: [],
+                effects: [
+                  {
+                    id: `effect:restart-continuation:${ownedRun}`,
+                    commandId,
+                    threadId: owned,
+                    request: { type: "provider-runtime.continue", sourceRunId: ownedRun },
+                  },
+                ],
+              });
+              return {
+                journal: yield* sql`SELECT * FROM workflow_operations`,
+                ownedEvents:
+                  yield* sql`SELECT * FROM orchestration_events WHERE aggregate_kind = 'thread' AND stream_id = ${owned} ORDER BY sequence`,
+              };
+            }).pipe(
+              Effect.provide(
+                Layer.merge(
+                  layerProviderReplay(scenario, harness, { databaseLayer, runEffectWorker: false }),
+                  databaseLayer,
+                ),
+              ),
+            ),
+          );
+          const after = yield* Effect.scoped(
+            Effect.gen(function* () {
+              const result = yield* runOrchestratorV2Scenario(scenario);
+              const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+              const executed = yield* worker.drain();
+              const sql = yield* SqlClient.SqlClient;
+              return {
+                result,
+                executed,
+                journal: yield* sql`SELECT * FROM workflow_operations`,
+                ownedEvents:
+                  yield* sql`SELECT * FROM orchestration_events WHERE aggregate_kind = 'thread' AND stream_id = ${owned} ORDER BY sequence`,
+                continuation:
+                  yield* sql`SELECT * FROM orchestration_v2_effect_outbox WHERE thread_id = ${owned} AND effect_id LIKE 'effect:restart-continuation:%'`,
+              };
+            }).pipe(
+              Effect.provide(
+                Layer.merge(
+                  layerProviderReplay(scenario, harness, {
+                    databaseLayer,
+                    recoverOnStartup: true,
+                    continueThreadsAfterServerUpdate: true,
+                  }),
+                  databaseLayer,
+                ),
+              ),
+            ),
+          );
+          assert.equal(after.result.projections.get(owned)?.runs[0]?.status, "running");
+          assert.equal(after.result.projections.get(ordinary)?.runs[0]?.status, "cancelled");
+          assert.deepEqual(after.journal, before.journal);
+          assert.isAbove(before.ownedEvents.length, 0);
+          assert.deepEqual(after.ownedEvents, before.ownedEvents);
+          assert.equal(after.executed, 0);
+          assert.lengthOf(after.continuation, 1);
+          assert.equal(after.continuation[0]?.status, "pending");
+        }).pipe(
+          provideDeterministicTestRuntime,
+          Effect.provide(
+            Layer.merge(IdAllocator.layer, Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+          ),
+        ),
+      ),
+  );
+
   it.effect(
     "resumes a provider-native Codex thread after recreating the orchestrator runtime",
     () =>
