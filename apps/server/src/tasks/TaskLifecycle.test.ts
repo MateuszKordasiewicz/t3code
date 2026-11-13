@@ -3,6 +3,8 @@ import * as Schema from "effect/Schema";
 import * as HashMap from "effect/HashMap";
 import { describe, expect, it } from "vite-plus/test";
 import {
+  ValidationReplayConflict,
+  reduceTaskValidation,
   CustodyReplayConflict,
   reduceTaskCustody,
   FoundationReplayConflict,
@@ -974,4 +976,168 @@ function custodyRecorded(sequence: number, event: object) {
     event: { ...base, id, commandId, ...event },
     context: { sequence, eventId: id, occurredAt: base.occurredAt, commandId },
   }) as Parameters<typeof reduceTaskCustody>[1];
+}
+
+describe("validation task replay", () => {
+  it("retains pinned validation history and uncertainty without inventing a debit or Done", () => {
+    const binding = validationBinding;
+    const reserved = validationRecorded(1, { ...binding, type: "task.validation-reserved" });
+    const started = validationRecorded(2, {
+      ...binding,
+      type: "task.validation-started",
+      runId: "validator-run",
+      startedAt: base.occurredAt,
+    });
+    const uncertain = validationRecorded(3, {
+      ...binding,
+      type: "task.validation-uncertain",
+      runId: "validator-run",
+      startedAt: base.occurredAt,
+      finishedAt: base.occurredAt,
+      reason: "process outcome unknown",
+    });
+    const first = reduceTaskValidation(undefined, reserved);
+    const running = reduceTaskValidation(first, started);
+    const lost = reduceTaskValidation(running, uncertain);
+    const newer = reduceTaskValidation(
+      lost,
+      validationRecorded(4, {
+        ...binding,
+        type: "task.validation-reserved",
+        attemptId: "newer",
+        allowanceUnit: 2,
+        definitionRevision: 2,
+        evidenceId: "new-evidence",
+      }),
+    );
+    const result = validationRecorded(5, {
+      ...binding,
+      type: "task.validation-result",
+      runId: "validator-run",
+      startedAt: base.occurredAt,
+      finishedAt: base.occurredAt,
+      outcome: "pass",
+      findings: [{ criterionId: "criterion", outcome: "pass", reason: "observed", evidence }],
+    });
+    const complete = reduceTaskValidation(newer, result);
+    const attempt = HashMap.getUnsafe(complete.attempts, "attempt");
+    expect(attempt.uncertain).toEqual(uncertain.event);
+    expect(attempt.result).toEqual(result.event);
+    expect(HashMap.size(complete.units)).toBe(2);
+    expect(HashMap.size(complete.runs)).toBe(1);
+    for (const event of [reserved, started, uncertain, result])
+      expect(reduceTaskValidation(complete, event)).toBe(complete);
+    expect(HashMap.getUnsafe(first.attempts, "attempt").started).toBeUndefined();
+    expect(HashMap.getUnsafe(lost.attempts, "attempt").result).toBeUndefined();
+    expect(replay([recorded(1, { type: "task.created", definition })]).completion).toBeUndefined();
+    expect(
+      reduceTaskCustody(undefined, custodyRecorded(1, { type: "task.manager-bound", ...identity }))
+        .allowance,
+    ).toEqual({ type: "unconfigured", consumed: 0 });
+    expect(() =>
+      reduceTaskValidation(
+        complete,
+        validationRecorded(6, {
+          ...result.event,
+          outcome: "fail",
+          findings: [{ criterionId: "criterion", outcome: "fail", reason: "changed", evidence }],
+        }),
+      ),
+    ).toThrow(ValidationReplayConflict);
+  });
+
+  it("rejects validation binding, run, allowance-unit and phase contradictions", () => {
+    const reserved = validationRecorded(1, {
+      ...validationBinding,
+      type: "task.validation-reserved",
+    });
+    const state = reduceTaskValidation(undefined, reserved);
+    const start = {
+      ...validationBinding,
+      type: "task.validation-started",
+      runId: "run",
+      startedAt: base.occurredAt,
+    };
+    for (const change of [
+      { evidenceId: "other" },
+      { claimId: "other" },
+      { managerGeneration: 2 },
+      { completionPolicyRevision: 2 },
+      { definitionRevision: 2 },
+      { allowanceUnit: 2 },
+      { workWatermark: "other" },
+      { validator: { ...validationBinding.validator, projectId: "other" } },
+    ])
+      expect(() =>
+        reduceTaskValidation(state, validationRecorded(2, { ...start, ...change })),
+      ).toThrow(ValidationReplayConflict);
+    expect(() => reduceTaskValidation(undefined, validationRecorded(2, start))).toThrow(
+      ValidationReplayConflict,
+    );
+    expect(() =>
+      reduceTaskValidation(
+        state,
+        validationRecorded(2, {
+          ...validationBinding,
+          type: "task.validation-reserved",
+          attemptId: "other",
+        }),
+      ),
+    ).toThrow(ValidationReplayConflict);
+    const running = reduceTaskValidation(state, validationRecorded(2, start));
+    expect(() => reduceTaskValidation(running, validationRecorded(3, start))).toThrow(
+      ValidationReplayConflict,
+    );
+    const second = reduceTaskValidation(
+      running,
+      validationRecorded(3, {
+        ...validationBinding,
+        type: "task.validation-reserved",
+        attemptId: "other",
+        allowanceUnit: 2,
+      }),
+    );
+    expect(() =>
+      reduceTaskValidation(
+        second,
+        validationRecorded(4, { ...start, attemptId: "other", allowanceUnit: 2 }),
+      ),
+    ).toThrow(ValidationReplayConflict);
+    expect(() =>
+      reduceTaskValidation(
+        running,
+        validationRecorded(3, {
+          ...start,
+          type: "task.validation-uncertain",
+          runId: "different",
+          finishedAt: base.occurredAt,
+          reason: "unknown",
+        }),
+      ),
+    ).toThrow(ValidationReplayConflict);
+    expect(HashMap.size(state.runs)).toBe(0);
+  });
+});
+
+const validationBinding = {
+  attemptId: "attempt",
+  managerGeneration: 1,
+  claimId: "claim",
+  evidenceId: "evidence",
+  workWatermark: "watermark",
+  validator: {
+    projectId: "project",
+    modelSelection: { instanceId: "codex", model: "model" },
+    workspace: { type: "root" },
+  },
+  allowanceUnit: 1,
+  createdAt: base.occurredAt,
+};
+function validationRecorded(sequence: number, event: object) {
+  const id = `validation-${sequence}`;
+  const commandId = `validation-command-${sequence}`;
+  return decode({
+    event: { ...base, ...event, id, commandId },
+    context: { sequence, eventId: id, occurredAt: base.occurredAt, commandId },
+  }) as Parameters<typeof reduceTaskValidation>[1];
 }

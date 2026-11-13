@@ -749,3 +749,150 @@ export function reduceTaskCustody(
       return fail("unsupported");
   }
 }
+
+type ValidationType =
+  | "task.validation-reserved"
+  | "task.validation-started"
+  | "task.validation-result"
+  | "task.validation-uncertain";
+type ValidationEvent = Extract<WorkTaskEvent, { readonly type: ValidationType }>;
+type ValidationOf<T extends ValidationType> = Extract<ValidationEvent, { readonly type: T }>;
+type ValidationRecorded = {
+  readonly event: ValidationEvent;
+  readonly context: WorkTaskPersistedEventContext;
+};
+type ValidationAttempt = {
+  readonly reserved: ValidationOf<"task.validation-reserved">;
+  readonly started?: ValidationOf<"task.validation-started">;
+  readonly uncertain?: ValidationOf<"task.validation-uncertain">;
+  readonly result?: ValidationOf<"task.validation-result">;
+};
+type ValidationState = {
+  readonly taskId: ValidationEvent["taskId"];
+  readonly attempts: HashMap.HashMap<string, ValidationAttempt>;
+  readonly units: HashMap.HashMap<number, string>;
+  readonly runs: HashMap.HashMap<string, string>;
+  readonly commands: HashMap.HashMap<string, string>;
+  readonly events: HashMap.HashMap<string, ValidationRecorded>;
+  readonly sequences: HashMap.HashMap<number, ValidationRecorded>;
+  readonly lastSequence: number;
+};
+export class ValidationReplayConflict extends Schema.TaggedError<ValidationReplayConflict>()(
+  "ValidationReplayConflict",
+  {
+    code: Schema.Literals([
+      "envelope",
+      "task_identity",
+      "event_identity",
+      "sequence",
+      "binding",
+      "phase",
+      "unit",
+      "run",
+      "command",
+      "unsupported",
+    ]),
+    eventId: Schema.String,
+  },
+) {}
+const validationIdentity = (event: ValidationEvent) => ({
+  definitionRevision: event.definitionRevision,
+  completionPolicyRevision: event.completionPolicyRevision,
+  attemptId: event.attemptId,
+  managerGeneration: event.managerGeneration,
+  claimId: event.claimId,
+  evidenceId: event.evidenceId,
+  workWatermark: event.workWatermark,
+  validator: event.validator,
+  allowanceUnit: event.allowanceUnit,
+  createdAt: event.createdAt,
+});
+
+/** Retains recorded validation phases; it neither launches a validator nor authorizes completion. */
+export function reduceTaskValidation(
+  state: ValidationState | undefined,
+  recorded: ValidationRecorded,
+): ValidationState {
+  const { event, context } = recorded;
+  const fail = (code: ValidationReplayConflict["code"]): never => {
+    throw new ValidationReplayConflict({ code, eventId: event.id });
+  };
+  if (
+    event.id !== context.eventId ||
+    event.occurredAt !== context.occurredAt ||
+    event.commandId !== context.commandId
+  )
+    return fail("envelope");
+  const previous: ValidationState = state ?? {
+    taskId: event.taskId,
+    attempts: HashMap.empty(),
+    units: HashMap.empty(),
+    runs: HashMap.empty(),
+    commands: HashMap.empty(),
+    events: HashMap.empty(),
+    sequences: HashMap.empty(),
+    lastSequence: 0,
+  };
+  if (event.taskId !== previous.taskId) return fail("task_identity");
+  const duplicate =
+    lookup(previous.events, event.id) ?? lookup(previous.sequences, context.sequence);
+  if (duplicate) {
+    if (NodeUtil.isDeepStrictEqual(duplicate, recorded)) return previous;
+    return fail(duplicate.event.id === event.id ? "event_identity" : "sequence");
+  }
+  if (context.sequence <= previous.lastSequence) return fail("sequence");
+  const commandKey = JSON.stringify([event.type, event.commandId]);
+  if (HashMap.has(previous.commands, commandKey)) return fail("command");
+  const next: ValidationState = {
+    ...previous,
+    events: HashMap.set(previous.events, event.id, recorded),
+    sequences: HashMap.set(previous.sequences, context.sequence, recorded),
+    lastSequence: context.sequence,
+    commands: HashMap.set(previous.commands, commandKey, event.attemptId),
+  };
+  const attempt = lookup(previous.attempts, event.attemptId);
+  if (event.type === "task.validation-reserved") {
+    if (attempt) return fail("phase");
+    if (HashMap.has(previous.units, event.allowanceUnit)) return fail("unit");
+    return {
+      ...next,
+      attempts: HashMap.set(previous.attempts, event.attemptId, { reserved: event }),
+      units: HashMap.set(previous.units, event.allowanceUnit, event.attemptId),
+    };
+  }
+  if (!attempt) return fail("phase");
+  if (!NodeUtil.isDeepStrictEqual(validationIdentity(attempt.reserved), validationIdentity(event)))
+    return fail("binding");
+  const runOwner = lookup(previous.runs, event.runId);
+  if (runOwner !== undefined && runOwner !== event.attemptId) return fail("run");
+  if (event.type === "task.validation-started") {
+    if (attempt.started || attempt.result || attempt.uncertain) return fail("phase");
+    return {
+      ...next,
+      attempts: HashMap.set(previous.attempts, event.attemptId, { ...attempt, started: event }),
+      runs: HashMap.set(previous.runs, event.runId, event.attemptId),
+    };
+  }
+  if (
+    !attempt.started ||
+    event.runId !== attempt.started.runId ||
+    event.startedAt !== attempt.started.startedAt
+  )
+    return fail("binding");
+  switch (event.type) {
+    case "task.validation-uncertain":
+      if (attempt.uncertain || attempt.result) return fail("phase");
+      return {
+        ...next,
+        attempts: HashMap.set(previous.attempts, event.attemptId, { ...attempt, uncertain: event }),
+      };
+    case "task.validation-result":
+      if (attempt.result) return fail("phase");
+      return {
+        ...next,
+        attempts: HashMap.set(previous.attempts, event.attemptId, { ...attempt, result: event }),
+      };
+    default:
+      return fail("unsupported");
+  }
+}
