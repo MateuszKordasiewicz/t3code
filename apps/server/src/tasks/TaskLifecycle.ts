@@ -677,9 +677,22 @@ export function reduceTaskCustody(
         };
       if (!reservation) return fail("reservation");
       if (event.type === "task.wake-claimed") {
-        if (reservation.claimed || reservation.acknowledged) return fail("phase");
+        if (reservation.acknowledged) return fail("phase");
+        if (
+          reservation.claimed &&
+          (reservation.claimed.messageId !== event.messageId ||
+            reservation.claimed.runId !== event.runId ||
+            event.dirtyGeneration <= reservation.claimed.dirtyGeneration)
+        )
+          return fail("phase");
         const keys = [`message:${event.messageId}`, `run:${event.runId}`];
-        if (keys.some((key) => HashMap.has(previous.launches, key))) return fail("reservation");
+        if (
+          keys.some((key) => {
+            const owner = lookup(previous.launches, key);
+            return owner !== undefined && owner !== event.reservationId;
+          })
+        )
+          return fail("reservation");
         return {
           ...next,
           reservations: HashMap.set(previous.reservations, event.reservationId, {

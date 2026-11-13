@@ -640,6 +640,42 @@ describe("custody task replay", () => {
         custodyRecorded(23, { ...payloads[8], previousAcknowledgedGeneration: 1 }),
       ),
     ).toThrow(CustodyReplayConflict);
+    const alreadyClaimed = reduceTaskCustody(before, events[5]!);
+    const laterSource = { ...source, sourceId: "coalesced" };
+    const withLater = reduceTaskCustody(
+      alreadyClaimed,
+      custodyRecorded(7, {
+        type: "task.wake-source-recorded",
+        source: laterSource,
+        reservationId: "reservation",
+        dirtyGeneration: 2,
+      }),
+    );
+    const coalescing = {
+      ...payloads[5],
+      dirtyGeneration: 2,
+      pending: { sources: [source, laterSource], overflowThroughGeneration: null },
+    };
+    const coalesced = reduceTaskCustody(withLater, custodyRecorded(8, coalescing));
+    expect(coalesced.allowance).toEqual(alreadyClaimed.allowance);
+    expect(HashMap.size(coalesced.debits)).toBe(1);
+    expect(HashMap.size(coalesced.launches)).toBe(2);
+    expect(HashMap.getUnsafe(coalesced.reservations, "reservation").claimed!.dirtyGeneration).toBe(
+      2,
+    );
+    for (const change of [{ runId: "different" }, { messageId: "different" }])
+      expect(() =>
+        reduceTaskCustody(withLater, custodyRecorded(8, { ...coalescing, ...change })),
+      ).toThrow(CustodyReplayConflict);
+    expect(() => reduceTaskCustody(coalesced, custodyRecorded(9, coalescing))).toThrow(
+      CustodyReplayConflict,
+    );
+    const coalescedAck = reduceTaskCustody(
+      coalesced,
+      custodyRecorded(9, { ...payloads[8], observedDirtyGeneration: 2, acknowledgedGeneration: 2 }),
+    );
+    expect(coalescedAck.acknowledgedGeneration).toBe(2);
+    expect(HashMap.size(coalescedAck.pendingSources)).toBe(0);
     expect(before.acknowledgedGeneration).toBe(0);
     expect(before.dirtyGeneration).toBe(1);
   });
