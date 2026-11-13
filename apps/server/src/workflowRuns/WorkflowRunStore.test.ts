@@ -28,6 +28,7 @@ import {
   upgradeDevelopmentPlanDocumentV1,
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import { stableStringify } from "@t3tools/shared/relaySigning";
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
 import * as Path from "effect/Path";
@@ -13440,4 +13441,607 @@ it.effect.each(["workflow", "planning"] as const)(
       }
       assert.strictEqual((yield* fixture.store.claimNativeIntent(selected)).kind, "claimed");
     }).pipe(Effect.provide(layer)),
+);
+
+const preparationInput = (threadId = "thread", id = "preparation-job") => ({
+  jobId: id,
+  entryKey: `entry-${id}`,
+  kind: "launch" as const,
+  environmentId: "environment",
+  projectId: "project",
+  threadId,
+  runId: null,
+  originatingLaunchJobId: null,
+  parentSelection: null,
+  serverBootId: "preparation-boot",
+  request: { command: "prepare" },
+});
+const preparationRow = (threadId: string, id = "preparation-job") => {
+  const identity = { v: 1, ...preparationInput(threadId, id) };
+  return {
+    format_version: 1,
+    job_id: id,
+    entry_key: identity.entryKey,
+    kind: identity.kind,
+    environment_id: identity.environmentId,
+    project_id: identity.projectId,
+    thread_id: identity.threadId,
+    run_id: identity.runId,
+    originating_launch_job_id: identity.originatingLaunchJobId,
+    server_boot_id: identity.serverBootId,
+    request_identity_json: stableStringify(identity),
+    request_identity_hash: WorkflowCanonicalHash.tagged("t3.preparation-job-identity.v1", identity),
+    created_at: DateTime.formatIso(DateTime.makeUnsafe(facts.now)),
+  };
+};
+it.effect.each(
+  physicalAdmissionKinds.flatMap((kind) =>
+    ["active", "quiescing", "unknown"].map((state) => ({ kind, state })),
+  ),
+)(
+  "preparation job custody denies fresh $kind with $state job and an empty physical ledger",
+  ({ kind, state }) =>
+    Effect.gen(function* () {
+      const prepared = yield* preparePhysicalAdmission(kind);
+      const store = yield* Store.WorkflowRunStore;
+      const sql = yield* SqlClient.SqlClient;
+      const row = preparationRow(prepared.threadId);
+      yield* sql`INSERT INTO orchestration_v2_preparation_jobs ${sql.insert(row)}`;
+      if (state !== "active")
+        yield* sql`UPDATE orchestration_v2_preparation_jobs SET state=${state},record_version=1 WHERE job_id=${row.job_id}`;
+      const subscription = yield* store.subscribeChanges;
+      const before = yield* rawReservationState;
+      const jobs = yield* sql`SELECT * FROM orchestration_v2_preparation_jobs`;
+      const result = yield* prepared.invoke;
+      if (kind.startsWith("workflow")) {
+        assert.strictEqual(result._tag, "Success");
+        if (result._tag === "Success")
+          assert.deepStrictEqual(result.success, { kind: "rejected", reason: "custody" });
+      } else {
+        assert.strictEqual(result._tag, "Failure");
+        if (result._tag === "Failure") assert.strictEqual(result.failure.reason, "custody");
+      }
+      assert.deepStrictEqual(yield* rawReservationState, before);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_preparation_jobs`, jobs);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_events`, []);
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+const preparationSelection = (
+  job: Effect.Success<ReturnType<Store.WorkflowRunStore["Service"]["closePreparationCode"]>>,
+) => ({
+  jobId: job.input.jobId,
+  entryKey: job.input.entryKey,
+  requestIdentityHash: job.requestIdentityHash,
+  serverBootId: job.input.serverBootId,
+  expectedVersion: job.recordVersion,
+});
+const acquirePreparation = Effect.fn("test.acquirePreparation")(function* (
+  input: Parameters<Store.WorkflowRunStore["Service"]["beginOrdinaryPreparation"]>[0],
+) {
+  const store = yield* Store.WorkflowRunStore;
+  const result = yield* store.beginOrdinaryPreparation(input);
+  if (result.kind !== "acquired") throw new Error(`expected acquired preparation: ${result.kind}`);
+  return result.job;
+});
+const preparationState = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  return yield* sql`SELECT * FROM orchestration_v2_preparation_jobs ORDER BY job_id`;
+});
+it.effect("ordinary preparation owns input synchronously and acquires each entry only once", () =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    const store = yield* Store.WorkflowRunStore;
+    const sql = yield* SqlClient.SqlClient;
+    const input = {
+      ...preparationInput("uncreated-thread"),
+      request: { nested: { value: "original" } },
+    };
+    const pending = store.beginOrdinaryPreparation(input);
+    input.threadId = "changed";
+    input.request.nested.value = "changed";
+    const first = yield* pending;
+    assert.strictEqual(first.kind, "acquired");
+    if (first.kind !== "acquired") throw new Error("not acquired");
+    assert.strictEqual(first.job.input.threadId, "uncreated-thread");
+    assert.deepStrictEqual(first.job.input.request, { nested: { value: "original" } });
+    assert.isTrue(Object.isFrozen(first.job));
+    assert.isTrue(Object.isFrozen(first.job.input.request));
+    const subscription = yield* store.subscribeChanges;
+    const before = yield* preparationState;
+    assert.strictEqual((yield* pending).kind, "existing");
+    assert.strictEqual(
+      (yield* store.beginOrdinaryPreparation({
+        ...preparationInput("uncreated-thread"),
+        request: { nested: { value: "original" } },
+      })).kind,
+      "existing",
+    );
+    for (const changed of [
+      { jobId: "other" },
+      { entryKey: "other" },
+      { serverBootId: "other" },
+      { request: { nested: { value: "other" } } },
+    ]) {
+      const result = yield* Effect.result(
+        store.beginOrdinaryPreparation({ ...first.job.input, ...changed }),
+      );
+      assert.strictEqual(result._tag, "Failure");
+      if (result._tag === "Failure") assert.strictEqual(result.failure.reason, "integrity");
+    }
+    assert.deepStrictEqual(yield* preparationState, before);
+    assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_projection_threads`, []);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_effect_outbox`, []);
+  }).pipe(Effect.provide(layerWithOutbox)),
+);
+it.effect(
+  "ordinary preparation rejects non-owned JSON and inherited writer contexts before mutation",
+  () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const store = yield* Store.WorkflowRunStore;
+      const sql = yield* SqlClient.SqlClient;
+      let reads = 0;
+      const getter = Object.defineProperty({ ...preparationInput() }, "request", {
+        enumerable: true,
+        get() {
+          reads++;
+          return {};
+        },
+      });
+      const cycle: Record<string, unknown> = {};
+      cycle.self = cycle;
+      for (const input of [
+        getter,
+        { ...preparationInput(), extra: true },
+        { ...preparationInput(), request: cycle },
+        { ...preparationInput(), request: { bad: undefined } },
+        { ...preparationInput(), request: { bad: -0 } },
+        { ...preparationInput(), request: { bad: "\ud800" } },
+        { ...preparationInput(), request: { bad: Number.NaN } },
+        { ...preparationInput(), request: [] },
+        { ...preparationInput(), parentSelection: { jobId: "fake" } },
+      ]) {
+        assert.strictEqual(
+          (yield* Effect.result(
+            store.beginOrdinaryPreparation(
+              input as Parameters<typeof store.beginOrdinaryPreparation>[0],
+            ),
+          ))._tag,
+          "Failure",
+        );
+      }
+      assert.strictEqual(reads, 0);
+      assert.strictEqual(
+        (yield* Effect.result(
+          sql.withTransaction(store.beginOrdinaryPreparation(preparationInput())),
+        ))._tag,
+        "Failure",
+      );
+      assert.deepStrictEqual(yield* preparationState, []);
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+it.effect.each(["workflow", "planning"] as const)(
+  "ordinary preparation denies direct and native-alias %s custody",
+  (owner) =>
+    Effect.gen(function* () {
+      const thread = yield* prepareLogicalCustodyOwner(owner);
+      const store = yield* Store.WorkflowRunStore;
+      const sql = yield* SqlClient.SqlClient;
+      yield* seedPhysicalSession("ordinary-session");
+      yield* seedPhysicalSession("owned-session");
+      yield* seedPhysicalProvider(
+        physicalProvider(
+          "ordinary-provider",
+          "ordinary-thread",
+          "ordinary-session",
+          "shared-native",
+        ),
+      );
+      yield* seedPhysicalProvider(
+        physicalProvider("owned-provider", thread, "owned-session", "shared-native"),
+      );
+      const before = yield* rawReservationState;
+      const subscription = yield* store.subscribeChanges;
+      for (const target of [thread, "ordinary-thread"])
+        assert.deepStrictEqual(yield* store.beginOrdinaryPreparation(preparationInput(target)), {
+          kind: "denied",
+          reason: "custody",
+        });
+      assert.deepStrictEqual(yield* preparationState, []);
+      assert.deepStrictEqual(yield* rawReservationState, before);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_submission_transports`, []);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+it.effect("preparation code closure and settlement require the exact retained CAS selection", () =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    const store = yield* Store.WorkflowRunStore;
+    let job = yield* acquirePreparation(preparationInput("uncreated-thread"));
+    const initial = preparationSelection(job);
+    for (const patch of [
+      { expectedVersion: 1 },
+      { serverBootId: "foreign" },
+      { entryKey: "foreign" },
+      { requestIdentityHash: "b".repeat(64) },
+    ]) {
+      const before = yield* preparationState;
+      const result = yield* Effect.result(store.closePreparationCode({ ...initial, ...patch }));
+      assert.strictEqual(result._tag, "Failure");
+      if (result._tag === "Failure") assert.strictEqual(result.failure.reason, "stale");
+      assert.deepStrictEqual(yield* preparationState, before);
+    }
+    assert.strictEqual(
+      (yield* Effect.result(store.settleCodeOnlyPreparation(initial)))._tag,
+      "Failure",
+    );
+    job = yield* store.quiescePreparationJob(initial);
+    assert.strictEqual(job.state, "quiescing");
+    assert.strictEqual((yield* Effect.result(store.closePreparationCode(initial)))._tag, "Failure");
+    job = yield* store.quiescePreparationJob(preparationSelection(job), "unknown");
+    assert.strictEqual(job.state, "unknown");
+    assert.strictEqual(
+      (yield* Effect.result(store.quiescePreparationJob(preparationSelection(job))))._tag,
+      "Failure",
+    );
+    const selected = preparationSelection(job);
+    const pending = store.closePreparationCode(selected);
+    selected.expectedVersion = 999;
+    job = yield* pending;
+    assert.isNotNull(job.codeClosedAt);
+    assert.strictEqual((yield* Effect.result(pending))._tag, "Failure");
+    job = yield* store.settleCodeOnlyPreparation(preparationSelection(job));
+    assert.strictEqual(job.state, "settled");
+    assert.isTrue(Object.isFrozen(job.settlement));
+    const before = yield* preparationState;
+    const subscription = yield* store.subscribeChanges;
+    assert.strictEqual(
+      (yield* Effect.result(store.settleCodeOnlyPreparation(preparationSelection(job))))._tag,
+      "Failure",
+    );
+    assert.strictEqual((yield* store.beginOrdinaryPreparation(job.input)).kind, "existing");
+    assert.deepStrictEqual(yield* preparationState, before);
+    assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+  }).pipe(Effect.provide(layerWithOutbox)),
+);
+it.effect.each(physicalAdmissionKinds)(
+  "code-only settled preparation permits fresh %s while retained children still hold",
+  (kind) =>
+    Effect.gen(function* () {
+      const prepared = yield* preparePhysicalAdmission(kind);
+      const store = yield* Store.WorkflowRunStore;
+      let parent = yield* acquirePreparation(
+        preparationInput(prepared.threadId, "parent-preparation"),
+      );
+      const childInput = {
+        ...preparationInput(prepared.threadId, "child-preparation"),
+        kind: "setup" as const,
+        originatingLaunchJobId: parent.input.jobId,
+        parentSelection: preparationSelection(parent),
+      };
+      let child = yield* acquirePreparation(childInput);
+      parent = yield* store.closePreparationCode(preparationSelection(parent));
+      parent = yield* store.settleCodeOnlyPreparation(preparationSelection(parent));
+      const blocked = yield* prepared.invoke;
+      if (kind.startsWith("workflow")) {
+        assert.strictEqual(blocked._tag, "Success");
+        if (blocked._tag === "Success") expectPhysicalRejection(blocked.success);
+      } else {
+        assert.strictEqual(blocked._tag, "Failure");
+        if (blocked._tag === "Failure") assert.strictEqual(blocked.failure.reason, "custody");
+      }
+      assert.strictEqual(
+        (yield* Effect.result(
+          store.beginOrdinaryPreparation({
+            ...childInput,
+            jobId: "late-child",
+            entryKey: "late-entry",
+          }),
+        ))._tag,
+        "Failure",
+      );
+      child = yield* store.closePreparationCode(preparationSelection(child));
+      child = yield* store.settleCodeOnlyPreparation(preparationSelection(child));
+      const accepted = yield* prepared.invoke;
+      assert.strictEqual(accepted._tag, "Success");
+      if (accepted._tag === "Success")
+        assert.strictEqual(
+          accepted.success.kind,
+          kind.endsWith("native")
+            ? "reserved"
+            : kind === "planning-legacy"
+              ? "applied"
+              : "accepted",
+        );
+      assert.strictEqual((yield* preparationState).length, 2);
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+it.effect("preparation setup validates the exact open parent identity and version", () =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    const store = yield* Store.WorkflowRunStore;
+    let parent = yield* acquirePreparation(preparationInput());
+    const selection = preparationSelection(parent);
+    const base = {
+      ...preparationInput("thread", "child"),
+      kind: "setup" as const,
+      originatingLaunchJobId: parent.input.jobId,
+      parentSelection: selection,
+    };
+    for (const patch of [
+      { projectId: "foreign" },
+      { threadId: "foreign" },
+      { serverBootId: "foreign" },
+      { parentSelection: { ...selection, expectedVersion: 1 } },
+      { parentSelection: { ...selection, requestIdentityHash: "b".repeat(64) } },
+    ])
+      assert.strictEqual(
+        (yield* Effect.result(store.beginOrdinaryPreparation({ ...base, ...patch })))._tag,
+        "Failure",
+      );
+    parent = yield* store.closePreparationCode(selection);
+    assert.strictEqual(
+      (yield* Effect.result(
+        store.beginOrdinaryPreparation({ ...base, parentSelection: preparationSelection(parent) }),
+      ))._tag,
+      "Failure",
+    );
+    assert.strictEqual((yield* preparationState).length, 1);
+  }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect.each(
+  physicalAdmissionKinds.flatMap((kind) =>
+    ["job-first", "association-first"].map((order) => ({ kind, order })),
+  ),
+)("preparation and $kind serialize $order across captured clients and reopen", ({ kind, order }) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const directory = yield* Effect.acquireRelease(
+        Effect.sync(() => NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "preparation-race-"))),
+        (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
+      );
+      const filename = NodePath.join(directory, "state.sqlite");
+      const fileLayer = () =>
+        Layer.merge(Store.layer, EffectOutbox.layer).pipe(
+          Layer.provideMerge(NodeSqliteClient.layer({ filename })),
+        );
+      const retained = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const prepared = yield* preparePhysicalAdmission(kind);
+          const store = yield* Store.WorkflowRunStore;
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`PRAGMA busy_timeout=0`;
+          const input = preparationInput(prepared.threadId);
+          const other = yield* Effect.acquireRelease(
+            Effect.sync(() => new NodeSqlite.DatabaseSync(filename)),
+            (db) => Effect.sync(() => db.close()),
+          );
+          yield* Effect.sync(() => other.exec("PRAGMA busy_timeout=0; BEGIN IMMEDIATE"));
+          const before = yield* rawReservationState;
+          const blocked =
+            order === "job-first"
+              ? yield* Effect.result(store.beginOrdinaryPreparation(input))
+              : yield* prepared.invoke;
+          assert.strictEqual(blocked._tag, "Failure");
+          assert.deepStrictEqual(yield* rawReservationState, before);
+          assert.deepStrictEqual(yield* preparationState, []);
+          yield* Effect.sync(() => other.exec("COMMIT"));
+          if (order === "job-first") {
+            yield* Effect.scoped(acquirePreparation(input).pipe(Effect.provide(fileLayer())));
+            const result = yield* prepared.invoke;
+            if (kind.startsWith("workflow")) {
+              assert.strictEqual(result._tag, "Success");
+              if (result._tag === "Success") expectPhysicalRejection(result.success);
+            } else {
+              assert.strictEqual(result._tag, "Failure");
+              if (result._tag === "Failure") assert.strictEqual(result.failure.reason, "custody");
+            }
+            assert.deepStrictEqual(yield* rawReservationState, before);
+          } else {
+            const result = yield* prepared.invoke;
+            assert.strictEqual(result._tag, "Success");
+            if (result._tag === "Success")
+              assert.strictEqual(
+                result.success.kind,
+                kind.endsWith("native")
+                  ? "reserved"
+                  : kind === "planning-legacy"
+                    ? "applied"
+                    : "accepted",
+              );
+            const denied = yield* Effect.scoped(
+              Effect.gen(function* () {
+                const second = yield* Store.WorkflowRunStore;
+                return yield* second.beginOrdinaryPreparation(input);
+              }).pipe(Effect.provide(fileLayer())),
+            );
+            assert.deepStrictEqual(denied, { kind: "denied", reason: "custody" });
+            assert.deepStrictEqual(yield* preparationState, []);
+          }
+          return {
+            invokeOn: prepared.invokeOn,
+            input,
+            state: yield* rawReservationState,
+            jobs: yield* preparationState,
+          };
+        }).pipe(Effect.provide(fileLayer())),
+      );
+      yield* Effect.gen(function* () {
+        const store = yield* Store.WorkflowRunStore;
+        if (order === "job-first") {
+          const result = yield* retained.invokeOn(store);
+          if (kind.startsWith("workflow")) {
+            assert.strictEqual(result._tag, "Success");
+            if (result._tag === "Success") expectPhysicalRejection(result.success);
+          } else {
+            assert.strictEqual(result._tag, "Failure");
+            if (result._tag === "Failure") assert.strictEqual(result.failure.reason, "custody");
+          }
+          assert.strictEqual(
+            (yield* store.beginOrdinaryPreparation(retained.input)).kind,
+            "existing",
+          );
+        } else
+          assert.deepStrictEqual(yield* store.beginOrdinaryPreparation(retained.input), {
+            kind: "denied",
+            reason: "custody",
+          });
+        assert.deepStrictEqual(yield* rawReservationState, retained.state);
+        assert.deepStrictEqual(yield* preparationState, retained.jobs);
+      }).pipe(Effect.provide(fileLayer()));
+    }),
+  ),
+);
+it.effect.each(physicalAdmissionKinds)(
+  "preparation custody retains historical exact %s replay without recharge",
+  (kind) =>
+    Effect.gen(function* () {
+      const prepared = yield* preparePhysicalAdmission(kind);
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      assert.strictEqual((yield* prepared.invoke)._tag, "Success");
+      yield* sql`INSERT INTO orchestration_v2_preparation_jobs ${sql.insert(preparationRow(prepared.threadId))}`;
+      const before = yield* rawReservationState;
+      const jobs = yield* preparationState;
+      const subscription = yield* store.subscribeChanges;
+      const replay = yield* prepared.invoke;
+      assert.strictEqual(replay._tag, "Success");
+      if (replay._tag === "Success") assert.strictEqual(replay.success.kind, "replay");
+      assert.deepStrictEqual(yield* rawReservationState, before);
+      assert.deepStrictEqual(yield* preparationState, jobs);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+it.effect.each(physicalAdmissionKinds)(
+  "preparation custody refuses missing storage for fresh %s",
+  (kind) =>
+    Effect.gen(function* () {
+      const prepared = yield* preparePhysicalAdmission(kind);
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      const before = yield* rawReservationState;
+      const subscription = yield* store.subscribeChanges;
+      yield* sql`ALTER TABLE orchestration_v2_preparation_jobs RENAME TO hidden_preparation_jobs`;
+      const result = yield* prepared.invoke;
+      assert.strictEqual(result._tag, "Failure");
+      if (result._tag === "Failure")
+        assert.strictEqual(
+          result.failure.reason,
+          kind.startsWith("workflow") ? "persistence" : "storage",
+        );
+      assert.deepStrictEqual(yield* rawReservationState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect(
+  "preparation custody pages settled history and retains an open job after the first page",
+  () =>
+    Effect.gen(function* () {
+      const prepared = yield* preparePhysicalAdmission("workflow-native");
+      const store = yield* Store.WorkflowRunStore;
+      const sql = yield* SqlClient.SqlClient;
+      for (let index = 0; index < 129; index++) {
+        let job = yield* acquirePreparation(
+          preparationInput(prepared.threadId, `page-${index.toString().padStart(3, "0")}`),
+        );
+        job = yield* store.closePreparationCode(preparationSelection(job));
+        yield* store.settleCodeOnlyPreparation(preparationSelection(job));
+      }
+      let last = yield* acquirePreparation(preparationInput(prepared.threadId, "zz-open"));
+      let result = yield* prepared.invoke;
+      assert.strictEqual(result._tag, "Success");
+      if (result._tag === "Success") expectPhysicalRejection(result.success);
+      last = yield* store.closePreparationCode(preparationSelection(last));
+      yield* store.settleCodeOnlyPreparation(preparationSelection(last));
+      const original =
+        (yield* sql`SELECT * FROM orchestration_v2_preparation_jobs WHERE job_id='page-000'`)[0]!;
+      yield* sql`DROP TRIGGER preparation_jobs_update_guard`;
+      for (const patch of [
+        { request_identity_hash: "b".repeat(64) },
+        { request_identity_json: ` ${original.request_identity_json}` },
+        { project_id: "substituted" },
+        { settlement_hash: "b".repeat(64) },
+      ]) {
+        yield* sql`UPDATE orchestration_v2_preparation_jobs SET ${sql.update(patch)} WHERE job_id='page-000'`;
+        const before = yield* rawReservationState;
+        const jobs = yield* preparationState;
+        result = yield* prepared.invoke;
+        assert.strictEqual(result._tag, "Failure");
+        if (result._tag === "Failure") assert.strictEqual(result.failure.reason, "integrity");
+        assert.deepStrictEqual(yield* rawReservationState, before);
+        assert.deepStrictEqual(yield* preparationState, jobs);
+        yield* sql`UPDATE orchestration_v2_preparation_jobs SET ${sql.update({ request_identity_hash: original.request_identity_hash, request_identity_json: original.request_identity_json, project_id: original.project_id, settlement_hash: original.settlement_hash })} WHERE job_id='page-000'`;
+      }
+      result = yield* prepared.invoke;
+      assert.strictEqual(result._tag, "Success");
+      if (result._tag === "Success") assert.strictEqual(result.success.kind, "reserved");
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+it.effect("preparation process exposure and unsupported resource settlement remain custody", () =>
+  Effect.gen(function* () {
+    const prepared = yield* preparePhysicalAdmission("workflow-native");
+    const store = yield* Store.WorkflowRunStore;
+    const sql = yield* SqlClient.SqlClient;
+    let job = yield* acquirePreparation(preparationInput(prepared.threadId));
+    yield* sql`UPDATE orchestration_v2_preparation_jobs SET process_exposed=1,record_version=1 WHERE job_id=${job.input.jobId}`;
+    job = yield* store.closePreparationCode({ ...preparationSelection(job), expectedVersion: 1 });
+    assert.strictEqual(
+      (yield* Effect.result(store.settleCodeOnlyPreparation(preparationSelection(job))))._tag,
+      "Failure",
+    );
+    const evidence = {
+      v: 1,
+      jobId: job.input.jobId,
+      entryKey: job.input.entryKey,
+      priorVersion: job.recordVersion,
+      kind: "owned_resources",
+    };
+    const settlementHash = WorkflowCanonicalHash.tagged("t3.preparation-job-settlement.v1", {
+      requestIdentityHash: job.requestIdentityHash,
+      codeClosedAt: job.codeClosedAt,
+      settlement: evidence,
+    });
+    yield* sql`UPDATE orchestration_v2_preparation_jobs SET state='settled',record_version=${job.recordVersion + 1},settlement_json=${stableStringify(evidence)},settlement_hash=${settlementHash},settled_at=${job.codeClosedAt} WHERE job_id=${job.input.jobId}`;
+    const before = yield* rawReservationState;
+    const result = yield* prepared.invoke;
+    assert.strictEqual(result._tag, "Success");
+    if (result._tag === "Success") expectPhysicalRejection(result.success);
+    assert.deepStrictEqual(yield* rawReservationState, before);
+  }).pipe(Effect.provide(layerWithOutbox)),
+);
+it.effect("preparation custody follows native aliases with an empty physical ledger", () =>
+  Effect.gen(function* () {
+    const prepared = yield* preparePhysicalAdmission("workflow-native");
+    const sql = yield* SqlClient.SqlClient;
+    yield* seedPhysicalSession("candidate-session");
+    yield* seedPhysicalSession("preparation-session");
+    yield* seedPhysicalProvider(
+      physicalProvider(
+        "candidate-provider",
+        prepared.threadId,
+        "candidate-session",
+        "shared-preparation-native",
+      ),
+    );
+    yield* seedPhysicalProvider(
+      physicalProvider(
+        "preparation-provider",
+        "preparing-alias",
+        "preparation-session",
+        "shared-preparation-native",
+      ),
+    );
+    yield* acquirePreparation(preparationInput("preparing-alias"));
+    const before = yield* rawReservationState;
+    const result = yield* prepared.invoke;
+    assert.strictEqual(result._tag, "Success");
+    if (result._tag === "Success") expectPhysicalRejection(result.success);
+    assert.deepStrictEqual(yield* rawReservationState, before);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_submission_transports`, []);
+  }).pipe(Effect.provide(layerWithOutbox)),
 );

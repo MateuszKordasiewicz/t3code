@@ -32,8 +32,10 @@ import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import type * as Path from "effect/Path";
+import { stableStringify } from "@t3tools/shared/relaySigning";
 import type { ServerConfig } from "../config.ts";
 import * as NativeProtocol from "./WorkflowNativeCommandProtocol.ts";
+import * as PreparationJob from "../preparation/PreparationJob.ts";
 import {
   decodeSubmissionTransportData,
   decodeSubmissionAttemptResourceData,
@@ -278,6 +280,58 @@ const makeStore = Effect.fnUntraced(function* (
       yield* sql`SELECT 1 FROM orchestration_v2_effect_outbox WHERE thread_id = ${threadId} AND status = 'running' AND effect_type IN ('provider-turn.start', 'provider-turn.restart', 'provider-runtime.continue') LIMIT 1`;
     return rows.length > 0;
   });
+  const readPreparationJob = Effect.fn("WorkflowRunStore.readPreparationJob")(function* (
+    jobId: string,
+  ) {
+    const rows = yield* sql`SELECT * FROM orchestration_v2_preparation_jobs WHERE job_id=${jobId}`;
+    if (rows.length !== 1) return yield* integrity();
+    return yield* Effect.try({ try: () => PreparationJob.decodeRow(rows[0]), catch: integrity });
+  });
+  const preparationMatches = (job: PreparationJob.Job, selected: PreparationJob.Selection) =>
+    stableStringify(PreparationJob.selection(job)) === stableStringify(selected);
+  const readPreparationParent = Effect.fn("WorkflowRunStore.readPreparationParent")(function* (
+    input: PreparationJob.Input,
+  ) {
+    if (input.parentSelection === null) return null;
+    const parent = yield* readPreparationJob(input.parentSelection.jobId);
+    const selected = input.parentSelection;
+    if (
+      parent.input.kind !== "launch" ||
+      parent.input.environmentId !== input.environmentId ||
+      parent.input.projectId !== input.projectId ||
+      parent.input.threadId !== input.threadId ||
+      parent.input.serverBootId !== input.serverBootId ||
+      parent.input.entryKey !== selected.entryKey ||
+      parent.requestIdentityHash !== selected.requestIdentityHash ||
+      parent.input.serverBootId !== selected.serverBootId ||
+      parent.recordVersion < selected.expectedVersion
+    )
+      return yield* integrity();
+    return parent;
+  });
+  const readPreparationCustody = Effect.fn("WorkflowRunStore.readPreparationCustody")(function* (
+    environmentId: string,
+    threadId: string,
+  ) {
+    let cursor = "";
+    let held = false;
+    for (;;) {
+      const rows =
+        yield* sql`SELECT * FROM orchestration_v2_preparation_jobs WHERE environment_id=${environmentId} AND thread_id=${threadId} AND job_id>${cursor} ORDER BY job_id LIMIT 128`;
+      for (const row of rows) {
+        const job = yield* Effect.try({
+          try: () => PreparationJob.decodeRow(row),
+          catch: integrity,
+        });
+        yield* readPreparationParent(job.input);
+        if (job.state !== "settled" || job.processExposed || job.settlement?.kind !== "code_only")
+          held = true;
+      }
+      if (rows.length < 128) break;
+      cursor = rows.at(-1)!.job_id as string;
+    }
+    return held;
+  });
   // Public readers own the span; both purposes share the captured projection traversal.
   const walkResourceCustodyInTransaction = Effect.fnUntraced(
     function* (
@@ -300,7 +354,7 @@ const makeStore = Effect.fnUntraced(function* (
       if (input.purpose === "physical") {
         if (!validId(environmentId)) return yield* integrity();
         const present =
-          yield* sql`SELECT 1 FROM orchestration_v2_submission_transports WHERE environment_id=${environmentId} LIMIT 1`;
+          yield* sql`SELECT 1 FROM orchestration_v2_submission_transports WHERE environment_id=${environmentId} UNION ALL SELECT 1 FROM orchestration_v2_preparation_jobs WHERE environment_id=${environmentId} LIMIT 1`;
         if (!present.length) return false;
       } else if (
         !Array.isArray(input.providerSessionIds) ||
@@ -505,6 +559,7 @@ const makeStore = Effect.fnUntraced(function* (
         const selected = work[index]!;
         if (selected.kind === "thread") {
           if (input.purpose === "physical") {
+            if (yield* readPreparationCustody(environmentId, selected.id)) return true;
             if (yield* transportHistory("opening_thread_id", selected.id)) return true;
             if (yield* attemptHistory({ field: "thread_id", id: selected.id })) return true;
           }
@@ -761,6 +816,138 @@ const makeStore = Effect.fnUntraced(function* (
           isStoreError(error) ? error : new WorkflowRunStoreError({ reason: "persistence" }),
         ),
       );
+  const beginOrdinaryPreparation = Effect.fn("WorkflowRunStore.beginOrdinaryPreparation")(
+    function* (input: PreparationJob.Input) {
+      if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+        return yield* integrity();
+      const result = yield* inTransaction(
+        Effect.gen(function* () {
+          const encoded = PreparationJob.identity(input);
+          const retained =
+            yield* sql`SELECT * FROM orchestration_v2_preparation_jobs WHERE job_id=${input.jobId} OR entry_key=${input.entryKey}`;
+          const jobs = yield* Effect.forEach(retained, (row) =>
+            Effect.try({ try: () => PreparationJob.decodeRow(row), catch: integrity }),
+          );
+          if (jobs.length) {
+            if (jobs.length !== 1 || jobs[0]!.requestIdentityHash !== encoded.hash)
+              return yield* integrity();
+            return Object.freeze({ kind: "existing" as const, job: jobs[0]! });
+          }
+          if (
+            yield* walkResourceCustodyInTransaction({
+              purpose: "workflow",
+              threadId: input.threadId,
+              providerSessionIds: [],
+            })
+          )
+            return Object.freeze({ kind: "denied" as const, reason: "custody" as const });
+          const parent = yield* readPreparationParent(input);
+          if (
+            parent !== null &&
+            (!preparationMatches(parent, input.parentSelection!) ||
+              parent.state !== "active" ||
+              parent.codeClosedAt !== null)
+          )
+            return yield* stale();
+          const createdAt = DateTime.formatIso(yield* DateTime.now);
+          const rows = yield* sql`INSERT INTO orchestration_v2_preparation_jobs ${sql.insert({
+            format_version: 1,
+            job_id: input.jobId,
+            entry_key: input.entryKey,
+            kind: input.kind,
+            environment_id: input.environmentId,
+            project_id: input.projectId,
+            thread_id: input.threadId,
+            run_id: input.runId,
+            originating_launch_job_id: input.originatingLaunchJobId,
+            server_boot_id: input.serverBootId,
+            request_identity_json: encoded.text,
+            request_identity_hash: encoded.hash,
+            created_at: createdAt,
+          })} RETURNING *`;
+          const job = yield* Effect.try({
+            try: () => PreparationJob.decodeRow(rows[0]),
+            catch: integrity,
+          });
+          return Object.freeze({ kind: "acquired" as const, job });
+        }),
+      );
+      if (result.kind === "acquired") yield* notify;
+      return result;
+    },
+  );
+  const mutatePreparation = Effect.fn("WorkflowRunStore.mutatePreparation")(function* (
+    selected: PreparationJob.Selection,
+    action: "close" | "quiescing" | "unknown" | "settle",
+  ) {
+    if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+      return yield* integrity();
+    const result = yield* inTransaction(
+      Effect.gen(function* () {
+        const rows =
+          yield* sql`SELECT * FROM orchestration_v2_preparation_jobs WHERE job_id=${selected.jobId}`;
+        if (rows.length !== 1) return yield* stale();
+        const job = yield* Effect.try({
+          try: () => PreparationJob.decodeRow(rows[0]),
+          catch: integrity,
+        });
+        if (
+          !preparationMatches(job, selected) ||
+          job.state === "settled" ||
+          job.recordVersion === Number.MAX_SAFE_INTEGER
+        )
+          return yield* stale();
+        yield* readPreparationParent(job.input);
+        const now = DateTime.formatIso(yield* DateTime.now);
+        let patch: Record<string, string | number>;
+        if (action === "close") {
+          if (job.codeClosedAt !== null) return yield* stale();
+          patch = { code_closed_at: now };
+        } else if (action === "settle") {
+          if (job.codeClosedAt === null || job.processExposed) return yield* integrity();
+          const settlement = {
+            v: 1,
+            jobId: selected.jobId,
+            entryKey: selected.entryKey,
+            priorVersion: job.recordVersion,
+            kind: "code_only",
+          };
+          patch = {
+            state: "settled",
+            settlement_json: stableStringify(settlement),
+            settlement_hash: PreparationJob.settlementHash(
+              job.requestIdentityHash,
+              job.codeClosedAt,
+              settlement,
+            ),
+            settled_at: now,
+          };
+        } else {
+          if (job.state === action || job.state === "unknown") return yield* stale();
+          patch = { state: action };
+        }
+        const changed =
+          yield* sql`UPDATE orchestration_v2_preparation_jobs SET ${sql.update({ ...patch, record_version: job.recordVersion + 1 })} WHERE job_id=${selected.jobId} AND entry_key=${selected.entryKey} AND request_identity_hash=${selected.requestIdentityHash} AND server_boot_id=${selected.serverBootId} AND record_version=${selected.expectedVersion} RETURNING *`;
+        if (changed.length !== 1) return yield* stale();
+        return yield* Effect.try({
+          try: () => PreparationJob.decodeRow(changed[0]),
+          catch: integrity,
+        });
+      }),
+    );
+    yield* notify;
+    return result;
+  });
+  const ownPreparationMutation = (
+    selected: PreparationJob.Selection,
+    action: "close" | "quiescing" | "unknown" | "settle",
+  ) => {
+    try {
+      return mutatePreparation(PreparationJob.ownSelection(selected), action);
+    } catch {
+      return Effect.fail(integrity());
+    }
+  };
   const createRun = Effect.fn("WorkflowRunStore.createRun")(function* (record: unknown) {
     const run = yield* decodeWorkflowRunV1(record).pipe(Effect.mapError(integrity));
     if (
@@ -6562,6 +6749,24 @@ const makeStore = Effect.fnUntraced(function* (
         return Effect.fail(integrity());
       }
     },
+    beginOrdinaryPreparation: (input: PreparationJob.Input) => {
+      try {
+        return beginOrdinaryPreparation(PreparationJob.ownInput(input));
+      } catch {
+        return Effect.fail(integrity());
+      }
+    },
+    closePreparationCode: (selected: PreparationJob.Selection) =>
+      ownPreparationMutation(selected, "close"),
+    quiescePreparationJob: (
+      selected: PreparationJob.Selection,
+      disposition: "quiescing" | "unknown" = "quiescing",
+    ) =>
+      disposition === "quiescing" || disposition === "unknown"
+        ? ownPreparationMutation(selected, disposition)
+        : Effect.fail(integrity()),
+    settleCodeOnlyPreparation: (selected: PreparationJob.Selection) =>
+      ownPreparationMutation(selected, "settle"),
     readThreadCustody,
     readNativeReservationInTransaction,
     readRecoveryCustodyInTransaction: (
