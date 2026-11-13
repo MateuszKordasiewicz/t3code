@@ -578,6 +578,160 @@ describe("WorkflowRunPolicy", () => {
       accepted("active", 3, [{ kind: "rearm", operationId: "op-1", fingerprint: hash }]),
     ],
     [
+      "resume verified native held operation valid",
+      input(
+        { kind: "resume" },
+        {
+          run: {
+            status: "paused",
+            allowance: { ...run.allowance, attemptsConsumed: run.allowance.maxAttempts },
+          },
+          facts: {
+            heldOperations: [pending],
+            verifiedNativeHeldOperations: [{ operationId: pending.id, fingerprint: hash }],
+          },
+        },
+      ),
+      {
+        kind: "accepted",
+        run: {
+          status: "active",
+          controlGeneration: 3,
+          allowance: { ...run.allowance, attemptsConsumed: run.allowance.maxAttempts },
+        },
+        actions: [{ kind: "rearm", operationId: pending.id, fingerprint: hash }],
+      },
+    ],
+    [
+      "resume verified native held operation duplicate",
+      input(
+        { kind: "resume" },
+        {
+          run: {
+            status: "paused",
+            allowance: { ...run.allowance, attemptsConsumed: run.allowance.maxAttempts },
+          },
+          facts: {
+            heldOperations: [pending],
+            verifiedNativeHeldOperations: [
+              { operationId: pending.id, fingerprint: hash },
+              { operationId: pending.id, fingerprint: hash },
+            ],
+          },
+        },
+      ),
+      {
+        kind: "accepted",
+        run: {
+          status: "active",
+          controlGeneration: 3,
+          allowance: { ...run.allowance, attemptsConsumed: run.allowance.maxAttempts },
+        },
+        actions: [{ kind: "rearm", operationId: pending.id, fingerprint: hash }],
+      },
+    ],
+    [
+      "resume verified native held operation id",
+      input(
+        { kind: "resume" },
+        {
+          run: {
+            status: "paused",
+            allowance: { ...run.allowance, attemptsConsumed: run.allowance.maxAttempts },
+          },
+          facts: {
+            heldOperations: [pending],
+            verifiedNativeHeldOperations: [{ operationId: "bogus", fingerprint: hash }],
+          },
+        },
+      ),
+      rejected("exhausted"),
+    ],
+    [
+      "resume verified native held operation fingerprint",
+      input(
+        { kind: "resume" },
+        {
+          run: {
+            status: "paused",
+            allowance: { ...run.allowance, attemptsConsumed: run.allowance.maxAttempts },
+          },
+          facts: {
+            heldOperations: [pending],
+            verifiedNativeHeldOperations: [
+              { operationId: pending.id, fingerprint: "b".repeat(64) },
+            ],
+          },
+        },
+      ),
+      rejected("exhausted"),
+    ],
+    [
+      "resume verified native held operation missing",
+      input(
+        { kind: "resume" },
+        {
+          run: {
+            status: "paused",
+            allowance: { ...run.allowance, attemptsConsumed: run.allowance.maxAttempts },
+          },
+          facts: {
+            heldOperations: [],
+            verifiedNativeHeldOperations: [{ operationId: pending.id, fingerprint: hash }],
+          },
+        },
+      ),
+      rejected("exhausted"),
+    ],
+    [
+      "resume verified native held operation unstarted",
+      input(
+        { kind: "resume" },
+        {
+          run: {
+            status: "paused",
+            allowance: { ...run.allowance, attemptsConsumed: run.allowance.maxAttempts },
+          },
+          facts: {
+            heldOperations: [{ ...pending, provablyUnstarted: false }],
+            verifiedNativeHeldOperations: [{ operationId: pending.id, fingerprint: hash }],
+          },
+        },
+      ),
+      rejected("exhausted"),
+    ],
+    [
+      "resume verified native held operation claimed",
+      input(
+        { kind: "resume" },
+        {
+          run: {
+            status: "paused",
+            allowance: { ...run.allowance, attemptsConsumed: run.allowance.maxAttempts },
+          },
+          facts: {
+            heldOperations: [{ ...pending, status: "claimed" }],
+            verifiedNativeHeldOperations: [{ operationId: pending.id, fingerprint: hash }],
+          },
+        },
+      ),
+      rejected("exhausted"),
+    ],
+    [
+      "resume verified native held operation legacy",
+      input(
+        { kind: "resume" },
+        {
+          run: {
+            status: "paused",
+            allowance: { ...run.allowance, attemptsConsumed: run.allowance.maxAttempts },
+          },
+          facts: { heldOperations: [pending], verifiedNativeHeldOperations: [] },
+        },
+      ),
+      rejected("exhausted"),
+    ],
+    [
       "resume charged native intent at final slot",
       input(
         { kind: "resume" },

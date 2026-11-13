@@ -115,6 +115,10 @@ type Facts = {
   readonly custody: "none" | "active" | "unknown";
   readonly activeWriterCount: number;
   readonly heldOperations: readonly HeldOperation[];
+  readonly verifiedNativeHeldOperations?: readonly {
+    readonly operationId: string;
+    readonly fingerprint: string;
+  }[];
   readonly heldNativeIntents?: readonly {
     readonly kind: "native_intent";
     readonly intentId: string;
@@ -458,7 +462,16 @@ const decide = ({
       if (
         run.allowance.attemptsConsumed > run.allowance.maxAttempts ||
         (run.allowance.attemptsConsumed === run.allowance.maxAttempts &&
-          !facts.heldNativeIntents?.length)
+          !facts.heldNativeIntents?.length &&
+          !(facts.verifiedNativeHeldOperations ?? []).some((verified) =>
+            facts.heldOperations.some(
+              (operation) =>
+                operation.id === verified.operationId &&
+                operation.fingerprint === verified.fingerprint &&
+                operation.status === "pending" &&
+                operation.provablyUnstarted,
+            ),
+          ))
       )
         return reject("exhausted");
       if (
