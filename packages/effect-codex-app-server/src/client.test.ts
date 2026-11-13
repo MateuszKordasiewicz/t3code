@@ -366,6 +366,12 @@ it.live("owns non-ending child stdin through repeated selected typed and raw sub
       const unexpected = yield* client.notify("initialized", {}).pipe(Effect.flip);
       assert.instanceOf(unexpected, CodexError.CodexAppServerRequestError);
       assert.strictEqual(yield* Queue.size(frames), 0);
+      yield* client.quiesceOutput;
+      yield* client.quiesceOutput;
+      assert.isTrue(yield* handle.isRunning);
+      const refused = yield* client.request("account/read", {}).pipe(Effect.flip);
+      assert.instanceOf(refused, CodexError.CodexAppServerFrameSubmissionError);
+      assert.strictEqual(yield* Queue.size(frames), 0);
     }).pipe(
       Effect.provideService(CodexClient.CodexAppServerControlledClient, service),
       Effect.ensuring(Scope.close(scope, Exit.void)),

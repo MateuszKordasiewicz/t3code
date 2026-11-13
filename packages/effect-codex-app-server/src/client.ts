@@ -360,6 +360,7 @@ const makeChildProcessClient = Effect.fn(
 export class CodexAppServerControlledClient extends Context.Service<
   CodexAppServerControlledClient,
   Omit<CodexAppServerClient["Service"], "raw" | "request" | "notify"> & {
+    readonly quiesceOutput: CodexProtocol.CodexAppServerControlledProtocol["quiesceOutput"];
     readonly raw: Omit<CodexAppServerClientRaw, "request" | "notify" | "respond" | "respondError"> &
       Pick<
         CodexProtocol.CodexAppServerControlledProtocol,
@@ -518,6 +519,7 @@ const makeOwnedControlledClient = Effect.fn(
     };
     return CodexAppServerControlledClient.of({
       ...state.handlers,
+      quiesceOutput: transport.quiesceOutput,
       awaitTermination: Deferred.await(state.termination),
       raw: {
         notifications: transport.incomingNotifications,

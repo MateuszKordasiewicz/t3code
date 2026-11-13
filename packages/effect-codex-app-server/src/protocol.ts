@@ -165,7 +165,12 @@ const toProtocolMessage = (
 const makeProtocolEngine = Effect.fn("makeCodexAppServerPatchedProtocol")(function* <E>(
   options: CodexAppServerPatchedProtocolOptions,
   controlled?: CodexAppServerControlledProtocolOptions<E>,
-): Effect.fn.Return<CodexAppServerControlledProtocol, never, Scope.Scope> {
+): Effect.fn.Return<
+  Omit<CodexAppServerControlledProtocol, "quiesceOutput"> &
+    Partial<Pick<CodexAppServerControlledProtocol, "quiesceOutput">>,
+  never,
+  Scope.Scope
+> {
   const protocolScope = yield* Scope.Scope;
   const requestHandlerScope = controlled
     ? yield* Scope.make("parallel")
@@ -580,10 +585,11 @@ const makeProtocolEngine = Effect.fn("makeCodexAppServerPatchedProtocol")(functi
     incomingNotifications: Stream.fromQueue(incomingNotifications),
     incomingRequests: Stream.fromQueue(incomingRequests),
     request: controlledRuntime ? controlledRuntime.requestSnapshot : request,
+    ...(controlledRuntime ? { quiesceOutput: controlledRuntime.quiesceOutput } : {}),
     notify,
     respond,
     respondError,
-  } satisfies CodexAppServerControlledProtocol;
+  };
 });
 
 const FRAME_BYTES_LIMIT = 1024 * 1024;
@@ -826,6 +832,7 @@ export const submitControlledCodexAppServerFrame = <E>(options: ControlledFrameO
 };
 
 export interface CodexAppServerControlledProtocol extends CodexAppServerPatchedProtocol {
+  readonly quiesceOutput: Effect.Effect<void, CodexError.CodexAppServerError>;
   readonly request: (
     method: string,
     payload?: unknown,
@@ -923,6 +930,9 @@ const makeControlledRuntime = Effect.fn("CodexAppServerProtocol.makeControlledRu
   const shutdownSignal =
     yield* Deferred.make<() => Effect.Effect<CodexError.CodexAppServerError>>();
   const shutdownDone = yield* Deferred.make<Exit.Exit<void>>();
+  const lifecycleStart = yield* Deferred.make<void>();
+  const quiesceDone = yield* Deferred.make<Exit.Exit<void, CodexError.CodexAppServerError>>();
+  let active: ControlledEnvelope | undefined;
   let closing = false;
   let outputBlock: CodexError.CodexAppServerFrameSubmissionError | undefined;
   let publicationFailure: CodexError.CodexAppServerFrameSubmissionError | undefined;
@@ -974,7 +984,13 @@ const makeControlledRuntime = Effect.fn("CodexAppServerProtocol.makeControlledRu
   const finish = Effect.fn("CodexAppServerProtocol.finishControlledFrame")(function* (
     entry: ControlledEnvelope,
   ) {
-    entry.local.phase = "done";
+    const local = entry.local;
+    if (local.cancelled && !local.error && local.outcome)
+      local.error = new CodexError.CodexAppServerFrameSubmissionError({
+        outcome: local.outcome.outcome,
+        reason: "interrupted",
+      });
+    local.phase = "done";
     yield* releaseCapacity(entry);
     yield* Deferred.succeed(entry.local.done, undefined);
     yield* publishResponse(entry);
@@ -1013,127 +1029,183 @@ const makeControlledRuntime = Effect.fn("CodexAppServerProtocol.makeControlledRu
     }
     yield* finish(entry);
   }, Effect.uninterruptible);
-  const processFrame = Effect.fn("CodexAppServerProtocol.processControlledFrame")(function* (
-    entry: ControlledEnvelope,
-  ) {
-    const local = entry.local;
-    local.dequeued = true;
-    if (local.phase === "done" || local.phase === "settling") {
-      yield* Deferred.await(local.done);
-      yield* releaseCapacity(entry);
-      return;
-    }
-    if (local.cancelled || closing || outputBlock) {
-      yield* settleKnown(
-        entry,
-        local.cancelled
-          ? new CodexError.CodexAppServerFrameSubmissionError({
-              outcome: "not_submitted",
-              reason: "interrupted",
-            })
-          : blockedError(),
-      );
-      return;
-    }
-    local.phase = "active";
-    const start = yield* Deferred.make<void>();
-    const previous = yield* CurrentControlledCallbacks;
-    const work = Deferred.await(start).pipe(
-      Effect.andThen(
-        Effect.suspend(() =>
-          submitControlledCodexAppServerFrame({
-            stdio: options.stdio,
-            encoded: local.frame.encoded,
-            ...(local.frame.selection !== null ? { selection: local.frame.selection } : {}),
-            ...(options.testSinkTimeoutMs !== undefined
-              ? { testSinkTimeoutMs: options.testSinkTimeoutMs }
-              : {}),
-            wrapper: (frame, submit) =>
-              options.wrapper(frame, () =>
-                Effect.suspend(() => {
-                  if (local.cancelled || closing) return Effect.fail(blockedError());
-                  return submit();
-                }),
-              ),
-            onOutcome: Effect.fn("CodexAppServerProtocol.recordLocalOutcome")(function* (
-              outcome: CodexAppServerFrameOutcome,
-            ) {
-              local.outcome = outcome;
-              yield* callHook(outcome);
-            }),
-          }),
-        ),
-      ),
-      Effect.result,
-      Effect.provideService(CurrentControlledCallbacks, new Set([...previous, marker])),
-      Effect.interruptible,
-    );
-    const child = yield* work.pipe(Effect.forkIn(writerScope));
-    local.fiber = child;
-    if (local.cancelled || closing) yield* Fiber.interrupt(child);
-    else yield* Deferred.succeed(start, undefined);
-    const exit = yield* Fiber.await(child);
-    delete local.fiber;
-    if (!local.outcome) {
-      const error =
-        Exit.isSuccess(exit) && Result.isFailure(exit.value)
-          ? exit.value.failure
-          : new CodexError.CodexAppServerFrameSubmissionError({
-              outcome:
-                Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)
-                  ? "not_submitted"
-                  : "unknown",
-              reason:
-                Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause) ? "interrupted" : "wrapper",
-              ...(Exit.isFailure(exit) ? { cause: exit.cause } : {}),
-            });
-      if (error.outcome === "not_submitted") {
-        yield* settleKnown(entry, error);
+  const processFrame = Effect.fn("CodexAppServerProtocol.processControlledFrame")(
+    function* (entry: ControlledEnvelope) {
+      const local = entry.local;
+      local.dequeued = true;
+      if (local.phase === "done" || local.phase === "settling") {
+        yield* Deferred.await(local.done);
+        yield* releaseCapacity(entry);
         return;
       }
-      local.outcome = Object.freeze({
-        frame: local.frame,
-        outcome: error.outcome,
-        reason: error.reason,
-      });
-      const publication = yield* Effect.exit(callHook(local.outcome));
-      local.error = Exit.isFailure(publication)
-        ? new CodexError.CodexAppServerFrameSubmissionError({
-            outcome: error.outcome,
-            reason: "outcome_hook",
-            cause: publication.cause,
-          })
-        : error;
-    } else if (Exit.isSuccess(exit) && Result.isFailure(exit.value))
-      local.error = exit.value.failure;
-    else if (Exit.isFailure(exit))
-      local.error = new CodexError.CodexAppServerFrameSubmissionError({
-        outcome: local.outcome.outcome,
-        reason: "interrupted",
-        cause: exit.cause,
-      });
-    if (
-      local.error &&
-      (local.error.outcome === "unknown" || local.error.reason === "outcome_hook")
-    ) {
-      if (local.error.reason === "outcome_hook") publicationFailure ??= local.error;
-      yield* blockOutput(local.error);
-    }
-    yield* finish(entry);
+      if (local.cancelled || closing || outputBlock) {
+        yield* settleKnown(
+          entry,
+          local.cancelled
+            ? new CodexError.CodexAppServerFrameSubmissionError({
+                outcome: "not_submitted",
+                reason: "interrupted",
+              })
+            : blockedError(),
+        );
+        return;
+      }
+      active = entry;
+      local.phase = "active";
+      const start = yield* Deferred.make<void>();
+      const previous = yield* CurrentControlledCallbacks;
+      const work = Deferred.await(start).pipe(
+        Effect.andThen(
+          Effect.suspend(() =>
+            submitControlledCodexAppServerFrame({
+              stdio: options.stdio,
+              encoded: local.frame.encoded,
+              ...(local.frame.selection !== null ? { selection: local.frame.selection } : {}),
+              ...(options.testSinkTimeoutMs !== undefined
+                ? { testSinkTimeoutMs: options.testSinkTimeoutMs }
+                : {}),
+              wrapper: (frame, submit) =>
+                options.wrapper(frame, () =>
+                  Effect.suspend(() => {
+                    if (local.cancelled || closing) return Effect.fail(blockedError());
+                    return submit();
+                  }),
+                ),
+              onOutcome: Effect.fn("CodexAppServerProtocol.recordLocalOutcome")(function* (
+                outcome: CodexAppServerFrameOutcome,
+              ) {
+                local.outcome = outcome;
+                yield* callHook(outcome);
+              }),
+            }),
+          ),
+        ),
+        Effect.result,
+        Effect.provideService(CurrentControlledCallbacks, new Set([...previous, marker])),
+        Effect.interruptible,
+      );
+      const child = yield* work.pipe(Effect.forkIn(writerScope));
+      local.fiber = child;
+      if (local.cancelled || closing) yield* Fiber.interrupt(child);
+      else yield* Deferred.succeed(start, undefined);
+      const exit = yield* Fiber.await(child);
+      delete local.fiber;
+      if (!local.outcome) {
+        const error =
+          Exit.isSuccess(exit) && Result.isFailure(exit.value)
+            ? exit.value.failure
+            : new CodexError.CodexAppServerFrameSubmissionError({
+                outcome:
+                  Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)
+                    ? "not_submitted"
+                    : "unknown",
+                reason:
+                  Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)
+                    ? "interrupted"
+                    : "wrapper",
+                ...(Exit.isFailure(exit) ? { cause: exit.cause } : {}),
+              });
+        if (error.outcome === "not_submitted") {
+          yield* settleKnown(entry, error);
+          return;
+        }
+        local.outcome = Object.freeze({
+          frame: local.frame,
+          outcome: error.outcome,
+          reason: error.reason,
+        });
+        const publication = yield* Effect.exit(callHook(local.outcome));
+        local.error = Exit.isFailure(publication)
+          ? new CodexError.CodexAppServerFrameSubmissionError({
+              outcome: error.outcome,
+              reason: "outcome_hook",
+              cause: publication.cause,
+            })
+          : error;
+      } else if (Exit.isSuccess(exit) && Result.isFailure(exit.value))
+        local.error = exit.value.failure;
+      else if (Exit.isFailure(exit))
+        local.error = new CodexError.CodexAppServerFrameSubmissionError({
+          outcome: local.outcome.outcome,
+          reason: "interrupted",
+          cause: exit.cause,
+        });
+      if (
+        local.error &&
+        (local.error.outcome === "unknown" || local.error.reason === "outcome_hook")
+      ) {
+        if (local.error.reason === "outcome_hook") publicationFailure ??= local.error;
+        yield* blockOutput(local.error);
+      }
+      yield* finish(entry);
+    },
+    Effect.uninterruptible,
+    Effect.ensuring(
+      Effect.sync(() => {
+        active = undefined;
+      }),
+    ),
+  );
+
+  const stopOutput = Effect.fn("CodexAppServerProtocol.stopControlledOutput")(function* () {
+    outputBlock ??= blockedError();
+    if (active?.local.phase === "active") active.local.cancelled = true;
+    yield* Queue.end(outgoing);
+    yield* Deferred.succeed(lifecycleStart, undefined);
   }, Effect.uninterruptible);
+  const quiesceOutput = Effect.uninterruptibleMask((restore) =>
+    Effect.gen(function* () {
+      if ((yield* CurrentControlledCallbacks).has(marker))
+        return yield* new CodexError.CodexAppServerFrameSubmissionError({
+          outcome: "not_submitted",
+          reason: "reentrant",
+        });
+      yield* stopOutput();
+      return yield* restore(Deferred.await(quiesceDone).pipe(Effect.flatten));
+    }),
+  );
 
   const terminate = Effect.fn("CodexAppServerProtocol.signalControlledTermination")(function* (
     classify: () => Effect.Effect<CodexError.CodexAppServerError>,
   ) {
     if (closing) return;
     closing = true;
-    yield* Queue.end(outgoing);
+    yield* stopOutput();
     yield* Deferred.succeed(input.terminationSignal, undefined);
     yield* Deferred.succeed(shutdownSignal, classify);
   }, Effect.uninterruptible);
 
-  // This actor owns shutdown so neither pump can join its own scope.
+  // This actor owns output settlement and shutdown so neither pump can join itself.
   yield* Effect.gen(function* () {
+    yield* Deferred.await(lifecycleStart);
+    const outputCleanups: Array<Exit.Exit<unknown>> = [];
+    if (active?.local.fiber)
+      outputCleanups.push(yield* Effect.exit(Fiber.interrupt(active.local.fiber)));
+    const writerExit = yield* Fiber.await(writer);
+    outputCleanups.push(writerExit);
+    for (;;) {
+      const queued = yield* Queue.poll(outgoing);
+      if (Option.isNone(queued)) break;
+      if (typeof queued.value === "string") continue;
+      const entry = queued.value;
+      entry.local.dequeued = true;
+      outputCleanups.push(yield* Effect.exit(settleKnown(entry, blockedError())));
+    }
+    if (publicationFailure) outputCleanups.push(Exit.die(publicationFailure));
+    const outputExit = combineControlledCleanup(outputCleanups);
+    yield* Deferred.succeed(
+      quiesceDone,
+      publicationFailure
+        ? Exit.fail(publicationFailure)
+        : Exit.isFailure(outputExit)
+          ? Exit.fail(
+              new CodexError.CodexAppServerTransportError({
+                operation: "write-output-stream",
+                cause: outputExit.cause,
+              }),
+            )
+          : Exit.void,
+    );
     const classify = yield* Deferred.await(shutdownSignal);
     const classified = yield* Effect.exit(Effect.suspend(classify));
     const error = Exit.isSuccess(classified)
@@ -1142,55 +1214,18 @@ const makeControlledRuntime = Effect.fn("CodexAppServerProtocol.makeControlledRu
           operation: "read-process-exit-status",
           cause: classified.cause,
         });
-    const cleanups: Array<Exit.Exit<unknown>> = [];
-    cleanups.push(
-      yield* Effect.exit(
-        Effect.gen(function* () {
-          yield* Ref.set(input.terminationFailure, Option.some(error));
-          cleanups.push(yield* Effect.exit(Scope.close(writerScope, Exit.void)));
-          for (;;) {
-            const queued = yield* Queue.poll(outgoing);
-            if (Option.isNone(queued)) break;
-            if (typeof queued.value === "string") continue;
-            const entry = queued.value;
-            entry.local.dequeued = true;
-            cleanups.push(
-              yield* Effect.exit(
-                settleKnown(
-                  entry,
-                  new CodexError.CodexAppServerFrameSubmissionError({
-                    outcome: "not_submitted",
-                    reason: entry.local.cancelled ? "interrupted" : "output_blocked",
-                    cause: error,
-                  }),
-                ),
-              ),
-            );
-          }
-        }),
-      ),
-    );
+    const cleanups: Array<Exit.Exit<unknown>> = [outputExit];
+    cleanups.push(yield* Effect.exit(Ref.set(input.terminationFailure, Option.some(error))));
+    cleanups.push(yield* Effect.exit(Scope.close(writerScope, Exit.void)));
     cleanups.push(yield* Effect.exit(input.failAllPending(error)));
     cleanups.push(yield* Effect.exit(Scope.close(input.inputScope, Exit.void)));
     cleanups.push(yield* Effect.exit(Scope.close(input.handlerScope, Exit.void)));
     const onTermination = options.onTermination;
     if (onTermination)
       cleanups.push(yield* Effect.exit(Effect.suspend(() => onTermination(error))));
-    if (publicationFailure) cleanups.push(Exit.die(publicationFailure));
     yield* Deferred.succeed(shutdownDone, combineControlledCleanup(cleanups));
   }).pipe(Effect.uninterruptible, Effect.forkIn(coordinatorScope, { startImmediately: true }));
-  yield* Scope.addFinalizer(
-    input.parent,
-    Effect.gen(function* () {
-      yield* terminate(() =>
-        Effect.succeed(new CodexError.CodexAppServerInputStreamEndedError({})),
-      );
-      const exit = yield* Deferred.await(shutdownDone);
-      const coordinatorClose = yield* Effect.exit(Scope.close(coordinatorScope, Exit.void));
-      return yield* combineControlledCleanup([exit, coordinatorClose]);
-    }).pipe(Effect.uninterruptible),
-  );
-  yield* Stream.fromQueue(outgoing).pipe(
+  const writer = yield* Stream.fromQueue(outgoing).pipe(
     Stream.runForEach((entry) =>
       typeof entry === "string"
         ? Effect.die("Unexpected raw frame in controlled writer")
@@ -1210,6 +1245,18 @@ const makeControlledRuntime = Effect.fn("CodexAppServerProtocol.makeControlledRu
     ),
     Effect.interruptible,
     Effect.forkIn(writerScope),
+  );
+
+  yield* Scope.addFinalizer(
+    input.parent,
+    Effect.gen(function* () {
+      yield* terminate(() =>
+        Effect.succeed(new CodexError.CodexAppServerInputStreamEndedError({})),
+      );
+      const exit = yield* Deferred.await(shutdownDone);
+      const coordinatorClose = yield* Effect.exit(Scope.close(coordinatorScope, Exit.void));
+      return yield* combineControlledCleanup([exit, coordinatorClose]);
+    }).pipe(Effect.uninterruptible),
   );
 
   const logFrame = Effect.fn("CodexAppServerProtocol.logControlledOutgoing")(function* (
@@ -1376,7 +1423,7 @@ const makeControlledRuntime = Effect.fn("CodexAppServerProtocol.makeControlledRu
       ? Effect.fail(owned.failure)
       : requestOwned(owned.success, selection);
   };
-  return { terminate, sendSnapshot, requestSnapshot };
+  return { terminate, sendSnapshot, requestSnapshot, quiesceOutput };
 }, Effect.uninterruptible);
 
 export const makeCodexAppServerPatchedProtocol = (
@@ -1401,5 +1448,11 @@ export const makeControlledCodexAppServerProtocol = <E>(
         reason: "invalid_frame",
       }),
     );
-  return makeProtocolEngine(owned, owned);
+  return makeProtocolEngine(owned, owned).pipe(
+    Effect.flatMap((protocol) =>
+      protocol.quiesceOutput
+        ? Effect.succeed({ ...protocol, quiesceOutput: protocol.quiesceOutput })
+        : Effect.die("Missing controlled output lifecycle"),
+    ),
+  );
 };

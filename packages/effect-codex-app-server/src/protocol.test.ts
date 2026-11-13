@@ -2113,6 +2113,7 @@ it.effect.each(["eof", "malformed"] as const)(
       if (kind === "eof") yield* Queue.end(peer.input);
       else yield* Queue.offer(peer.input, encoder.encode("{bad}\n"));
       const error = yield* Deferred.await(stopped);
+      yield* peer.transport.quiesceOutput;
       assert.strictEqual(
         error._tag,
         kind === "eof" ? "CodexAppServerInputStreamEndedError" : "CodexAppServerProtocolParseError",
@@ -2149,6 +2150,253 @@ it.effect.each(["selection", "oversize"] as const)(
             kind === "oversize" ? "frame_limit" : "invalid_frame",
           );
       }
+      assert.strictEqual(yield* Queue.size(peer.frames), 0);
+      assert.strictEqual(yield* Queue.size(peer.outcomes), 0);
+      assert.strictEqual(yield* Queue.size(peer.output), 0);
+    }),
+);
+
+it.effect.each([false, true])(
+  "controlled output quiescence joins active and queued outcomes after attempted=%s",
+  (attempted) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const hold = yield* Deferred.make<void>();
+      const hookEntered = yield* Deferred.make<void>();
+      const releaseHook = yield* Deferred.make<void>();
+      const finished = yield* Deferred.make<void>();
+      const terminated = yield* Deferred.make<void>();
+      let wrapperReleased = false;
+      const peer = yield* makeControlledPeer({
+        wrapper: (_frame, submit) =>
+          Effect.gen(function* () {
+            if (attempted) yield* submit();
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(hold);
+            return yield* submit();
+          }).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                wrapperReleased = true;
+              }),
+            ),
+          ),
+        onOutcome: (outcome) =>
+          outcome.frame.method === "active"
+            ? Effect.gen(function* () {
+                assert.isTrue(wrapperReleased);
+                yield* Deferred.succeed(hookEntered, undefined);
+                yield* Deferred.await(releaseHook);
+              })
+            : Effect.void,
+        onTermination: () => Deferred.succeed(terminated, undefined).pipe(Effect.asVoid),
+      });
+      const active = yield* Effect.result(peer.transport.request("active")).pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      yield* Deferred.await(entered);
+      yield* Queue.take(peer.frames);
+      const queued = yield* Effect.result(peer.transport.notify("queued")).pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      const quiescing = yield* peer.transport.quiesceOutput.pipe(
+        Effect.tap(() => Deferred.succeed(finished, undefined)),
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      yield* Deferred.await(hookEntered);
+      assert.isFalse(yield* Deferred.isDone(finished));
+      assert.isFalse(yield* Deferred.isDone(terminated));
+      const refused = yield* peer.transport.notify("too-late").pipe(Effect.flip);
+      assert.isTrue(isControlledFrameFailure(refused));
+      if (isControlledFrameFailure(refused)) assert.strictEqual(refused.reason, "output_blocked");
+      yield* Deferred.succeed(releaseHook, undefined);
+      yield* Fiber.join(quiescing);
+      yield* peer.transport.quiesceOutput;
+      assert.strictEqual((yield* Fiber.join(active))._tag, "Failure");
+      assert.strictEqual((yield* Fiber.join(queued))._tag, "Failure");
+      const outcomes = yield* Queue.takeN(peer.outcomes, 2);
+      assert.deepStrictEqual(
+        outcomes.map((o) => [o.frame.method, o.outcome]),
+        [
+          ["active", attempted ? "unknown" : "not_submitted"],
+          ["queued", "not_submitted"],
+        ],
+      );
+      assert.strictEqual(yield* Queue.size(peer.output), attempted ? 1 : 0);
+      assert.strictEqual(yield* Queue.size(peer.frames), 0);
+      assert.isFalse(yield* Deferred.isDone(terminated));
+    }),
+);
+
+it.effect("controlled output quiescence preserves submitted response waits and late input", () =>
+  Effect.gen(function* () {
+    const notification = yield* Deferred.make<void>();
+    const terminated = yield* Deferred.make<void>();
+    const peer = yield* makeControlledPeer({
+      onNotification: () => Deferred.succeed(notification, undefined).pipe(Effect.asVoid),
+      onTermination: () => Deferred.succeed(terminated, undefined).pipe(Effect.asVoid),
+    });
+    const response = yield* peer.transport.request("submitted").pipe(Effect.forkScoped);
+    yield* Queue.take(peer.output);
+    assert.strictEqual((yield* Queue.take(peer.outcomes)).outcome, "submitted");
+    yield* peer.transport.notify("fifo-completion-barrier");
+    yield* Queue.take(peer.output);
+    assert.strictEqual((yield* Queue.take(peer.outcomes)).frame.method, "fifo-completion-barrier");
+    yield* Effect.all([peer.transport.quiesceOutput, peer.transport.quiesceOutput], {
+      concurrency: "unbounded",
+    });
+    yield* Queue.offer(peer.input, encodeJsonl({ method: "late-input" }));
+    yield* Deferred.await(notification);
+    yield* Queue.offer(peer.input, encodeJsonl({ id: 1, result: "late-response" }));
+    assert.strictEqual(yield* Fiber.join(response), "late-response");
+    assert.isFalse(yield* Deferred.isDone(terminated));
+    assert.strictEqual(yield* Queue.size(peer.outcomes), 0);
+  }),
+);
+
+it.effect.each(["wrapper", "hook", "logger"] as const)(
+  "controlled output quiescence rejects reentrancy from %s without closing output",
+  (location) =>
+    Effect.gen(function* () {
+      const rejected = yield* Queue.unbounded<string>();
+      let transport: CodexProtocol.CodexAppServerControlledProtocol | undefined;
+      const recurse = Effect.fn("test.reenterControlledQuiescence")(function* () {
+        if (!transport) return yield* Effect.die("transport not initialized");
+        const result = yield* Effect.result(transport.quiesceOutput);
+        assert.strictEqual(result._tag, "Failure");
+        if (result._tag === "Failure") {
+          assert.isTrue(isControlledFrameFailure(result.failure));
+          if (isControlledFrameFailure(result.failure))
+            yield* Queue.offer(rejected, result.failure.reason);
+        }
+      });
+      const peer = yield* makeControlledPeer({
+        logOutgoing: location === "logger",
+        logger: () => recurse(),
+        wrapper: (_frame, submit) =>
+          location === "wrapper" ? recurse().pipe(Effect.andThen(submit())) : submit(),
+        onOutcome: () => (location === "hook" ? recurse() : Effect.void),
+      });
+      transport = peer.transport;
+      yield* transport.notify("first");
+      const count = location === "logger" ? 2 : 1;
+      assert.deepStrictEqual(yield* Queue.takeN(rejected, count), Array(count).fill("reentrant"));
+      yield* transport.notify("second");
+      assert.strictEqual((yield* Queue.takeN(peer.output, 2)).length, 2);
+      yield* transport.quiesceOutput;
+    }),
+);
+
+it.effect("interrupted quiescence caller leaves owned cleanup for concurrent physical close", () =>
+  Effect.gen(function* () {
+    const scope = yield* Effect.acquireRelease(Scope.make("sequential"), (scope) =>
+      Scope.close(scope, Exit.void),
+    );
+    const hookEntered = yield* Deferred.make<void>();
+    const releaseHook = yield* Deferred.make<void>();
+    const closed = yield* Deferred.make<void>();
+    const terminations = yield* Queue.unbounded<CodexError.CodexAppServerError>();
+    const peer = yield* makeControlledPeer({
+      wrapper: () => Effect.never,
+      onOutcome: () =>
+        Deferred.succeed(hookEntered, undefined).pipe(Effect.andThen(Deferred.await(releaseHook))),
+      onTermination: (error) => Queue.offer(terminations, error).pipe(Effect.asVoid),
+    }).pipe(Scope.provide(scope));
+    const active = yield* Effect.result(peer.transport.notify("active")).pipe(
+      Effect.forkScoped({ startImmediately: true }),
+    );
+    yield* Queue.take(peer.frames);
+    const quiescing = yield* peer.transport.quiesceOutput.pipe(
+      Effect.forkIn(scope, { startImmediately: true }),
+    );
+    yield* Deferred.await(hookEntered);
+    yield* Fiber.interrupt(quiescing);
+    const closing = yield* Scope.close(scope, Exit.void).pipe(
+      Effect.tap(() => Deferred.succeed(closed, undefined)),
+      Effect.forkScoped({ startImmediately: true }),
+    );
+    assert.isFalse(yield* Deferred.isDone(closed));
+    yield* Deferred.succeed(releaseHook, undefined);
+    yield* Fiber.join(closing);
+    assert.strictEqual((yield* Fiber.join(active))._tag, "Failure");
+    assert.strictEqual((yield* Queue.take(peer.outcomes)).outcome, "not_submitted");
+    assert.strictEqual(yield* Queue.size(peer.outcomes), 0);
+    yield* Queue.take(terminations);
+    assert.strictEqual(yield* Queue.size(terminations), 0);
+    yield* peer.transport.quiesceOutput;
+  }),
+);
+
+it.effect("controlled output quiescence preserves hook failure through physical close", () =>
+  Effect.gen(function* () {
+    const scope = yield* Effect.acquireRelease(Scope.make("sequential"), (scope) =>
+      Scope.close(scope, Exit.void),
+    );
+    const peer = yield* makeControlledPeer({
+      onOutcome: () => Effect.die("failed outcome publication"),
+    }).pipe(Scope.provide(scope));
+    const failed = yield* peer.transport.notify("failed-hook").pipe(Effect.flip);
+    assert.isTrue(isControlledFrameFailure(failed));
+    const quiesced = yield* Effect.exit(peer.transport.quiesceOutput);
+    assert.isTrue(Exit.isFailure(quiesced));
+    const again = yield* Effect.exit(peer.transport.quiesceOutput);
+    assert.deepStrictEqual(again, quiesced);
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(Scope.close(scope, Exit.void))));
+  }),
+);
+
+it.effect(
+  "controlled output quiescence waits for an active submitted hook without losing its outcome",
+  () =>
+    Effect.gen(function* () {
+      const hookEntered = yield* Deferred.make<void>();
+      const releaseHook = yield* Deferred.make<void>();
+      const quiesced = yield* Deferred.make<void>();
+      const peer = yield* makeControlledPeer({
+        onOutcome: () =>
+          Deferred.succeed(hookEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseHook)),
+          ),
+      });
+      const active = yield* Effect.result(peer.transport.request("active-hook")).pipe(
+        Effect.forkScoped,
+      );
+      yield* Deferred.await(hookEntered);
+      const quiescing = yield* peer.transport.quiesceOutput.pipe(
+        Effect.tap(() => Deferred.succeed(quiesced, undefined)),
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      assert.isFalse(yield* Deferred.isDone(quiesced));
+      yield* Queue.offer(peer.input, encodeJsonl({ id: 1, result: "must-not-publish" }));
+      yield* Deferred.succeed(releaseHook, undefined);
+      yield* Fiber.join(quiescing);
+      const result = yield* Fiber.join(active);
+      assert.strictEqual(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.isTrue(isControlledFrameFailure(result.failure));
+        if (isControlledFrameFailure(result.failure))
+          assert.strictEqual(result.failure.outcome, "submitted");
+      }
+      assert.strictEqual((yield* Queue.take(peer.outcomes)).outcome, "submitted");
+      assert.strictEqual(yield* Queue.size(peer.outcomes), 0);
+      assert.strictEqual(yield* Queue.size(peer.output), 1);
+    }),
+);
+
+it.effect(
+  "controlled output lifecycle constructs safely under an already closed parent scope",
+  () =>
+    Effect.gen(function* () {
+      const scope = yield* Scope.make("sequential");
+      yield* Scope.close(scope, Exit.void);
+      const terminated = yield* Deferred.make<void>();
+      const peer = yield* makeControlledPeer({
+        onTermination: () => Deferred.succeed(terminated, undefined).pipe(Effect.asVoid),
+      }).pipe(Scope.provide(scope));
+      yield* Deferred.await(terminated);
+      yield* peer.transport.quiesceOutput;
+      const result = yield* Effect.result(peer.transport.notify("closed"));
+      assert.strictEqual(result._tag, "Failure");
       assert.strictEqual(yield* Queue.size(peer.frames), 0);
       assert.strictEqual(yield* Queue.size(peer.outcomes), 0);
       assert.strictEqual(yield* Queue.size(peer.output), 0);
