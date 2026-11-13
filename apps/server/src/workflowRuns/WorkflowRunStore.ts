@@ -2551,6 +2551,93 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
   }) {
     return yield* inTransaction(readThreadCustodyInTransaction(input.threadId));
   });
+  const readNativeReservationInTransaction = Effect.fn(
+    "WorkflowRunStore.readNativeReservationInTransaction",
+  )(
+    function* (input: { readonly intentId: string }) {
+      if (typeof input !== "object" || input === null || Object.keys(input).join() !== "intentId")
+        return yield* integrity();
+      const intentId = input.intentId;
+      if (typeof intentId !== "string" || intentId.length === 0) return yield* integrity();
+      if (Option.isNone(yield* Effect.serviceOption(sql.transactionService)))
+        return yield* integrity();
+      const rows =
+        yield* sql<IntentRow>`SELECT * FROM workflow_native_launch_intents WHERE intent_id = ${intentId}`;
+      const row = rows[0];
+      if (rows.length !== 1 || !row) return yield* integrity();
+      const custody = yield* readThreadCustodyInTransaction(row.thread_id);
+      const owner =
+        row.workflow_run_id !== null && row.planning_session_id === null
+          ? { kind: "workflow_run" as const, workflowRunId: row.workflow_run_id }
+          : row.workflow_run_id === null && row.planning_session_id !== null
+            ? { kind: "planning_session" as const, planningSessionId: row.planning_session_id }
+            : undefined;
+      if (!owner || custody.kind !== "owned" || !sameCustodyValue(custody.owner, owner))
+        return yield* integrity();
+      const draft = yield* Effect.try({ try: () => parse(row.draft_json), catch: integrity });
+      if (
+        typeof draft !== "object" ||
+        draft === null ||
+        !("version" in draft) ||
+        draft.version !== 2
+      )
+        return yield* integrity();
+      const receipts = yield* sql<{
+        command_id: string;
+        receipt_id: string;
+        fingerprint: string;
+      }>`SELECT command_id, receipt_id, fingerprint FROM workflow_native_intent_receipts WHERE intent_id = ${intentId}`;
+      const materials = yield* sql<{
+        material_json: string;
+        material_hash: string;
+      }>`SELECT material_json, material_hash FROM workflow_native_reservation_material WHERE intent_id = ${intentId}`;
+      if (receipts.length !== 1 || !receipts[0] || materials.length !== 1 || !materials[0])
+        return yield* integrity();
+      const raw = yield* Effect.try({
+        try: () => parse(materials[0]!.material_json),
+        catch: integrity,
+      });
+      const decoded = yield* decodeNativeReservationMaterial(raw).pipe(Effect.mapError(integrity));
+      if (
+        decoded.materialHash !== materials[0].material_hash ||
+        decoded.material.intentId !== row.intent_id ||
+        decoded.material.intentFingerprint !== row.fingerprint ||
+        receipts[0].fingerprint !== row.fingerprint ||
+        decoded.material.intentFingerprint !== receipts[0].fingerprint ||
+        decoded.material.receiptId !== receipts[0].receipt_id
+      )
+        return yield* integrity();
+      return {
+        ...decoded,
+        intentId: row.intent_id,
+        receiptId: receipts[0].receipt_id,
+        reservationCommandId: receipts[0].command_id,
+        fingerprint: row.fingerprint,
+        owner,
+        operationId: row.operation_id,
+        attemptId: row.attempt_id,
+        passId: row.pass_id,
+        itemId: row.item_id,
+        chargeAttempt: row.charge_attempt === 1,
+        repair: row.repair === 1,
+        role: row.role,
+        destination: { environmentId: row.environment_id, projectId: row.project_id },
+        launchCommandId: row.launch_command_id,
+        threadId: row.thread_id,
+        messageId: row.message_id,
+        generation: row.generation!,
+        state: row.state,
+        held: row.held === 1,
+        bootId: row.boot_id,
+        workerId: row.worker_id,
+        nativeRunId: row.native_run_id,
+        finalizedOperationId: row.finalized_operation_id,
+      };
+    },
+    Effect.mapError((error) =>
+      isStoreError(error) ? error : new WorkflowRunStoreError({ reason: "persistence" }),
+    ),
+  );
   const readRecoveryCustodyInTransaction = Effect.fn(
     "WorkflowRunStore.readRecoveryCustodyInTransaction",
   )(
@@ -4099,6 +4186,7 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     reserveWorkflowNativeIntent,
     reservePlanningNativeIntent,
     readThreadCustody,
+    readNativeReservationInTransaction,
     readRecoveryCustodyInTransaction,
     subscribeChanges,
     listPending,

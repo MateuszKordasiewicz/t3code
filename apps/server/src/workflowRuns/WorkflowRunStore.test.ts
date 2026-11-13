@@ -778,6 +778,48 @@ it.effect("stored V3 workflow material provides custody and retains bytes throug
       ...reserved,
       kind: "replay",
     });
+    assert.strictEqual(
+      (yield* Effect.flip(store.readNativeReservationInTransaction({ intentId: input.intentId })))
+        .reason,
+      "integrity",
+    );
+    const read = () =>
+      sql.withTransaction(store.readNativeReservationInTransaction({ intentId: input.intentId }));
+    const first = yield* read();
+    assert.deepStrictEqual(first.owner, { kind: "workflow_run", workflowRunId: run.id });
+    assert.deepStrictEqual<unknown>(first.material.launch, input.launch);
+    assert.strictEqual(first.receiptId, input.receiptId);
+    assert.strictEqual(first.state, "reserved");
+    const selected = { intentId: input.intentId };
+    let selectionChanged = false;
+    const mutateSelection: Statement.Transformer = (statement) => {
+      const [query, parameters] = statement.compile();
+      return Effect.sync(() => {
+        if (
+          !selectionChanged &&
+          query.includes("SELECT * FROM workflow_native_launch_intents WHERE intent_id") &&
+          parameters.includes(input.intentId)
+        ) {
+          selected.intentId = "missing";
+          selectionChanged = true;
+        }
+        return statement;
+      });
+    };
+    const captured = yield* sql
+      .withTransaction(store.readNativeReservationInTransaction(selected))
+      .pipe(Effect.provideService(Statement.CurrentTransformer, mutateSelection));
+    assert.isTrue(selectionChanged);
+    assert.strictEqual(captured.intentId, input.intentId);
+    assert.strictEqual(captured.material.intentId, input.intentId);
+    (first.material.launch.initialMessage.attachments as unknown[]).push({ altered: true });
+    assert.deepStrictEqual<unknown>((yield* read()).material.launch, input.launch);
+    assert.strictEqual(
+      (yield* Effect.flip(
+        sql.withTransaction(store.readNativeReservationInTransaction({ intentId: "missing" })),
+      )).reason,
+      "integrity",
+    );
     const before = yield* sql`SELECT draft_json, fingerprint FROM workflow_native_launch_intents`;
     const receipt = yield* sql`SELECT * FROM workflow_native_intent_receipts`;
     const material = yield* sql`SELECT * FROM workflow_native_reservation_material`;
@@ -962,6 +1004,12 @@ it.effect.each([
       yield* sql`UPDATE workflow_native_launch_intents SET fingerprint = ${legacy}`;
       yield* sql`UPDATE workflow_native_intent_receipts SET fingerprint = ${legacy}, result_json = ${json({ intentId: input.intentId, fingerprint: legacy })}`;
     }
+    assert.strictEqual(
+      (yield* Effect.flip(
+        sql.withTransaction(store.readNativeReservationInTransaction({ intentId: input.intentId })),
+      )).reason,
+      "integrity",
+    );
     const beforeRun = yield* sql`SELECT * FROM workflow_runs`;
     const beforeIntent = yield* sql`SELECT * FROM workflow_native_launch_intents`;
     const beforeReceipt = yield* sql`SELECT * FROM workflow_native_intent_receipts`;
@@ -1019,6 +1067,12 @@ it.effect("stored V3 material SQL failures map to persistence", () =>
     yield* storedV3(input);
     yield* sql`DROP TABLE workflow_native_reservation_material`;
     assert.strictEqual(
+      (yield* Effect.flip(
+        sql.withTransaction(store.readNativeReservationInTransaction({ intentId: input.intentId })),
+      )).reason,
+      "persistence",
+    );
+    assert.strictEqual(
       (yield* Effect.flip(store.readThreadCustody({ threadId: input.threadId }))).reason,
       "persistence",
     );
@@ -1047,6 +1101,12 @@ it.effect("unanchored material does not promote a legacy workflow reservation", 
     );
     yield* seedHistoricalReservation(input, 2);
     yield* sql`INSERT INTO workflow_native_reservation_material VALUES (${input.intentId}, '{}', ${hash})`;
+    assert.strictEqual(
+      (yield* Effect.flip(
+        sql.withTransaction(store.readNativeReservationInTransaction({ intentId: input.intentId })),
+      )).reason,
+      "integrity",
+    );
     assert.strictEqual(
       (yield* store.readThreadCustody({ threadId: input.threadId })).kind,
       "owned",
@@ -5378,6 +5438,14 @@ it.effect("planning material retains the exact charged snapshot through controls
       const reserved = yield* store.reservePlanningNativeIntent(input);
       assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 1);
       const owner = yield* store.getPlanning({ sessionId: session.id });
+      const reservation = yield* sql.withTransaction(
+        store.readNativeReservationInTransaction({ intentId: input.intentId }),
+      );
+      assert.deepStrictEqual(reservation.owner, {
+        kind: "planning_session",
+        planningSessionId: session.id,
+      });
+      assert.deepStrictEqual(reservation.material.planningSession, owner);
       const rows = yield* sql<{
         material_json: string;
         material_hash: string;
@@ -5647,6 +5715,12 @@ it.effect.each([
       yield* sql`CREATE TRIGGER workflow_native_reservation_material_delete_guard BEFORE DELETE ON workflow_native_reservation_material BEGIN SELECT RAISE(ABORT, 'workflow native reservation material is immutable'); END`;
     }
     const before = yield* sql`SELECT * FROM workflow_planning_sessions`;
+    assert.strictEqual(
+      (yield* Effect.flip(
+        sql.withTransaction(store.readNativeReservationInTransaction({ intentId: input.intentId })),
+      )).reason,
+      "integrity",
+    );
     assert.strictEqual(
       (yield* Effect.flip(store.reservePlanningNativeIntent(input))).reason,
       "integrity",
