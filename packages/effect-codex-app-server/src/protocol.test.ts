@@ -1,3 +1,10 @@
+// @effect-diagnostics nodeBuiltinImport:off
+// Real Node Writable fixtures verify backpressure at the actual write boundary.
+import * as Cause from "effect/Cause";
+import * as NodeStream from "node:stream";
+import * as NodeSink from "@effect/platform-node/NodeSink";
+import * as Exit from "effect/Exit";
+import * as Scope from "effect/Scope";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -889,3 +896,504 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
     }),
   );
 });
+
+const makeControlledFrameWritable = Effect.fn("test.makeControlledFrameWritable")(function* (
+  blocked = true,
+) {
+  const writes = yield* Queue.unbounded<string>();
+  const callbacks = yield* Queue.unbounded<(error?: Error | null) => void>();
+  const writable = yield* Effect.acquireRelease(
+    Effect.sync(
+      () =>
+        new NodeStream.Writable({
+          highWaterMark: blocked ? 1 : 2 * 1024 * 1024,
+          write(chunk: Buffer, _encoding, callback) {
+            Queue.offerUnsafe(writes, chunk.toString("utf8"));
+            if (blocked) Queue.offerUnsafe(callbacks, callback);
+            else callback();
+          },
+        }),
+    ),
+    (stream) =>
+      Effect.sync(() => {
+        stream.destroy();
+      }),
+  );
+  const stdio = Stdio.make({
+    args: Effect.succeed([]),
+    stdin: Stream.never,
+    stderr: () => Sink.drain,
+    stdout: () =>
+      NodeSink.fromWritable({
+        evaluate: () => writable,
+        endOnDone: false,
+        onError: (cause) =>
+          PlatformError.systemError({
+            module: "Stream",
+            method: "write",
+            _tag: "Unknown",
+            cause,
+          }),
+      }),
+  });
+  return { writes, callbacks, writable, stdio };
+});
+const controlledFrame = '{"id":7,"method":"turn/start","params":{"text":"owned"}}\n';
+
+it.effect(
+  "controlled frame submission spans actual write and drain with owned input and open stdin",
+  () =>
+    Effect.gen(function* () {
+      const io = yield* makeControlledFrameWritable();
+      const outcomes = yield* Queue.unbounded<CodexProtocol.CodexAppServerFrameOutcome>();
+      let wrapperOpen = false;
+      const options = {
+        stdio: io.stdio,
+        encoded: controlledFrame,
+        selection: "native-selection",
+        wrapper: (
+          frame: CodexProtocol.CodexAppServerControlledFrame,
+          submit: CodexProtocol.CodexAppServerFrameSubmit,
+        ) =>
+          Effect.gen(function* () {
+            wrapperOpen = true;
+            assert.strictEqual(frame.encoded, controlledFrame);
+            assert.strictEqual(frame.method, "turn/start");
+            assert.strictEqual(frame.requestId, 7);
+            assert.strictEqual(frame.selection, "native-selection");
+            assert.isTrue(Object.isFrozen(frame));
+            return yield* submit();
+          }).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                wrapperOpen = false;
+              }),
+            ),
+          ),
+        onOutcome: (outcome: CodexProtocol.CodexAppServerFrameOutcome) =>
+          Effect.gen(function* () {
+            assert.isFalse(wrapperOpen);
+            yield* Queue.offer(outcomes, outcome);
+          }),
+      };
+      const pending = CodexProtocol.submitControlledCodexAppServerFrame(options);
+      options.encoded = '{"method":"mutated"}\n';
+      options.selection = "mutated";
+      const fiber = yield* pending.pipe(Effect.forkScoped);
+      assert.strictEqual(yield* Queue.take(io.writes), controlledFrame);
+      assert.isTrue(wrapperOpen);
+      assert.strictEqual(yield* Queue.size(outcomes), 0);
+      const releaseDrain = yield* Queue.take(io.callbacks);
+      yield* Effect.sync(releaseDrain);
+      const result = yield* Fiber.join(fiber);
+      assert.strictEqual(result.outcome, "submitted");
+      assert.isTrue(Object.isFrozen(result));
+      assert.deepStrictEqual(yield* Queue.take(outcomes), result);
+      assert.isFalse(io.writable.writableEnded);
+      assert.isFalse(io.writable.destroyed);
+      const next = yield* CodexProtocol.submitControlledCodexAppServerFrame({
+        ...options,
+        encoded: controlledFrame,
+        selection: "native-selection",
+      }).pipe(Effect.forkScoped);
+      assert.strictEqual(yield* Queue.take(io.writes), controlledFrame);
+      const releaseNextDrain = yield* Queue.take(io.callbacks);
+      yield* Effect.sync(releaseNextDrain);
+      assert.strictEqual((yield* Fiber.join(next)).outcome, "submitted");
+      assert.isFalse(io.writable.writableEnded);
+    }),
+);
+
+it.effect(
+  "controlled frame submission retains unknown after successful write and wrapper commit failure",
+  () =>
+    Effect.gen(function* () {
+      const io = yield* makeControlledFrameWritable(false);
+      const outcomes = yield* Queue.unbounded<CodexProtocol.CodexAppServerFrameOutcome>();
+      const result = yield* Effect.result(
+        CodexProtocol.submitControlledCodexAppServerFrame({
+          stdio: io.stdio,
+          encoded: controlledFrame,
+          wrapper: (_frame, submit) =>
+            Effect.gen(function* () {
+              yield* submit();
+              return yield* Effect.fail("commit-failed");
+            }),
+          onOutcome: (outcome) => Queue.offer(outcomes, outcome).pipe(Effect.asVoid),
+        }),
+      );
+      assert.strictEqual(yield* Queue.take(io.writes), controlledFrame);
+      assert.strictEqual(result._tag, "Failure");
+      if (result._tag === "Failure") assert.strictEqual(result.failure.outcome, "unknown");
+      assert.strictEqual((yield* Queue.take(outcomes)).outcome, "unknown");
+    }),
+);
+
+const controlledFrameFixture = Effect.fn("test.controlledFrameFixture")(function* (
+  blocked = false,
+) {
+  const io = yield* makeControlledFrameWritable(blocked);
+  const outcomes = yield* Queue.unbounded<CodexProtocol.CodexAppServerFrameOutcome>();
+  return {
+    ...io,
+    outcomes,
+    options: {
+      stdio: io.stdio,
+      encoded: controlledFrame,
+      wrapper: (
+        _frame: CodexProtocol.CodexAppServerControlledFrame,
+        submit: CodexProtocol.CodexAppServerFrameSubmit,
+      ) => submit(),
+      onOutcome: (outcome: CodexProtocol.CodexAppServerFrameOutcome) =>
+        Queue.offer(outcomes, outcome).pipe(Effect.asVoid),
+    },
+  };
+});
+
+it.effect.each([
+  "",
+  "{}\n",
+  "[]\n",
+  "null\n",
+  "{bad}\n",
+  '{"method":7}\n',
+  '{"method":"turn/start","method":"model/list"}\n',
+  '{"id":7,"id":8,"method":"turn/start"}\n',
+  '{"id":"' + String.fromCharCode(0xd800) + '","method":"turn/start"}\n',
+  '{"id":9007199254740992,"method":"turn/start"}\n',
+  '{"id":1.5,"method":"turn/start"}\n',
+  '{"method":"turn/start","id":null}\n',
+  '{"method":"turn/start"}',
+  '{"method":"turn/start"}\n{}\n',
+  '{\n"method":"turn/start"}\n',
+])("controlled frame submission denies invalid JSONL %j before wrapper or write", (encoded) =>
+  Effect.gen(function* () {
+    const io = yield* controlledFrameFixture();
+    const result = yield* Effect.result(
+      CodexProtocol.submitControlledCodexAppServerFrame({
+        ...io.options,
+        encoded,
+        wrapper: () => Effect.die("invalid frame must never enter wrapper"),
+      }),
+    );
+    assert.strictEqual(result._tag, "Failure");
+    if (result._tag === "Failure") {
+      assert.strictEqual(result.failure.outcome, "not_submitted");
+      assert.strictEqual(result.failure.reason, "invalid_frame");
+    }
+    assert.strictEqual(yield* Queue.size(io.writes), 0);
+    assert.strictEqual(yield* Queue.size(io.outcomes), 0);
+  }),
+);
+
+it.effect.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY, 2001])(
+  "controlled frame submission rejects invalid Sink interval %s",
+  (testSinkTimeoutMs) =>
+    Effect.gen(function* () {
+      const io = yield* controlledFrameFixture();
+      const result = yield* Effect.result(
+        CodexProtocol.submitControlledCodexAppServerFrame({
+          ...io.options,
+          testSinkTimeoutMs,
+          wrapper: () => Effect.die("invalid limit must never enter wrapper"),
+        }),
+      );
+      assert.strictEqual(result._tag, "Failure");
+      if (result._tag === "Failure") assert.strictEqual(result.failure.reason, "invalid_timeout");
+      assert.strictEqual(yield* Queue.size(io.writes), 0);
+    }),
+);
+
+it.effect.each([0, 1])(
+  "controlled frame submission enforces exact UTF8 cap with extra byte %s",
+  (extra) =>
+    Effect.gen(function* () {
+      const io = yield* controlledFrameFixture();
+      const empty = '{"id":7,"method":"turn/start","params":""}\n';
+      const remaining = 1048576 - Buffer.byteLength(empty);
+      const text = "é".repeat(Math.floor(remaining / 2)) + "x".repeat((remaining % 2) + extra);
+      const encoded = `{"id":7,"method":"turn/start","params":"${text}"}\n`;
+      assert.strictEqual(Buffer.byteLength(encoded), 1048576 + extra);
+      const result = yield* Effect.result(
+        CodexProtocol.submitControlledCodexAppServerFrame({ ...io.options, encoded }),
+      );
+      if (extra === 0) {
+        assert.strictEqual(result._tag, "Success");
+        assert.strictEqual(Buffer.byteLength(yield* Queue.take(io.writes)), 1048576);
+        assert.strictEqual((yield* Queue.take(io.outcomes)).outcome, "submitted");
+      } else {
+        assert.strictEqual(result._tag, "Failure");
+        if (result._tag === "Failure") {
+          assert.strictEqual(result.failure.outcome, "not_submitted");
+          assert.strictEqual(result.failure.reason, "frame_limit");
+        }
+        assert.strictEqual(yield* Queue.size(io.writes), 0);
+        assert.strictEqual(yield* Queue.size(io.outcomes), 0);
+      }
+    }),
+);
+
+it.effect.each([false, true])(
+  "controlled frame submission forbids repeated continuation after attempted=%s",
+  (attempt) =>
+    Effect.gen(function* () {
+      const io = yield* controlledFrameFixture();
+      const result = yield* Effect.result(
+        CodexProtocol.submitControlledCodexAppServerFrame({
+          ...io.options,
+          wrapper: (_frame, submit) =>
+            Effect.gen(function* () {
+              if (!attempt)
+                return yield* Effect.scoped(
+                  submit().pipe(Effect.forkScoped, Effect.flatMap(Fiber.join)),
+                );
+              const receipt = yield* submit();
+              yield* Effect.result(submit());
+              return receipt;
+            }),
+        }),
+      );
+      assert.strictEqual(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.strictEqual(result.failure.reason, "continuation");
+        assert.strictEqual(result.failure.outcome, attempt ? "unknown" : "not_submitted");
+      }
+      assert.strictEqual(yield* Queue.size(io.writes), attempt ? 1 : 0);
+      assert.strictEqual(
+        (yield* Queue.take(io.outcomes)).outcome,
+        attempt ? "unknown" : "not_submitted",
+      );
+    }),
+);
+
+it.effect(
+  "controlled frame submission rejects escaped continuation and foreign receipt without writing",
+  () =>
+    Effect.gen(function* () {
+      const io = yield* controlledFrameFixture();
+      let escaped: CodexProtocol.CodexAppServerFrameSubmit | undefined;
+      let oldReceipt:
+        | Effect.Success<ReturnType<CodexProtocol.CodexAppServerFrameSubmit>>
+        | undefined;
+      yield* CodexProtocol.submitControlledCodexAppServerFrame({
+        ...io.options,
+        wrapper: (_frame, submit) =>
+          Effect.gen(function* () {
+            escaped = submit;
+            oldReceipt = yield* submit();
+            return oldReceipt;
+          }),
+      });
+      assert.strictEqual(yield* Queue.take(io.writes), controlledFrame);
+      if (!escaped || !oldReceipt) throw new Error("expected captured continuation and receipt");
+      assert.strictEqual((yield* Effect.result(escaped()))._tag, "Failure");
+      const receipt = oldReceipt;
+      const result = yield* Effect.result(
+        CodexProtocol.submitControlledCodexAppServerFrame({
+          ...io.options,
+          wrapper: () => Effect.succeed(receipt),
+        }),
+      );
+      assert.strictEqual(result._tag, "Failure");
+      if (result._tag === "Failure") assert.strictEqual(result.failure.outcome, "not_submitted");
+      assert.strictEqual(yield* Queue.size(io.writes), 0);
+    }),
+);
+
+it.effect.each([false, true])(
+  "controlled frame submission times out delayed drain with masked wrapper=%s",
+  (masked) =>
+    Effect.gen(function* () {
+      const io = yield* controlledFrameFixture(true);
+      const fiber = yield* Effect.result(
+        CodexProtocol.submitControlledCodexAppServerFrame({
+          ...io.options,
+          testSinkTimeoutMs: 20,
+          wrapper: (_frame, submit) => (masked ? Effect.uninterruptible(submit()) : submit()),
+        }),
+      ).pipe(Effect.forkScoped);
+      assert.strictEqual(yield* Queue.take(io.writes), controlledFrame);
+      yield* TestClock.adjust("20 millis");
+      const result = yield* Fiber.join(fiber);
+      assert.strictEqual(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.strictEqual(result.failure.reason, "timeout");
+        assert.strictEqual(result.failure.outcome, "unknown");
+      }
+      assert.strictEqual((yield* Queue.take(io.outcomes)).outcome, "unknown");
+      assert.isFalse(io.writable.destroyed);
+      assert.isFalse(io.writable.writableEnded);
+    }),
+);
+
+it.effect("controlled frame submission retains unknown on actual Writable error", () =>
+  Effect.gen(function* () {
+    const io = yield* controlledFrameFixture(true);
+    const fiber = yield* Effect.result(
+      CodexProtocol.submitControlledCodexAppServerFrame(io.options),
+    ).pipe(Effect.forkScoped);
+    assert.strictEqual(yield* Queue.take(io.writes), controlledFrame);
+    const failWrite = yield* Queue.take(io.callbacks);
+    yield* Effect.sync(() => failWrite(new Error("fixture write failed")));
+    const result = yield* Fiber.join(fiber);
+    assert.strictEqual(result._tag, "Failure");
+    if (result._tag === "Failure") {
+      assert.strictEqual(result.failure.outcome, "unknown");
+      assert.strictEqual(result.failure.reason, "sink");
+    }
+    assert.strictEqual((yield* Queue.take(io.outcomes)).outcome, "unknown");
+  }),
+);
+
+it.effect.each(["before", "drain", "after"] as const)(
+  "controlled frame submission classifies interruption %s write",
+  (stage) =>
+    Effect.gen(function* () {
+      const io = yield* controlledFrameFixture(stage === "drain");
+      const entered = yield* Deferred.make<void>();
+      const hold = yield* Deferred.make<void>();
+      const fiber = yield* CodexProtocol.submitControlledCodexAppServerFrame({
+        ...io.options,
+        wrapper: (_frame, submit) =>
+          Effect.gen(function* () {
+            if (stage === "before") {
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(hold);
+            }
+            const receipt = yield* submit();
+            yield* Deferred.succeed(entered, undefined);
+            if (stage === "after") yield* Deferred.await(hold);
+            return receipt;
+          }),
+      }).pipe(Effect.forkScoped);
+      if (stage === "drain") yield* Queue.take(io.writes);
+      else yield* Deferred.await(entered);
+      yield* Fiber.interrupt(fiber);
+      const exit = yield* Fiber.await(fiber);
+      assert.isTrue(Exit.isFailure(exit));
+      if (Exit.isFailure(exit)) assert.isTrue(Cause.hasInterrupts(exit.cause));
+      const outcome = yield* Queue.take(io.outcomes);
+      assert.strictEqual(outcome.outcome, stage === "before" ? "not_submitted" : "unknown");
+      assert.strictEqual(outcome.reason, "interrupted");
+      assert.strictEqual(yield* Queue.size(io.writes), stage === "after" ? 1 : 0);
+    }),
+);
+
+it.effect("controlled frame submission completes outcome hook before owned Scope closes", () =>
+  Effect.gen(function* () {
+    const io = yield* controlledFrameFixture(true);
+    const scope = yield* Effect.acquireRelease(Scope.make("sequential"), (scope) =>
+      Scope.close(scope, Exit.void),
+    );
+    const hookEntered = yield* Deferred.make<void>();
+    const releaseHook = yield* Deferred.make<void>();
+    const closeFinished = yield* Deferred.make<void>();
+    let wrapperReleased = false;
+    const fiber = yield* CodexProtocol.submitControlledCodexAppServerFrame({
+      ...io.options,
+      wrapper: (_frame, submit) =>
+        submit().pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              wrapperReleased = true;
+            }),
+          ),
+        ),
+      onOutcome: (outcome) =>
+        Effect.gen(function* () {
+          assert.isTrue(wrapperReleased);
+          yield* Deferred.succeed(hookEntered, undefined);
+          yield* Deferred.await(releaseHook);
+          yield* io.options.onOutcome(outcome);
+        }),
+    }).pipe(Effect.forkIn(scope));
+    yield* Queue.take(io.writes);
+    const closing = yield* Scope.close(scope, Exit.void).pipe(
+      Effect.andThen(Deferred.succeed(closeFinished, undefined)),
+      Effect.forkScoped,
+    );
+    yield* Deferred.await(hookEntered);
+    try {
+      assert.isFalse(yield* Deferred.isDone(closeFinished));
+    } finally {
+      yield* Deferred.succeed(releaseHook, undefined);
+    }
+    yield* Fiber.join(closing);
+    assert.strictEqual((yield* Queue.take(io.outcomes)).outcome, "unknown");
+    const exit = yield* Fiber.await(fiber);
+    assert.isTrue(Exit.isFailure(exit));
+    if (Exit.isFailure(exit)) assert.isTrue(Cause.hasInterrupts(exit.cause));
+  }),
+);
+
+it.effect.each([false, true])(
+  "controlled frame submission preserves outcome on hook defect with sent=%s",
+  (sent) =>
+    Effect.gen(function* () {
+      const io = yield* controlledFrameFixture();
+      let calls = 0;
+      const result = yield* Effect.result(
+        CodexProtocol.submitControlledCodexAppServerFrame({
+          ...io.options,
+          wrapper: (_frame, submit) =>
+            Effect.gen(function* () {
+              if (!sent) return yield* Effect.fail("refused");
+              return yield* submit();
+            }),
+          onOutcome: (outcome) =>
+            Effect.gen(function* () {
+              calls++;
+              yield* io.options.onOutcome(outcome);
+              return yield* Effect.die("fixture outcome failed");
+            }),
+        }),
+      );
+      assert.strictEqual(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.strictEqual(result.failure.reason, "outcome_hook");
+        assert.strictEqual(result.failure.outcome, sent ? "submitted" : "not_submitted");
+      }
+      assert.strictEqual(
+        (yield* Queue.take(io.outcomes)).outcome,
+        sent ? "submitted" : "not_submitted",
+      );
+      assert.strictEqual(calls, 1);
+      assert.strictEqual(yield* Queue.size(io.writes), sent ? 1 : 0);
+    }),
+);
+
+it.effect(
+  "controlled frame submission preserves completed outcome during protected hook cancellation",
+  () =>
+    Effect.gen(function* () {
+      const io = yield* controlledFrameFixture();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const interruptFinished = yield* Deferred.make<void>();
+      const fiber = yield* CodexProtocol.submitControlledCodexAppServerFrame({
+        ...io.options,
+        onOutcome: (outcome) =>
+          Effect.gen(function* () {
+            yield* io.options.onOutcome(outcome);
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(release);
+          }),
+      }).pipe(Effect.forkScoped);
+      yield* Deferred.await(entered);
+      const interrupting = yield* Fiber.interrupt(fiber).pipe(
+        Effect.andThen(Deferred.succeed(interruptFinished, undefined)),
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      try {
+        assert.isFalse(yield* Deferred.isDone(interruptFinished));
+      } finally {
+        yield* Deferred.succeed(release, undefined);
+      }
+      yield* Fiber.join(interrupting);
+      const exit = yield* Fiber.await(fiber);
+      assert.isTrue(Exit.isFailure(exit));
+      if (Exit.isFailure(exit)) assert.isTrue(Cause.hasInterrupts(exit.cause));
+      assert.strictEqual((yield* Queue.take(io.outcomes)).outcome, "submitted");
+      assert.strictEqual(yield* Queue.size(io.outcomes), 0);
+    }),
+);

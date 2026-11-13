@@ -368,7 +368,31 @@ export class CodexAppServerRequestError extends Schema.TaggedError<CodexAppServe
   }
 }
 
+export class CodexAppServerFrameSubmissionError extends Schema.TaggedError<CodexAppServerFrameSubmissionError>()(
+  "CodexAppServerFrameSubmissionError",
+  {
+    outcome: Schema.Literals(["not_submitted", "unknown", "submitted"]),
+    reason: Schema.Literals([
+      "invalid_frame",
+      "frame_limit",
+      "invalid_timeout",
+      "continuation",
+      "wrapper",
+      "sink",
+      "timeout",
+      "interrupted",
+      "outcome_hook",
+    ]),
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message() {
+    return "Controlled Codex frame submission failed.";
+  }
+}
+
 export const CodexAppServerError = Schema.Union([
+  CodexAppServerFrameSubmissionError,
   CodexAppServerRequestError,
   CodexAppServerSpawnError,
   CodexAppServerProcessExitedError,

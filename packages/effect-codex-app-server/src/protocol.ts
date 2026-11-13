@@ -545,3 +545,225 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     } satisfies CodexAppServerPatchedProtocol;
   },
 );
+
+const FRAME_BYTES_LIMIT = 1024 * 1024;
+const FRAME_SINK_TIMEOUT_MS = 2_000;
+const frameReceiptBrand = Symbol("controlled-frame-receipt");
+interface FrameReceipt {
+  readonly [frameReceiptBrand]: true;
+}
+export type CodexAppServerFrameSubmit = () => Effect.Effect<
+  FrameReceipt,
+  CodexError.CodexAppServerFrameSubmissionError
+>;
+export interface CodexAppServerControlledFrame {
+  readonly encoded: string;
+  readonly byteLength: number;
+  readonly method: string | null;
+  readonly requestId: string | number | null;
+  readonly selection: string | null;
+}
+export interface CodexAppServerFrameOutcome {
+  readonly frame: CodexAppServerControlledFrame;
+  readonly outcome: "not_submitted" | "unknown" | "submitted";
+  readonly reason: "completed" | CodexError.CodexAppServerFrameSubmissionError["reason"];
+}
+interface ControlledFrameOptions<E> {
+  readonly stdio: Stdio.Stdio;
+  readonly encoded: string;
+  readonly selection?: string;
+  readonly wrapper: (
+    frame: CodexAppServerControlledFrame,
+    submit: CodexAppServerFrameSubmit,
+  ) => Effect.Effect<FrameReceipt, E>;
+  readonly onOutcome: (outcome: CodexAppServerFrameOutcome) => Effect.Effect<void>;
+  // Tests may shorten the local Sink interval, but cannot increase the production maximum.
+  readonly testSinkTimeoutMs?: number;
+}
+const runControlledFrame = Effect.fn("CodexAppServerProtocol.submitControlledFrame")(function* <
+  E,
+>(owned: {
+  readonly frame: CodexAppServerControlledFrame;
+  readonly sink: ReturnType<Stdio.Stdio["stdout"]>;
+  readonly wrapper: ControlledFrameOptions<E>["wrapper"];
+  readonly onOutcome: ControlledFrameOptions<E>["onOutcome"];
+  readonly timeoutMs: number;
+}) {
+  return yield* Effect.withFiber((writer) =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        let open = true;
+        let used = false;
+        let attempted = false;
+        let completed = false;
+        let misused = false;
+        let writeFailure: CodexError.CodexAppServerFrameSubmissionError | undefined;
+        const receipt: FrameReceipt = Object.freeze({ [frameReceiptBrand]: true as const });
+        const submit: CodexAppServerFrameSubmit = () =>
+          Effect.withFiber((current) =>
+            Effect.suspend(() => {
+              if (!open || used || misused || current.id !== writer.id) {
+                misused = true;
+                return Effect.fail(
+                  new CodexError.CodexAppServerFrameSubmissionError({
+                    outcome: attempted ? "unknown" : "not_submitted",
+                    reason: "continuation",
+                  }),
+                );
+              }
+              used = true;
+              attempted = true;
+              return Stream.make(owned.frame.encoded).pipe(
+                Stream.run(owned.sink),
+                Effect.interruptible,
+                Effect.mapError(
+                  (cause) =>
+                    new CodexError.CodexAppServerFrameSubmissionError({
+                      outcome: "unknown",
+                      reason: "sink",
+                      cause,
+                    }),
+                ),
+                Effect.timeoutOrElse({
+                  duration: owned.timeoutMs,
+                  orElse: () =>
+                    Effect.fail(
+                      new CodexError.CodexAppServerFrameSubmissionError({
+                        outcome: "unknown",
+                        reason: "timeout",
+                      }),
+                    ),
+                }),
+                Effect.tapError((error) =>
+                  Effect.sync(() => {
+                    writeFailure = error;
+                  }),
+                ),
+                Effect.andThen(
+                  Effect.sync(() => {
+                    completed = true;
+                    return receipt;
+                  }),
+                ),
+              );
+            }),
+          );
+        const exit = yield* Effect.exit(
+          restore(Effect.suspend(() => owned.wrapper(owned.frame, submit))).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                open = false;
+              }),
+            ),
+          ),
+        );
+        const succeeded = Exit.isSuccess(exit) && exit.value === receipt && completed && !misused;
+        const outcome: CodexAppServerFrameOutcome = Object.freeze({
+          frame: owned.frame,
+          outcome: succeeded ? "submitted" : attempted ? "unknown" : "not_submitted",
+          reason: succeeded
+            ? "completed"
+            : Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)
+              ? "interrupted"
+              : misused
+                ? "continuation"
+                : (writeFailure?.reason ?? "wrapper"),
+        });
+        const publication = yield* Effect.exit(Effect.suspend(() => owned.onOutcome(outcome)));
+        if (Exit.isFailure(publication)) {
+          const error = new CodexError.CodexAppServerFrameSubmissionError({
+            outcome: outcome.outcome,
+            reason: "outcome_hook",
+            cause: publication.cause,
+          });
+          return yield* Effect.failCause(
+            Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)
+              ? Cause.combine(
+                  Cause.map(exit.cause, () => error),
+                  Cause.fail(error),
+                )
+              : Cause.fail(error),
+          );
+        }
+        if (succeeded) return outcome;
+        const error = new CodexError.CodexAppServerFrameSubmissionError({
+          outcome: outcome.outcome,
+          reason: outcome.reason === "completed" ? "wrapper" : outcome.reason,
+          ...(Exit.isFailure(exit) ? { cause: exit.cause } : {}),
+        });
+        if (Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause))
+          return yield* Effect.failCause(Cause.map(exit.cause, () => error));
+        return yield* error;
+      }),
+    ),
+  );
+});
+
+// The supplied Sink must already be non-ending; a Stdio option cannot prove its construction.
+export const submitControlledCodexAppServerFrame = <E>(options: ControlledFrameOptions<E>) => {
+  try {
+    const { encoded, selection, wrapper, onOutcome, stdio } = options;
+    const timeoutMs = options.testSinkTimeoutMs ?? FRAME_SINK_TIMEOUT_MS;
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > FRAME_SINK_TIMEOUT_MS)
+      return Effect.fail(
+        new CodexError.CodexAppServerFrameSubmissionError({
+          outcome: "not_submitted",
+          reason: "invalid_timeout",
+        }),
+      );
+    if (
+      typeof encoded !== "string" ||
+      !encoded.isWellFormed() ||
+      !encoded.endsWith("\n") ||
+      encoded.indexOf("\n") !== encoded.length - 1 ||
+      typeof wrapper !== "function" ||
+      typeof onOutcome !== "function" ||
+      (selection !== undefined && (typeof selection !== "string" || !selection.trim()))
+    )
+      throw new Error("invalid controlled frame");
+    const byteLength = Buffer.byteLength(encoded, "utf8");
+    if (byteLength > FRAME_BYTES_LIMIT)
+      return Effect.fail(
+        new CodexError.CodexAppServerFrameSubmissionError({
+          outcome: "not_submitted",
+          reason: "frame_limit",
+        }),
+      );
+    const decoded: unknown = JSON.parse(encoded);
+    // Canonical bytes exclude duplicate selectors and UTF-8 or numeric identity changes.
+    if (JSON.stringify(decoded) + "\n" !== encoded)
+      throw new Error("noncanonical controlled frame");
+    if (
+      !isObject(decoded) ||
+      Array.isArray(decoded) ||
+      ("method" in decoded && (typeof decoded.method !== "string" || !decoded.method.trim())) ||
+      ("id" in decoded &&
+        (!isJsonRpcId(decoded.id) ||
+          (typeof decoded.id === "number" && !Number.isSafeInteger(decoded.id)))) ||
+      (!("method" in decoded) && !("id" in decoded))
+    )
+      throw new Error("invalid controlled frame");
+    const frame: CodexAppServerControlledFrame = Object.freeze({
+      encoded,
+      byteLength,
+      method: typeof decoded.method === "string" ? decoded.method : null,
+      requestId: isJsonRpcId(decoded.id) ? decoded.id : null,
+      selection: selection ?? null,
+    });
+    return runControlledFrame({
+      frame,
+      sink: stdio.stdout({ endOnDone: false }),
+      wrapper,
+      onOutcome,
+      timeoutMs,
+    });
+  } catch (cause) {
+    return Effect.fail(
+      new CodexError.CodexAppServerFrameSubmissionError({
+        outcome: "not_submitted",
+        reason: "invalid_frame",
+        cause,
+      }),
+    );
+  }
+};
