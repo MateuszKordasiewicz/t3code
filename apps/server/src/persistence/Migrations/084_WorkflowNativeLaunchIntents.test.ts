@@ -170,7 +170,9 @@ it.effect("upgrades seeded 083 without changing legacy rows, replays, and surviv
             (yield* lookupPlan(key)).some((detail) => detail.includes("SCAN workflow_operations")),
           );
         }
-        assert.deepStrictEqual(yield* runMigrations(), [[85, "WorkflowNativeThreadLookup"]]);
+        assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 85 }), [
+          [85, "WorkflowNativeThreadLookup"],
+        ]);
         assert.deepStrictEqual(yield* snapshot, preserved);
         assert.deepStrictEqual(
           yield* sql`SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name LIKE 'workflow_%' AND name <> 'workflow_operations_native_thread' ORDER BY name`,
@@ -187,7 +189,7 @@ it.effect("upgrades seeded 083 without changing legacy rows, replays, and surviv
             ),
           );
         }
-        assert.deepStrictEqual(yield* runMigrations(), []);
+        assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 85 }), []);
         assert.deepStrictEqual(yield* snapshot, preserved);
         assert.deepStrictEqual(yield* lookup("target"), matches);
         assert.deepStrictEqual(yield* lookup("absent"), missing);
@@ -195,7 +197,7 @@ it.effect("upgrades seeded 083 without changing legacy rows, replays, and surviv
       yield* Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
         yield* sql`PRAGMA foreign_keys = ON`;
-        assert.deepStrictEqual(yield* runMigrations(), []);
+        assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 85 }), []);
         assert.deepStrictEqual(yield* snapshot, preserved);
         assert.deepStrictEqual(
           yield* sql`SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name LIKE 'workflow_%' AND name <> 'workflow_operations_native_thread' ORDER BY name`,
@@ -242,7 +244,7 @@ it.effect(
       const sql = yield* SqlClient.SqlClient;
       yield* sql`PRAGMA foreign_keys = ON`;
       assert.deepStrictEqual(yield* sql`PRAGMA foreign_keys`, [{ foreign_keys: 1 }]);
-      yield* runMigrations();
+      yield* runMigrations({ toMigrationInclusive: 85 });
       yield* seed;
       const valid = [
         row("one", { native_run_id: "native-one" }),
@@ -411,4 +413,110 @@ it.effect(
       );
       assert.strictEqual((yield* sql`SELECT * FROM workflow_native_intent_receipts`).length, 1);
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+);
+
+it.effect(
+  "upgrades 085 with empty immutable reservation material and preserves history on reopen",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const dir = yield* Effect.acquireRelease(
+          Effect.sync(() => NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "native-material-"))),
+          (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
+        );
+        const filename = NodePath.join(dir, "test.sqlite");
+        let preserved: Effect.Success<typeof snapshot>;
+        let material: ReadonlyArray<unknown>;
+        yield* Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`PRAGMA foreign_keys = ON`;
+          yield* sql`PRAGMA recursive_triggers = OFF`;
+          assert.deepStrictEqual(yield* sql`PRAGMA foreign_keys`, [{ foreign_keys: 1 }]);
+          assert.deepStrictEqual(yield* sql`PRAGMA recursive_triggers`, [
+            { recursive_triggers: 0 },
+          ]);
+          yield* runMigrations({ toMigrationInclusive: 85 });
+          yield* seed;
+          yield* sql.unsafe(insert(row("workflow")));
+          yield* sql.unsafe(
+            insert(
+              row("planning", {
+                workflow_run_id: null,
+                planning_session_id: "session",
+                attempt_id: null,
+                item_id: null,
+                pass_id: "pass",
+                charge_attempt: 0,
+              }),
+            ),
+          );
+          yield* sql.unsafe(insert(row("unreceipted")));
+          yield* sql`INSERT INTO workflow_native_intent_receipts VALUES ('workflow-command', 'workflow-receipt', 'workflow', ${hash}, '{ "workflow": true }')`;
+          yield* sql`INSERT INTO workflow_native_intent_receipts VALUES ('planning-command', 'planning-receipt', 'planning', ${hash}, '{ "planning": true }')`;
+          preserved = yield* snapshot;
+          assert.deepStrictEqual(yield* runMigrations(), [
+            [86, "WorkflowNativeReservationMaterial"],
+          ]);
+          assert.deepStrictEqual(
+            yield* sql`SELECT * FROM workflow_native_reservation_material`,
+            [],
+          );
+          assert.deepStrictEqual(yield* snapshot, preserved);
+          assert.deepStrictEqual(yield* runMigrations(), []);
+          assert.deepStrictEqual(yield* snapshot, preserved);
+
+          const invalid = [
+            ["missing", "{}", hash],
+            ["planning", "bad", hash],
+            ["planning", "[]", hash],
+            ["planning", "null", hash],
+            ["planning", "{}", "a".repeat(63)],
+            ["planning", "{}", "a".repeat(65)],
+            ["planning", "{}", "A".repeat(64)],
+            ["planning", "{}", "g".repeat(64)],
+          ];
+          for (const [id, json, digest] of invalid) {
+            assert.isTrue(
+              Exit.isFailure(
+                yield* Effect.exit(
+                  sql`INSERT INTO workflow_native_reservation_material VALUES (${id}, ${json}, ${digest})`,
+                ),
+              ),
+              `${id} ${json} ${digest}`,
+            );
+          }
+          yield* sql`INSERT INTO workflow_native_reservation_material VALUES ('workflow', '{ "material": 1 }', ${hash})`;
+          yield* sql`INSERT INTO workflow_native_reservation_material VALUES ('planning', '{ "planning": true }', ${hash})`;
+          yield* sql`INSERT INTO workflow_native_reservation_material VALUES ('unreceipted', '{}', ${hash})`;
+          material =
+            yield* sql`SELECT * FROM workflow_native_reservation_material ORDER BY intent_id`;
+          const writes = [
+            sql`INSERT INTO workflow_native_reservation_material VALUES ('workflow', '{}', ${hash})`,
+            sql`UPDATE workflow_native_reservation_material SET material_json = '{}' WHERE intent_id = 'workflow'`,
+            sql`DELETE FROM workflow_native_reservation_material WHERE intent_id = 'workflow'`,
+            sql`INSERT OR REPLACE INTO workflow_native_reservation_material VALUES ('workflow', '{ "changed": true }', ${hash})`,
+            sql`INSERT INTO workflow_native_reservation_material VALUES ('workflow', '{ "changed": true }', ${hash}) ON CONFLICT(intent_id) DO UPDATE SET material_json = excluded.material_json`,
+            sql`DELETE FROM workflow_native_launch_intents WHERE intent_id = 'unreceipted'`,
+          ];
+          for (const write of writes) {
+            assert.isTrue(Exit.isFailure(yield* Effect.exit(write)));
+            assert.deepStrictEqual(
+              yield* sql`SELECT * FROM workflow_native_reservation_material ORDER BY intent_id`,
+              material,
+            );
+            assert.deepStrictEqual(yield* snapshot, preserved);
+          }
+        }).pipe(Effect.provide(NodeSqliteClient.layer({ filename })));
+        yield* Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`PRAGMA foreign_keys = ON`;
+          assert.deepStrictEqual(yield* runMigrations(), []);
+          assert.deepStrictEqual(yield* snapshot, preserved);
+          assert.deepStrictEqual(
+            yield* sql`SELECT * FROM workflow_native_reservation_material ORDER BY intent_id`,
+            material,
+          );
+        }).pipe(Effect.provide(NodeSqliteClient.layer({ filename })));
+      }),
+    ),
 );
