@@ -385,7 +385,7 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     if (result.kind === "applied") yield* notify;
     return result;
   });
-  type PlanningNativeInput = {
+  type PlanningNativeBase = {
     readonly intentId: string;
     readonly sessionId: S["id"];
     readonly operationId: WorkflowOperationV1["id"];
@@ -414,8 +414,13 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     };
     readonly now: string;
   };
+  type PlanningNativeInput = PlanningNativeBase &
+    (
+      | { readonly materialVersion?: never; readonly launch?: never }
+      | { readonly materialVersion: 1; readonly launch: unknown }
+    );
   const validatePlanningNativeIntent = Effect.fn("WorkflowRunStore.validatePlanningNativeIntent")(
-    function* (input: Omit<PlanningNativeInput, "now">) {
+    function* (input: Omit<PlanningNativeBase, "now">) {
       const { draft } = input;
       const valid = yield* Effect.try({
         try: () => {
@@ -532,6 +537,144 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
       return { pass, operation, params, context, fingerprint, command, same };
     },
   );
+  const planningV3Fingerprint = (
+    input: Omit<PlanningNativeBase, "now" | "draft">,
+    draft: unknown,
+    receiptId: string,
+  ) =>
+    WorkflowCanonicalHash.tagged("t3.workflow-native-launch-intent.v3", {
+      intentId: input.intentId,
+      workflowRunId: null,
+      planningSessionId: input.sessionId,
+      operationId: input.operationId,
+      attemptId: null,
+      passId: input.passId,
+      itemId: null,
+      chargeAttempt: 0,
+      repair: input.role === "repair",
+      role: input.role,
+      environmentId: input.environmentId,
+      projectId: input.projectId,
+      launchCommandId: input.launchCommandId,
+      threadId: input.threadId,
+      messageId: input.messageId,
+      draft,
+      receiptId,
+    });
+  const verifyStoredPlanningIntent = Effect.fn("WorkflowRunStore.verifyStoredPlanningIntent")(
+    function* (
+      input: Omit<PlanningNativeBase, "now" | "draft">,
+      storedDraft: unknown,
+      receipt: {
+        command_id: string;
+        receipt_id: string;
+        intent_id: string;
+        fingerprint: string;
+        result_json: string;
+      },
+    ) {
+      const info = yield* Effect.try({
+        try: () => {
+          WorkflowCanonicalHash.assertCanonical(storedDraft);
+          const draft = storedDraft as PlanningNativeBase["draft"] & {
+            material?: { version: number; launchHash: string };
+          };
+          if ((draft.version as number) !== 2) return { draft, marked: false as const };
+          if (
+            Object.keys(draft).sort().join() !== "admission,kind,material,operation,pass,version" ||
+            !draft.material ||
+            Object.keys(draft.material).sort().join() !== "launchHash,version" ||
+            draft.material.version !== 1 ||
+            !/^[0-9a-f]{64}$/.test(draft.material.launchHash)
+          )
+            throw new Error();
+          const { material, ...base } = draft;
+          return {
+            draft: { ...base, version: 1 as const },
+            marked: true as const,
+            marker: material,
+          };
+        },
+        catch: () => planningError("integrity"),
+      });
+      const validated = yield* validatePlanningNativeIntent({ ...input, draft: info.draft }).pipe(
+        Effect.mapError(() => planningError("integrity")),
+      );
+      if (
+        receipt.intent_id !== input.intentId ||
+        receipt.command_id !== validated.command.commandId ||
+        receipt.receipt_id !== validated.command.receiptId ||
+        !receipt.receipt_id
+      )
+        return yield* planningError("integrity");
+      let result: object;
+      if (info.marked) {
+        const fingerprint = yield* Effect.try({
+          try: () => planningV3Fingerprint(input, storedDraft, receipt.receipt_id),
+          catch: () => planningError("integrity"),
+        });
+        if (fingerprint !== receipt.fingerprint) return yield* planningError("integrity");
+        const rows = yield* sql<{
+          material_json: string;
+          material_hash: string;
+        }>`SELECT material_json, material_hash FROM workflow_native_reservation_material WHERE intent_id = ${input.intentId}`;
+        if (rows.length !== 1 || !rows[0]) return yield* planningError("integrity");
+        const raw = yield* Effect.try({
+          try: () => parse(rows[0]!.material_json),
+          catch: () => planningError("integrity"),
+        });
+        const { material, launchHash, materialHash } = yield* decodeNativeReservationMaterial(
+          raw,
+        ).pipe(Effect.mapError(() => planningError("integrity")));
+        const snapshot = material.planningSession;
+        const launch = material.launch;
+        if (
+          !snapshot ||
+          material.intentId !== input.intentId ||
+          material.receiptId !== receipt.receipt_id ||
+          material.intentFingerprint !== fingerprint ||
+          rows[0].material_hash !== materialHash ||
+          info.marker.launchHash !== launchHash ||
+          launch.commandId !== input.launchCommandId ||
+          launch.threadId !== input.threadId ||
+          launch.initialMessage.messageId !== input.messageId ||
+          launch.projectId !== input.projectId ||
+          launch.modelSelection.instanceId !== validated.pass.provider.providerInstanceId ||
+          launch.modelSelection.model !== validated.pass.provider.model ||
+          snapshot.id !== input.sessionId ||
+          snapshot.environmentId !== input.environmentId ||
+          snapshot.projectId !== input.projectId ||
+          !validated.same(snapshot.origin, validated.context.actor) ||
+          snapshot.planId !== validated.pass.binding.planId ||
+          !validated.same(snapshot.limits, validated.params.limits) ||
+          !snapshot.allowedRoles.includes(validated.pass.role) ||
+          !snapshot.allowedProviders.some(
+            (p) =>
+              p.providerInstanceId === validated.pass.provider.providerInstanceId &&
+              p.model === validated.pass.provider.model,
+          ) ||
+          snapshot.status !== "active" ||
+          snapshot.recordVersion !== info.draft.admission.expectedVersion + 1 ||
+          !Number.isSafeInteger(snapshot.controlGeneration) ||
+          !Number.isSafeInteger(input.generation) ||
+          snapshot.controlGeneration > input.generation ||
+          snapshot.consumed.passes < 1 ||
+          (input.role === "repair" && snapshot.consumed.repairRounds < 1)
+        )
+          return yield* planningError("integrity");
+        result = { intentId: input.intentId, fingerprint, materialVersion: 1, materialHash };
+      } else {
+        if (validated.fingerprint !== receipt.fingerprint) return yield* planningError("integrity");
+        result = { intentId: input.intentId, fingerprint: receipt.fingerprint };
+      }
+      const matches = yield* Effect.try({
+        try: () => validated.same(parse(receipt.result_json), result),
+        catch: () => planningError("integrity"),
+      });
+      if (!matches) return yield* planningError("integrity");
+      return { ...validated, marked: info.marked };
+    },
+  );
   const validatePlanningRevision = Effect.fn("WorkflowRunStore.validatePlanningRevision")(
     function* (pass: P) {
       const b = pass.binding;
@@ -572,10 +715,53 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     },
   );
   const reservePlanningNativeIntent = Effect.fn("WorkflowRunStore.reservePlanningNativeIntent")(
-    function* (input: PlanningNativeInput) {
-      const { pass, params, context, fingerprint, command, same } =
-        yield* validatePlanningNativeIntent(input);
+    function* (request: PlanningNativeInput) {
+      const input = yield* Effect.try({
+        try: () => {
+          const copy = { ...request };
+          WorkflowCanonicalHash.assertCanonical(copy.draft);
+          const snapshot = { ...copy, draft: structuredClone(copy.draft) };
+          if (!Object.hasOwn(copy, "launch")) return snapshot;
+          WorkflowCanonicalHash.assertCanonical(copy.launch);
+          return { ...snapshot, launch: structuredClone(copy.launch) };
+        },
+        catch: () => planningError("invalid"),
+      });
+      const {
+        pass,
+        params,
+        context,
+        fingerprint: legacyFingerprint,
+        command,
+        same,
+      } = yield* validatePlanningNativeIntent(input);
       const { draft } = input;
+      const hasVersion = Object.hasOwn(input, "materialVersion");
+      const hasLaunch = Object.hasOwn(input, "launch");
+      if (hasVersion !== hasLaunch || (hasVersion && input.materialVersion !== 1))
+        return yield* planningError("invalid");
+      const retained = yield* Effect.gen(function* () {
+        if (!hasVersion) return null;
+        const { launch, launchHash } = yield* decodeNativeReservationLaunch(input.launch).pipe(
+          Effect.mapError(() => planningError("integrity")),
+        );
+        if (
+          launch.commandId !== input.launchCommandId ||
+          launch.threadId !== input.threadId ||
+          launch.initialMessage.messageId !== input.messageId ||
+          launch.projectId !== input.projectId ||
+          launch.modelSelection.instanceId !== pass.provider.providerInstanceId ||
+          launch.modelSelection.model !== pass.provider.model
+        )
+          return yield* planningError("integrity");
+        const persistedDraft = { ...draft, version: 2, material: { version: 1, launchHash } };
+        const fingerprint = yield* Effect.try({
+          try: () => planningV3Fingerprint(input, persistedDraft, command.receiptId),
+          catch: () => planningError("integrity"),
+        });
+        return { launch, persistedDraft, fingerprint, persistedDraftJson: encode(persistedDraft) };
+      });
+      const fingerprint = retained?.fingerprint ?? legacyFingerprint;
       const result = yield* planningTransaction(
         Effect.gen(function* () {
           const receipts = yield* sql<{
@@ -602,6 +788,7 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
             launch_command_id: string;
             thread_id: string;
             message_id: string;
+            generation: number;
           }>`SELECT * FROM workflow_native_launch_intents WHERE intent_id = ${input.intentId}`;
           if (receipts.length || orphan.length) {
             const r = receipts[0];
@@ -634,13 +821,21 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
               i.message_id !== input.messageId
             )
               return yield* planningError("integrity");
+            const storedDraft = yield* Effect.try({
+              try: () => parse(r.draft_json),
+              catch: () => planningError("integrity"),
+            });
             const matches = yield* Effect.try({
-              try: () =>
-                same(parse(r.draft_json), draft) &&
-                same(parse(r.result_json), { intentId: input.intentId, fingerprint }),
+              try: () => same(storedDraft, retained?.persistedDraft ?? draft),
               catch: () => planningError("integrity"),
             });
             if (!matches) return yield* planningError("integrity");
+            const verified = yield* verifyStoredPlanningIntent(
+              { ...input, generation: i.generation },
+              storedDraft,
+              r,
+            );
+            if (verified.marked !== (retained !== null)) return yield* planningError("integrity");
             return {
               kind: "replay" as const,
               receiptId: r.receipt_id,
@@ -648,6 +843,7 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
               fingerprint,
             };
           }
+          if (!retained) return yield* planningError("integrity");
           if (yield* runningNativeEffect(input.threadId)) return yield* planningError("custody");
           const custody = yield* readThreadCustodyInTransaction(input.threadId).pipe(
             Effect.mapError((error) =>
@@ -714,17 +910,46 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
               repairRounds: current.consumed.repairRounds + (pass.role === "repair" ? 1 : 0),
             },
           };
-          yield* decodePlanningSessionV1(updated).pipe(
+          const decodedUpdated = yield* decodePlanningSessionV1(updated).pipe(
             Effect.mapError(() => planningError("integrity")),
           );
+          if (
+            decodedUpdated.id !== current.id ||
+            decodedUpdated.controlGeneration !== input.generation ||
+            !sameContext(decodedUpdated, context) ||
+            decodedUpdated.recordVersion !== current.recordVersion + 1 ||
+            decodedUpdated.consumed.passes !== current.consumed.passes + 1 ||
+            decodedUpdated.consumed.repairRounds !==
+              current.consumed.repairRounds + (pass.role === "repair" ? 1 : 0)
+          )
+            return yield* planningError("integrity");
+          const decodedMaterial = yield* decodeNativeReservationMaterial({
+            version: 1,
+            intentId: input.intentId,
+            receiptId: command.receiptId,
+            intentFingerprint: fingerprint,
+            launch: retained.launch,
+            planningSession: decodedUpdated,
+          }).pipe(Effect.mapError(() => planningError("integrity")));
+          const ownerJson = encode(decodedUpdated);
+          const materialJson = encode(decodedMaterial.material);
+          const receiptJson = encode({
+            intentId: input.intentId,
+            fingerprint,
+            materialVersion: 1,
+            materialHash: decodedMaterial.materialHash,
+          });
           const changed =
-            yield* sql`UPDATE workflow_planning_sessions SET record_version = ${updated.recordVersion}, record_json = ${encode(updated)} WHERE id = ${current.id} AND record_version = ${current.recordVersion} AND control_generation = ${current.controlGeneration} RETURNING id`;
+            yield* sql`UPDATE workflow_planning_sessions SET record_version = ${decodedUpdated.recordVersion}, record_json = ${ownerJson} WHERE id = ${current.id} AND record_version = ${current.recordVersion} AND control_generation = ${current.controlGeneration} RETURNING id`;
           if (changed.length !== 1) return yield* planningError("conflict");
           const inserted =
-            yield* sql`INSERT INTO workflow_native_launch_intents (intent_id, planning_session_id, operation_id, pass_id, charge_attempt, repair, role, environment_id, project_id, launch_command_id, thread_id, message_id, fingerprint, draft_json, generation, state, held) VALUES (${input.intentId}, ${input.sessionId}, ${input.operationId}, ${input.passId}, 0, ${input.role === "repair" ? 1 : 0}, ${input.role}, ${input.environmentId}, ${input.projectId}, ${input.launchCommandId}, ${input.threadId}, ${input.messageId}, ${fingerprint}, ${encode(draft)}, ${input.generation}, 'reserved', 0) RETURNING intent_id`;
+            yield* sql`INSERT INTO workflow_native_launch_intents (intent_id, planning_session_id, operation_id, pass_id, charge_attempt, repair, role, environment_id, project_id, launch_command_id, thread_id, message_id, fingerprint, draft_json, generation, state, held) VALUES (${input.intentId}, ${input.sessionId}, ${input.operationId}, ${input.passId}, 0, ${input.role === "repair" ? 1 : 0}, ${input.role}, ${input.environmentId}, ${input.projectId}, ${input.launchCommandId}, ${input.threadId}, ${input.messageId}, ${fingerprint}, ${retained.persistedDraftJson}, ${input.generation}, 'reserved', 0) RETURNING intent_id`;
           if (inserted.length !== 1) return yield* planningError("conflict");
+          const material =
+            yield* sql`INSERT INTO workflow_native_reservation_material (intent_id, material_json, material_hash) VALUES (${input.intentId}, ${materialJson}, ${decodedMaterial.materialHash}) RETURNING intent_id`;
+          if (material.length !== 1) return yield* planningError("conflict");
           const saved =
-            yield* sql`INSERT INTO workflow_native_intent_receipts (command_id, receipt_id, intent_id, fingerprint, result_json) VALUES (${command.commandId}, ${command.receiptId}, ${input.intentId}, ${fingerprint}, ${encode({ intentId: input.intentId, fingerprint })}) RETURNING receipt_id`;
+            yield* sql`INSERT INTO workflow_native_intent_receipts (command_id, receipt_id, intent_id, fingerprint, result_json) VALUES (${command.commandId}, ${command.receiptId}, ${input.intentId}, ${fingerprint}, ${receiptJson}) RETURNING receipt_id`;
           if (saved.length !== 1) return yield* planningError("conflict");
           return {
             kind: "reserved" as const,
@@ -1427,48 +1652,39 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
               try: () => parse(row.draft_json) as PlanningNativeInput["draft"],
               catch: () => planningError("integrity"),
             });
-            const validated = yield* validatePlanningNativeIntent({
-              intentId: row.intent_id,
-              sessionId: value.id,
-              operationId: row.operation_id,
-              passId: row.pass_id,
-              role: row.role,
-              environmentId: row.environment_id,
-              projectId: row.project_id,
-              launchCommandId: row.launch_command_id,
-              threadId: row.thread_id,
-              messageId: row.message_id,
-              generation: row.generation,
-              draft,
-            }).pipe(Effect.mapError(() => planningError("integrity")));
-            if (validated.fingerprint !== row.fingerprint || !sameContext(value, validated.context))
-              return yield* planningError("integrity");
+            const command = yield* Effect.try({
+              try: () => draft.admission.command,
+              catch: () => planningError("integrity"),
+            });
+            if (!validCommand(command)) return yield* planningError("integrity");
             const receipts = yield* sql<{
               command_id: string;
               receipt_id: string;
               intent_id: string;
               fingerprint: string;
               result_json: string;
-            }>`SELECT * FROM workflow_native_intent_receipts WHERE intent_id = ${row.intent_id} OR command_id = ${validated.command.commandId} OR receipt_id = ${validated.command.receiptId}`;
+            }>`SELECT * FROM workflow_native_intent_receipts WHERE intent_id = ${row.intent_id} OR command_id = ${command.commandId} OR receipt_id = ${command.receiptId}`;
             const receipt = receipts[0];
-            if (
-              receipts.length !== 1 ||
-              !receipt ||
-              receipt.command_id !== validated.command.commandId ||
-              receipt.receipt_id !== validated.command.receiptId ||
-              receipt.intent_id !== row.intent_id ||
-              receipt.fingerprint !== row.fingerprint
-            )
+            if (receipts.length !== 1 || !receipt || receipt.fingerprint !== row.fingerprint)
               return yield* planningError("integrity");
-            const matches = yield* Effect.try({
-              try: () =>
-                validated.same(parse(receipt.result_json), {
-                  intentId: row.intent_id,
-                  fingerprint: row.fingerprint,
-                }),
-              catch: () => planningError("integrity"),
-            });
-            if (!matches) return yield* planningError("integrity");
+            const validated = yield* verifyStoredPlanningIntent(
+              {
+                intentId: row.intent_id,
+                sessionId: value.id,
+                operationId: row.operation_id,
+                passId: row.pass_id,
+                role: row.role,
+                environmentId: row.environment_id,
+                projectId: row.project_id,
+                launchCommandId: row.launch_command_id,
+                threadId: row.thread_id,
+                messageId: row.message_id,
+                generation: row.generation,
+              },
+              draft,
+              receipt,
+            );
+            if (!sameContext(value, validated.context)) return yield* planningError("integrity");
             return { row, ...validated };
           }),
         );
@@ -2236,36 +2452,24 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
           row.pass_id !== null &&
           row.charge_attempt === 0
         ) {
-          const resultValid = yield* Effect.try({
-            try: () =>
-              sameCustodyValue(parse(receipt.result_json), {
-                intentId: row.intent_id,
-                fingerprint: row.fingerprint,
-              }),
-            catch: integrity,
-          });
-          if (!resultValid) return yield* integrity();
-          const validated = yield* validatePlanningNativeIntent({
-            intentId: row.intent_id,
-            sessionId: row.planning_session_id,
-            operationId: row.operation_id,
-            passId: row.pass_id,
-            role: row.role as P["role"],
-            environmentId: row.environment_id,
-            projectId: row.project_id,
-            launchCommandId: row.launch_command_id,
-            threadId: row.thread_id,
-            messageId: row.message_id,
-            generation: row.generation,
-            draft: draft as PlanningNativeInput["draft"],
-          }).pipe(Effect.mapError(integrity));
-          if (
-            validated.fingerprint !== row.fingerprint ||
-            validated.command.commandId !== receipt.command_id ||
-            validated.command.receiptId !== receipt.receipt_id ||
-            row.repair !== (row.role === "repair" ? 1 : 0)
-          )
-            return yield* integrity();
+          if (row.repair !== (row.role === "repair" ? 1 : 0)) return yield* integrity();
+          const validated = yield* verifyStoredPlanningIntent(
+            {
+              intentId: row.intent_id,
+              sessionId: row.planning_session_id,
+              operationId: row.operation_id,
+              passId: row.pass_id,
+              role: row.role as P["role"],
+              environmentId: row.environment_id,
+              projectId: row.project_id,
+              launchCommandId: row.launch_command_id,
+              threadId: row.thread_id,
+              messageId: row.message_id,
+              generation: row.generation,
+            },
+            draft,
+            receipt,
+          ).pipe(Effect.mapError((error) => (isPlanningError(error) ? integrity() : error)));
           draftOperation = validated.operation;
           draftPass = validated.pass;
         } else return yield* integrity();

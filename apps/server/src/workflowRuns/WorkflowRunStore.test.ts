@@ -3153,6 +3153,20 @@ const planningReservation = (admission: ReturnType<typeof admissionInput>) => {
     threadId: admission.pass.native!.threadId,
     messageId: `message-${pass.id}`,
     generation: admission.operation.controlGeneration,
+    materialVersion: 1 as const,
+    launch: {
+      commandId: `launch-${pass.id}`,
+      threadId: admission.pass.native!.threadId,
+      projectId: admission.context.destination.projectId,
+      title: "Planning",
+      modelSelection: { instanceId: pass.provider.providerInstanceId, model: pass.provider.model },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      workspaceStrategy: { type: "root", branch: "main" },
+      initialMessage: { messageId: `message-${pass.id}`, text: "Plan the work", attachments: [] },
+      createdBy: "agent",
+      creationSource: "mcp",
+    },
     draft: {
       version: 1 as const,
       kind: "planning_pass" as const,
@@ -4794,9 +4808,11 @@ it.effect(
         revisionHash: hash,
         sourcePacketHash: hash,
       };
+      const planningBase = planningReservation(admissionInput(binding, "foreign-owner"));
       const planning = {
-        ...planningReservation(admissionInput(binding, "foreign-owner")),
+        ...planningBase,
         threadId: first.threadId,
+        launch: { ...planningBase.launch, threadId: first.threadId },
       };
       const snapshot = () =>
         Effect.gen(function* () {
@@ -4863,9 +4879,11 @@ it.effect("workflow reservation refuses a planning-owned thread and maps failed 
     const sql = yield* SqlClient.SqlClient;
     const store = yield* Store.WorkflowRunStore;
     yield* begin(store, session);
+    const planningBase = planningReservation(admissionInput(binding, "planning-owner"));
     const planning = {
-      ...planningReservation(admissionInput(binding, "planning-owner")),
+      ...planningBase,
       threadId: "thread",
+      launch: { ...planningBase.launch, threadId: "thread" },
     };
     yield* store.reservePlanningNativeIntent(planning);
     const owner = {
@@ -5055,51 +5073,58 @@ it.effect.each([false, true])(
     }).pipe(Effect.provide(layer)),
 );
 
-it.effect.each(["draft", "fingerprint", "receipt", "custody", "generation"] as const)(
-  "planning control rejects tampered %s before writes",
-  (tamper) =>
-    Effect.gen(function* () {
-      const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
-      const sql = yield* SqlClient.SqlClient;
-      const store = yield* Store.WorkflowRunStore;
-      yield* begin(store, session);
-      const input = planningReservation(admissionInput(binding, "tamper"));
-      yield* store.reservePlanningNativeIntent(input);
-      if (tamper === "draft")
-        yield* sql`UPDATE workflow_native_launch_intents SET draft_json = json_set(draft_json, '$.pass.inputManifest.sources[0].sha256', ${hash})`;
-      if (tamper === "fingerprint")
-        yield* sql`UPDATE workflow_native_launch_intents SET fingerprint = ${hash}`;
-      if (tamper === "receipt")
-        yield* sql`UPDATE workflow_native_intent_receipts SET result_json = '{}'`;
-      if (tamper === "custody")
-        yield* sql`UPDATE workflow_native_launch_intents SET boot_id = 'boot', worker_id = 'worker'`;
-      if (tamper === "generation")
-        yield* sql`UPDATE workflow_native_launch_intents SET generation = generation + 1`;
-      const before = {
+it.effect.each([
+  "draft",
+  "missing-command",
+  "fingerprint",
+  "receipt",
+  "custody",
+  "generation",
+] as const)("planning control rejects tampered %s before writes", (tamper) =>
+  Effect.gen(function* () {
+    const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    yield* begin(store, session);
+    const input = planningReservation(admissionInput(binding, "tamper"));
+    yield* store.reservePlanningNativeIntent(input);
+    if (tamper === "draft")
+      yield* sql`UPDATE workflow_native_launch_intents SET draft_json = json_set(draft_json, '$.pass.inputManifest.sources[0].sha256', ${hash})`;
+    if (tamper === "missing-command")
+      yield* sql`UPDATE workflow_native_launch_intents SET draft_json = json_remove(draft_json, '$.admission.command')`;
+    if (tamper === "fingerprint")
+      yield* sql`UPDATE workflow_native_launch_intents SET fingerprint = ${hash}`;
+    if (tamper === "receipt")
+      yield* sql`UPDATE workflow_native_intent_receipts SET result_json = '{}'`;
+    if (tamper === "custody")
+      yield* sql`UPDATE workflow_native_launch_intents SET boot_id = 'boot', worker_id = 'worker'`;
+    if (tamper === "generation")
+      yield* sql`UPDATE workflow_native_launch_intents SET generation = generation + 1`;
+    const before = {
+      owner: yield* sql`SELECT * FROM workflow_planning_sessions`,
+      intents: yield* sql`SELECT * FROM workflow_native_launch_intents`,
+      receipts: yield* sql`SELECT * FROM workflow_command_receipts`,
+    };
+    const error = yield* Effect.flip(
+      store.controlPlanning({
+        sessionId: session.id,
+        action: "pause",
+        expectedVersion: 1,
+        now: facts.now,
+        context,
+        command: { commandId: "tamper-pause", receiptId: "tamper-pause" },
+      }),
+    );
+    assert.strictEqual(error.reason, "integrity");
+    assert.deepStrictEqual(
+      {
         owner: yield* sql`SELECT * FROM workflow_planning_sessions`,
         intents: yield* sql`SELECT * FROM workflow_native_launch_intents`,
         receipts: yield* sql`SELECT * FROM workflow_command_receipts`,
-      };
-      const error = yield* Effect.flip(
-        store.controlPlanning({
-          sessionId: session.id,
-          action: "pause",
-          expectedVersion: 1,
-          now: facts.now,
-          context,
-          command: { commandId: "tamper-pause", receiptId: "tamper-pause" },
-        }),
-      );
-      assert.strictEqual(error.reason, "integrity");
-      assert.deepStrictEqual(
-        {
-          owner: yield* sql`SELECT * FROM workflow_planning_sessions`,
-          intents: yield* sql`SELECT * FROM workflow_native_launch_intents`,
-          receipts: yield* sql`SELECT * FROM workflow_command_receipts`,
-        },
-        before,
-      );
-    }).pipe(Effect.provide(layer)),
+      },
+      before,
+    );
+  }).pipe(Effect.provide(layer)),
 );
 
 it.effect.each([
@@ -5338,6 +5363,350 @@ it.effect.each(["pause", "stop"] as const)(
     }).pipe(Effect.provide(layer)),
 );
 
+it.effect("planning material retains the exact charged snapshot through controls and replay", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      yield* begin(store, session);
+      const prior = { ...session, recordVersion: 1, consumed: { passes: 1, repairRounds: 0 } };
+      yield* sql`UPDATE workflow_planning_sessions SET record_version = 1, record_json = ${json(prior)} WHERE id = ${session.id}`;
+      const admission = { ...admissionInput(binding, "snapshot"), expectedVersion: 1 };
+      const input = planningReservation(admission);
+      const subscription = yield* store.subscribeChanges;
+      const reserved = yield* store.reservePlanningNativeIntent(input);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 1);
+      const owner = yield* store.getPlanning({ sessionId: session.id });
+      const rows = yield* sql<{
+        material_json: string;
+        material_hash: string;
+      }>`SELECT material_json, material_hash FROM workflow_native_reservation_material`;
+      const decoded = yield* decodeNativeReservationMaterial(parse(rows[0]!.material_json));
+      assert.deepStrictEqual(decoded.material.planningSession, owner);
+      assert.deepStrictEqual(owner.consumed, { passes: 2, repairRounds: 0 });
+      assert.strictEqual(decoded.materialHash, rows[0]!.material_hash);
+      const before = yield* sql`SELECT * FROM workflow_native_reservation_material`;
+      const receipt = yield* sql`SELECT * FROM workflow_native_intent_receipts`;
+      for (const [action, version] of [
+        ["pause", 2],
+        ["resume", 3],
+      ] as const) {
+        yield* store.controlPlanning({
+          sessionId: session.id,
+          action,
+          expectedVersion: version,
+          now: facts.now,
+          context,
+          command: { commandId: `snapshot-${action}`, receiptId: `snapshot-${action}` },
+        });
+      }
+      assert.deepStrictEqual(
+        yield* sql`SELECT * FROM workflow_native_reservation_material`,
+        before,
+      );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_intent_receipts`, receipt);
+      const current = yield* store.getPlanning({ sessionId: session.id });
+      assert.strictEqual(current.controlGeneration, 2);
+      assert.strictEqual(decoded.material.planningSession!.controlGeneration, 0);
+      yield* PubSub.takeUpTo(subscription, 10);
+      assert.deepStrictEqual(
+        yield* store.reservePlanningNativeIntent({
+          ...input,
+          generation: 999,
+          now: "2099-01-01T00:00:00Z",
+        }),
+        { ...reserved, kind: "replay" },
+      );
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+      assert.deepStrictEqual(yield* store.getPlanning({ sessionId: session.id }), current);
+      assert.deepStrictEqual(yield* store.readThreadCustody({ threadId: input.threadId }), {
+        kind: "owned",
+        owner: { kind: "planning_session", planningSessionId: session.id },
+      });
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.effect("planning reservation snapshots caller context before the owner write", () =>
+  Effect.gen(function* () {
+    const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    yield* begin(store, session);
+    const input = planningReservation(admissionInput(binding, "alias"));
+    const payload = { item: "original" };
+    const launch = {
+      ...input.launch,
+      initialMessage: {
+        ...input.launch.initialMessage,
+        context: {
+          version: 1,
+          records: [
+            { version: 1, contextId: "ctx", kind: "future-kind", label: "Context", payload },
+          ],
+        },
+      },
+    };
+    const originalLaunch = structuredClone(launch);
+    let mutated = false;
+    const mutate: Statement.Transformer = (statement) => {
+      const [query] = statement.compile();
+      return Effect.sync(() => {
+        if (query.includes("UPDATE workflow_planning_sessions SET record_version")) {
+          payload.item = "changed";
+          mutated = true;
+        }
+        return statement;
+      });
+    };
+    const reserved = yield* store
+      .reservePlanningNativeIntent({ ...input, launch })
+      .pipe(Effect.provideService(Statement.CurrentTransformer, mutate));
+    assert.isTrue(mutated);
+    assert.strictEqual(payload.item, "changed");
+    const row = (yield* sql<{
+      material_json: string;
+    }>`SELECT material_json FROM workflow_native_reservation_material`)[0]!;
+    const { material } = yield* decodeNativeReservationMaterial(parse(row.material_json));
+    assert.deepStrictEqual(material.launch as unknown, originalLaunch);
+    assert.deepStrictEqual(
+      yield* store.reservePlanningNativeIntent({ ...input, launch: originalLaunch }),
+      { ...reserved, kind: "replay" },
+    );
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("historical planning V1 replays and controls without promotion to material", () =>
+  Effect.gen(function* () {
+    const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    yield* begin(store, session);
+    const materialized = planningReservation(admissionInput(binding, "historical"));
+    const { materialVersion: _version, launch: _launch, ...input } = materialized;
+    const fingerprint = WorkflowCanonicalHash.tagged("t3.workflow-native-launch-intent.v1", {
+      intentId: input.intentId,
+      workflowRunId: null,
+      planningSessionId: input.sessionId,
+      operationId: input.operationId,
+      attemptId: null,
+      passId: input.passId,
+      itemId: null,
+      chargeAttempt: 0,
+      repair: false,
+      role: input.role,
+      environmentId: input.environmentId,
+      projectId: input.projectId,
+      launchCommandId: input.launchCommandId,
+      threadId: input.threadId,
+      messageId: input.messageId,
+      draft: input.draft,
+    });
+    const owner = { ...session, recordVersion: 1, consumed: { passes: 1, repairRounds: 0 } };
+    yield* sql`UPDATE workflow_planning_sessions SET record_version = 1, record_json = ${json(owner)} WHERE id = ${session.id}`;
+    yield* sql`INSERT INTO workflow_native_launch_intents (intent_id, planning_session_id, operation_id, pass_id, charge_attempt, repair, role, environment_id, project_id, launch_command_id, thread_id, message_id, fingerprint, draft_json, generation, state, held) VALUES (${input.intentId}, ${input.sessionId}, ${input.operationId}, ${input.passId}, 0, 0, ${input.role}, ${input.environmentId}, ${input.projectId}, ${input.launchCommandId}, ${input.threadId}, ${input.messageId}, ${fingerprint}, ${json(input.draft)}, 0, 'reserved', 0)`;
+    yield* sql`INSERT INTO workflow_native_intent_receipts VALUES (${input.draft.admission.command.commandId}, ${input.draft.admission.command.receiptId}, ${input.intentId}, ${fingerprint}, ${json({ intentId: input.intentId, fingerprint })})`;
+    const unanchored = yield* decodeNativeReservationMaterial({
+      version: 1,
+      intentId: input.intentId,
+      receiptId: input.draft.admission.command.receiptId,
+      intentFingerprint: fingerprint,
+      launch: materialized.launch,
+      planningSession: owner,
+    });
+    yield* sql`INSERT INTO workflow_native_reservation_material (intent_id, material_json, material_hash) VALUES (${input.intentId}, ${json(unanchored.material)}, ${unanchored.materialHash})`;
+    const expected = {
+      kind: "replay",
+      receiptId: input.draft.admission.command.receiptId,
+      intentId: input.intentId,
+      fingerprint,
+    };
+    assert.deepStrictEqual(yield* store.reservePlanningNativeIntent(input), expected);
+    assert.strictEqual(
+      (yield* Effect.flip(store.reservePlanningNativeIntent(materialized))).reason,
+      "conflict",
+    );
+    yield* store.controlPlanning({
+      sessionId: session.id,
+      action: "pause",
+      expectedVersion: 1,
+      now: facts.now,
+      context,
+      command: { commandId: "legacy-pause", receiptId: "legacy-pause" },
+    });
+    assert.deepStrictEqual(yield* store.reservePlanningNativeIntent(input), expected);
+    assert.deepStrictEqual(yield* store.readThreadCustody({ threadId: input.threadId }), {
+      kind: "owned",
+      owner: { kind: "planning_session", planningSessionId: session.id },
+    });
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_native_reservation_material`).length, 1);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect(
+  "planning rejects fresh legacy, cross-format, malformed and changed launch without writes",
+  () =>
+    Effect.gen(function* () {
+      const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      yield* begin(store, session);
+      const input = planningReservation(admissionInput(binding, "formats"));
+      const { materialVersion: _version, launch: _launch, ...legacy } = input;
+      const before = yield* sql`SELECT * FROM workflow_planning_sessions`;
+      for (const candidate of [
+        legacy,
+        { ...legacy, materialVersion: 1 },
+        { ...input, materialVersion: 2 },
+        { ...legacy, launch: input.launch },
+      ]) {
+        assert.strictEqual(
+          (yield* Effect.result(store.reservePlanningNativeIntent(candidate as typeof input)))._tag,
+          "Failure",
+        );
+      }
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_planning_sessions`, before);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_launch_intents`, []);
+      yield* store.reservePlanningNativeIntent(input);
+      const saved = yield* sql`SELECT * FROM workflow_native_reservation_material`;
+      assert.strictEqual(
+        (yield* Effect.result(store.reservePlanningNativeIntent(legacy)))._tag,
+        "Failure",
+      );
+      assert.strictEqual(
+        (yield* Effect.result(
+          store.reservePlanningNativeIntent({
+            ...input,
+            launch: { ...input.launch, title: "Changed" },
+          }),
+        ))._tag,
+        "Failure",
+      );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_reservation_material`, saved);
+      assert.strictEqual((yield* store.getPlanning({ sessionId: session.id })).consumed.passes, 1);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  "missing",
+  "hash",
+  "receipt",
+  "snapshot-plan",
+  "snapshot-null",
+  "snapshot-actor",
+  "snapshot-version",
+  "snapshot-generation",
+  "snapshot-count",
+  "snapshot-role",
+] as const)("planning %s material tampering fails replay, control and custody", (scenario) =>
+  Effect.gen(function* () {
+    const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    yield* begin(store, session);
+    const input = planningReservation(admissionInput(binding, "tamper-material"));
+    yield* store.reservePlanningNativeIntent(input);
+    if (scenario === "receipt")
+      yield* sql`UPDATE workflow_native_intent_receipts SET result_json = '{}'`;
+    else {
+      yield* sql`DROP TRIGGER workflow_native_reservation_material_update_guard`;
+      yield* sql`DROP TRIGGER workflow_native_reservation_material_delete_guard`;
+      if (scenario === "missing") yield* sql`DELETE FROM workflow_native_reservation_material`;
+      if (scenario === "hash")
+        yield* sql`UPDATE workflow_native_reservation_material SET material_hash = ${hash}`;
+      if (scenario.startsWith("snapshot-")) {
+        const row = (yield* sql<{
+          material_json: string;
+        }>`SELECT material_json FROM workflow_native_reservation_material`)[0]!;
+        const decoded = yield* decodeNativeReservationMaterial(parse(row.material_json));
+        const snapshot = decoded.material.planningSession!;
+        const changes =
+          scenario === "snapshot-plan"
+            ? { planId: "other-plan" }
+            : scenario === "snapshot-actor"
+              ? { origin: { ...snapshot.origin, id: "other" } }
+              : scenario === "snapshot-version"
+                ? { recordVersion: 2 }
+                : scenario === "snapshot-generation"
+                  ? { controlGeneration: 1 }
+                  : scenario === "snapshot-count"
+                    ? { consumed: { passes: 0, repairRounds: 0 } }
+                    : scenario === "snapshot-role"
+                      ? { allowedRoles: ["review"] }
+                      : {};
+        const altered = {
+          ...decoded.material,
+          planningSession: scenario === "snapshot-null" ? null : { ...snapshot, ...changes },
+        };
+        const { materialHash } = yield* decodeNativeReservationMaterial(altered);
+        yield* sql`UPDATE workflow_native_reservation_material SET material_json = ${json(altered)}, material_hash = ${materialHash}`;
+        yield* sql`UPDATE workflow_native_intent_receipts SET result_json = ${json({ intentId: input.intentId, fingerprint: decoded.material.intentFingerprint, materialVersion: 1, materialHash })}`;
+      }
+      yield* sql`CREATE TRIGGER workflow_native_reservation_material_update_guard BEFORE UPDATE ON workflow_native_reservation_material BEGIN SELECT RAISE(ABORT, 'workflow native reservation material is immutable'); END`;
+      yield* sql`CREATE TRIGGER workflow_native_reservation_material_delete_guard BEFORE DELETE ON workflow_native_reservation_material BEGIN SELECT RAISE(ABORT, 'workflow native reservation material is immutable'); END`;
+    }
+    const before = yield* sql`SELECT * FROM workflow_planning_sessions`;
+    assert.strictEqual(
+      (yield* Effect.flip(store.reservePlanningNativeIntent(input))).reason,
+      "integrity",
+    );
+    assert.strictEqual(
+      (yield* Effect.flip(store.readThreadCustody({ threadId: input.threadId }))).reason,
+      "integrity",
+    );
+    assert.strictEqual(
+      (yield* Effect.flip(
+        store.controlPlanning({
+          sessionId: session.id,
+          action: "pause",
+          expectedVersion: 1,
+          now: facts.now,
+          context,
+          command: { commandId: "tamper-control", receiptId: "tamper-control" },
+        }),
+      )).reason,
+      "integrity",
+    );
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_planning_sessions`, before);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect(
+  "planning material SELECT errors retain storage and custody persistence classification",
+  () =>
+    Effect.gen(function* () {
+      const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      yield* begin(store, session);
+      const input = planningReservation(admissionInput(binding, "material-sql"));
+      yield* store.reservePlanningNativeIntent(input);
+      yield* sql`ALTER TABLE workflow_native_reservation_material RENAME TO unavailable_material`;
+      assert.strictEqual(
+        (yield* Effect.flip(store.reservePlanningNativeIntent(input))).reason,
+        "storage",
+      );
+      assert.strictEqual(
+        (yield* Effect.flip(store.readThreadCustody({ threadId: input.threadId }))).reason,
+        "persistence",
+      );
+      assert.strictEqual(
+        (yield* Effect.flip(
+          store.controlPlanning({
+            sessionId: session.id,
+            action: "pause",
+            expectedVersion: 1,
+            now: facts.now,
+            context,
+            command: { commandId: "sql-pause", receiptId: "sql-pause" },
+          }),
+        )).reason,
+        "storage",
+      );
+    }).pipe(Effect.provide(layer)),
+);
+
 it.effect("cancelled planning reservation replays after reopening the database", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -5355,6 +5724,14 @@ it.effect("cancelled planning reservation replays after reopening the database",
           const admission = admissionInput(binding, "reopen-cancel");
           const input = planningReservation(admission);
           const reserved = yield* store.reservePlanningNativeIntent(input);
+          const charged = yield* store.getPlanning({ sessionId: session.id });
+          const sql = yield* SqlClient.SqlClient;
+          const material = yield* sql<{
+            material_json: string;
+            material_hash: string;
+          }>`SELECT * FROM workflow_native_reservation_material`;
+          const decoded = yield* decodeNativeReservationMaterial(parse(material[0]!.material_json));
+          assert.deepStrictEqual(decoded.material.planningSession, charged);
           yield* store.controlPlanning({
             sessionId: session.id,
             action: "stop",
@@ -5363,13 +5740,25 @@ it.effect("cancelled planning reservation replays after reopening the database",
             context,
             command: { commandId: "reopen-stop", receiptId: "reopen-stop" },
           });
-          return { admission, input, reserved };
+          assert.deepStrictEqual(
+            yield* sql`SELECT * FROM workflow_native_reservation_material`,
+            material,
+          );
+          return { admission, input, reserved, material, charged };
         }).pipe(Effect.provide(fileLayer)),
       );
       yield* Effect.scoped(
         Effect.gen(function* () {
           const store = yield* Store.WorkflowRunStore;
           const sql = yield* SqlClient.SqlClient;
+          assert.deepStrictEqual(
+            yield* sql`SELECT * FROM workflow_native_reservation_material`,
+            saved.material,
+          );
+          const decoded = yield* decodeNativeReservationMaterial(
+            parse(saved.material[0]!.material_json),
+          );
+          assert.deepStrictEqual(decoded.material.planningSession, saved.charged);
           assert.deepStrictEqual(
             yield* store.reservePlanningNativeIntent({
               ...saved.input,
@@ -5571,14 +5960,22 @@ it.effect("planning reservation enforces plan-wide writer custody across session
     });
     assert.strictEqual(
       (yield* Effect.flip(
-        store.reservePlanningNativeIntent({ ...reviewInput, threadId: firstIntent.threadId }),
+        store.reservePlanningNativeIntent({
+          ...reviewInput,
+          threadId: firstIntent.threadId,
+          launch: { ...reviewInput.launch, threadId: firstIntent.threadId },
+        }),
       )).reason,
       "custody",
     );
     yield* sql`UPDATE workflow_native_launch_intents SET state = 'cancelled' WHERE intent_id = ${firstIntent.intentId}`;
     assert.strictEqual(
       (yield* Effect.flip(
-        store.reservePlanningNativeIntent({ ...reviewInput, threadId: firstIntent.threadId }),
+        store.reservePlanningNativeIntent({
+          ...reviewInput,
+          threadId: firstIntent.threadId,
+          launch: { ...reviewInput.launch, threadId: firstIntent.threadId },
+        }),
       )).reason,
       "custody",
     );
@@ -5633,6 +6030,12 @@ it.effect.each(["operation", "pass", "command", "receipt", "launch", "message"] 
       if (input.draft.operation.parameters.kind !== "planning_pass") return;
       const adjusted = {
         ...input,
+        launch: {
+          ...input.launch,
+          commandId: input.launchCommandId,
+          threadId: input.threadId,
+          initialMessage: { ...input.launch.initialMessage, messageId: input.messageId },
+        },
         draft: {
           ...input.draft,
           operation: {
@@ -5860,22 +6263,38 @@ it.effect.each(["reservation", "legacy"] as const)(
     }).pipe(Effect.provide(layer)),
 );
 
-it.effect("planning reservation receipt failure rolls back the charge and intent", () =>
-  Effect.gen(function* () {
-    const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
-    const store = yield* Store.WorkflowRunStore;
-    const sql = yield* SqlClient.SqlClient;
-    yield* begin(store, session);
-    yield* sql`CREATE TRIGGER reject_planning_intent_receipt BEFORE INSERT ON workflow_native_intent_receipts BEGIN SELECT RAISE(ABORT, 'failure'); END`;
-    const input = planningReservation(admissionInput(binding, "rollback"));
-    assert.strictEqual(
-      (yield* Effect.flip(store.reservePlanningNativeIntent(input))).reason,
-      "storage",
-    );
-    assert.strictEqual((yield* store.getPlanning({ sessionId: session.id })).consumed.passes, 0);
-    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_launch_intents`, []);
-    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_intent_receipts`, []);
-  }).pipe(Effect.provide(layer)),
+it.effect.each(["material", "receipt"] as const)(
+  "planning %s insertion rolls back without notification",
+  (fault) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+        const store = yield* Store.WorkflowRunStore;
+        const sql = yield* SqlClient.SqlClient;
+        yield* begin(store, session);
+        const subscription = yield* store.subscribeChanges;
+        if (fault === "material")
+          yield* sql`CREATE TRIGGER reject_planning BEFORE INSERT ON workflow_native_reservation_material BEGIN SELECT RAISE(ABORT, 'failure'); END`;
+        else
+          yield* sql`CREATE TRIGGER reject_planning BEFORE INSERT ON workflow_native_intent_receipts BEGIN SELECT RAISE(ABORT, 'failure'); END`;
+        const input = planningReservation(admissionInput(binding, "rollback"));
+        const owner = yield* sql`SELECT * FROM workflow_planning_sessions`;
+        assert.strictEqual(
+          (yield* Effect.flip(store.reservePlanningNativeIntent(input))).reason,
+          "storage",
+        );
+        assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_planning_sessions`, owner);
+        assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_launch_intents`, []);
+        assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_reservation_material`, []);
+        assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_intent_receipts`, []);
+        assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+        yield* sql`DROP TRIGGER reject_planning`;
+        assert.strictEqual((yield* store.reservePlanningNativeIntent(input)).kind, "reserved");
+        assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 1);
+        assert.strictEqual((yield* store.reservePlanningNativeIntent(input)).kind, "replay");
+        assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+      }),
+    ).pipe(Effect.provide(layer)),
 );
 
 it.effect(
