@@ -420,6 +420,7 @@ export function layerWithRegistry<Error>(
       Layer.mergeAll(
         layerContextHandoffServiceProvided,
         layerEventSinkProvided,
+        WorkflowRunStore.layer.pipe(Layer.provide(layerDatabase)),
         IdAllocator.layer,
         layerStores,
         layerProviderSessionManagerProvided,

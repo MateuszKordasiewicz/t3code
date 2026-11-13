@@ -25,6 +25,7 @@ import * as Path from "effect/Path";
 import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
 
+import * as WorkflowRunStore from "../workflowRuns/WorkflowRunStore.ts";
 import * as ServerConfig from "../config.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
@@ -132,6 +133,7 @@ export const layer: Layer.Layer<
   ProviderTurnStartServiceV2,
   never,
   | EventSink.EventSinkV2
+  | WorkflowRunStore.WorkflowRunStore
   | ContextHandoffService.ContextHandoffServiceV2
   | IdAllocator.IdAllocatorV2
   | FileSystem.FileSystem
@@ -149,6 +151,7 @@ export const layer: Layer.Layer<
   ProviderTurnStartServiceV2,
   Effect.gen(function* () {
     const eventSink = yield* EventSink.EventSinkV2;
+    const workflowRuns = yield* WorkflowRunStore.WorkflowRunStore;
     const turnAnalytics = yield* ProviderUsageAnalytics.ProviderTurnAnalytics;
     const contextHandoffService = yield* ContextHandoffService.ContextHandoffServiceV2;
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
@@ -341,7 +344,48 @@ export const layer: Layer.Layer<
       readonly willRetry?: boolean;
     }) {
       const { runId } = input;
-      const projection = yield* projectionStore.getTurnStartContext(input.threadId, runId);
+      const projection = yield* eventSink.withProviderBatch(
+        Effect.gen(function* () {
+          const projection = yield* projectionStore.getTurnStartContext(input.threadId, runId);
+          const sessionIds = [
+            ...new Set([
+              ...projection.providerSessions.map((session) => session.id),
+              ...projection.providerThreads.flatMap((thread) =>
+                thread.providerSessionId === null ? [] : [thread.providerSessionId],
+              ),
+            ]),
+          ];
+          const threadIds = new Set<string>([
+            input.threadId,
+            projection.thread.id,
+            ...[
+              projection.runs,
+              projection.attempts,
+              projection.nodes,
+              projection.subagents,
+              projection.providerTurns,
+              projection.messages,
+              projection.turnItems,
+              projection.checkpointScopes,
+              projection.contextHandoffs,
+              projection.contextTransfers,
+            ].flatMap((rows) => rows.flatMap((row) => ("threadId" in row ? [row.threadId] : []))),
+            ...projection.providerThreads.flatMap((thread) =>
+              thread.appThreadId === null ? [] : [thread.appThreadId],
+            ),
+          ]);
+          let owned = false;
+          for (const threadId of threadIds) {
+            const custody = yield* workflowRuns.readRecoveryCustodyInTransaction({
+              threadId,
+              providerSessionIds: sessionIds,
+            });
+            if (custody.kind === "owned") owned = true;
+          }
+          if (owned) return yield* new ProviderTurnStartError({ runId });
+          return projection;
+        }),
+      );
       const run = projection.runs.find((candidate) => candidate.id === runId);
       if (run === undefined) {
         return yield* new ProviderTurnStartError({ runId, cause: `Run ${runId} was not found.` });

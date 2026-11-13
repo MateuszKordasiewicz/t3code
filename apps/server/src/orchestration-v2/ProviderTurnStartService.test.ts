@@ -21,6 +21,8 @@ import {
   ProjectId,
   type OrchestrationV2ThreadProjection,
   OrchestrationV2DomainEvent,
+  WorkflowOperationV1,
+  WorkflowRunV1,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
@@ -33,7 +35,16 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
 
+import * as WorkflowRunStore from "../workflowRuns/WorkflowRunStore.ts";
+import { WorkflowCanonicalHash } from "../workflowRuns/WorkflowCanonicalHash.ts";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import * as CommandReceiptStore from "./CommandReceiptStore.ts";
+import * as EffectOutbox from "./EffectOutbox.ts";
+import * as EventStore from "./EventStore.ts";
+import * as ProjectStore from "./ProjectStore.ts";
+import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 import * as ServerConfig from "../config.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
@@ -116,7 +127,10 @@ function startWithMissingWorktree(
     ],
     nodes: [{ id: rootNodeId, checkpointScopeId }],
     attempts: [{ id: attemptId }],
-    providerThreads: [{ id: providerThreadId, providerSessionId }],
+    providerThreads: [{ id: providerThreadId, providerSessionId, appThreadId: null }],
+    providerSessions: [],
+    subagents: [],
+    providerTurns: [],
     messages: [{ id: messageId, text: "Continue", attachments: [] }],
     checkpointScopes: [{ id: checkpointScopeId }],
     contextHandoffs: [],
@@ -135,7 +149,13 @@ function startWithMissingWorktree(
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({}),
-        Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
+        Layer.mock(EventSink.EventSinkV2)({
+          writeIfRunCurrent,
+          withProviderBatch: (effect) => effect,
+        }),
+        Layer.mock(WorkflowRunStore.WorkflowRunStore)({
+          readRecoveryCustodyInTransaction: () => Effect.succeed({ kind: "ordinary" }),
+        }),
         IdAllocator.layer,
         Layer.succeed(FileSystem.FileSystem, {
           exists: () => Effect.succeed(false),
@@ -269,6 +289,9 @@ it.each([
 
 function makeLocalCommandHarness(input: {
   readonly text: string;
+  readonly custody?: WorkflowRunStore.WorkflowRunStore["Service"]["readRecoveryCustodyInTransaction"];
+  readonly withProviderBatch?: EventSink.EventSinkV2Shape["withProviderBatch"];
+  readonly onProjectionRead?: Effect.Effect<void>;
   readonly nativeGoals?: boolean;
   readonly worktreePath?: string;
   readonly worktreesDir?: string;
@@ -906,37 +929,52 @@ function makeLocalCommandHarness(input: {
   const createWorktree = vi.fn<GitWorkflow.GitWorkflowService["Service"]["createWorktree"]>(() =>
     Effect.succeed({} as never),
   );
+  const checkWorkspace = vi.fn(() => Effect.succeed(true));
+  const prepareProviderHandoff = vi.fn(
+    (
+      handoff: Parameters<
+        ContextHandoffService.ContextHandoffServiceV2Shape["prepareProviderHandoff"]
+      >[0],
+    ) =>
+      input.sideChat?.nativeForkFrom === undefined
+        ? Effect.die("history read must fail first")
+        : Effect.succeed({
+            ...handoff,
+            id: ContextHandoffId.make("side-chat-fork-context"),
+            createdByProviderInstanceId: handoff.toProviderInstanceId,
+            status: "ready" as const,
+            summaryMessageId: null,
+            summaryText: "PARENT_HISTORY",
+            updatedAt: handoff.createdAt,
+          }),
+  );
   const getThreadRecords = vi.fn<ProjectionStore.ProjectionStoreV2Shape["getThreadRecords"]>((id) =>
     Effect.succeed(id === parentThreadId ? parentRecords : projection),
   );
   const getTurnStartContext = vi.fn(() =>
-    Effect.succeed({
-      ...projection,
-      hasConversation: projection.messages.some(
-        (m) =>
-          m.role === "user" &&
-          (m.text.trim().toLowerCase() !== "/compact" || m.attachments.length > 0),
-      ),
-    }),
+    (input.onProjectionRead ?? Effect.void).pipe(
+      Effect.as({
+        ...projection,
+        hasConversation: projection.messages.some(
+          (m) =>
+            m.role === "user" &&
+            (m.text.trim().toLowerCase() !== "/compact" || m.attachments.length > 0),
+        ),
+      }),
+    ),
   );
   const layer = ProviderTurnStart.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({
-          prepareProviderHandoff: (handoff) =>
-            input.sideChat?.nativeForkFrom === undefined
-              ? Effect.die("history read must fail first")
-              : Effect.succeed({
-                  ...handoff,
-                  id: ContextHandoffId.make("side-chat-fork-context"),
-                  createdByProviderInstanceId: handoff.toProviderInstanceId,
-                  status: "ready",
-                  summaryMessageId: null,
-                  summaryText: "PARENT_HISTORY",
-                  updatedAt: handoff.createdAt,
-                }),
+          prepareProviderHandoff,
+        }),
+        Layer.mock(WorkflowRunStore.WorkflowRunStore)({
+          readRecoveryCustodyInTransaction:
+            input.custody ?? (() => Effect.succeed({ kind: "ordinary" })),
         }),
         Layer.mock(EventSink.EventSinkV2)({
+          withProviderBatch: input.withProviderBatch ?? ((effect) => effect),
           writeIfRunCurrent,
           write: ({ events: incoming }) =>
             Effect.sync(() => {
@@ -950,7 +988,7 @@ function makeLocalCommandHarness(input: {
         IdAllocator.layer,
         layerWorktreeLocation(input.worktreesDir),
         input.fileSystem === undefined
-          ? FileSystem.layerNoop({ exists: () => Effect.succeed(true) })
+          ? FileSystem.layerNoop({ exists: checkWorkspace })
           : Layer.succeed(FileSystem.FileSystem, input.fileSystem),
         input.gitWorkflow === undefined
           ? Layer.mock(GitWorkflow.GitWorkflowService)({
@@ -1021,6 +1059,8 @@ function makeLocalCommandHarness(input: {
       projection = next;
     },
     resolveRuntimePolicy,
+    checkWorkspace,
+    prepareProviderHandoff,
     createWorktree,
     open,
     fallbackEnsureThread,
@@ -1873,3 +1913,242 @@ for (const previousMessages of [[], ["/compact", " /COMPACT "]]) {
       }),
   );
 }
+
+effectIt.effect("denies provider start before authentication for owned custody", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "/logout",
+      custody: () => Effect.succeed({ kind: "owned" }),
+    });
+    const error = yield* harness.start.pipe(Effect.flip);
+    expect(error._tag).toBe("ProviderTurnStartError");
+    expect(harness.tryHandlePromptCommand).not.toHaveBeenCalled();
+    expect(harness.events).toEqual([]);
+    expect(harness.settledRuns).toEqual([]);
+  }),
+);
+
+const decodeStartCustodyRun = Schema.decodeEffect(WorkflowRunV1);
+const decodeStartCustodyOperation = Schema.decodeEffect(WorkflowOperationV1);
+const seedStartCustody = (threadId: string, malformed: boolean) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const hash = "a".repeat(64);
+    const run = yield* decodeStartCustodyRun({
+      schemaVersion: 1,
+      id: "custody-run",
+      spec: {
+        ref: { kind: "configuration", id: "spec", sha256: hash },
+        plan: {
+          planId: "custody-plan",
+          revisionId: "revision",
+          revisionSchemaVersion: 1,
+          revisionHash: hash,
+          sourcePacketHash: hash,
+        },
+      },
+      mode: "ordinary",
+      origin: { kind: "human", id: "human" },
+      status: "active",
+      controlGeneration: 0,
+      recordVersion: 0,
+      allowance: {
+        maxAttempts: 2,
+        maxRepairRounds: 1,
+        maxActiveWriters: 1,
+        attemptsConsumed: 0,
+        repairRoundsConsumed: 0,
+        deadline: "2026-12-01T00:00:00Z",
+      },
+      amendmentSequence: 0,
+      createdAt: "2026-11-01T00:00:00Z",
+      access: { origins: [] },
+    });
+    const base = yield* decodeStartCustodyOperation({
+      schemaVersion: 1,
+      id: "custody-operation",
+      owner: { kind: "workflow_run", workflowRunId: run.id },
+      kind: "stage_launch",
+      parameters: {
+        kind: "stage_launch",
+        stage: "implementation",
+        context: {
+          specHash: hash,
+          policyHash: hash,
+          itemId: "item",
+          attemptId: "attempt",
+          candidateHash: hash,
+          configurationHash: hash,
+        },
+        provider: { providerInstanceId: "provider", model: "model" },
+        nativeThreadId: threadId,
+        nativeRunId: "native-run",
+      },
+      fingerprint: hash,
+      origin: run.origin,
+      destination: { environmentId: "environment", projectId: "project-native-account-command" },
+      controlGeneration: 0,
+      status: "pending",
+      access: { origins: [] },
+    });
+    const operation = { ...base, fingerprint: WorkflowCanonicalHash.operation(base) };
+    yield* sql`INSERT INTO workflow_plan_identities VALUES ('custody-plan')`;
+    yield* sql`INSERT INTO workflow_revision_identities VALUES ('custody-plan', 'revision', ${hash}, ${hash})`;
+    yield* sql`INSERT INTO workflow_runs VALUES ('custody-run', 'custody-plan', 'revision', ${hash}, ${hash}, ${hash}, 'active', 0, 0, ${JSON.stringify(run)})`;
+    const record = malformed
+      ? JSON.stringify({ parameters: { nativeThreadId: threadId } })
+      : JSON.stringify(operation);
+    yield* sql`INSERT INTO workflow_operations (id, workflow_run_id, kind, fingerprint, status, generation, record_json) VALUES ('custody-operation', 'custody-run', 'stage_launch', ${operation.fingerprint}, 'pending', 0, ${record})`;
+  });
+
+const startDatabase = SqlitePersistence.layerMemory;
+const startStore = WorkflowRunStore.layer.pipe(Layer.provide(startDatabase));
+const startSink = EventSink.layerFromStores.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      startDatabase,
+      Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({}),
+      Layer.mock(EffectOutbox.EffectOutboxV2)({}),
+      Layer.mock(EventStore.EventStoreV2)({}),
+      Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
+      Layer.mock(ProjectStore.ProjectStoreV2)({}),
+      Layer.mock(TurnItemPositionStore.TurnItemPositionStoreV2)({}),
+    ),
+  ),
+);
+const startIntegration = Layer.mergeAll(startDatabase, startStore, startSink);
+
+effectIt.effect.each([
+  "owned",
+  "shared",
+  "malformed",
+  "owned-and-malformed",
+  "read-error",
+  "ordinary",
+  "pristine",
+] as const)("checks %s custody in the actual provider batch before start effects", (evidence) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* WorkflowRunStore.WorkflowRunStore;
+    const sink = yield* EventSink.EventSinkV2;
+    const thread = "thread-native-account-command";
+    const peer = "owned-peer";
+    if (evidence === "pristine") {
+      const allocation = {
+        id: "new-provider-thread",
+        driver: "codex",
+        providerInstanceId: "codex-personal",
+        providerSessionId: "new-provider-session",
+        appThreadId: thread,
+        ownerNodeId: null,
+        nativeThreadRef: null,
+        nativeConversationHeadRef: null,
+        status: "not_loaded",
+        firstRunOrdinal: 2,
+        lastRunOrdinal: 2,
+        handoffIds: [],
+        forkedFrom: null,
+        pendingBackgroundTasks: [],
+        createdAt: "2026-11-01T00:00:00Z",
+        updatedAt: "2026-11-01T00:00:00Z",
+      };
+      yield* sql`INSERT INTO orchestration_v2_projection_provider_threads (provider_thread_id, thread_id, owner_node_id, provider, driver, provider_instance_id, provider_session_id, status, updated_at, payload_json) VALUES ('new-provider-thread', ${thread}, NULL, 'codex', 'codex', 'codex-personal', 'new-provider-session', 'not_loaded', '2026-11-01T00:00:00Z', ${JSON.stringify(allocation)})`;
+    } else {
+      const session = {
+        id: "new-provider-session",
+        driver: "codex",
+        providerInstanceId: "codex-personal",
+        status: "running",
+        cwd: "/workspace",
+        model: "model",
+        capabilities: CodexProviderCapabilitiesV2,
+        createdAt: "2026-11-01T00:00:00Z",
+        updatedAt: "2026-11-01T00:00:00Z",
+        lastError: null,
+      };
+      yield* sql`INSERT INTO orchestration_v2_projection_provider_sessions (provider_session_id, thread_id, provider, status, updated_at, payload_json) VALUES ('new-provider-session', NULL, 'codex', 'running', '2026-11-01T00:00:00Z', ${JSON.stringify(session)})`;
+      yield* sql`INSERT INTO orchestration_v2_projection_provider_session_bindings VALUES ('new-provider-session', ${thread})`;
+    }
+    if (evidence === "shared") {
+      yield* sql`INSERT INTO orchestration_v2_projection_provider_session_bindings VALUES ('new-provider-session', ${peer})`;
+    }
+    if (
+      evidence === "owned" ||
+      evidence === "shared" ||
+      evidence === "malformed" ||
+      evidence === "owned-and-malformed"
+    ) {
+      yield* seedStartCustody(evidence === "shared" ? peer : thread, evidence === "malformed");
+    }
+    if (evidence === "owned-and-malformed") {
+      const record = JSON.stringify({ parameters: { nativeThreadId: "malformed-peer" } });
+      yield* sql`INSERT INTO workflow_operations (id, workflow_run_id, kind, fingerprint, status, generation, record_json) VALUES ('malformed-operation', 'custody-run', 'stage_launch', ${"b".repeat(64)}, 'pending', 0, ${record})`;
+    }
+    if (evidence === "read-error") yield* sql`DROP TABLE workflow_native_launch_intents`;
+    const snapshot = Effect.gen(function* () {
+      return {
+        intents:
+          evidence === "read-error" ? [] : yield* sql`SELECT * FROM workflow_native_launch_intents`,
+        operations: yield* sql`SELECT * FROM workflow_operations`,
+        runs: yield* sql`SELECT * FROM workflow_runs`,
+        sessions: yield* sql`SELECT * FROM orchestration_v2_projection_provider_sessions`,
+        bindings: yield* sql`SELECT * FROM orchestration_v2_projection_provider_session_bindings`,
+        providerThreads: yield* sql`SELECT * FROM orchestration_v2_projection_provider_threads`,
+        nativeRuns: yield* sql`SELECT * FROM orchestration_v2_projection_runs`,
+        outbox: yield* sql`SELECT * FROM orchestration_v2_effect_outbox`,
+        events: yield* sql`SELECT * FROM orchestration_events`,
+        receipts: yield* sql`SELECT * FROM orchestration_command_receipts`,
+      };
+    });
+    const before = yield* snapshot;
+    let projectionReadInTransaction = false;
+    const harness = makeLocalCommandHarness({
+      text: "/logout",
+      worktreePath: "/tmp/custody-worktree",
+      custody: store.readRecoveryCustodyInTransaction,
+      withProviderBatch: sink.withProviderBatch,
+      onProjectionRead: Effect.gen(function* () {
+        projectionReadInTransaction = Option.isSome(
+          yield* Effect.serviceOption(sql.transactionService),
+        );
+      }),
+    });
+    if (evidence === "owned-and-malformed") {
+      const projection = harness.projection();
+      harness.setProjection({
+        ...projection,
+        messages: [
+          ...projection.messages,
+          { ...projection.messages[0]!, threadId: ThreadId.make("malformed-peer") },
+        ],
+      });
+    }
+    if (evidence === "ordinary" || evidence === "pristine") {
+      yield* harness.start;
+      expect(harness.tryHandlePromptCommand).toHaveBeenCalledOnce();
+    } else {
+      const error = yield* harness.start.pipe(Effect.flip);
+      expect(error._tag).toBe("ProviderTurnStartError");
+      if (
+        evidence === "malformed" ||
+        evidence === "owned-and-malformed" ||
+        evidence === "read-error"
+      )
+        expect(error.cause).toMatchObject({ _tag: "WorkflowRunStoreError" });
+      else expect(error.cause).toBeUndefined();
+      expect(harness.getTurnStartContext).toHaveBeenCalledOnce();
+      expect(harness.tryHandlePromptCommand).not.toHaveBeenCalled();
+      expect(harness.checkWorkspace).not.toHaveBeenCalled();
+      expect(harness.prepareProviderHandoff).not.toHaveBeenCalled();
+      expect(harness.resolveRuntimePolicy).not.toHaveBeenCalled();
+      expect(harness.createWorktree).not.toHaveBeenCalled();
+      expect(harness.open).not.toHaveBeenCalled();
+      expect(harness.startRootRun).not.toHaveBeenCalled();
+      expect(harness.writeIfRunCurrent).not.toHaveBeenCalled();
+      expect(harness.events).toEqual([]);
+      expect(harness.settledRuns).toEqual([]);
+    }
+    expect(projectionReadInTransaction).toBe(true);
+    expect(yield* snapshot).toEqual(before);
+  }).pipe(Effect.provide(startIntegration)),
+);
