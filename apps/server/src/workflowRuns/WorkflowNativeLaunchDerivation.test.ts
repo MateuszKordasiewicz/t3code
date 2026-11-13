@@ -6,6 +6,7 @@ import * as NodeSqlite from "node:sqlite";
 import * as NodePathService from "@effect/platform-node/NodePath";
 import { assert, it } from "@effect/vitest";
 import {
+  EnvironmentId,
   MessageId,
   OrchestrationV2Command,
   ProviderInstanceId,
@@ -27,6 +28,15 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
+import * as TestClock from "effect/testing/TestClock";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as ConfigModule from "../config.ts";
+import * as SessionStore from "../auth/SessionStore.ts";
+import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
+import * as ExecutionAuthority from "./WorkflowExecutionAuthority.ts";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
@@ -2101,6 +2111,8 @@ it.effect.each([false, true])(
 const proofOrchestrator = Effect.fn("test.proofOrchestrator")(function* (
   nativeCommandProofs = true,
   capabilitiesGate: Effect.Effect<void> = Effect.void,
+  nativeWorkflowAuthority?: EventSink.NativeWorkflowAuthority,
+  serverConfig?: ServerConfig["Service"],
 ) {
   const sql = yield* SqlClient.SqlClient;
   const adapter = {
@@ -2118,6 +2130,8 @@ const proofOrchestrator = Effect.fn("test.proofOrchestrator")(function* (
         {
           databaseLayer: Layer.succeed(SqlClient.SqlClient, sql),
           nativeCommandProofs,
+          ...(serverConfig === undefined ? {} : { serverConfig }),
+          ...(nativeWorkflowAuthority === undefined ? {} : { nativeWorkflowAuthority }),
           runEffectWorker: false,
           runContinuationWorker: false,
           recoverOnStartup: false,
@@ -2458,4 +2472,466 @@ it.effect("real native message decision uses an owned copy of nested caller cont
     );
     assert.deepStrictEqual(yield* nativeCounts, before);
   }).pipe(Effect.provide(testLayer())),
+);
+
+const controlledNativeFixture = Effect.fn("test.controlledNativeFixture")(function* (
+  kind: "workflow" | "planning",
+  reuse = false,
+  claim = true,
+  materialVersion: 1 | 2 = 2,
+) {
+  assert.isFunction(EventSink.makeCapturedAuthorizedNativeEventInfrastructure);
+  yield* TestClock.setTime(DateTime.makeUnsafe(facts.now).epochMilliseconds);
+  const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+  yield* seedProject;
+  const sql = yield* SqlClient.SqlClient;
+  const identity = { getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")) };
+  const base = Layer.mergeAll(
+    Layer.succeed(SqlClient.SqlClient, sql),
+    Layer.succeed(ServerEnvironment.ServerEnvironmentIdentity, identity),
+    ManagedPolicy.layerTest(),
+    ConfigModule.layerTest(process.cwd(), { prefix: "native-controlled-authority-" }),
+  ).pipe(Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)));
+  const authContext = yield* Layer.build(
+    Layer.fresh(
+      SessionStore.layer.pipe(
+        Layer.provideMerge(ServerSecretStore.layer.pipe(Layer.provideMerge(base))),
+      ),
+    ),
+  );
+  const sessions = Context.get(authContext, SessionStore.SessionStore);
+  const issued = yield* sessions.issue({
+    subject: "human",
+    method: "bearer-access-token",
+    scopes: ["orchestration:read", "orchestration:operate"],
+  });
+  const reference = ExecutionAuthority.captureLocalRpcExecutionAuthority(
+    yield* sessions.verify(issued.token),
+    EnvironmentId.make("environment"),
+    "verified-session",
+  );
+  if (!reference) throw new Error("reference missing");
+  const authority = {
+    identity,
+    policy: Context.get(authContext, ManagedPolicy.ManagedPolicy),
+    coordinator: { bootId: "controlled-boot", workerId: "controlled-worker" },
+  };
+  const config = yield* ProviderReplayHarness.makeReplayServerConfig(
+    "native-controlled-authority",
+  ).pipe(Effect.provide(NodeServices.layer));
+  const runtime = yield* proofOrchestrator(true, Effect.void, authority, config);
+  const store = Context.get(runtime, Store.WorkflowRunStore);
+  const orchestrator = Context.get(runtime, Orchestrator.OrchestratorV2);
+  const requestedInput =
+    kind === "workflow"
+      ? {
+          ...basicInput(),
+          materialVersion: 2 as const,
+          authority: reference,
+          launch: { ...basicInput().launch, reuseExistingThread: reuse },
+        }
+      : (() => {
+          const value = planningReservation(admissionInput(binding, "controlled"));
+          return {
+            ...value,
+            materialVersion: 2 as const,
+            authority: reference,
+            launch: { ...value.launch, reuseExistingThread: reuse },
+          };
+        })();
+  const input =
+    materialVersion === 2
+      ? requestedInput
+      : (() => {
+          const { authority: _authority, materialVersion: _version, ...base } = requestedInput;
+          return { ...base, materialVersion: 1 as const };
+        })();
+  if (reuse) {
+    yield* orchestrator.dispatch(
+      decodeOrchestratorFixtureCommand({
+        type: "thread.create",
+        commandId: "controlled-existing-thread",
+        threadId: input.threadId,
+        projectId: input.projectId,
+        title: "Existing",
+        modelSelection: input.launch.modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: "main",
+        worktreePath: null,
+        createdBy: "agent",
+        creationSource: "mcp",
+      }),
+    );
+  }
+  let fingerprint: string;
+  if (kind === "workflow" && "runId" in input) {
+    yield* store.createRun({
+      ...run,
+      spec: { ...run.spec, plan: binding },
+      access: { origins: [destination] },
+    });
+    const result = yield* store.reserveWorkflowNativeIntent(input);
+    if (result.kind !== "reserved") throw new Error("reservation denied");
+    fingerprint = result.fingerprint;
+  } else if ("sessionId" in input) {
+    yield* store.beginPlanning({
+      session,
+      now: facts.now,
+      context,
+      command: { commandId: "controlled-begin", receiptId: "controlled-begin" },
+    });
+    fingerprint = (yield* store.reservePlanningNativeIntent(input)).fingerprint;
+  } else throw new Error("wrong fixture owner");
+  if (claim)
+    assert.strictEqual(
+      (yield* store.claimNativeIntent({
+        intentId: input.intentId,
+        expectedFingerprint: fingerprint,
+        expectedOwnerVersion: 1,
+        expectedGeneration: 0,
+        ...authority.coordinator,
+      })).kind,
+      "claimed",
+    );
+  const derivation = yield* Derivation.make.pipe(
+    Effect.provideService(Store.WorkflowRunStore, store),
+  );
+  const derived = yield* sql.withTransaction(
+    derivation.deriveInTransaction({ intentId: input.intentId }),
+  );
+  return {
+    kind,
+    config,
+    sql,
+    sessions,
+    reference,
+    authority,
+    runtime,
+    store,
+    orchestrator,
+    input,
+    derived,
+  };
+});
+
+it.effect.each([
+  ["workflow", false],
+  ["workflow", true],
+  ["planning", false],
+  ["planning", true],
+] as const)("authorized native graph dispatches real $0 phases with reuse=$1", ([kind, reuse]) =>
+  Effect.gen(function* () {
+    const { orchestrator, derived, input, store } = yield* controlledNativeFixture(kind, reuse);
+    const claimHint = { intentId: input.intentId, phase: "claim" } as const;
+    const messageHint = { intentId: input.intentId, phase: "message" } as const;
+    yield* orchestrator.dispatch(derived.claimCommand, claimHint);
+    const result = yield* orchestrator.dispatch(derived.messageCommand, messageHint);
+    const created = result.storedEvents.find(({ event }) => event.type === "run.created");
+    assert.isDefined(created);
+    if (created?.event.type !== "run.created") throw new Error("run missing");
+    assert.strictEqual(created.event.payload.userMessageId, input.messageId);
+    const sql = yield* SqlClient.SqlClient;
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_native_command_proofs`).length, 2);
+    assert.deepStrictEqual(
+      yield* sql`SELECT * FROM orchestration_v2_effect_outbox WHERE effect_type IN ('provider-turn.start','provider-turn.restart','provider-runtime.continue')`,
+      [],
+    );
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_operations`, []);
+    const retained = yield* sql.withTransaction(
+      store.readNativeReservationInTransaction({ intentId: input.intentId }),
+    );
+    assert.strictEqual(retained.state, "dispatching");
+    assert.strictEqual(retained.nativeRunId, null);
+    assert.strictEqual(retained.material.version, 2);
+  }).pipe(Effect.provide(testLayer())),
+);
+
+const controlNativeFixture = Effect.fn("test.controlNativeFixture")(function* (
+  fixture: Effect.Success<ReturnType<typeof controlledNativeFixture>>,
+  action: "pause" | "stop",
+) {
+  const { store, sql } = fixture;
+  if (fixture.kind === "workflow") {
+    const row = (yield* sql<{
+      record_version: number;
+      control_generation: number;
+    }>`SELECT record_version,control_generation FROM workflow_runs`)[0]!;
+    yield* store.commitTransition({
+      runId: run.id,
+      command: {
+        ...command,
+        kind: action,
+        commandId: `controlled-${action}`,
+        expectedVersion: row.record_version,
+        expectedGeneration: row.control_generation,
+      },
+      externalFacts: admissionFacts,
+      receiptId: `controlled-${action}`,
+    });
+  } else {
+    const row = (yield* sql<{
+      record_version: number;
+    }>`SELECT record_version FROM workflow_planning_sessions`)[0]!;
+    yield* store.controlPlanning({
+      sessionId: session.id,
+      action,
+      expectedVersion: row.record_version,
+      now: facts.now,
+      context,
+      command: { commandId: `controlled-${action}`, receiptId: `controlled-${action}` },
+    });
+  }
+});
+
+it.effect.each([
+  ["workflow", "revoke"],
+  ["planning", "revoke"],
+  ["workflow", "pause"],
+  ["planning", "pause"],
+  ["workflow", "stop"],
+  ["planning", "stop"],
+  ["workflow", "delete-column"],
+  ["planning", "delete-column"],
+  ["workflow", "delete-payload"],
+  ["planning", "delete-payload"],
+  ["workflow", "coordinator"],
+  ["planning", "coordinator"],
+  ["workflow", "deadline"],
+  ["planning", "deadline"],
+] as const)(
+  "authorized native graph denies new $0 message after $1 and preserves claim replay",
+  ([kind, change]) =>
+    Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture(kind);
+      const { orchestrator, derived, input, sessions, reference, sql } = fixture;
+      const claimHint = { intentId: input.intentId, phase: "claim" } as const;
+      const messageHint = { intentId: input.intentId, phase: "message" } as const;
+      const first = yield* orchestrator.dispatch(derived.claimCommand, claimHint);
+      let selected = orchestrator;
+      if (change === "revoke") yield* sessions.revoke(reference.sessionId);
+      else if (change === "pause" || change === "stop")
+        yield* controlNativeFixture(fixture, change);
+      else if (change === "deadline")
+        yield* TestClock.setTime(DateTime.makeUnsafe("2026-12-02T00:00:00Z").epochMilliseconds);
+      else if (change === "coordinator")
+        selected = Context.get(
+          yield* proofOrchestrator(
+            true,
+            Effect.void,
+            {
+              ...fixture.authority,
+              coordinator: { ...fixture.authority.coordinator, workerId: "other-coordinator" },
+            },
+            fixture.config,
+          ),
+          Orchestrator.OrchestratorV2,
+        );
+      else if (change === "delete-column")
+        yield* sql`UPDATE orchestration_v2_projection_threads SET deleted_at = ${facts.now} WHERE thread_id = ${input.threadId}`;
+      else
+        yield* sql`UPDATE orchestration_v2_projection_threads SET payload_json = json_set(payload_json,'$.deletedAt',${facts.now}) WHERE thread_id = ${input.threadId}`;
+      const before = yield* nativeCounts;
+      assert.isTrue(
+        isOrchestratorDispatchError(
+          yield* Effect.flip(selected.dispatch(derived.messageCommand, messageHint)),
+        ),
+      );
+      assert.deepStrictEqual(yield* nativeCounts, before);
+      assert.deepStrictEqual(
+        (yield* selected.dispatch(derived.claimCommand, claimHint)).storedEvents,
+        first.storedEvents,
+      );
+      assert.deepStrictEqual(yield* nativeCounts, before);
+      assert.strictEqual((yield* sql`SELECT * FROM workflow_native_command_proofs`).length, 1);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_operations`, []);
+    }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "authorized native graph refuses unclaimed $0 intent without native writes",
+  (kind) =>
+    Effect.gen(function* () {
+      const { orchestrator, derived, input } = yield* controlledNativeFixture(kind, false, false);
+      const before = yield* nativeCounts;
+      assert.isTrue(
+        isOrchestratorDispatchError(
+          yield* Effect.flip(
+            orchestrator.dispatch(derived.claimCommand, {
+              intentId: input.intentId,
+              phase: "claim",
+            }),
+          ),
+        ),
+      );
+      assert.deepStrictEqual(yield* nativeCounts, before);
+    }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "authorized native graph preserves verified $0 message replay after revocation and stop",
+  (kind) =>
+    Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture(kind);
+      const { orchestrator, derived, input, sessions, reference } = fixture;
+      yield* orchestrator.dispatch(derived.claimCommand, {
+        intentId: input.intentId,
+        phase: "claim",
+      });
+      const hint = { intentId: input.intentId, phase: "message" } as const;
+      const first = yield* orchestrator.dispatch(derived.messageCommand, hint);
+      yield* sessions.revoke(reference.sessionId);
+      yield* controlNativeFixture(fixture, "stop");
+      const before = yield* nativeCounts;
+      const other = Context.get(
+        yield* proofOrchestrator(
+          true,
+          Effect.void,
+          {
+            ...fixture.authority,
+            coordinator: { bootId: "other-boot", workerId: "other-worker" },
+          },
+          fixture.config,
+        ),
+        Orchestrator.OrchestratorV2,
+      );
+      assert.deepStrictEqual(
+        (yield* other.dispatch(derived.messageCommand, hint)).storedEvents,
+        first.storedEvents,
+      );
+      assert.deepStrictEqual(yield* nativeCounts, before);
+    }).pipe(Effect.provide(testLayer())),
+);
+
+const observeAuthorizedSink = Effect.fn("test.observeAuthorizedSink")(function* (
+  sink: EventSink.EventSinkV2["Service"],
+  afterSequence = 0,
+) {
+  const ready = yield* Deferred.make<void>();
+  const observe: Statement.Transformer = (statement) => {
+    const [query] = statement.compile();
+    return /FROM orchestration_events/.test(query)
+      ? Deferred.succeed(ready, undefined).pipe(Effect.as(statement))
+      : Effect.succeed(statement);
+  };
+  const publication = yield* sink
+    .stream({ afterSequence })
+    .pipe(
+      Stream.take(1),
+      Stream.runCollect,
+      Effect.provideService(Statement.CurrentTransformer, observe),
+      Effect.forkScoped({ startImmediately: true }),
+    );
+  yield* Deferred.await(ready);
+  return publication;
+});
+
+it.effect(
+  "authorized native graph owns coordinator/config and shares atomic publication and outbox wakeups",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture("workflow");
+      const mutableAuthority = {
+        ...fixture.authority,
+        coordinator: { ...fixture.authority.coordinator },
+      };
+      const mutableConfig = { ...fixture.config };
+      const pending = EventSink.makeCapturedAuthorizedNativeEventInfrastructure(
+        fixture.sql,
+        mutableConfig,
+        yield* Path.Path,
+        mutableAuthority,
+      );
+      mutableAuthority.coordinator.workerId = "mutated-worker";
+      mutableConfig.baseDir = "/mutated-config";
+      const graph = yield* pending;
+      const sink = Context.get(graph, EventSink.EventSinkV2);
+      const outbox = Context.get(graph, EffectOutbox.EffectOutboxV2);
+      const selectedStore = Context.get(graph, Store.WorkflowRunStore);
+      assert.deepStrictEqual(
+        yield* fixture.sql.withTransaction(
+          selectedStore.verifyClaimedNativeIntentInTransaction({
+            intentId: fixture.input.intentId,
+            ...fixture.authority.coordinator,
+          }),
+        ),
+        { kind: "current" },
+      );
+      const plan = {
+        ...(yield* nativeDecision(fixture.derived, "claim")),
+        effects: [
+          {
+            id: "authorized-pending-effect",
+            commandId: fixture.derived.claimCommand.commandId,
+            threadId: fixture.derived.claimCommand.threadId,
+            request: { type: "terminal.cleanup" as const },
+          },
+        ],
+      };
+      const publication = yield* observeAuthorizedSink(sink);
+      const wake = yield* outbox.awaitAvailable.pipe(Effect.forkScoped({ startImmediately: true }));
+      const before = yield* nativeCounts;
+      yield* fixture.sql`CREATE TRIGGER reject_authorized_proof BEFORE INSERT ON workflow_native_command_proofs BEGIN SELECT RAISE(ABORT,'injected authorized proof failure'); END`;
+      assert.instanceOf(
+        yield* Effect.flip(sink.commitNativeCommand!(plan)),
+        EventSink.EventSinkWriteError,
+      );
+      assert.deepStrictEqual(yield* nativeCounts, before);
+      assert.isUndefined(publication.pollUnsafe());
+      assert.isUndefined(wake.pollUnsafe());
+      yield* fixture.sql`DROP TRIGGER reject_authorized_proof`;
+      const committed = yield* sink.commitNativeCommand!(plan);
+      assert.isTrue(committed.committed);
+      assert.strictEqual(
+        (yield* Fiber.join(publication))[0]?.sequence,
+        committed.receipt.resultSequence,
+      );
+      yield* Fiber.join(wake);
+      const proof = (yield* fixture.sql<{
+        proof_json: string;
+      }>`SELECT proof_json FROM workflow_native_command_proofs`)[0]!;
+      assert.strictEqual(
+        JSON.parse(proof.proof_json).normalization.scratchRoot,
+        (yield* Path.Path).resolve(fixture.config.baseDir, "scratch"),
+      );
+      const nextPublication = yield* observeAuthorizedSink(sink, committed.receipt.resultSequence);
+      const nextWake = yield* outbox.awaitAvailable.pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      yield* fixture.sessions.revoke(fixture.reference.sessionId);
+      yield* controlNativeFixture(fixture, "stop");
+      assert.isFalse((yield* sink.commitNativeCommand!(plan)).committed);
+      assert.strictEqual(
+        (yield* sink.replayNativeCommand!({ command: plan.command, hint: plan.hint })).kind,
+        "verified",
+      );
+      assert.isUndefined(nextPublication.pollUnsafe());
+      assert.isUndefined(nextWake.pollUnsafe());
+    }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "authorized native graph denies legacy %s state flags without a grant",
+  (kind) =>
+    Effect.gen(function* () {
+      const { orchestrator, derived, input, sql } = yield* controlledNativeFixture(
+        kind,
+        false,
+        false,
+        1,
+      );
+      yield* sql`UPDATE workflow_native_launch_intents SET state = 'dispatching',boot_id = 'controlled-boot',worker_id = 'controlled-worker'`;
+      const before = yield* nativeCounts;
+      assert.isTrue(
+        isOrchestratorDispatchError(
+          yield* Effect.flip(
+            orchestrator.dispatch(derived.claimCommand, {
+              intentId: input.intentId,
+              phase: "claim",
+            }),
+          ),
+        ),
+      );
+      assert.deepStrictEqual(yield* nativeCounts, before);
+    }).pipe(Effect.provide(testLayer())),
 );

@@ -1,5 +1,6 @@
 import {
   CommandId,
+  OrchestrationV2AppThreadJson,
   type OrchestrationV2Run,
   OrchestrationV2DomainEvent,
   OrchestrationV2DomainEventJson,
@@ -42,6 +43,9 @@ import * as ProjectStore from "./ProjectStore.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 import type { ServerConfig } from "../config.ts";
 import * as NativeProof from "../workflowRuns/WorkflowNativeCommandProof.ts";
+import * as WorkflowRunStore from "../workflowRuns/WorkflowRunStore.ts";
+import type { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
+import type { ManagedPolicy } from "../policy/ManagedPolicy.ts";
 import {
   snapshotNativeInput,
   type OwnedNativeInput,
@@ -283,8 +287,22 @@ const NativePlan = Schema.Struct({
 const encodeNativePlan = Schema.encodeSync(Schema.fromJsonString(NativePlan));
 const decodeNativePlan = Schema.decodeUnknownSync(Schema.fromJsonString(NativePlan));
 
+export interface NativeWorkflowAuthority {
+  readonly identity: ServerEnvironmentIdentity["Service"];
+  readonly policy: ManagedPolicy["Service"];
+  readonly coordinator: { readonly bootId: string; readonly workerId: string };
+}
+type CapturedNativeAuthority = {
+  readonly store: WorkflowRunStore.WorkflowRunStore["Service"];
+  readonly coordinator: NativeWorkflowAuthority["coordinator"];
+};
+const decodeNativeTarget = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(OrchestrationV2AppThreadJson),
+);
+
 const makeSink = Effect.fn("orchestrationV2.EventSink.make")(function* (
   nativeVerifier?: NativeVerifier,
+  nativeAuthority?: CapturedNativeAuthority,
 ) {
   const sql = yield* SqlClient.SqlClient;
   const commandReceipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
@@ -720,6 +738,57 @@ const makeSink = Effect.fn("orchestrationV2.EventSink.make")(function* (
               committed: false as const,
               cancelledEffectIds: [],
             };
+          }
+          if (nativeAuthority) {
+            const current = yield* nativeAuthority.store
+              .verifyClaimedNativeIntentInTransaction({
+                intentId: native.hint.intentId,
+                ...nativeAuthority.coordinator,
+              })
+              .pipe(
+                Effect.mapError(
+                  (error) =>
+                    new NativeProof.NativeCommandProofError({
+                      reason: error.reason === "persistence" ? "persistence" : "conflict",
+                    }),
+                ),
+              );
+            if (current.kind !== "current")
+              return yield* new NativeProof.NativeCommandProofError({ reason: "conflict" });
+            if (native.hint.phase === "message") {
+              const rows = yield* sql<{
+                intent_thread_id: string;
+                intent_project_id: string;
+                thread_id: string;
+                project_id: string;
+                deleted_at: string | null;
+                payload_json: string;
+              }>`SELECT i.thread_id AS intent_thread_id,i.project_id AS intent_project_id,t.thread_id,t.project_id,t.deleted_at,t.payload_json FROM workflow_native_launch_intents i JOIN orchestration_v2_projection_threads t ON t.thread_id = i.thread_id WHERE i.intent_id = ${native.hint.intentId}`.pipe(
+                Effect.mapError(
+                  () => new NativeProof.NativeCommandProofError({ reason: "persistence" }),
+                ),
+              );
+              const row = rows[0];
+              if (rows.length !== 1 || !row)
+                return yield* new NativeProof.NativeCommandProofError({ reason: "conflict" });
+              const target = yield* decodeNativeTarget(row.payload_json, {
+                onExcessProperty: "error",
+              }).pipe(
+                Effect.mapError(
+                  () => new NativeProof.NativeCommandProofError({ reason: "integrity" }),
+                ),
+              );
+              if (
+                row.intent_thread_id !== native.command.threadId ||
+                row.thread_id !== row.intent_thread_id ||
+                row.project_id !== row.intent_project_id ||
+                row.deleted_at !== null ||
+                target.id !== row.intent_thread_id ||
+                target.projectId !== row.intent_project_id ||
+                target.deletedAt !== null
+              )
+                return yield* new NativeProof.NativeCommandProofError({ reason: "conflict" });
+            }
           }
           if (
             input.events.length === 0 ||
@@ -1359,6 +1428,7 @@ export const makeCapturedEventInfrastructure = Effect.fn(
   return yield* Layer.build(Layer.fresh(capturedGraph(sql, layerBase)));
 });
 
+// Proof-only fixtures use this constructor; claimed workflows use the authorized graph.
 export function makeCapturedNativeEventInfrastructure(
   sql: SqlClient.SqlClient,
   config: ServerConfig["Service"],
@@ -1372,4 +1442,51 @@ export function makeCapturedNativeEventInfrastructure(
     }),
   );
   return Layer.build(Layer.fresh(capturedGraph(sql, nativeLayer)));
+}
+
+const makeAuthorizedNativeInfrastructure = Effect.fn(
+  "orchestrationV2.makeCapturedAuthorizedNativeEventInfrastructure",
+)(function* (
+  sql: SqlClient.SqlClient,
+  config: ServerConfig["Service"],
+  path: Path.Path,
+  authority: NativeWorkflowAuthority,
+) {
+  const store = yield* WorkflowRunStore.makeCapturedAuthorizedWorkflowRunStore(
+    sql,
+    authority.identity,
+    authority.policy,
+  );
+  const verifier = yield* NativeProof.makeNativeCommandProofVerifier(sql, config, path);
+  const nativeLayer = Layer.effect(
+    EventSinkV2,
+    makeSink(verifier, { store, coordinator: authority.coordinator }),
+  );
+  const captured = yield* Layer.build(Layer.fresh(capturedGraph(sql, nativeLayer)));
+  return Context.add(captured, WorkflowRunStore.WorkflowRunStore, store);
+});
+
+export function makeCapturedAuthorizedNativeEventInfrastructure(
+  sql: SqlClient.SqlClient,
+  config: ServerConfig["Service"],
+  path: Path.Path,
+  authority: NativeWorkflowAuthority,
+) {
+  try {
+    const coordinator = Object.freeze({ ...authority.coordinator });
+    if (
+      Object.keys(coordinator).sort().join() !== "bootId,workerId" ||
+      ![coordinator.bootId, coordinator.workerId].every(
+        (id) => typeof id === "string" && id.trim().length > 0,
+      )
+    )
+      throw new Error();
+    return makeAuthorizedNativeInfrastructure(sql, { ...config, baseDir: config.baseDir }, path, {
+      identity: authority.identity,
+      policy: authority.policy,
+      coordinator,
+    });
+  } catch {
+    return Effect.fail(new NativeProof.NativeCommandProofError({ reason: "invalid" }));
+  }
 }

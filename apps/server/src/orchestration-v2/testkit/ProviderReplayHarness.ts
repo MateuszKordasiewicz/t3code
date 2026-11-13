@@ -8,6 +8,7 @@ import type {
   ProviderReplayTranscript,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Context from "effect/Context";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -275,11 +276,13 @@ export function layerWithRegistry<Error>(
     McpProviderSessions.McpProviderSessions
   >,
   options: {
+    readonly serverConfig?: ServerConfig.ServerConfig["Service"];
     readonly databaseLayer?: Layer.Layer<
       SqlClient.SqlClient,
       MigrationError | PlatformError.PlatformError | SqlError
     >;
     readonly nativeCommandProofs?: boolean;
+    readonly nativeWorkflowAuthority?: EventSink.NativeWorkflowAuthority;
     readonly runEffectWorker?: boolean;
     readonly runContinuationWorker?: boolean;
     readonly recoverOnStartup?: boolean;
@@ -291,13 +294,18 @@ export function layerWithRegistry<Error>(
   | EffectWorker.OrchestrationEffectWorkerV2
   | EventSink.EventSinkV2
   | ProviderSessionManager.ProviderSessionManagerV2
-  | CommandOutputRecorder.CommandOutputRecorder,
+  | CommandOutputRecorder.CommandOutputRecorder
+  | WorkflowRunStore.WorkflowRunStore
+  | EffectOutbox.EffectOutboxV2,
   Error | MigrationError | PlatformError.PlatformError | SqlError
 > {
-  const layerServerConfig = Layer.effect(
-    ServerConfig.ServerConfig,
-    makeReplayServerConfig(scenario.name).pipe(Effect.orDie),
-  ).pipe(Layer.provide(NodeServices.layer));
+  const layerServerConfig =
+    options.serverConfig === undefined
+      ? Layer.effect(
+          ServerConfig.ServerConfig,
+          makeReplayServerConfig(scenario.name).pipe(Effect.orDie),
+        ).pipe(Layer.provide(NodeServices.layer))
+      : Layer.succeed(ServerConfig.ServerConfig, options.serverConfig);
   const layerRuntimeBase =
     scenario.runtimePolicyOverride === undefined
       ? RuntimePolicy.layer
@@ -324,15 +332,34 @@ export function layerWithRegistry<Error>(
       ),
     ),
   ).pipe(Layer.orDie);
+  const nativeEnabled =
+    options.nativeCommandProofs === true || options.nativeWorkflowAuthority !== undefined;
   const layerNativePersistence = Layer.effectContext(
     Effect.gen(function* () {
-      return yield* EventSink.makeCapturedNativeEventInfrastructure(
-        yield* SqlClient.SqlClient,
-        yield* ServerConfig.ServerConfig,
-        yield* Path.Path,
+      const sql = yield* SqlClient.SqlClient;
+      const config = yield* ServerConfig.ServerConfig;
+      const path = yield* Path.Path;
+      if (options.nativeWorkflowAuthority !== undefined) {
+        return yield* EventSink.makeCapturedAuthorizedNativeEventInfrastructure(
+          sql,
+          config,
+          path,
+          options.nativeWorkflowAuthority,
+        ).pipe(Effect.orDie);
+      }
+      const captured = yield* EventSink.makeCapturedNativeEventInfrastructure(sql, config, path);
+      const store = yield* WorkflowRunStore.make().pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
       );
+      return Context.add(captured, WorkflowRunStore.WorkflowRunStore, store);
     }),
   ).pipe(Layer.provide(Layer.mergeAll(layerDatabase, layerServerConfig, NodeServices.layer)));
+  const layerWorkflowStore: Layer.Layer<
+    WorkflowRunStore.WorkflowRunStore,
+    MigrationError | PlatformError.PlatformError | SqlError
+  > = nativeEnabled
+    ? layerNativePersistence
+    : WorkflowRunStore.layer.pipe(Layer.provide(layerDatabase));
   const layerStores: Layer.Layer<
     | EventStore.EventStoreV2
     | ProjectionStore.ProjectionStoreV2
@@ -341,34 +368,31 @@ export function layerWithRegistry<Error>(
     | EffectOutbox.EffectOutboxV2
     | TurnItemPositionStore.TurnItemPositionStoreV2,
     MigrationError | PlatformError.PlatformError | SqlError
-  > =
-    options.nativeCommandProofs === true
-      ? layerNativePersistence
-      : Layer.mergeAll(
-          EventStore.layer,
-          ProjectionStore.layer,
-          ProjectStore.layer,
-          CommandReceiptStore.layer,
-          EffectOutbox.layer,
-          TurnItemPositionStore.layer,
-        ).pipe(Layer.provide(layerDatabase));
+  > = nativeEnabled
+    ? layerNativePersistence
+    : Layer.mergeAll(
+        EventStore.layer,
+        ProjectionStore.layer,
+        ProjectStore.layer,
+        CommandReceiptStore.layer,
+        EffectOutbox.layer,
+        TurnItemPositionStore.layer,
+      ).pipe(Layer.provide(layerDatabase));
   const layerEventSinkProvided: Layer.Layer<
     EventSink.EventSinkV2,
     MigrationError | PlatformError.PlatformError | SqlError
-  > =
-    options.nativeCommandProofs === true
-      ? layerNativePersistence
-      : EventSink.layerFromStores.pipe(Layer.provide(Layer.mergeAll(layerStores, layerDatabase)));
+  > = nativeEnabled
+    ? layerNativePersistence
+    : EventSink.layerFromStores.pipe(Layer.provide(Layer.mergeAll(layerStores, layerDatabase)));
   const layerRuntime = RuntimePolicy.layerEnforcingCeiling.pipe(
     Layer.provide(Layer.merge(layerRuntimeBase, layerServerSettings)),
   );
   const layerCommandReceiptStoreProvided: Layer.Layer<
     CommandReceiptStore.CommandReceiptStoreV2,
     MigrationError | PlatformError.PlatformError | SqlError
-  > =
-    options.nativeCommandProofs === true
-      ? layerNativePersistence
-      : CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase));
+  > = nativeEnabled
+    ? layerNativePersistence
+    : CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase));
   const layerProviderEventIngestorProvided = ProviderEventIngestor.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
@@ -437,7 +461,7 @@ export function layerWithRegistry<Error>(
         PreviewAgentActivity.layer,
         layerCheckpointServiceProvided,
         layerEventSinkProvided,
-        WorkflowRunStore.layer.pipe(Layer.provide(layerDatabase)),
+        layerWorkflowStore,
         IdAllocator.layer,
         layerProviderEventIngestorProvided,
         layerServerSettings,
@@ -450,7 +474,7 @@ export function layerWithRegistry<Error>(
       Layer.mergeAll(
         layerContextHandoffServiceProvided,
         layerEventSinkProvided,
-        WorkflowRunStore.layer.pipe(Layer.provide(layerDatabase)),
+        layerWorkflowStore,
         IdAllocator.layer,
         layerStores,
         layerProviderSessionManagerProvided,
@@ -573,6 +597,8 @@ export function layerWithRegistry<Error>(
     layerEventSinkProvided,
     layerContinuationWorkerProvided,
     layerCommandOutputHubProvided,
+    layerWorkflowStore,
+    layerStores,
   ).pipe(
     Layer.provide(ProviderTurnStartServiceTestkit.layer),
     Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
@@ -599,7 +625,7 @@ export function layerWithRegistry<Error>(
               layerEventSinkProvided,
               IdAllocator.layer,
               layerServerSettings,
-              WorkflowRunStore.layer.pipe(Layer.provide(layerDatabase)),
+              layerWorkflowStore,
             ),
           ),
         )
