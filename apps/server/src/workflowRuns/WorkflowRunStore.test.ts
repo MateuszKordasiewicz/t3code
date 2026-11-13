@@ -23,6 +23,7 @@ import {
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as TestClock from "effect/testing/TestClock";
 import * as Context from "effect/Context";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -7837,7 +7838,7 @@ it.effect("competing workflow controls on separate connections have one complete
   ),
 );
 
-const authorizedStore = Effect.fn("test.authorizedStore")(function* () {
+const authorizedStore = Effect.fn("test.authorizedStore")(function* (ttl?: Duration.Duration) {
   const sql = yield* SqlClient.SqlClient;
   const identity = {
     getEnvironmentId: Effect.succeed(EnvironmentId.make(destination.environmentId)),
@@ -7858,6 +7859,7 @@ const authorizedStore = Effect.fn("test.authorizedStore")(function* () {
   );
   const sessions = Context.get(scope, SessionStore.SessionStore);
   const issued = yield* sessions.issue({
+    ...(ttl === undefined ? {} : { ttl }),
     subject: "human",
     method: "bearer-access-token",
     scopes: ["orchestration:read", "orchestration:operate"],
@@ -8458,12 +8460,13 @@ const nativeClaimControl = Effect.fn("test.nativeClaimControl")(function* (
 const nativeClaimFixture = Effect.fn("test.nativeClaimFixture")(function* (
   kind: "workflow" | "planning",
   materialVersion: 1 | 2 = 2,
+  ttl?: Duration.Duration,
 ) {
   yield* TestClock.setTime(DateTime.makeUnsafe(facts.now).epochMilliseconds);
   const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
   const sql = yield* SqlClient.SqlClient;
   yield* sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at) VALUES ('project','Project','/work','[]',${facts.now},${facts.now})`;
-  const auth = yield* authorizedStore();
+  const auth = yield* authorizedStore(ttl);
   const material =
     materialVersion === 2
       ? { materialVersion: 2 as const, authority: auth.authority }
@@ -8857,5 +8860,221 @@ it.effect.each(["workflow", "planning"] as const)(
       yield* sql`DELETE FROM orchestration_v2_effect_outbox WHERE effect_id = 'running-before-claim'`;
       assert.deepStrictEqual(yield* rawReservationState, original);
       assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "claimed native intent verification observes current %s custody without writes",
+  (kind) =>
+    Effect.gen(function* () {
+      const { store, claimInput } = yield* nativeClaimFixture(kind);
+      const sql = yield* SqlClient.SqlClient;
+      assert.strictEqual((yield* store.claimNativeIntent(claimInput)).kind, "claimed");
+      const subscription = yield* store.subscribeChanges;
+      const input = {
+        intentId: claimInput.intentId,
+        bootId: claimInput.bootId,
+        workerId: claimInput.workerId,
+      };
+      const before = yield* rawReservationState;
+      assert.deepStrictEqual(
+        yield* sql.withTransaction(store.verifyClaimedNativeIntentInTransaction(input)),
+        { kind: "current" },
+      );
+      assert.deepStrictEqual(yield* rawReservationState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "claimed native intent verification rejects foreign transactions, labels and ordinary %s construction",
+  (kind) =>
+    Effect.gen(function* () {
+      const { store, claimInput } = yield* nativeClaimFixture(kind);
+      const sql = yield* SqlClient.SqlClient;
+      const ordinary = yield* Store.WorkflowRunStore;
+      const input = { intentId: claimInput.intentId, bootId: "boot", workerId: "worker" };
+      const before = yield* rawReservationState;
+      assert.deepStrictEqual(
+        yield* sql.withTransaction(store.verifyClaimedNativeIntentInTransaction(input)),
+        { kind: "denied", reason: "state" },
+      );
+      assert.strictEqual(
+        (yield* Effect.flip(store.verifyClaimedNativeIntentInTransaction(input))).reason,
+        "integrity",
+      );
+      const foreign = Context.get(
+        yield* Layer.build(Layer.fresh(NodeSqliteClient.layer({ filename: ":memory:" }))),
+        SqlClient.SqlClient,
+      );
+      assert.strictEqual(
+        (yield* Effect.flip(
+          foreign.withTransaction(store.verifyClaimedNativeIntentInTransaction(input)),
+        )).reason,
+        "integrity",
+      );
+      assert.deepStrictEqual(yield* rawReservationState, before);
+      yield* store.claimNativeIntent(claimInput);
+      const claimed = yield* rawReservationState;
+      for (const changes of [{ bootId: "other-boot" }, { workerId: "other-worker" }])
+        assert.deepStrictEqual(
+          yield* sql.withTransaction(
+            store.verifyClaimedNativeIntentInTransaction({ ...input, ...changes }),
+          ),
+          { kind: "stale" },
+        );
+      assert.deepStrictEqual(
+        yield* sql.withTransaction(ordinary.verifyClaimedNativeIntentInTransaction(input)),
+        { kind: "denied", reason: "authority" },
+      );
+      const mutable = { ...input };
+      const pending = store.verifyClaimedNativeIntentInTransaction(mutable);
+      mutable.workerId = "mutated";
+      assert.deepStrictEqual(yield* sql.withTransaction(pending), { kind: "current" });
+      assert.deepStrictEqual(yield* rawReservationState, claimed);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "claimed native intent verification refuses elapsed or revoked %s authority without writes",
+  (kind) =>
+    Effect.gen(function* () {
+      const { store, sessions, authority, claimInput } = yield* nativeClaimFixture(
+        kind,
+        2,
+        Duration.hours(1),
+      );
+      const sql = yield* SqlClient.SqlClient;
+      yield* store.claimNativeIntent(claimInput);
+      const input = { intentId: claimInput.intentId, bootId: "boot", workerId: "worker" };
+      const before = yield* rawReservationState;
+      yield* TestClock.setTime(DateTime.makeUnsafe("2026-11-12T02:00:00Z").epochMilliseconds);
+      assert.deepStrictEqual(
+        yield* sql.withTransaction(store.verifyClaimedNativeIntentInTransaction(input)),
+        { kind: "denied", reason: "authority" },
+      );
+      yield* TestClock.setTime(DateTime.makeUnsafe("2026-12-02T00:00:00Z").epochMilliseconds);
+      assert.deepStrictEqual(
+        yield* sql.withTransaction(store.verifyClaimedNativeIntentInTransaction(input)),
+        { kind: "denied", reason: "deadline" },
+      );
+      yield* TestClock.setTime(DateTime.makeUnsafe(facts.now).epochMilliseconds);
+      yield* sessions.revoke(authority.sessionId);
+      assert.deepStrictEqual(
+        yield* sql.withTransaction(store.verifyClaimedNativeIntentInTransaction(input)),
+        { kind: "denied", reason: "authority" },
+      );
+      assert.deepStrictEqual(yield* rawReservationState, before);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  ["workflow", "pause"],
+  ["workflow", "stop"],
+  ["planning", "pause"],
+  ["planning", "stop"],
+] as const)(
+  "claimed native intent verification observes $0/$1 control without renewed custody",
+  ([kind, action]) =>
+    Effect.gen(function* () {
+      const { store, control, claimInput } = yield* nativeClaimFixture(kind);
+      const sql = yield* SqlClient.SqlClient;
+      yield* store.claimNativeIntent(claimInput);
+      yield* control(action);
+      const subscription = yield* store.subscribeChanges;
+      const before = yield* rawReservationState;
+      assert.notStrictEqual(
+        (yield* sql.withTransaction(
+          store.verifyClaimedNativeIntentInTransaction({
+            intentId: claimInput.intentId,
+            bootId: "boot",
+            workerId: "worker",
+          }),
+        )).kind,
+        "current",
+      );
+      assert.deepStrictEqual(yield* rawReservationState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "claimed native intent verification retains %s unknown custody and rejects tampering",
+  (kind) =>
+    Effect.gen(function* () {
+      const { store, claimInput } = yield* nativeClaimFixture(kind);
+      const sql = yield* SqlClient.SqlClient;
+      yield* store.claimNativeIntent(claimInput);
+      const input = { intentId: claimInput.intentId, bootId: "boot", workerId: "worker" };
+      yield* sql`UPDATE workflow_native_launch_intents SET state = 'unknown'`;
+      const before = yield* rawReservationState;
+      assert.deepStrictEqual(
+        yield* sql.withTransaction(store.verifyClaimedNativeIntentInTransaction(input)),
+        { kind: "denied", reason: "state" },
+      );
+      assert.deepStrictEqual(yield* rawReservationState, before);
+      yield* sql`UPDATE workflow_native_launch_intents SET state = 'dispatching'`;
+      yield* sql`DROP TRIGGER workflow_native_reservation_material_update_guard`;
+      yield* sql`UPDATE workflow_native_reservation_material SET material_hash = ${nextHash}`;
+      const tampered = yield* rawReservationState;
+      assert.strictEqual(
+        (yield* Effect.flip(
+          sql.withTransaction(store.verifyClaimedNativeIntentInTransaction(input)),
+        )).reason,
+        "integrity",
+      );
+      assert.deepStrictEqual(yield* rawReservationState, tampered);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "claimed native intent verification keeps %s protocol evidence separate from current authority",
+  (kind) =>
+    Effect.gen(function* () {
+      const { store, claimInput } = yield* nativeClaimFixture(kind);
+      const sql = yield* SqlClient.SqlClient;
+      yield* store.claimNativeIntent(claimInput);
+      const row = (yield* sql<{
+        launch_command_id: string;
+        thread_id: string;
+      }>`SELECT launch_command_id,thread_id FROM workflow_native_launch_intents`)[0]!;
+      yield* sql`INSERT INTO orchestration_command_receipts (command_id,aggregate_kind,aggregate_id,accepted_at,result_sequence,status) VALUES (${row.launch_command_id},'thread',${row.thread_id},${facts.now},0,'accepted')`;
+      yield* sql`INSERT INTO workflow_native_command_proofs (command_id,intent_id,phase,proof_json,proof_hash) VALUES (${row.launch_command_id},${claimInput.intentId},'claim','{}',${hash})`;
+      const input = { intentId: claimInput.intentId, bootId: "boot", workerId: "worker" };
+      const before = yield* rawReservationState;
+      assert.deepStrictEqual(
+        yield* sql.withTransaction(store.verifyClaimedNativeIntentInTransaction(input)),
+        { kind: "current" },
+      );
+      assert.deepStrictEqual(yield* rawReservationState, before);
+      yield* sql`UPDATE workflow_native_launch_intents SET native_run_id = 'observed-native-run'`;
+      const bound = yield* rawReservationState;
+      assert.deepStrictEqual(
+        yield* sql.withTransaction(store.verifyClaimedNativeIntentInTransaction(input)),
+        { kind: "denied", reason: "state" },
+      );
+      assert.deepStrictEqual(yield* rawReservationState, bound);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "claimed native intent verification cannot promote legacy %s rows through state flags",
+  (kind) =>
+    Effect.gen(function* () {
+      const { store, claimInput } = yield* nativeClaimFixture(kind, 1);
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`UPDATE workflow_native_launch_intents SET state = 'dispatching',boot_id = 'boot',worker_id = 'worker'`;
+      const before = yield* rawReservationState;
+      assert.deepStrictEqual(
+        yield* sql.withTransaction(
+          store.verifyClaimedNativeIntentInTransaction({
+            intentId: claimInput.intentId,
+            bootId: "boot",
+            workerId: "worker",
+          }),
+        ),
+        { kind: "denied", reason: "authority" },
+      );
+      assert.deepStrictEqual(yield* rawReservationState, before);
     }).pipe(Effect.provide(layer)),
 );
