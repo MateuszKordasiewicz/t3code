@@ -23,7 +23,10 @@ import * as SqlClient from "effect/sql/SqlClient";
 import type { PlanningObservation } from "../developmentPlans/PlanningPassObservation.ts";
 import { DevelopmentPlanHash } from "../developmentPlans/DevelopmentPlanHash.ts";
 import { WorkflowCanonicalHash } from "./WorkflowCanonicalHash.ts";
-import { decodeNativeReservationMaterial } from "./WorkflowNativeReservationMaterial.ts";
+import {
+  decodeNativeReservationLaunch,
+  decodeNativeReservationMaterial,
+} from "./WorkflowNativeReservationMaterial.ts";
 import { WorkflowRunPolicy } from "./WorkflowRunPolicy.ts";
 
 type PolicyInput = Parameters<typeof WorkflowRunPolicy.decide>[0];
@@ -1652,7 +1655,7 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     yield* notify;
     return recorded;
   });
-  type WorkflowNativeInput = {
+  type WorkflowNativeBase = {
     readonly intentId: string;
     readonly runId: string;
     readonly operationId: WorkflowOperationV1["id"];
@@ -1693,8 +1696,13 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     };
     readonly externalFacts: Facts;
   };
+  type WorkflowNativeInput = WorkflowNativeBase &
+    (
+      | { readonly materialVersion?: never; readonly launch?: never }
+      | { readonly materialVersion: 1; readonly launch: unknown }
+    );
   const validateWorkflowNativeIntent = Effect.fn("WorkflowRunStore.validateWorkflowNativeIntent")(
-    function* (input: Omit<WorkflowNativeInput, "externalFacts">) {
+    function* (input: Omit<WorkflowNativeBase, "externalFacts">) {
       const { draft } = input;
       const valid = yield* Effect.try({
         try: () => {
@@ -1820,7 +1828,7 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
   );
   const verifyStoredWorkflowIntent = Effect.fn("WorkflowRunStore.verifyStoredWorkflowIntent")(
     function* (
-      input: Omit<WorkflowNativeInput, "externalFacts" | "draft">,
+      input: Omit<WorkflowNativeBase, "externalFacts" | "draft">,
       storedDraft: unknown,
       receipt: {
         command_id: string;
@@ -2473,11 +2481,85 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     ),
   );
   const reserveWorkflowNativeIntent = Effect.fn("WorkflowRunStore.reserveWorkflowNativeIntent")(
-    function* (input: WorkflowNativeInput) {
+    function* (request: WorkflowNativeInput) {
+      const input = yield* Effect.try({
+        try: () => {
+          const copy = { ...request };
+          WorkflowCanonicalHash.assertCanonical(copy.draft);
+          const snapshot = { ...copy, draft: structuredClone(copy.draft) };
+          if (!Object.hasOwn(copy, "launch")) return snapshot;
+          WorkflowCanonicalHash.assertCanonical(copy.launch);
+          return { ...snapshot, launch: structuredClone(copy.launch) };
+        },
+        catch: integrity,
+      });
       const work = Effect.gen(function* () {
         const { draft } = input;
-        const { operation, fingerprint, legacyFingerprint } =
-          yield* validateWorkflowNativeIntent(input);
+        const {
+          operation,
+          fingerprint: v2Fingerprint,
+          legacyFingerprint,
+        } = yield* validateWorkflowNativeIntent(input);
+        const hasVersion = Object.hasOwn(input, "materialVersion");
+        const hasLaunch = Object.hasOwn(input, "launch");
+        if (hasVersion !== hasLaunch || (hasVersion && input.materialVersion !== 1))
+          return yield* integrity();
+        const retained = yield* Effect.gen(function* () {
+          if (!hasVersion) return null;
+          const { launch, launchHash } = yield* decodeNativeReservationLaunch(input.launch).pipe(
+            Effect.mapError(integrity),
+          );
+          const params = operation.parameters;
+          if (
+            launch.commandId !== input.launchCommandId ||
+            launch.threadId !== input.threadId ||
+            launch.initialMessage.messageId !== input.messageId ||
+            launch.projectId !== input.projectId ||
+            params.kind !== "stage_launch" ||
+            launch.modelSelection.instanceId !== params.provider.providerInstanceId ||
+            launch.modelSelection.model !== params.provider.model
+          )
+            return yield* integrity();
+          const persistedDraft = { ...draft, version: 2, material: { version: 1, launchHash } };
+          const fingerprint = yield* Effect.try({
+            try: () =>
+              WorkflowCanonicalHash.tagged("t3.workflow-native-launch-intent.v3", {
+                intentId: input.intentId,
+                workflowRunId: input.runId,
+                planningSessionId: null,
+                operationId: input.operationId,
+                attemptId: input.attemptId,
+                passId: null,
+                itemId: input.itemId,
+                chargeAttempt: 1,
+                repair: input.repair,
+                role: "implementation",
+                environmentId: input.environmentId,
+                projectId: input.projectId,
+                launchCommandId: input.launchCommandId,
+                threadId: input.threadId,
+                messageId: input.messageId,
+                draft: persistedDraft,
+                receiptId: input.receiptId,
+              }),
+            catch: integrity,
+          });
+          const decoded = yield* decodeNativeReservationMaterial({
+            version: 1,
+            intentId: input.intentId,
+            receiptId: input.receiptId,
+            intentFingerprint: fingerprint,
+            launch,
+            planningSession: null,
+          }).pipe(Effect.mapError(integrity));
+          return {
+            persistedDraft,
+            fingerprint,
+            ...decoded,
+            persistedDraftJson: encode(persistedDraft),
+            materialJson: encode(decoded.material),
+          };
+        });
         const receipts = yield* sql<{
           command_id: string;
           receipt_id: string;
@@ -2517,7 +2599,9 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
             receipt.command_id !== draft.admission.command.commandId ||
             receipt.receipt_id !== input.receiptId ||
             receipt.intent_id !== input.intentId ||
-            (replayFingerprint !== fingerprint && replayFingerprint !== legacyFingerprint) ||
+            (retained
+              ? replayFingerprint !== retained.fingerprint
+              : replayFingerprint !== v2Fingerprint && replayFingerprint !== legacyFingerprint) ||
             intent.workflow_run_id !== input.runId ||
             intent.planning_session_id !== null ||
             intent.operation_id !== input.operationId ||
@@ -2535,17 +2619,20 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
             intent.fingerprint !== replayFingerprint ||
             (yield* Effect.try({
               try: () =>
-                WorkflowCanonicalHash.tagged("compare", parse(intent.draft_json)) ===
-                  WorkflowCanonicalHash.tagged("compare", draft) &&
-                WorkflowCanonicalHash.tagged("compare", parse(receipt.result_json)) ===
-                  WorkflowCanonicalHash.tagged("compare", {
-                    intentId: input.intentId,
-                    fingerprint: replayFingerprint,
-                  }),
+                sameCustodyValue(parse(intent.draft_json), retained?.persistedDraft ?? draft),
               catch: integrity,
             })) === false
           )
             return yield* integrity();
+          const verified = yield* verifyStoredWorkflowIntent(
+            input,
+            yield* Effect.try({
+              try: () => parse(intent.draft_json),
+              catch: integrity,
+            }),
+            receipt,
+          );
+          if ((verified.format === "materialV3") !== (retained !== null)) return yield* integrity();
           return {
             kind: "replay" as const,
             receiptId: receipt.receipt_id,
@@ -2553,6 +2640,8 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
             fingerprint: replayFingerprint,
           };
         }
+        if (!retained) return yield* integrity();
+        const { fingerprint } = retained;
         if (yield* runningNativeEffect(input.threadId))
           return { kind: "rejected" as const, reason: "custody" as const };
         const custody = yield* readThreadCustodyInTransaction(input.threadId);
@@ -2699,10 +2788,13 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
           yield* sql`UPDATE workflow_runs SET status = ${decision.run.status}, record_version = ${decision.run.recordVersion}, control_generation = ${decision.run.controlGeneration}, spec_hash = ${decision.run.spec.ref.sha256}, record_json = ${encode(decision.run)} WHERE id = ${run.id} AND record_version = ${run.recordVersion} AND control_generation = ${run.controlGeneration} AND spec_hash = ${run.spec.ref.sha256} RETURNING id`;
         if (updated.length !== 1) return yield* stale();
         const inserted =
-          yield* sql`INSERT INTO workflow_native_launch_intents (intent_id, workflow_run_id, operation_id, attempt_id, item_id, charge_attempt, repair, role, environment_id, project_id, launch_command_id, thread_id, message_id, fingerprint, draft_json, generation, state, held) VALUES (${input.intentId}, ${input.runId}, ${input.operationId}, ${input.attemptId}, ${input.itemId}, 1, ${input.repair ? 1 : 0}, 'implementation', ${input.environmentId}, ${input.projectId}, ${input.launchCommandId}, ${input.threadId}, ${input.messageId}, ${fingerprint}, ${encode(draft)}, ${input.generation}, 'reserved', 0) RETURNING intent_id`;
+          yield* sql`INSERT INTO workflow_native_launch_intents (intent_id, workflow_run_id, operation_id, attempt_id, item_id, charge_attempt, repair, role, environment_id, project_id, launch_command_id, thread_id, message_id, fingerprint, draft_json, generation, state, held) VALUES (${input.intentId}, ${input.runId}, ${input.operationId}, ${input.attemptId}, ${input.itemId}, 1, ${input.repair ? 1 : 0}, 'implementation', ${input.environmentId}, ${input.projectId}, ${input.launchCommandId}, ${input.threadId}, ${input.messageId}, ${fingerprint}, ${retained.persistedDraftJson}, ${input.generation}, 'reserved', 0) RETURNING intent_id`;
         if (inserted.length !== 1) return yield* integrity();
+        const material =
+          yield* sql`INSERT INTO workflow_native_reservation_material (intent_id, material_json, material_hash) VALUES (${input.intentId}, ${retained.materialJson}, ${retained.materialHash}) RETURNING intent_id`;
+        if (material.length !== 1) return yield* integrity();
         const receipt =
-          yield* sql`INSERT INTO workflow_native_intent_receipts (command_id, receipt_id, intent_id, fingerprint, result_json) VALUES (${command.commandId}, ${input.receiptId}, ${input.intentId}, ${fingerprint}, ${encode({ intentId: input.intentId, fingerprint })}) RETURNING receipt_id`;
+          yield* sql`INSERT INTO workflow_native_intent_receipts (command_id, receipt_id, intent_id, fingerprint, result_json) VALUES (${command.commandId}, ${input.receiptId}, ${input.intentId}, ${fingerprint}, ${encode({ intentId: input.intentId, fingerprint, materialVersion: 1, materialHash: retained.materialHash })}) RETURNING receipt_id`;
         if (receipt.length !== 1) return yield* integrity();
         return {
           kind: "reserved" as const,

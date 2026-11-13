@@ -30,6 +30,7 @@ import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Statement from "effect/sql/Statement";
 import migration from "../persistence/Migrations/081_WorkflowRuns.ts";
 import planMigration from "../persistence/Migrations/082_DevelopmentPlans.ts";
 import intentMigration from "../persistence/Migrations/084_WorkflowNativeLaunchIntents.ts";
@@ -608,7 +609,7 @@ const setupAdmission = Effect.gen(function* () {
   yield* sql`UPDATE workflow_runs SET record_json = ${json(updated)} WHERE id = ${run.id}`;
 });
 
-const reservation = (operation: WorkflowOperationV1, attemptId: string) => {
+const legacyReservation = (operation: WorkflowOperationV1, attemptId: string) => {
   if (operation.parameters.kind !== "stage_launch") throw new Error("expected stage launch");
   const {
     fingerprint: _fingerprint,
@@ -646,7 +647,69 @@ const reservation = (operation: WorkflowOperationV1, attemptId: string) => {
   };
 };
 
-// Converts an already charged V2 reservation only in this isolated migrated database.
+const reservation = (operation: WorkflowOperationV1, attemptId: string) => {
+  const input = legacyReservation(operation, attemptId);
+  return {
+    ...input,
+    materialVersion: 1 as const,
+    launch: {
+      commandId: input.launchCommandId,
+      threadId: input.threadId,
+      projectId: input.projectId,
+      title: "Work",
+      modelSelection: { instanceId: "provider", model: "model" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      workspaceStrategy: { type: "root", branch: "main" },
+      initialMessage: { messageId: input.messageId, text: "Do the work", attachments: [] },
+      createdBy: "agent",
+      creationSource: "mcp",
+    },
+  };
+};
+
+const seedHistoricalReservation = (input: ReturnType<typeof legacyReservation>, version: 1 | 2) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const envelope = {
+      intentId: input.intentId,
+      workflowRunId: input.runId,
+      planningSessionId: null,
+      operationId: input.operationId,
+      attemptId: input.attemptId,
+      passId: null,
+      itemId: input.itemId,
+      chargeAttempt: 1,
+      repair: input.repair,
+      role: "implementation",
+      environmentId: input.environmentId,
+      projectId: input.projectId,
+      launchCommandId: input.launchCommandId,
+      threadId: input.threadId,
+      messageId: input.messageId,
+      draft: input.draft,
+    };
+    const fingerprint =
+      version === 1
+        ? WorkflowCanonicalHash.tagged("t3.workflow-native-launch-intent.v1", envelope)
+        : WorkflowCanonicalHash.tagged("t3.workflow-native-launch-intent.v2", {
+            ...envelope,
+            receiptId: input.receiptId,
+          });
+    const owner = {
+      ...run,
+      access: { origins: [{ ...destination, threadId: "thread" }] },
+      recordVersion: 1,
+      allowance: { ...run.allowance, attemptsConsumed: 1 },
+    };
+    yield* sql`UPDATE workflow_runs SET record_version = 1, record_json = ${json(owner)}`;
+    yield* sql`INSERT INTO workflow_native_launch_intents (intent_id, workflow_run_id, operation_id, attempt_id, item_id, charge_attempt, repair, role, environment_id, project_id, launch_command_id, thread_id, message_id, fingerprint, draft_json, generation, state, held) VALUES (${input.intentId}, ${input.runId}, ${input.operationId}, ${input.attemptId}, ${input.itemId}, 1, 0, 'implementation', ${input.environmentId}, ${input.projectId}, ${input.launchCommandId}, ${input.threadId}, ${input.messageId}, ${fingerprint}, ${json(input.draft)}, 0, 'reserved', 0)`;
+    yield* sql`INSERT INTO workflow_native_intent_receipts VALUES (${input.draft.admission.command.commandId}, ${input.receiptId}, ${input.intentId}, ${fingerprint}, ${json({ intentId: input.intentId, fingerprint })})`;
+    return { fingerprint, owner };
+  });
+
+// Tamper with isolated stored evidence after a valid reservation.
+
 const storedV3 = (
   input: ReturnType<typeof reservation>,
   changes: {
@@ -659,20 +722,7 @@ const storedV3 = (
     const sql = yield* SqlClient.SqlClient;
     const store = yield* Store.WorkflowRunStore;
     assert.strictEqual((yield* store.reserveWorkflowNativeIntent(input)).kind, "reserved");
-    const launch = {
-      commandId: input.launchCommandId,
-      threadId: input.threadId,
-      projectId: input.projectId,
-      title: "Work",
-      modelSelection: { instanceId: "provider", model: "model" },
-      runtimeMode: "full-access",
-      interactionMode: "default",
-      workspaceStrategy: { type: "root", branch: "main" },
-      initialMessage: { messageId: input.messageId, text: "Do the work", attachments: [] },
-      createdBy: "agent",
-      creationSource: "mcp",
-      ...changes.launch,
-    };
+    const launch = { ...input.launch, ...changes.launch };
     const { launchHash } = yield* decodeNativeReservationLaunch(launch);
     const draft = {
       ...input.draft,
@@ -710,7 +760,9 @@ const storedV3 = (
     const { materialHash } = yield* decodeNativeReservationMaterial(material);
     yield* sql`UPDATE workflow_native_launch_intents SET draft_json = ${json(draft)}, fingerprint = ${fingerprint} WHERE intent_id = ${input.intentId}`;
     yield* sql`UPDATE workflow_native_intent_receipts SET fingerprint = ${fingerprint}, result_json = ${json({ intentId: input.intentId, fingerprint, materialVersion: 1, materialHash })} WHERE intent_id = ${input.intentId}`;
-    yield* sql`INSERT INTO workflow_native_reservation_material VALUES (${input.intentId}, ${json(material)}, ${materialHash})`;
+    yield* sql`DROP TRIGGER workflow_native_reservation_material_update_guard`;
+    yield* sql`UPDATE workflow_native_reservation_material SET material_json = ${json(material)}, material_hash = ${materialHash} WHERE intent_id = ${input.intentId}`;
+    yield* sql`CREATE TRIGGER workflow_native_reservation_material_update_guard BEFORE UPDATE ON workflow_native_reservation_material BEGIN SELECT RAISE(ABORT, 'workflow native reservation material is immutable'); END`;
     return { draft, fingerprint, material, materialHash };
   });
 
@@ -720,7 +772,12 @@ it.effect("stored V3 workflow material provides custody and retains bytes throug
     const sql = yield* SqlClient.SqlClient;
     const store = yield* Store.WorkflowRunStore;
     const input = reservation(operationFor("v3-op", "v3-attempt"), "v3-attempt");
-    yield* storedV3(input);
+    const reserved = yield* store.reserveWorkflowNativeIntent(input);
+    assert.strictEqual(reserved.kind, "reserved");
+    assert.deepStrictEqual(yield* store.reserveWorkflowNativeIntent(input), {
+      ...reserved,
+      kind: "replay",
+    });
     const before = yield* sql`SELECT draft_json, fingerprint FROM workflow_native_launch_intents`;
     const receipt = yield* sql`SELECT * FROM workflow_native_intent_receipts`;
     const material = yield* sql`SELECT * FROM workflow_native_reservation_material`;
@@ -764,6 +821,13 @@ it.effect("stored V3 workflow material provides custody and retains bytes throug
       material,
     );
     assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_effect_outbox`, outbox);
+    assert.deepStrictEqual(
+      yield* store.reserveWorkflowNativeIntent({
+        ...input,
+        externalFacts: { ...admissionFacts, now: "2099-01-01T00:00:00Z" },
+      }),
+      { ...reserved, kind: "replay" },
+    );
     const owner = parse(
       (yield* sql<{ record_json: string }>`SELECT record_json FROM workflow_runs`)[0]!.record_json,
     ) as typeof run;
@@ -977,8 +1041,11 @@ it.effect("unanchored material does not promote a legacy workflow reservation", 
     yield* setupAdmission;
     const sql = yield* SqlClient.SqlClient;
     const store = yield* Store.WorkflowRunStore;
-    const input = reservation(operationFor("old-material-op", "old-material"), "old-material");
-    yield* store.reserveWorkflowNativeIntent(input);
+    const input = legacyReservation(
+      operationFor("old-material-op", "old-material"),
+      "old-material",
+    );
+    yield* seedHistoricalReservation(input, 2);
     yield* sql`INSERT INTO workflow_native_reservation_material VALUES (${input.intentId}, '{}', ${hash})`;
     assert.strictEqual(
       (yield* store.readThreadCustody({ threadId: input.threadId })).kind,
@@ -1431,7 +1498,7 @@ it.effect("reserves once, replays after expiry and prevents legacy admission", (
     if (first.kind !== "reserved") return;
     assert.strictEqual(
       first.fingerprint,
-      WorkflowCanonicalHash.tagged("t3.workflow-native-launch-intent.v2", {
+      WorkflowCanonicalHash.tagged("t3.workflow-native-launch-intent.v3", {
         intentId: input.intentId,
         workflowRunId: input.runId,
         planningSessionId: null,
@@ -1447,11 +1514,31 @@ it.effect("reserves once, replays after expiry and prevents legacy admission", (
         launchCommandId: input.launchCommandId,
         threadId: input.threadId,
         messageId: input.messageId,
-        draft: input.draft,
+        draft: {
+          ...input.draft,
+          version: 2,
+          material: {
+            version: 1,
+            launchHash: (yield* decodeNativeReservationLaunch(input.launch)).launchHash,
+          },
+        },
         receiptId: input.receiptId,
       }),
     );
+    const snapshot = {
+      owner: yield* sql`SELECT * FROM workflow_runs`,
+      intent: yield* sql`SELECT * FROM workflow_native_launch_intents`,
+      material: yield* sql`SELECT * FROM workflow_native_reservation_material`,
+      receipt: yield* sql`SELECT * FROM workflow_native_intent_receipts`,
+    };
+    assert.strictEqual(
+      (yield* Effect.flip(
+        store.reserveWorkflowNativeIntent(legacyReservation(operation, "reservation-attempt")),
+      )).reason,
+      "integrity",
+    );
     for (const changed of [
+      { ...input, launch: { ...input.launch, title: "Changed launch" } },
       { ...input, receiptId: "changed" },
       { ...input, intentId: "changed" },
       { ...input, messageId: "changed" },
@@ -1467,6 +1554,15 @@ it.effect("reserves once, replays after expiry and prevents legacy admission", (
         (yield* Effect.flip(store.reserveWorkflowNativeIntent(changed))).reason,
         "integrity",
       );
+    assert.deepStrictEqual(
+      {
+        owner: yield* sql`SELECT * FROM workflow_runs`,
+        intent: yield* sql`SELECT * FROM workflow_native_launch_intents`,
+        material: yield* sql`SELECT * FROM workflow_native_reservation_material`,
+        receipt: yield* sql`SELECT * FROM workflow_native_intent_receipts`,
+      },
+      snapshot,
+    );
     const rowsBefore = yield* sql<{ record_json: string }>`SELECT record_json FROM workflow_runs`;
     const changedRun = {
       ...(parse(rowsBefore[0]!.record_json) as typeof run),
@@ -1493,6 +1589,156 @@ it.effect("reserves once, replays after expiry and prevents legacy admission", (
     assert.strictEqual((yield* sql`SELECT * FROM workflow_operations`).length, 0);
     assert.strictEqual((yield* sql`SELECT * FROM workflow_attempts`).length, 0);
   }).pipe(Effect.provide(layer)),
+);
+
+it.effect("freezes reservation material before SQL can yield to caller mutation", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const input = reservation(operationFor("snapshot-op", "snapshot"), "snapshot");
+    const payload = { item: "original" };
+    const launch = {
+      ...input.launch,
+      initialMessage: {
+        ...input.launch.initialMessage,
+        context: {
+          version: 1,
+          records: [
+            { version: 1, contextId: "ctx", kind: "future-kind", label: "Context", payload },
+          ],
+        },
+      },
+    };
+    let mutated = false;
+    const mutate: Statement.Transformer = (statement) => {
+      const [query] = statement.compile();
+      return Effect.sync(() => {
+        if (query.includes("UPDATE workflow_runs SET status")) {
+          payload.item = "changed";
+          mutated = true;
+        }
+        return statement;
+      });
+    };
+    const result = yield* store
+      .reserveWorkflowNativeIntent({ ...input, launch })
+      .pipe(Effect.provideService(Statement.CurrentTransformer, mutate));
+    assert.strictEqual(result.kind, "reserved");
+    assert.isTrue(mutated);
+    assert.strictEqual(payload.item, "changed");
+    assert.deepStrictEqual(yield* store.readThreadCustody({ threadId: input.threadId }), {
+      kind: "owned",
+      owner: { kind: "workflow_run", workflowRunId: run.id },
+    });
+    const rows = yield* sql<{
+      material_json: string;
+      material_hash: string;
+    }>`SELECT material_json, material_hash FROM workflow_native_reservation_material WHERE intent_id = ${input.intentId}`;
+    const { material, materialHash } = yield* decodeNativeReservationMaterial(
+      parse(rows[0]!.material_json),
+    );
+    assert.strictEqual(materialHash, rows[0]!.material_hash);
+    assert.deepStrictEqual(
+      material.launch.initialMessage.context?.records.map((record) =>
+        "payload" in record ? record.payload : undefined,
+      ),
+      [{ item: "original" }],
+    );
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect(
+  "fresh legacy and partial material requests fail without writes; historical V2 replays",
+  () =>
+    Effect.gen(function* () {
+      yield* setupAdmission;
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      const operation = operationFor("old-v2-op", "old-v2");
+      const input = legacyReservation(operation, "old-v2");
+      const before = yield* sql`SELECT * FROM workflow_runs`;
+      for (const invalid of [
+        input,
+        { ...input, materialVersion: 1 },
+        { ...input, launch: {} },
+        { ...input, materialVersion: 2, launch: {} },
+      ]) {
+        assert.strictEqual(
+          (yield* Effect.flip(
+            store.reserveWorkflowNativeIntent(
+              invalid as Parameters<typeof store.reserveWorkflowNativeIntent>[0],
+            ),
+          )).reason,
+          "integrity",
+        );
+      }
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_runs`, before);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_launch_intents`, []);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_reservation_material`, []);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_intent_receipts`, []);
+      const { fingerprint } = yield* seedHistoricalReservation(input, 2);
+      const historical = {
+        owner: yield* sql`SELECT * FROM workflow_runs`,
+        intent: yield* sql`SELECT * FROM workflow_native_launch_intents`,
+        material: yield* sql`SELECT * FROM workflow_native_reservation_material`,
+        receipt: yield* sql`SELECT * FROM workflow_native_intent_receipts`,
+      };
+      assert.deepStrictEqual(yield* store.reserveWorkflowNativeIntent(input), {
+        kind: "replay",
+        receiptId: input.receiptId,
+        intentId: input.intentId,
+        fingerprint,
+      });
+      assert.strictEqual(
+        (yield* Effect.flip(store.reserveWorkflowNativeIntent(reservation(operation, "old-v2"))))
+          .reason,
+        "integrity",
+      );
+      assert.deepStrictEqual(
+        {
+          owner: yield* sql`SELECT * FROM workflow_runs`,
+          intent: yield* sql`SELECT * FROM workflow_native_launch_intents`,
+          material: yield* sql`SELECT * FROM workflow_native_reservation_material`,
+          receipt: yield* sql`SELECT * FROM workflow_native_intent_receipts`,
+        },
+        historical,
+      );
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["material", "receipt"] as const)(
+  "reservation %s insertion failure rolls back and does not notify",
+  (fault) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        yield* setupAdmission;
+        const sql = yield* SqlClient.SqlClient;
+        const store = yield* Store.WorkflowRunStore;
+        const subscription = yield* store.subscribeChanges;
+        if (fault === "material")
+          yield* sql`CREATE TRIGGER fail_reservation BEFORE INSERT ON workflow_native_reservation_material BEGIN SELECT RAISE(ABORT, 'fault'); END`;
+        else
+          yield* sql`CREATE TRIGGER fail_reservation BEFORE INSERT ON workflow_native_intent_receipts BEGIN SELECT RAISE(ABORT, 'fault'); END`;
+        const before = yield* sql`SELECT * FROM workflow_runs`;
+        const input = reservation(operationFor("rollback-op", "rollback"), "rollback");
+        assert.strictEqual(
+          (yield* Effect.flip(store.reserveWorkflowNativeIntent(input))).reason,
+          "persistence",
+        );
+        assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_runs`, before);
+        assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_launch_intents`, []);
+        assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_reservation_material`, []);
+        assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_intent_receipts`, []);
+        assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+        yield* sql`DROP TRIGGER fail_reservation`;
+        const result = yield* store.reserveWorkflowNativeIntent(input);
+        assert.strictEqual(result.kind, "reserved");
+        assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 1);
+        assert.strictEqual((yield* store.reserveWorkflowNativeIntent(input)).kind, "replay");
+        assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+      }),
+    ).pipe(Effect.provide(layer)),
 );
 
 it.effect("finalized workflow intent preserves exact V1 receipt replay", () =>
@@ -4648,6 +4894,7 @@ it.effect("workflow reservation refuses a planning-owned thread and maps failed 
         store.reserveWorkflowNativeIntent({
           ...input,
           threadId: "empty",
+          launch: { ...input.launch, threadId: "empty" },
           draft: {
             ...input.draft,
             operation: {
@@ -6827,34 +7074,8 @@ it.effect("legacy workflow reservation replays exactly but cannot authorize cont
     yield* setupAdmission;
     const sql = yield* SqlClient.SqlClient;
     const store = yield* Store.WorkflowRunStore;
-    const input = reservation(operationFor("v1-op", "v1-attempt"), "v1-attempt");
-    const legacy = WorkflowCanonicalHash.tagged("t3.workflow-native-launch-intent.v1", {
-      intentId: input.intentId,
-      workflowRunId: input.runId,
-      planningSessionId: null,
-      operationId: input.operationId,
-      attemptId: input.attemptId,
-      passId: null,
-      itemId: input.itemId,
-      chargeAttempt: 1,
-      repair: input.repair,
-      role: "implementation",
-      environmentId: input.environmentId,
-      projectId: input.projectId,
-      launchCommandId: input.launchCommandId,
-      threadId: input.threadId,
-      messageId: input.messageId,
-      draft: input.draft,
-    });
-    const owner = {
-      ...run,
-      access: { origins: [{ ...destination, threadId: "thread" }] },
-      recordVersion: 1,
-      allowance: { ...run.allowance, attemptsConsumed: 1 },
-    };
-    yield* sql`UPDATE workflow_runs SET record_version = 1, record_json = ${json(owner)}`;
-    yield* sql`INSERT INTO workflow_native_launch_intents (intent_id, workflow_run_id, operation_id, attempt_id, item_id, charge_attempt, repair, role, environment_id, project_id, launch_command_id, thread_id, message_id, fingerprint, draft_json, generation, state, held) VALUES (${input.intentId}, ${input.runId}, ${input.operationId}, ${input.attemptId}, ${input.itemId}, 1, 0, 'implementation', ${input.environmentId}, ${input.projectId}, ${input.launchCommandId}, ${input.threadId}, ${input.messageId}, ${legacy}, ${json(input.draft)}, 0, 'reserved', 0)`;
-    yield* sql`INSERT INTO workflow_native_intent_receipts VALUES (${input.draft.admission.command.commandId}, ${input.receiptId}, ${input.intentId}, ${legacy}, ${json({ intentId: input.intentId, fingerprint: legacy })})`;
+    const input = legacyReservation(operationFor("v1-op", "v1-attempt"), "v1-attempt");
+    const { fingerprint: legacy, owner } = yield* seedHistoricalReservation(input, 1);
     assert.deepStrictEqual(yield* store.readThreadCustody({ threadId: input.threadId }), {
       kind: "owned",
       owner: { kind: "workflow_run", workflowRunId: run.id },
@@ -6871,6 +7092,14 @@ it.effect("legacy workflow reservation replays exactly but cannot authorize cont
         externalFacts: { ...admissionFacts, now: "2099-01-01T00:00:00Z" },
       }),
       { kind: "replay", receiptId: input.receiptId, intentId: input.intentId, fingerprint: legacy },
+    );
+    assert.strictEqual(
+      (yield* Effect.flip(
+        store.reserveWorkflowNativeIntent(
+          reservation(operationFor("v1-op", "v1-attempt"), "v1-attempt"),
+        ),
+      )).reason,
+      "integrity",
     );
     for (const changed of [
       { ...input, receiptId: "changed" },

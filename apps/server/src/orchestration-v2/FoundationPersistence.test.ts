@@ -795,6 +795,23 @@ it.effect.each(["association", "recovery"] as const)(
             messageId: "order-message",
             receiptId: "order-receipt",
             generation: 0,
+            materialVersion: 1,
+            launch: {
+              commandId: "order-launch",
+              threadId,
+              projectId: "project",
+              title: "Work",
+              modelSelection: {
+                instanceId: parameters.provider.providerInstanceId,
+                model: parameters.provider.model,
+              },
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              workspaceStrategy: { type: "root", branch: "main" },
+              initialMessage: { messageId: "order-message", text: "Do the work", attachments: [] },
+              createdBy: "agent",
+              creationSource: "mcp",
+            },
             draft: {
               version: 1,
               kind: "stage_launch",
