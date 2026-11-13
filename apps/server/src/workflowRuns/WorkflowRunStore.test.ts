@@ -8412,3 +8412,450 @@ it.effect(
       );
     }).pipe(Effect.provide(layer)),
 );
+
+const nativeClaimControl = Effect.fn("test.nativeClaimControl")(function* (
+  kind: "workflow" | "planning",
+  store: Store.WorkflowRunStore["Service"],
+  action: "pause" | "stop",
+) {
+  const sql = yield* SqlClient.SqlClient;
+  if (kind === "workflow") {
+    const row = (yield* sql<{
+      record_version: number;
+      control_generation: number;
+    }>`SELECT record_version,control_generation FROM workflow_runs`)[0]!;
+    return yield* store
+      .commitTransition({
+        runId: run.id,
+        command: {
+          ...command,
+          kind: action,
+          commandId: `claim-${action}-${row.record_version}`,
+          expectedVersion: row.record_version,
+          expectedGeneration: row.control_generation,
+        },
+        externalFacts: admissionFacts,
+        receiptId: `claim-control-${action}-${row.record_version}`,
+      })
+      .pipe(Effect.asVoid);
+  }
+  const row = (yield* sql<{
+    record_version: number;
+  }>`SELECT record_version FROM workflow_planning_sessions`)[0]!;
+  yield* store.controlPlanning({
+    sessionId: session.id,
+    action,
+    expectedVersion: row.record_version,
+    now: facts.now,
+    context,
+    command: {
+      commandId: `claim-${action}-${row.record_version}`,
+      receiptId: `claim-${action}-${row.record_version}`,
+    },
+  });
+});
+
+const nativeClaimFixture = Effect.fn("test.nativeClaimFixture")(function* (
+  kind: "workflow" | "planning",
+  materialVersion: 1 | 2 = 2,
+) {
+  yield* TestClock.setTime(DateTime.makeUnsafe(facts.now).epochMilliseconds);
+  const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at) VALUES ('project','Project','/work','[]',${facts.now},${facts.now})`;
+  const auth = yield* authorizedStore();
+  const material =
+    materialVersion === 2
+      ? { materialVersion: 2 as const, authority: auth.authority }
+      : { materialVersion: 1 as const };
+  let intentId: string;
+  let fingerprint: string;
+  if (kind === "workflow") {
+    const owner = {
+      ...run,
+      spec: { ...run.spec, plan: binding },
+      access: { origins: [destination] },
+      allowance: { ...run.allowance, maxAttempts: 1 },
+    };
+    yield* auth.store.createRun(owner);
+    const input = {
+      ...reservation(operationFor("claim-op", "claim-attempt"), "claim-attempt"),
+      ...material,
+    };
+    const receipt = yield* auth.store.reserveWorkflowNativeIntent(input);
+    if (receipt.kind !== "reserved") throw new Error("expected reservation");
+    intentId = input.intentId;
+    fingerprint = receipt.fingerprint;
+  } else {
+    const owner = { ...session, limits: { ...session.limits, maxPasses: 1 } };
+    yield* begin(auth.store, owner);
+    const input = {
+      ...planningReservation(admissionInput(binding, "claim", owner)),
+      ...material,
+    };
+    const receipt = yield* auth.store.reservePlanningNativeIntent(input);
+    intentId = input.intentId;
+    fingerprint = receipt.fingerprint;
+  }
+  const control = (action: "pause" | "stop") => nativeClaimControl(kind, auth.store, action);
+  return {
+    ...auth,
+    kind,
+    control,
+    claimInput: {
+      intentId,
+      expectedFingerprint: fingerprint,
+      expectedOwnerVersion: 1,
+      expectedGeneration: 0,
+      bootId: "boot",
+      workerId: "worker",
+    },
+  };
+});
+
+it.effect.each(["workflow", "planning"] as const)(
+  "native intent claim owns %s custody once at the last charged slot",
+  (kind) =>
+    Effect.gen(function* () {
+      const { store, claimInput } = yield* nativeClaimFixture(kind);
+      const sql = yield* SqlClient.SqlClient;
+      const before = {
+        workflow: yield* sql`SELECT * FROM workflow_runs`,
+        planning: yield* sql`SELECT * FROM workflow_planning_sessions`,
+        material: yield* sql`SELECT * FROM workflow_native_reservation_material`,
+        receipts: yield* sql`SELECT * FROM workflow_native_intent_receipts`,
+      };
+      const subscription = yield* store.subscribeChanges;
+      const first = yield* store.claimNativeIntent(claimInput);
+      assert.strictEqual(first.kind, "claimed");
+      assert.deepStrictEqual(
+        yield* sql`SELECT state,held,boot_id,worker_id FROM workflow_native_launch_intents`,
+        [{ state: "dispatching", held: 0, boot_id: "boot", worker_id: "worker" }],
+      );
+      yield* PubSub.take(subscription);
+      for (const workerId of ["worker", "other-worker"])
+        assert.notStrictEqual(
+          (yield* store.claimNativeIntent({ ...claimInput, workerId })).kind,
+          "claimed",
+        );
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+      assert.deepStrictEqual(
+        {
+          workflow: yield* sql`SELECT * FROM workflow_runs`,
+          planning: yield* sql`SELECT * FROM workflow_planning_sessions`,
+          material: yield* sql`SELECT * FROM workflow_native_reservation_material`,
+          receipts: yield* sql`SELECT * FROM workflow_native_intent_receipts`,
+        },
+        before,
+      );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_operations`, []);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_planning_passes`, []);
+      yield* sql`UPDATE workflow_native_launch_intents SET state = 'unknown'`;
+      const uncertain = yield* sql`SELECT * FROM workflow_native_launch_intents`;
+      yield* TestClock.setTime(DateTime.makeUnsafe("2027-12-02T00:00:00Z").epochMilliseconds);
+      assert.notStrictEqual(
+        (yield* store.claimNativeIntent({ ...claimInput, bootId: "later-boot" })).kind,
+        "claimed",
+      );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_launch_intents`, uncertain);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "native intent claim rejects stale, missing authority and elapsed %s work without writes",
+  (kind) =>
+    Effect.gen(function* () {
+      const { store, sessions, authority, claimInput } = yield* nativeClaimFixture(kind);
+      const sql = yield* SqlClient.SqlClient;
+      const ordinary = yield* Store.WorkflowRunStore;
+      const subscription = yield* store.subscribeChanges;
+      const before = yield* rawReservationState;
+      assert.deepStrictEqual(yield* ordinary.claimNativeIntent(claimInput), {
+        kind: "denied",
+        reason: "authority",
+      });
+      for (const changes of [
+        { expectedFingerprint: nextHash },
+        { expectedGeneration: 1 },
+        { expectedOwnerVersion: 2 },
+      ])
+        assert.deepStrictEqual(yield* store.claimNativeIntent({ ...claimInput, ...changes }), {
+          kind: "stale",
+        });
+      yield* TestClock.setTime(DateTime.makeUnsafe("2026-12-02T00:00:00Z").epochMilliseconds);
+      assert.deepStrictEqual(yield* store.claimNativeIntent(claimInput), {
+        kind: "denied",
+        reason: "deadline",
+      });
+      yield* TestClock.setTime(DateTime.makeUnsafe(facts.now).epochMilliseconds);
+      yield* sessions.revoke(authority.sessionId);
+      assert.deepStrictEqual(yield* store.claimNativeIntent(claimInput), {
+        kind: "denied",
+        reason: "authority",
+      });
+      assert.deepStrictEqual(yield* rawReservationState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+      assert.strictEqual(
+        (yield* Effect.flip(sql.withTransaction(store.claimNativeIntent(claimInput)))).reason,
+        "integrity",
+      );
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "native intent claim refuses legacy %s material without rewriting it",
+  (kind) =>
+    Effect.gen(function* () {
+      const { store, claimInput } = yield* nativeClaimFixture(kind, 1);
+      const before = yield* rawReservationState;
+      assert.deepStrictEqual(yield* store.claimNativeIntent(claimInput), {
+        kind: "denied",
+        reason: "authority",
+      });
+      assert.deepStrictEqual(yield* rawReservationState, before);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "native intent claim rolls back and snapshots %s custody input before execution",
+  (kind) =>
+    Effect.gen(function* () {
+      const { store, claimInput } = yield* nativeClaimFixture(kind);
+      const sql = yield* SqlClient.SqlClient;
+      const subscription = yield* store.subscribeChanges;
+      const before = yield* rawReservationState;
+      yield* sql`CREATE TRIGGER reject_native_claim AFTER UPDATE OF state ON workflow_native_launch_intents WHEN NEW.state = 'dispatching' BEGIN SELECT RAISE(ABORT,'injected claim failure'); END`;
+      assert.strictEqual(
+        (yield* Effect.flip(store.claimNativeIntent(claimInput))).reason,
+        "persistence",
+      );
+      assert.deepStrictEqual(yield* rawReservationState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+      yield* sql`DROP TRIGGER reject_native_claim`;
+      const mutable = { ...claimInput };
+      const pending = store.claimNativeIntent(mutable);
+      mutable.workerId = "mutated";
+      mutable.expectedFingerprint = nextHash;
+      assert.strictEqual((yield* pending).kind, "claimed");
+      assert.deepStrictEqual(
+        yield* sql`SELECT boot_id,worker_id FROM workflow_native_launch_intents`,
+        [{ boot_id: "boot", worker_id: "worker" }],
+      );
+      yield* PubSub.take(subscription);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  ["workflow", "receipt"],
+  ["planning", "receipt"],
+  ["workflow", "event"],
+  ["planning", "event"],
+  ["workflow", "proof"],
+  ["planning", "proof"],
+] as const)(
+  "native intent claim retains $0 reservation when existing $1 needs reconciliation",
+  ([kind, evidence]) =>
+    Effect.gen(function* () {
+      const { store, claimInput } = yield* nativeClaimFixture(kind);
+      const sql = yield* SqlClient.SqlClient;
+      const native = (yield* sql<{
+        launch_command_id: string;
+        thread_id: string;
+      }>`SELECT launch_command_id,thread_id FROM workflow_native_launch_intents`)[0]!;
+      const commandId =
+        evidence === "proof"
+          ? "foreign-proof-command"
+          : `${native.launch_command_id}:initial-message`;
+      if (evidence === "receipt" || evidence === "proof")
+        yield* sql`INSERT INTO orchestration_command_receipts (command_id,aggregate_kind,aggregate_id,accepted_at,result_sequence,status) VALUES (${commandId},'thread',${native.thread_id},${facts.now},0,'accepted')`;
+      if (evidence === "event")
+        yield* sql`INSERT INTO orchestration_events (event_id,aggregate_kind,stream_id,stream_version,event_type,occurred_at,command_id,actor_kind,payload_json,metadata_json) VALUES ('orphan-native-event','thread',${native.thread_id},1,'run.created',${facts.now},${commandId},'system','{}','{}')`;
+      if (evidence === "proof")
+        yield* sql`INSERT INTO workflow_native_command_proofs (command_id,intent_id,phase,proof_json,proof_hash) VALUES (${commandId},${claimInput.intentId},'claim','{}',${hash})`;
+      const before = yield* rawReservationState;
+      assert.deepStrictEqual(yield* store.claimNativeIntent(claimInput), {
+        kind: "denied",
+        reason: "evidence",
+      });
+      assert.deepStrictEqual(yield* rawReservationState, before);
+      assert.deepStrictEqual(
+        yield* sql`SELECT state,boot_id,worker_id FROM workflow_native_launch_intents`,
+        [{ state: "reserved", boot_id: null, worker_id: null }],
+      );
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  ["workflow", "revoke", "claim"],
+  ["workflow", "revoke", "control"],
+  ["planning", "revoke", "claim"],
+  ["planning", "revoke", "control"],
+  ["workflow", "pause", "claim"],
+  ["workflow", "pause", "control"],
+  ["planning", "pause", "claim"],
+  ["planning", "pause", "control"],
+  ["workflow", "stop", "claim"],
+  ["workflow", "stop", "control"],
+  ["planning", "stop", "claim"],
+  ["planning", "stop", "control"],
+] as const)(
+  "independent native intent claim $0/$1 preserves $2-first commit order",
+  ([kind, action, first]) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const directory = yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "native-authority-claim-")),
+          ),
+          (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
+        );
+        const filename = NodePath.join(directory, "state.sqlite");
+        const fileLayer = Store.layer.pipe(
+          Layer.provideMerge(NodeSqliteClient.layer({ filename })),
+        );
+        yield* Effect.gen(function* () {
+          const prepared = yield* nativeClaimFixture(kind);
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`PRAGMA journal_mode = WAL`;
+          const contextB = yield* Layer.build(Layer.fresh(NodeSqliteClient.layer({ filename })));
+          const sqlB = Context.get(contextB, SqlClient.SqlClient);
+          const other = yield* authorizedStore().pipe(
+            Effect.provideService(SqlClient.SqlClient, sqlB),
+          );
+          const control =
+            action === "revoke"
+              ? other.sessions.revoke(prepared.authority.sessionId).pipe(Effect.asVoid)
+              : nativeClaimControl(kind, other.store, action).pipe(
+                  Effect.provideService(SqlClient.SqlClient, sqlB),
+                );
+          const originals = {
+            material: yield* sql`SELECT * FROM workflow_native_reservation_material`,
+            receipts: yield* sql`SELECT * FROM workflow_native_intent_receipts`,
+          };
+          if (first === "control") {
+            yield* control;
+            const before = yield* rawReservationState;
+            assert.notStrictEqual(
+              (yield* prepared.store.claimNativeIntent(prepared.claimInput)).kind,
+              "claimed",
+            );
+            assert.deepStrictEqual(yield* rawReservationState, before);
+          } else {
+            assert.strictEqual(
+              (yield* prepared.store.claimNativeIntent(prepared.claimInput)).kind,
+              "claimed",
+            );
+            yield* control;
+            const before = yield* rawReservationState;
+            assert.notStrictEqual(
+              (yield* other.store.claimNativeIntent({
+                ...prepared.claimInput,
+                bootId: "replacement-boot",
+                workerId: "replacement-worker",
+              })).kind,
+              "claimed",
+            );
+            assert.deepStrictEqual(yield* rawReservationState, before);
+            assert.deepStrictEqual(
+              yield* sqlB`SELECT state,boot_id,worker_id FROM workflow_native_launch_intents`,
+              [{ state: "dispatching", boot_id: "boot", worker_id: "worker" }],
+            );
+            const status =
+              kind === "workflow"
+                ? yield* sqlB<{ status: string }>`SELECT status FROM workflow_runs`
+                : yield* sqlB<{ status: string }>`SELECT status FROM workflow_planning_sessions`;
+            assert.strictEqual(
+              status[0]!.status,
+              action === "revoke" ? "active" : action === "pause" ? "pausing" : "stopping",
+            );
+          }
+          assert.deepStrictEqual(
+            {
+              material: yield* sqlB`SELECT * FROM workflow_native_reservation_material`,
+              receipts: yield* sqlB`SELECT * FROM workflow_native_intent_receipts`,
+            },
+            originals,
+          );
+          const owners =
+            kind === "workflow"
+              ? yield* sqlB<{ record_json: string }>`SELECT record_json FROM workflow_runs`
+              : yield* sqlB<{
+                  record_json: string;
+                }>`SELECT record_json FROM workflow_planning_sessions`;
+          const record = parse(owners[0]!.record_json) as typeof run & typeof session;
+          assert.strictEqual(
+            kind === "workflow" ? record.allowance.attemptsConsumed : record.consumed.passes,
+            1,
+          );
+        }).pipe(Effect.provide(fileLayer));
+      }),
+    ),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "native intent claim rechecks current %s bindings, resources and running effects",
+  (kind) =>
+    Effect.gen(function* () {
+      const { store, claimInput } = yield* nativeClaimFixture(kind);
+      const sql = yield* SqlClient.SqlClient;
+      const subscription = yield* store.subscribeChanges;
+      const original = yield* rawReservationState;
+      yield* sql`UPDATE projection_projects SET deleted_at = ${facts.now}`;
+      assert.deepStrictEqual(yield* store.claimNativeIntent(claimInput), {
+        kind: "denied",
+        reason: "authority",
+      });
+      yield* sql`UPDATE projection_projects SET deleted_at = NULL`;
+      if (kind === "workflow") {
+        const rows = yield* sql<{ record_json: string }>`SELECT record_json FROM workflow_runs`;
+        const owner = parse(rows[0]!.record_json) as typeof run;
+        yield* sql`UPDATE workflow_runs SET spec_hash = ${nextHash}, record_json = ${json({ ...owner, spec: { ...owner.spec, ref: { ...owner.spec.ref, sha256: nextHash } } })}`;
+        assert.strictEqual(
+          (yield* Effect.flip(store.claimNativeIntent(claimInput))).reason,
+          "integrity",
+        );
+        yield* sql`UPDATE workflow_runs SET spec_hash = ${hash},record_json = ${rows[0]!.record_json}`;
+      } else {
+        const rows = yield* sql<{
+          record_json: string;
+        }>`SELECT record_json FROM workflow_planning_sessions`;
+        const owner = parse(rows[0]!.record_json) as typeof session;
+        yield* sql`UPDATE workflow_planning_sessions SET record_json = ${json({ ...owner, allowedProviders: [{ providerInstanceId: "different", model: "different" }] })}`;
+        assert.deepStrictEqual(yield* store.claimNativeIntent(claimInput), {
+          kind: "denied",
+          reason: "ineligible",
+        });
+        yield* sql`UPDATE workflow_planning_sessions SET record_json = ${rows[0]!.record_json}`;
+      }
+      const revisions = yield* sql<{
+        revision_json: string;
+      }>`SELECT revision_json FROM development_plan_revisions`;
+      yield* sql`UPDATE development_plan_revisions SET revision_json = '{}'`;
+      assert.strictEqual(
+        (yield* Effect.flip(store.claimNativeIntent(claimInput))).reason,
+        "integrity",
+      );
+      yield* sql`UPDATE development_plan_revisions SET revision_json = ${revisions[0]!.revision_json}`;
+      yield* sql`ALTER TABLE development_plan_revisions RENAME TO unavailable_plan_revisions`;
+      assert.strictEqual(
+        (yield* Effect.flip(store.claimNativeIntent(claimInput))).reason,
+        "persistence",
+      );
+      yield* sql`ALTER TABLE unavailable_plan_revisions RENAME TO development_plan_revisions`;
+      const native = (yield* sql<{
+        thread_id: string;
+      }>`SELECT thread_id FROM workflow_native_launch_intents`)[0]!;
+      yield* sql`INSERT INTO orchestration_v2_effect_outbox (effect_id,command_id,thread_id,effect_type,payload_json,status,available_at,created_at,updated_at) VALUES ('running-before-claim','native-command',${native.thread_id},'provider-turn.start',${json(nativeRequests[0])},'running',${facts.now},${facts.now},${facts.now})`;
+      const before = yield* rawReservationState;
+      assert.deepStrictEqual(yield* store.claimNativeIntent(claimInput), {
+        kind: "denied",
+        reason: "custody",
+      });
+      assert.deepStrictEqual(yield* rawReservationState, before);
+      yield* sql`DELETE FROM orchestration_v2_effect_outbox WHERE effect_id = 'running-before-claim'`;
+      assert.deepStrictEqual(yield* rawReservationState, original);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layer)),
+);

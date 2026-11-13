@@ -753,7 +753,7 @@ const makeStore = Effect.fnUntraced(function* (
     },
   );
   const validatePlanningRevision = Effect.fn("WorkflowRunStore.validatePlanningRevision")(
-    function* (pass: P) {
+    function* (pass: Pick<P, "binding">) {
       const b = pass.binding;
       const rows = yield* sql<{
         revision_json: string;
@@ -4052,6 +4052,221 @@ const makeStore = Effect.fnUntraced(function* (
       isStoreError(error) ? error : new WorkflowRunStoreError({ reason: "persistence" }),
     ),
   );
+  type NativeIntentClaimInput = {
+    readonly intentId: string;
+    readonly expectedFingerprint: string;
+    readonly expectedOwnerVersion: number;
+    readonly expectedGeneration: number;
+    readonly bootId: string;
+    readonly workerId: string;
+  };
+  const nativeClaimValidationError = (error: unknown) =>
+    isPlanningError(error) && error.reason !== "storage"
+      ? integrity()
+      : new WorkflowRunStoreError({ reason: "persistence" });
+  const claimNativeIntent = Effect.fn("WorkflowRunStore.claimNativeIntent")(function* (
+    input: NativeIntentClaimInput,
+  ) {
+    const denied = (
+      reason: "authority" | "state" | "deadline" | "custody" | "evidence" | "ineligible",
+    ) => ({ kind: "denied" as const, reason });
+    if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+      return yield* integrity();
+    const result = yield* inTransaction(
+      Effect.gen(function* () {
+        const reservation = yield* readNativeReservationInTransaction({ intentId: input.intentId });
+        if (
+          reservation.fingerprint !== input.expectedFingerprint ||
+          reservation.generation !== input.expectedGeneration
+        )
+          return { kind: "stale" as const };
+        if (reservation.state !== "reserved" || reservation.held) return denied("state");
+        if (reservation.material.version !== 2 || !currentAuthority) return denied("authority");
+        const rows =
+          yield* sql<IntentRow>`SELECT * FROM workflow_native_launch_intents WHERE intent_id = ${input.intentId}`;
+        const row = rows[0];
+        if (
+          !row ||
+          row.boot_id !== null ||
+          row.worker_id !== null ||
+          row.native_run_id !== null ||
+          row.finalized_operation_id !== null
+        )
+          return yield* integrity();
+        const draft = yield* Effect.try({ try: () => parse(row.draft_json), catch: integrity });
+        const receipts = yield* sql<{
+          command_id: string;
+          receipt_id: string;
+          intent_id: string;
+          fingerprint: string;
+          result_json: string;
+        }>`SELECT * FROM workflow_native_intent_receipts WHERE intent_id = ${row.intent_id}`;
+        const receipt = receipts[0];
+        if (!receipt || receipts.length !== 1) return yield* integrity();
+        let operation: WorkflowOperationV1;
+        let owner: WorkflowRunV1 | S;
+        const now = DateTime.formatIso(yield* DateTime.now);
+        if (reservation.owner.kind === "workflow_run") {
+          const verified = yield* verifyStoredWorkflowIntent(
+            {
+              intentId: row.intent_id,
+              runId: reservation.owner.workflowRunId,
+              operationId: row.operation_id,
+              attemptId: reservation.attemptId!,
+              itemId: reservation.itemId!,
+              repair: reservation.repair,
+              environmentId: row.environment_id,
+              projectId: row.project_id,
+              launchCommandId: row.launch_command_id,
+              threadId: row.thread_id,
+              messageId: row.message_id,
+              receiptId: receipt.receipt_id,
+              generation: input.expectedGeneration,
+            },
+            draft,
+            receipt,
+          );
+          operation = verified.operation;
+          const owners = yield* sql<{
+            record_json: string;
+          }>`SELECT record_json FROM workflow_runs WHERE id = ${reservation.owner.workflowRunId}`;
+          const value = yield* Effect.try({
+            try: () => parse(owners[0]!.record_json),
+            catch: integrity,
+          }).pipe(Effect.flatMap(decodeWorkflowRunV1), Effect.mapError(integrity));
+          owner = value;
+          if (
+            value.recordVersion !== input.expectedOwnerVersion ||
+            value.controlGeneration !== input.expectedGeneration
+          )
+            return { kind: "stale" as const };
+          if (value.status !== "active") return denied("state");
+          if (!isWorkflowTimestampAfter(value.allowance.deadline, now)) return denied("deadline");
+          if (
+            operation.parameters.kind !== "stage_launch" ||
+            operation.parameters.stage !== "implementation" ||
+            operation.parameters.context.specHash !== value.spec.ref.sha256 ||
+            verified.draft.admission.command.expectedSpecHash !== value.spec.ref.sha256 ||
+            !sameCustodyValue(value.origin, operation.origin)
+          )
+            return yield* integrity();
+          const charged = yield* sql<{
+            total: number;
+            repairs: number;
+          }>`SELECT COUNT(*) AS total, COALESCE(SUM(repair),0) AS repairs FROM workflow_native_launch_intents WHERE workflow_run_id = ${value.id} AND charge_attempt = 1`;
+          if (
+            !charged[0] ||
+            value.allowance.attemptsConsumed < charged[0].total ||
+            value.allowance.attemptsConsumed > value.allowance.maxAttempts ||
+            value.allowance.repairRoundsConsumed < charged[0].repairs ||
+            value.allowance.repairRoundsConsumed > value.allowance.maxRepairRounds
+          )
+            return yield* integrity();
+          const competing =
+            yield* sql`SELECT 1 FROM workflow_native_launch_intents WHERE workflow_run_id = ${value.id} AND intent_id <> ${row.intent_id} AND state IN ('reserved','dispatching','unknown') UNION ALL SELECT 1 FROM workflow_operations WHERE workflow_run_id = ${value.id} AND (status IN ('claimed','unknown') OR (status = 'pending' AND kind = 'stage_launch' AND json_extract(record_json,'$.parameters.stage') = 'implementation'))`;
+          if (competing.length) return denied("custody");
+          yield* validatePlanningRevision({ binding: value.spec.plan }).pipe(
+            Effect.mapError(nativeClaimValidationError),
+          );
+        } else {
+          const verified = yield* verifyStoredPlanningIntent(
+            {
+              intentId: row.intent_id,
+              sessionId: reservation.owner.planningSessionId,
+              operationId: row.operation_id,
+              passId: reservation.passId!,
+              role: row.role as P["role"],
+              environmentId: row.environment_id,
+              projectId: row.project_id,
+              launchCommandId: row.launch_command_id,
+              threadId: row.thread_id,
+              messageId: row.message_id,
+              generation: input.expectedGeneration,
+            },
+            draft,
+            receipt,
+          ).pipe(Effect.mapError(nativeClaimValidationError));
+          operation = verified.operation;
+          const value = yield* readSession(reservation.owner.planningSessionId).pipe(
+            Effect.mapError(nativeClaimValidationError),
+          );
+          owner = value;
+          if (
+            value.recordVersion !== input.expectedOwnerVersion ||
+            value.controlGeneration !== input.expectedGeneration
+          )
+            return { kind: "stale" as const };
+          if (value.status !== "active") return denied("state");
+          if (!isWorkflowTimestampAfter(value.limits.deadline, now)) return denied("deadline");
+          if (
+            !sameContext(value, verified.context) ||
+            verified.pass.binding.planId !== value.planId ||
+            !sameCustodyValue(verified.params.limits, value.limits)
+          )
+            return yield* integrity();
+          if (
+            !value.allowedRoles.includes(verified.pass.role) ||
+            !value.allowedProviders.some(
+              (provider) =>
+                provider.providerInstanceId === verified.pass.provider.providerInstanceId &&
+                provider.model === verified.pass.provider.model,
+            )
+          )
+            return denied("ineligible");
+          const charged = yield* sql<{
+            total: number;
+            repairs: number;
+          }>`SELECT COUNT(*) AS total, COALESCE(SUM(repair),0) AS repairs FROM workflow_native_launch_intents WHERE planning_session_id = ${value.id}`;
+          if (
+            !charged[0] ||
+            value.consumed.passes < charged[0].total ||
+            value.consumed.passes > value.limits.maxPasses ||
+            value.consumed.repairRounds < charged[0].repairs ||
+            value.consumed.repairRounds > value.limits.maxRepairRounds
+          )
+            return yield* integrity();
+          if (verified.pass.role === "author" || verified.pass.role === "repair") {
+            const competing =
+              yield* sql`SELECT 1 FROM workflow_planning_passes p JOIN workflow_operations o ON o.id = p.operation_id WHERE p.plan_id = ${value.planId} AND o.status IN ('pending','claimed','unknown') AND json_extract(p.record_json,'$.role') IN ('author','repair') UNION ALL SELECT 1 FROM workflow_native_launch_intents i JOIN workflow_planning_sessions s ON s.id = i.planning_session_id WHERE s.plan_id = ${value.planId} AND i.intent_id <> ${row.intent_id} AND i.state IN ('reserved','dispatching','unknown') AND i.role IN ('author','repair')`;
+            if (competing.length) return denied("custody");
+          }
+          yield* validatePlanningRevision(verified.pass).pipe(
+            Effect.mapError(nativeClaimValidationError),
+          );
+        }
+        if (yield* runningNativeEffect(row.thread_id)) return denied("custody");
+        if (!(yield* checkWorkflowAuthority(reservation.material, operation, owner)))
+          return denied("authority");
+        const messageCommandId = `${row.launch_command_id}:initial-message`;
+        const evidence =
+          yield* sql`SELECT 1 FROM orchestration_command_receipts WHERE command_id IN (${row.launch_command_id},${messageCommandId}) UNION ALL SELECT 1 FROM orchestration_events WHERE command_id IN (${row.launch_command_id},${messageCommandId}) UNION ALL SELECT 1 FROM workflow_native_command_proofs WHERE intent_id = ${row.intent_id} OR command_id IN (${row.launch_command_id},${messageCommandId})`;
+        if (evidence.length) return denied("evidence");
+        const changed =
+          yield* sql`UPDATE workflow_native_launch_intents SET state = 'dispatching', boot_id = ${input.bootId}, worker_id = ${input.workerId} WHERE intent_id = ${row.intent_id} AND fingerprint = ${input.expectedFingerprint} AND generation = ${input.expectedGeneration} AND state = 'reserved' AND held = 0 AND boot_id IS NULL AND worker_id IS NULL AND native_run_id IS NULL AND finalized_operation_id IS NULL RETURNING intent_id`;
+        if (changed.length !== 1) return { kind: "stale" as const };
+        const claimed = yield* readNativeReservationInTransaction({ intentId: row.intent_id });
+        if (
+          claimed.state !== "dispatching" ||
+          claimed.bootId !== input.bootId ||
+          claimed.workerId !== input.workerId
+        )
+          return yield* integrity();
+        return {
+          kind: "claimed" as const,
+          claim: Object.freeze({
+            intentId: row.intent_id,
+            fingerprint: row.fingerprint,
+            owner: Object.freeze({ ...reservation.owner }),
+            generation: input.expectedGeneration,
+            bootId: input.bootId,
+            workerId: input.workerId,
+          }),
+        };
+      }),
+    );
+    if (result.kind === "claimed") yield* notify;
+    return result;
+  });
   const claim = Effect.fn("WorkflowRunStore.claim")(function* (input: {
     readonly operationId: string;
     readonly expectedOwnerVersion: number;
@@ -4409,6 +4624,26 @@ const makeStore = Effect.fnUntraced(function* (
         return reservePlanningNativeIntent(structuredClone(input));
       } catch {
         return Effect.fail(planningError("invalid"));
+      }
+    },
+    claimNativeIntent: (input: NativeIntentClaimInput) => {
+      try {
+        WorkflowCanonicalHash.assertCanonical(input);
+        if (
+          Object.keys(input).sort().join() !==
+            "bootId,expectedFingerprint,expectedGeneration,expectedOwnerVersion,intentId,workerId" ||
+          ![input.intentId, input.bootId, input.workerId].every(
+            (id) => typeof id === "string" && id.trim().length > 0,
+          ) ||
+          !/^[0-9a-f]{64}$/.test(input.expectedFingerprint) ||
+          ![input.expectedOwnerVersion, input.expectedGeneration].every(
+            (value) => Number.isSafeInteger(value) && value >= 0,
+          )
+        )
+          throw integrity();
+        return claimNativeIntent(structuredClone(input));
+      } catch {
+        return Effect.fail(integrity());
       }
     },
     readThreadCustody,
