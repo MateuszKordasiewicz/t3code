@@ -14,6 +14,9 @@ import {
   WorkflowOperationV1,
   WorkflowRunV1,
   OrchestrationV2ProviderThreadJson,
+  OrchestrationV2RunJson,
+  OrchestrationV2RunAttemptJson,
+  OrchestrationV2ExecutionNodeJson,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Digest from "effect/crypto/Digest";
@@ -101,6 +104,15 @@ const attemptFacts = <
 };
 const encode = (value: unknown) => JSON.stringify(value);
 const parse = (value: string): unknown => JSON.parse(value);
+const decodeNativeFinalizationRun = Schema.decodeEffect(
+  Schema.fromJsonString(OrchestrationV2RunJson),
+);
+const decodeNativeFinalizationAttempt = Schema.decodeEffect(
+  Schema.fromJsonString(OrchestrationV2RunAttemptJson),
+);
+const decodeNativeFinalizationNode = Schema.decodeEffect(
+  Schema.fromJsonString(OrchestrationV2ExecutionNodeJson),
+);
 const decodeRecoveryProviderThread = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2ProviderThreadJson),
 );
@@ -4460,6 +4472,372 @@ const makeStore = Effect.fnUntraced(function* (
     const { notify: _notify, ...result } = outcome;
     return result;
   });
+  const verifyPreparingNativeRun = Effect.fn("WorkflowRunStore.verifyPreparingNativeRun")(
+    function* (
+      nativeRunId: string,
+      threadId: string,
+      events: readonly { readonly event_type: string; readonly payload_json: string }[],
+    ) {
+      const originals = events.filter((event) => event.event_type === "run.created");
+      if (originals.length !== 1 || !originals[0]) return yield* integrity();
+      const original = yield* decodeNativeFinalizationRun(originals[0].payload_json).pipe(
+        Effect.mapError(integrity),
+      );
+      const rows = yield* sql<{
+        run_id: string;
+        thread_id: string;
+        provider_instance_id: string;
+        provider_thread_id: string | null;
+        status: string;
+        completed_at: string | null;
+        payload_json: string;
+      }>`SELECT * FROM orchestration_v2_projection_runs WHERE run_id = ${nativeRunId}`;
+      const row = rows[0];
+      if (rows.length !== 1 || !row) return yield* integrity();
+      const run = yield* decodeNativeFinalizationRun(row.payload_json).pipe(
+        Effect.mapError(integrity),
+      );
+      if (
+        original.id !== nativeRunId ||
+        original.threadId !== threadId ||
+        original.status !== "preparing" ||
+        original.startedAt !== null ||
+        original.completedAt !== null ||
+        original.workStartedAt !== undefined ||
+        !original.activeAttemptId ||
+        !original.rootNodeId ||
+        !original.providerThreadId ||
+        row.run_id !== run.id ||
+        row.thread_id !== run.threadId ||
+        run.id !== nativeRunId ||
+        run.threadId !== threadId ||
+        row.status !== run.status ||
+        row.completed_at !== null ||
+        row.provider_instance_id !== run.providerInstanceId ||
+        row.provider_thread_id !== run.providerThreadId ||
+        run.activeAttemptId !== original.activeAttemptId ||
+        run.rootNodeId !== original.rootNodeId ||
+        run.providerThreadId !== original.providerThreadId ||
+        run.providerInstanceId !== original.providerInstanceId
+      )
+        return yield* integrity();
+      if (
+        run.status !== "preparing" ||
+        run.startedAt !== null ||
+        run.completedAt !== null ||
+        run.workStartedAt !== undefined
+      )
+        return false;
+      const attempts = yield* sql<{
+        attempt_id: string;
+        thread_id: string;
+        run_id: string;
+        attempt_ordinal: number;
+        root_node_id: string;
+        provider_instance_id: string;
+        provider_thread_id: string | null;
+        provider_turn_id: string | null;
+        status: string;
+        payload_json: string;
+      }>`SELECT * FROM orchestration_v2_projection_run_attempts WHERE attempt_id = ${run.activeAttemptId}`;
+      const nodes = yield* sql<{
+        node_id: string;
+        thread_id: string;
+        run_id: string;
+        parent_node_id: string | null;
+        root_node_id: string;
+        kind: string;
+        status: string;
+        provider_thread_id: string | null;
+        provider_turn_id: string | null;
+        started_at: string | null;
+        completed_at: string | null;
+        payload_json: string;
+      }>`SELECT * FROM orchestration_v2_projection_nodes WHERE node_id = ${run.rootNodeId}`;
+      const a = attempts[0];
+      const n = nodes[0];
+      if (attempts.length !== 1 || !a || nodes.length !== 1 || !n) return yield* integrity();
+      const attempt = yield* decodeNativeFinalizationAttempt(a.payload_json).pipe(
+        Effect.mapError(integrity),
+      );
+      const node = yield* decodeNativeFinalizationNode(n.payload_json).pipe(
+        Effect.mapError(integrity),
+      );
+      if (
+        a.attempt_id !== attempt.id ||
+        attempt.id !== run.activeAttemptId ||
+        a.thread_id !== threadId ||
+        a.run_id !== nativeRunId ||
+        attempt.runId !== nativeRunId ||
+        a.attempt_ordinal !== attempt.attemptOrdinal ||
+        attempt.attemptOrdinal !== 1 ||
+        attempt.reason !== "initial" ||
+        a.root_node_id !== attempt.rootNodeId ||
+        attempt.rootNodeId !== run.rootNodeId ||
+        a.provider_instance_id !== attempt.providerInstanceId ||
+        attempt.providerInstanceId !== run.providerInstanceId ||
+        a.provider_thread_id !== attempt.providerThreadId ||
+        attempt.providerThreadId !== run.providerThreadId ||
+        a.provider_turn_id !== attempt.providerTurnId ||
+        a.status !== attempt.status ||
+        n.node_id !== node.id ||
+        node.id !== run.rootNodeId ||
+        n.thread_id !== node.threadId ||
+        node.threadId !== threadId ||
+        n.run_id !== node.runId ||
+        node.runId !== nativeRunId ||
+        n.root_node_id !== node.rootNodeId ||
+        node.rootNodeId !== node.id ||
+        n.parent_node_id !== node.parentNodeId ||
+        node.parentNodeId !== null ||
+        n.kind !== node.kind ||
+        node.kind !== "root_turn" ||
+        n.status !== node.status ||
+        n.provider_thread_id !== node.providerThreadId ||
+        node.providerThreadId !== run.providerThreadId ||
+        n.provider_turn_id !== node.providerTurnId ||
+        !node.countsForRun
+      )
+        return yield* integrity();
+      return (
+        attempt.status === "pending" &&
+        attempt.providerTurnId === null &&
+        attempt.startedAt === null &&
+        attempt.completedAt === null &&
+        node.status === "pending" &&
+        node.providerTurnId === null &&
+        node.startedAt === null &&
+        node.completedAt === null &&
+        n.started_at === null &&
+        n.completed_at === null &&
+        node.runtimeRequestId === null &&
+        node.checkpointScopeId === null &&
+        node.nativeItemRef === null
+      );
+    },
+  );
+  const finalizeWorkflowNativeIntent = Effect.fn("WorkflowRunStore.finalizeWorkflowNativeIntent")(
+    function* (input: NativeBindingInput) {
+      if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+        return yield* integrity();
+      if (!nativeBinding) return { kind: "denied" as const, reason: "unavailable" as const };
+      const outcome = yield* inTransaction(
+        Effect.gen(function* () {
+          const reservation = yield* readNativeReservationInTransaction({
+            intentId: input.intentId,
+          });
+          if (
+            reservation.fingerprint !== input.expectedFingerprint ||
+            reservation.generation !== input.expectedGeneration
+          )
+            return { kind: "stale" as const, notify: false };
+          if (reservation.material.version !== 2 || reservation.owner.kind !== "workflow_run")
+            return { kind: "denied" as const, reason: "authority" as const, notify: false };
+          const workflowRunId = reservation.owner.workflowRunId;
+          if (
+            reservation.bootId !== nativeBinding.coordinator.bootId ||
+            reservation.workerId !== nativeBinding.coordinator.workerId
+          )
+            return { kind: "stale" as const, notify: false };
+          if (
+            !reservation.nativeRunId ||
+            (reservation.state !== "dispatching" && reservation.state !== "finalized") ||
+            reservation.held
+          )
+            return { kind: "denied" as const, reason: "state" as const, notify: false };
+          const rows =
+            yield* sql<IntentRow>`SELECT * FROM workflow_native_launch_intents WHERE intent_id = ${input.intentId}`;
+          const row = rows[0];
+          if (rows.length !== 1 || !row) return yield* integrity();
+          const receipts = yield* sql<{
+            command_id: string;
+            intent_id: string;
+            receipt_id: string;
+            fingerprint: string;
+            result_json: string;
+          }>`SELECT * FROM workflow_native_intent_receipts WHERE intent_id = ${input.intentId}`;
+          if (receipts.length !== 1 || !receipts[0]) return yield* integrity();
+          const draft = yield* Effect.try({ try: () => parse(row.draft_json), catch: integrity });
+          const verified = yield* verifyStoredWorkflowIntent(
+            {
+              intentId: row.intent_id,
+              runId: workflowRunId,
+              operationId: row.operation_id,
+              attemptId: reservation.attemptId!,
+              itemId: reservation.itemId!,
+              repair: reservation.repair,
+              environmentId: row.environment_id,
+              projectId: row.project_id,
+              launchCommandId: row.launch_command_id,
+              threadId: row.thread_id,
+              messageId: row.message_id,
+              receiptId: reservation.receiptId,
+              generation: reservation.generation,
+            },
+            draft,
+            receipts[0],
+          );
+          if (verified.operation.parameters.kind !== "stage_launch") return yield* integrity();
+          const base = {
+            ...verified.operation,
+            parameters: {
+              ...verified.operation.parameters,
+              nativeRunId: reservation.nativeRunId,
+            },
+          };
+          const decoded = yield* decodeWorkflowOperationV1(base).pipe(Effect.mapError(integrity));
+          const operation = { ...decoded, fingerprint: WorkflowCanonicalHash.operation(decoded) };
+          const command = {
+            ...verified.draft.admission.command,
+            operationFingerprint: operation.fingerprint,
+          };
+          const hash = WorkflowCanonicalHash.command(workflowRunId, command);
+          const derived = yield* nativeBinding.protocol
+            .deriveInTransaction(reservation)
+            .pipe(Effect.mapError(nativeProtocolError));
+          const evidence = yield* nativeBinding.protocol
+            .readStoredInTransaction(reservation, derived.messageCommand, {
+              intentId: row.intent_id,
+              phase: "message",
+            })
+            .pipe(Effect.mapError(nativeProtocolError));
+          if (
+            evidence.kind !== "verified" ||
+            !("actualT3RunId" in evidence) ||
+            evidence.actualT3RunId !== reservation.nativeRunId
+          )
+            return yield* integrity();
+          const readArtifacts = Effect.gen(function* () {
+            const operations = yield* sql<{
+              record_json: string;
+            }>`SELECT record_json FROM workflow_operations WHERE id = ${operation.id}`;
+            const attempts = yield* sql<{
+              id: string;
+              workflow_run_id: string;
+              operation_id: string;
+              item_id: string;
+              repair: number;
+            }>`SELECT * FROM workflow_attempts WHERE id = ${reservation.attemptId} OR operation_id = ${operation.id}`;
+            const admissions = yield* sql<{
+              command_id: string;
+              workflow_run_id: string | null;
+              planning_session_id: string | null;
+              fingerprint: string;
+              receipt_id: string;
+              operation_id: string | null;
+              result_json: string;
+            }>`SELECT * FROM workflow_command_receipts WHERE command_id = ${command.commandId} OR receipt_id = ${reservation.receiptId} OR operation_id = ${operation.id}`;
+            return { operations, attempts, admissions };
+          });
+          const { operations, attempts, admissions } = yield* readArtifacts;
+          const accepted = { kind: "accepted" as const, receiptId: reservation.receiptId };
+          const validateArtifacts = Effect.fn("WorkflowRunStore.verifyWorkflowFinalization")(
+            function* (artifacts: Effect.Success<typeof readArtifacts>, fresh = false) {
+              const { operations, attempts, admissions } = artifacts;
+              if (
+                operations.length !== 1 ||
+                !operations[0] ||
+                attempts.length !== 1 ||
+                !attempts[0] ||
+                admissions.length !== 1 ||
+                !admissions[0]
+              )
+                return yield* integrity();
+              const stored = yield* Effect.try({
+                try: () => parse(operations[0]!.record_json),
+                catch: integrity,
+              }).pipe(Effect.flatMap(decodeWorkflowOperationV1), Effect.mapError(integrity));
+              const immutable = (value: WorkflowOperationV1) => {
+                const {
+                  status: _status,
+                  controlGeneration: _generation,
+                  claim: _claim,
+                  outcome: _outcome,
+                  nextDueAt: _due,
+                  ...rest
+                } = value;
+                return rest;
+              };
+              const a = attempts[0];
+              const r = admissions[0];
+              const matches = yield* Effect.try({
+                try: () =>
+                  (!fresh || sameCustodyValue(stored, operation)) &&
+                  sameCustodyValue(immutable(stored), immutable(operation)) &&
+                  sameCustodyValue(parse(r.result_json), accepted),
+                catch: integrity,
+              });
+              if (
+                !matches ||
+                a.id !== reservation.attemptId ||
+                a.workflow_run_id !== workflowRunId ||
+                a.operation_id !== operation.id ||
+                a.item_id !== reservation.itemId ||
+                a.repair !== (reservation.repair ? 1 : 0) ||
+                r.command_id !== command.commandId ||
+                r.workflow_run_id !== workflowRunId ||
+                r.planning_session_id !== null ||
+                r.fingerprint !== hash ||
+                r.receipt_id !== reservation.receiptId ||
+                r.operation_id !== operation.id
+              )
+                return yield* integrity();
+            },
+          );
+          if (reservation.state === "finalized") {
+            if (reservation.finalizedOperationId !== operation.id) return yield* integrity();
+            yield* validateArtifacts({ operations, attempts, admissions });
+            return {
+              kind: "replay" as const,
+              operationId: operation.id,
+              receiptId: reservation.receiptId,
+              notify: false,
+            };
+          }
+          if (
+            reservation.finalizedOperationId !== null ||
+            operations.length ||
+            attempts.length ||
+            admissions.length
+          )
+            return yield* integrity();
+          const eligible = yield* verifyNativeIntentEligibility(reservation, row, undefined, true);
+          if (eligible.kind !== "current") return { ...eligible, notify: false };
+          if (
+            !(yield* verifyPreparingNativeRun(
+              reservation.nativeRunId,
+              reservation.threadId,
+              evidence.events,
+            ))
+          )
+            return { kind: "denied" as const, reason: "state" as const, notify: false };
+          yield* sql`INSERT INTO workflow_operations (id,workflow_run_id,kind,fingerprint,status,generation,record_json) VALUES (${operation.id},${workflowRunId},${operation.kind},${operation.fingerprint},'pending',${operation.controlGeneration},${encode(operation)})`;
+          yield* sql`INSERT INTO workflow_attempts VALUES (${reservation.attemptId},${workflowRunId},${operation.id},${reservation.itemId},${reservation.repair ? 1 : 0})`;
+          yield* sql`INSERT INTO workflow_command_receipts (command_id,workflow_run_id,fingerprint,receipt_id,operation_id,result_json) VALUES (${command.commandId},${workflowRunId},${hash},${reservation.receiptId},${operation.id},${encode(accepted)})`;
+          const changed =
+            yield* sql`UPDATE workflow_native_launch_intents SET state = 'finalized',finalized_operation_id = ${operation.id} WHERE intent_id = ${row.intent_id} AND state = 'dispatching' AND held = 0 AND fingerprint = ${input.expectedFingerprint} AND generation = ${input.expectedGeneration} AND boot_id = ${nativeBinding.coordinator.bootId} AND worker_id = ${nativeBinding.coordinator.workerId} AND native_run_id = ${reservation.nativeRunId} AND finalized_operation_id IS NULL RETURNING intent_id`;
+          if (changed.length !== 1) return yield* stale();
+          const retained = yield* readNativeReservationInTransaction({ intentId: row.intent_id });
+          if (
+            retained.state !== "finalized" ||
+            retained.finalizedOperationId !== operation.id ||
+            retained.nativeRunId !== reservation.nativeRunId
+          )
+            return yield* integrity();
+          yield* validateArtifacts(yield* readArtifacts, true);
+          return {
+            kind: "finalized" as const,
+            operationId: operation.id,
+            receiptId: reservation.receiptId,
+            notify: true,
+          };
+        }),
+      );
+      if (outcome.notify) yield* notify;
+      const { notify: _notify, ...result } = outcome;
+      return result;
+    },
+  );
   const claim = Effect.fn("WorkflowRunStore.claim")(function* (input: {
     readonly operationId: string;
     readonly expectedOwnerVersion: number;
@@ -4832,6 +5210,23 @@ const makeStore = Effect.fnUntraced(function* (
         )
           throw integrity();
         return bindNativeIntent(structuredClone(input));
+      } catch {
+        return Effect.fail(integrity());
+      }
+    },
+    finalizeWorkflowNativeIntent: (input: NativeBindingInput) => {
+      try {
+        WorkflowCanonicalHash.assertCanonical(input);
+        if (
+          Object.keys(input).sort().join() !== "expectedFingerprint,expectedGeneration,intentId" ||
+          typeof input.intentId !== "string" ||
+          !input.intentId.trim() ||
+          !/^[0-9a-f]{64}$/.test(input.expectedFingerprint) ||
+          !Number.isSafeInteger(input.expectedGeneration) ||
+          input.expectedGeneration < 0
+        )
+          throw integrity();
+        return finalizeWorkflowNativeIntent(structuredClone(input));
       } catch {
         return Effect.fail(integrity());
       }

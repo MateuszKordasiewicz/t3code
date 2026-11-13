@@ -578,6 +578,7 @@ it.effect.each([
 );
 
 const decodeOperation = Schema.decodeSync(WorkflowOperationV1);
+const decodeStoredFinalizationOperation = Schema.decodeUnknownEffect(WorkflowOperationV1);
 const decodeWorkflowRunId = Schema.decodeSync(WorkflowRunV1.fields.id);
 const destination = { environmentId: "environment", projectId: "project" };
 const operationFor = (id: string, attemptId: string) => {
@@ -9116,6 +9117,7 @@ const nativeBindingFixture = Effect.fn("test.nativeBindingFixture")(function* (
   reuse = false,
   materialVersion: 1 | 2 = 2,
   claim = true,
+  repair = false,
 ) {
   yield* TestClock.setTime(DateTime.makeUnsafe(facts.now).epochMilliseconds);
   const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
@@ -9159,6 +9161,21 @@ const nativeBindingFixture = Effect.fn("test.nativeBindingFixture")(function* (
       ? {
           ...reservation(operationFor("binding-operation", "binding-attempt"), "binding-attempt"),
           ...material,
+          repair,
+          draft: {
+            ...reservation(operationFor("binding-operation", "binding-attempt"), "binding-attempt")
+              .draft,
+            admission: {
+              command: {
+                ...reservation(
+                  operationFor("binding-operation", "binding-attempt"),
+                  "binding-attempt",
+                ).draft.admission.command,
+                repair,
+                expectedVersion: repair ? 1 : 0,
+              },
+            },
+          },
           launch: {
             ...reservation(operationFor("binding-operation", "binding-attempt"), "binding-attempt")
               .launch,
@@ -9191,9 +9208,23 @@ const nativeBindingFixture = Effect.fn("test.nativeBindingFixture")(function* (
     yield* store.createRun({
       ...run,
       spec: { ...run.spec, plan: binding },
-      allowance: { ...run.allowance, maxAttempts: 1 },
+      allowance: { ...run.allowance, maxAttempts: repair ? 2 : 1 },
       access: { origins: [destination] },
     });
+    if (repair) {
+      const prior = operationFor("prior-operation", "prior-attempt");
+      assert.strictEqual(
+        (yield* store.commitTransition({
+          runId: run.id,
+          command: admission(prior, "prior-attempt"),
+          operation: prior,
+          externalFacts: admissionFacts,
+          receiptId: "prior-receipt",
+        })).kind,
+        "accepted",
+      );
+      yield* sql`UPDATE workflow_operations SET status='settled',record_json=${json({ ...prior, status: "settled", outcome: { kind: "failed", summary: "Needs repair", evidence: [] } })} WHERE id=${prior.id}`;
+    }
     const result = yield* store.reserveWorkflowNativeIntent(input);
     if (result.kind !== "reserved") throw new Error("expected reservation");
     fingerprint = result.fingerprint;
@@ -9206,7 +9237,7 @@ const nativeBindingFixture = Effect.fn("test.nativeBindingFixture")(function* (
       (yield* store.claimNativeIntent({
         intentId: input.intentId,
         expectedFingerprint: fingerprint,
-        expectedOwnerVersion: 1,
+        expectedOwnerVersion: repair ? 2 : 1,
         expectedGeneration: 0,
         ...coordinator,
       })).kind,
@@ -9725,4 +9756,651 @@ it.effect.each(["workflow", "planning"] as const)(
         );
       }),
     ),
+);
+
+it.effect.each([false, true])(
+  "workflow native finalization preserves charged V1 admission with reuse=%s",
+  (reuse) =>
+    Effect.gen(function* () {
+      const fixture = yield* nativeBindingFixture("workflow", reuse);
+      const { store, sql, selection, input } = fixture;
+      if (!("runId" in input)) throw new Error("expected workflow input");
+      yield* fixture.dispatch("claim");
+      yield* fixture.dispatch("message");
+      const bound = yield* store.bindNativeIntent(selection);
+      if (bound.kind !== "bound") throw new Error("expected actual binding");
+      const before = yield* nativeBindingState;
+      const subscription = yield* store.subscribeChanges;
+      assert.deepStrictEqual(yield* store.finalizeWorkflowNativeIntent(selection), {
+        kind: "finalized",
+        operationId: input.operationId,
+        receiptId: input.receiptId,
+      });
+      yield* PubSub.take(subscription);
+      const rows = yield* sql<{
+        record_json: string;
+      }>`SELECT record_json FROM workflow_operations WHERE id = ${input.operationId}`;
+      const operation = yield* decodeStoredFinalizationOperation(parse(rows[0]!.record_json));
+      assert.strictEqual(operation.status, "pending");
+      if (operation.parameters.kind !== "stage_launch") throw new Error("wrong operation kind");
+      assert.strictEqual(String(operation.parameters.nativeRunId), String(bound.nativeRunId));
+      assert.strictEqual(operation.parameters.nativeThreadId, input.threadId);
+      assert.strictEqual(operation.fingerprint, WorkflowCanonicalHash.operation(operation));
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_attempts`, [
+        {
+          id: input.attemptId,
+          workflow_run_id: input.runId,
+          operation_id: input.operationId,
+          item_id: input.itemId,
+          repair: 0,
+        },
+      ]);
+      const actualCommand = {
+        ...input.draft.admission.command,
+        operationFingerprint: operation.fingerprint,
+      };
+      assert.deepStrictEqual(
+        yield* sql`SELECT command_id,workflow_run_id,planning_session_id,fingerprint,receipt_id,operation_id,result_json FROM workflow_command_receipts`,
+        [
+          {
+            command_id: actualCommand.commandId,
+            workflow_run_id: input.runId,
+            planning_session_id: null,
+            fingerprint: WorkflowCanonicalHash.command(input.runId, actualCommand),
+            receipt_id: input.receiptId,
+            operation_id: input.operationId,
+            result_json: json({ kind: "accepted", receiptId: input.receiptId }),
+          },
+        ],
+      );
+      const after = yield* nativeBindingState;
+      assert.deepStrictEqual(after.runs, before.runs);
+      assert.deepStrictEqual(after.material, before.material);
+      assert.deepStrictEqual(after.receipts, before.receipts);
+      assert.deepStrictEqual(after.nativeProofs, before.nativeProofs);
+      assert.deepStrictEqual(after.intents, [
+        { ...before.intents[0], state: "finalized", finalized_operation_id: input.operationId },
+      ]);
+      assert.deepStrictEqual(yield* store.finalizeWorkflowNativeIntent(selection), {
+        kind: "replay",
+        operationId: input.operationId,
+        receiptId: input.receiptId,
+      });
+      assert.deepStrictEqual(
+        yield* store.commitTransition({
+          runId: input.runId,
+          command: {
+            ...actualCommand,
+            fingerprint: WorkflowCanonicalHash.command(input.runId, actualCommand),
+          },
+          operation,
+          externalFacts: admissionFacts,
+          receiptId: input.receiptId,
+        }),
+        { kind: "replay", receiptId: input.receiptId },
+      );
+      assert.deepStrictEqual(yield* nativeBindingState, after);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layer)),
+);
+
+const workflowFinalizationFixture = Effect.fn("test.workflowFinalizationFixture")(function* () {
+  const fixture = yield* nativeBindingFixture("workflow");
+  yield* fixture.dispatch("claim");
+  yield* fixture.dispatch("message");
+  const bound = yield* fixture.store.bindNativeIntent(fixture.selection);
+  if (bound.kind !== "bound") throw new Error("expected binding");
+  return { ...fixture, bound };
+});
+
+it.effect.each(["pause", "stop", "revoke", "deadline", "unknown", "unbound"] as const)(
+  "workflow native finalization refuses fresh %s work without creating pending records",
+  (change) =>
+    Effect.gen(function* () {
+      const fixture = yield* workflowFinalizationFixture();
+      const { store, sql, selection } = fixture;
+      if (change === "pause" || change === "stop")
+        yield* nativeClaimControl("workflow", store, change);
+      else if (change === "revoke") yield* fixture.sessions.revoke(fixture.authority.sessionId);
+      else if (change === "deadline")
+        yield* TestClock.setTime(DateTime.makeUnsafe("2026-12-02T00:00:00Z").epochMilliseconds);
+      else if (change === "unknown")
+        yield* sql`UPDATE workflow_native_launch_intents SET state = 'unknown'`;
+      else yield* sql`UPDATE workflow_native_launch_intents SET native_run_id = NULL`;
+      const before = yield* nativeBindingState;
+      const subscription = yield* store.subscribeChanges;
+      assert.notStrictEqual(
+        (yield* store.finalizeWorkflowNativeIntent(selection)).kind,
+        "finalized",
+      );
+      assert.deepStrictEqual(yield* nativeBindingState, before);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_operations`, []);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_attempts`, []);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  "run",
+  "run-time",
+  "attempt",
+  "attempt-turn",
+  "root",
+  "root-time",
+  "root-request",
+  "root-checkpoint",
+] as const)("workflow native finalization refuses progressed %s native work", (change) =>
+  Effect.gen(function* () {
+    const { store, sql, selection } = yield* workflowFinalizationFixture();
+    if (change === "run")
+      yield* sql`UPDATE orchestration_v2_projection_runs SET status='running',payload_json=json_set(payload_json,'$.status','running')`;
+    else if (change === "run-time")
+      yield* sql`UPDATE orchestration_v2_projection_runs SET payload_json=json_set(payload_json,'$.workStartedAt',${facts.now})`;
+    else if (change === "attempt")
+      yield* sql`UPDATE orchestration_v2_projection_run_attempts SET status='running',payload_json=json_set(payload_json,'$.status','running')`;
+    else if (change === "attempt-turn")
+      yield* sql`UPDATE orchestration_v2_projection_run_attempts SET provider_turn_id='started-turn',payload_json=json_set(payload_json,'$.providerTurnId','started-turn')`;
+    else if (change === "root")
+      yield* sql`UPDATE orchestration_v2_projection_nodes SET status='running',payload_json=json_set(payload_json,'$.status','running')`;
+    else if (change === "root-time")
+      yield* sql`UPDATE orchestration_v2_projection_nodes SET started_at=${facts.now},payload_json=json_set(payload_json,'$.startedAt',${facts.now})`;
+    else if (change === "root-request")
+      yield* sql`UPDATE orchestration_v2_projection_nodes SET payload_json=json_set(payload_json,'$.runtimeRequestId','runtime-request')`;
+    else
+      yield* sql`UPDATE orchestration_v2_projection_nodes SET payload_json=json_set(payload_json,'$.checkpointScopeId','checkpoint')`;
+    const before = yield* nativeBindingState;
+    const subscription = yield* store.subscribeChanges;
+    assert.deepStrictEqual(yield* store.finalizeWorkflowNativeIntent(selection), {
+      kind: "denied",
+      reason: "state",
+    });
+    assert.deepStrictEqual(yield* nativeBindingState, before);
+    assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect(
+  "workflow native finalization owns selection and refuses wrong construction, labels and captured transactions",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* workflowFinalizationFixture();
+      const { store, sql, selection } = fixture;
+      const before = yield* nativeBindingState;
+      const subscription = yield* store.subscribeChanges;
+      assert.deepStrictEqual(
+        yield* (yield* Store.WorkflowRunStore).finalizeWorkflowNativeIntent(selection),
+        { kind: "denied", reason: "unavailable" },
+      );
+      for (const change of [{ expectedFingerprint: nextHash }, { expectedGeneration: 1 }])
+        assert.deepStrictEqual(
+          yield* store.finalizeWorkflowNativeIntent({ ...selection, ...change }),
+          { kind: "stale" },
+        );
+      const wrong = yield* Store.makeCapturedNativeWorkflowRunStore(
+        sql,
+        fixture.config,
+        fixture.path,
+        fixture.identity,
+        fixture.policy,
+        { ...fixture.coordinator, workerId: "other" },
+      );
+      assert.deepStrictEqual(yield* wrong.finalizeWorkflowNativeIntent(selection), {
+        kind: "stale",
+      });
+      for (const forged of [
+        { ...selection, nativeRunId: "invented" },
+        { ...selection, expectedGeneration: -1 },
+      ])
+        assert.strictEqual(
+          (yield* Effect.flip(store.finalizeWorkflowNativeIntent(forged))).reason,
+          "integrity",
+        );
+      assert.strictEqual(
+        (yield* Effect.flip(sql.withTransaction(store.finalizeWorkflowNativeIntent(selection))))
+          .reason,
+        "integrity",
+      );
+      assert.deepStrictEqual(yield* nativeBindingState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+      const mutable = { ...selection };
+      const pending = store.finalizeWorkflowNativeIntent(mutable);
+      mutable.intentId = "changed";
+      mutable.expectedFingerprint = nextHash;
+      assert.strictEqual((yield* pending).kind, "finalized");
+      yield* PubSub.take(subscription);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  "operation",
+  "attempt",
+  "receipt",
+  "cas",
+  "corrupt-attempt",
+  "corrupt-receipt",
+  "corrupt-operation",
+] as const)(
+  "workflow native finalization atomically rolls back %s failure without publication",
+  (stage) =>
+    Effect.gen(function* () {
+      const { store, sql, selection } = yield* workflowFinalizationFixture();
+      const before = yield* nativeBindingState;
+      const subscription = yield* store.subscribeChanges;
+      if (stage === "operation")
+        yield* sql`CREATE TRIGGER reject_finalization AFTER INSERT ON workflow_operations BEGIN SELECT RAISE(ABORT,'finalization failure'); END`;
+      else if (stage === "attempt")
+        yield* sql`CREATE TRIGGER reject_finalization AFTER INSERT ON workflow_attempts BEGIN SELECT RAISE(ABORT,'finalization failure'); END`;
+      else if (stage === "receipt")
+        yield* sql`CREATE TRIGGER reject_finalization AFTER INSERT ON workflow_command_receipts BEGIN SELECT RAISE(ABORT,'finalization failure'); END`;
+      else if (stage === "corrupt-attempt")
+        yield* sql`CREATE TRIGGER reject_finalization AFTER INSERT ON workflow_attempts BEGIN UPDATE workflow_attempts SET item_id='silently-replaced' WHERE id=NEW.id; END`;
+      else if (stage === "corrupt-receipt")
+        yield* sql`CREATE TRIGGER reject_finalization AFTER INSERT ON workflow_command_receipts BEGIN UPDATE workflow_command_receipts SET result_json='{}' WHERE command_id=NEW.command_id; END`;
+      else if (stage === "corrupt-operation")
+        yield* sql`CREATE TRIGGER reject_finalization AFTER INSERT ON workflow_operations BEGIN UPDATE workflow_operations SET generation=1,record_json=json_set(record_json,'$.controlGeneration',1) WHERE id=NEW.id; END`;
+      else
+        yield* sql`CREATE TRIGGER reject_finalization AFTER UPDATE OF state ON workflow_native_launch_intents WHEN NEW.state='finalized' BEGIN SELECT RAISE(ABORT,'finalization failure'); END`;
+      assert.strictEqual(
+        (yield* Effect.flip(store.finalizeWorkflowNativeIntent(selection))).reason,
+        stage.startsWith("corrupt-") ? "integrity" : "persistence",
+      );
+      assert.deepStrictEqual(yield* nativeBindingState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+      yield* sql`DROP TRIGGER reject_finalization`;
+      assert.strictEqual((yield* store.finalizeWorkflowNativeIntent(selection)).kind, "finalized");
+      yield* PubSub.take(subscription);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  "binding",
+  "proof",
+  "native-receipt",
+  "native-event",
+  "operation-id",
+  "operation-access",
+  "attempt-item",
+  "attempt-repair",
+  "receipt-result",
+  "receipt-hash",
+  "receipt-operation",
+  "missing-attempt",
+  "missing-receipt",
+] as const)(
+  "workflow native finalization rejects finalized %s tampering without repairing it",
+  (change) =>
+    Effect.gen(function* () {
+      const fixture = yield* workflowFinalizationFixture();
+      const { store, sql, selection } = fixture;
+      yield* store.finalizeWorkflowNativeIntent(selection);
+      if (change === "binding")
+        yield* sql`UPDATE workflow_native_launch_intents SET native_run_id='wrong-run'`;
+      else if (change === "proof") {
+        yield* sql`DROP TRIGGER workflow_native_command_proofs_update_guard`;
+        yield* sql`UPDATE workflow_native_command_proofs SET proof_hash=${nextHash} WHERE phase='message'`;
+      } else if (change === "native-receipt")
+        yield* sql`UPDATE orchestration_command_receipts SET status='rejected' WHERE command_id=${fixture.input.launchCommandId + ":initial-message"}`;
+      else if (change === "native-event")
+        yield* sql`UPDATE orchestration_events SET payload_json='{}' WHERE event_type='run.created'`;
+      else if (change === "operation-id")
+        yield* sql`UPDATE workflow_operations SET record_json=json_set(record_json,'$.id','substituted')`;
+      else if (change === "operation-access")
+        yield* sql`UPDATE workflow_operations SET record_json=json_set(record_json,'$.access.origins[0].projectId','substituted')`;
+      else if (change === "attempt-item")
+        yield* sql`UPDATE workflow_attempts SET item_id='substituted'`;
+      else if (change === "attempt-repair") yield* sql`UPDATE workflow_attempts SET repair=1`;
+      else if (change === "receipt-result")
+        yield* sql`UPDATE workflow_command_receipts SET result_json='{"kind":"accepted","receiptId":"substituted"}'`;
+      else if (change === "receipt-hash")
+        yield* sql`UPDATE workflow_command_receipts SET fingerprint=${nextHash}`;
+      else if (change === "receipt-operation")
+        yield* sql`UPDATE workflow_command_receipts SET operation_id=NULL`;
+      else if (change === "missing-attempt") yield* sql`DELETE FROM workflow_attempts`;
+      else yield* sql`DELETE FROM workflow_command_receipts`;
+      const before = yield* nativeBindingState;
+      const subscription = yield* store.subscribeChanges;
+      assert.strictEqual(
+        (yield* Effect.flip(store.finalizeWorkflowNativeIntent(selection))).reason,
+        "integrity",
+      );
+      assert.deepStrictEqual(yield* nativeBindingState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["operation", "attempt", "receipt"] as const)(
+  "workflow native finalization rejects nonfinalized orphan %s records",
+  (change) =>
+    Effect.gen(function* () {
+      const { store, sql, selection } = yield* workflowFinalizationFixture();
+      yield* store.finalizeWorkflowNativeIntent(selection);
+      yield* sql`UPDATE workflow_native_launch_intents SET state='dispatching',finalized_operation_id=NULL`;
+      if (change !== "attempt") yield* sql`DELETE FROM workflow_attempts`;
+      if (change !== "receipt") yield* sql`DELETE FROM workflow_command_receipts`;
+      if (change === "receipt") {
+        yield* sql`UPDATE workflow_command_receipts SET operation_id=NULL`;
+        yield* sql`DELETE FROM workflow_operations`;
+      }
+      const before = yield* nativeBindingState;
+      assert.strictEqual(
+        (yield* Effect.flip(store.finalizeWorkflowNativeIntent(selection))).reason,
+        "integrity",
+      );
+      assert.deepStrictEqual(yield* nativeBindingState, before);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["pause", "stop", "revoke", "deadline", "progress"] as const)(
+  "workflow native finalization replays history after %s without notification or another charge",
+  (change) =>
+    Effect.gen(function* () {
+      const fixture = yield* workflowFinalizationFixture();
+      const { store, sql, selection } = fixture;
+      const result = yield* store.finalizeWorkflowNativeIntent(selection);
+      if (change === "pause" || change === "stop")
+        yield* nativeClaimControl("workflow", store, change);
+      else if (change === "revoke") yield* fixture.sessions.revoke(fixture.authority.sessionId);
+      else if (change === "deadline")
+        yield* TestClock.setTime(DateTime.makeUnsafe("2027-01-01T00:00:00Z").epochMilliseconds);
+      else {
+        yield* sql`UPDATE orchestration_v2_projection_runs SET status='running',payload_json=json_set(payload_json,'$.status','running')`;
+        yield* sql`UPDATE workflow_operations SET status='settled',record_json=json_set(record_json,'$.status','settled','$.outcome',json(${json({ kind: "succeeded", summary: "Done", evidence: [] })}))`;
+      }
+      const before = yield* nativeBindingState;
+      const subscription = yield* store.subscribeChanges;
+      assert.deepStrictEqual(yield* store.finalizeWorkflowNativeIntent(selection), {
+        ...result,
+        kind: "replay",
+      });
+      if (!("runId" in fixture.input)) throw new Error("expected workflow");
+      const rows = yield* sql<{
+        record_json: string;
+      }>`SELECT record_json FROM workflow_operations WHERE id=${fixture.input.operationId}`;
+      const operation = yield* decodeStoredFinalizationOperation(parse(rows[0]!.record_json));
+      for (const commandId of [
+        fixture.input.draft.admission.command.commandId,
+        "alternate-legacy-admission",
+      ]) {
+        const actual = {
+          ...fixture.input.draft.admission.command,
+          commandId,
+          operationFingerprint: operation.fingerprint,
+        };
+        assert.deepStrictEqual(
+          yield* store.commitTransition({
+            runId: fixture.input.runId,
+            command: {
+              ...actual,
+              fingerprint: WorkflowCanonicalHash.command(fixture.input.runId, actual),
+            },
+            operation,
+            receiptId: fixture.input.receiptId,
+            externalFacts: admissionFacts,
+          }),
+          { kind: "replay", receiptId: fixture.input.receiptId },
+        );
+      }
+      assert.deepStrictEqual(yield* nativeBindingState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["repair", "rearm"] as const)(
+  "workflow native finalization preserves %s reservation history",
+  (change) =>
+    Effect.gen(function* () {
+      const fixture = yield* nativeBindingFixture(
+        "workflow",
+        false,
+        2,
+        change === "repair",
+        change === "repair",
+      );
+      const { store, sql, input } = fixture;
+      if (!("runId" in input)) throw new Error("expected workflow");
+      const selection = { ...fixture.selection };
+      if (change === "rearm") {
+        yield* nativeClaimControl("workflow", store, "pause");
+        assert.strictEqual(
+          (yield* store.commitTransition({
+            runId: run.id,
+            command: {
+              ...command,
+              kind: "resume",
+              commandId: "before-claim-resume",
+              expectedVersion: 2,
+              expectedGeneration: 1,
+            },
+            externalFacts: admissionFacts,
+            receiptId: "before-claim-resume",
+          })).kind,
+          "accepted",
+        );
+        selection.expectedGeneration = 2;
+        assert.strictEqual(
+          (yield* store.claimNativeIntent({
+            ...selection,
+            expectedOwnerVersion: 3,
+            ...fixture.coordinator,
+          })).kind,
+          "claimed",
+        );
+      }
+      yield* fixture.dispatch("claim");
+      yield* fixture.dispatch("message");
+      yield* store.bindNativeIntent(selection);
+      const before = yield* nativeBindingState;
+      assert.strictEqual((yield* store.finalizeWorkflowNativeIntent(selection)).kind, "finalized");
+      const rows = yield* sql<{
+        record_json: string;
+      }>`SELECT record_json FROM workflow_operations WHERE id=${input.operationId}`;
+      const operation = yield* decodeStoredFinalizationOperation(parse(rows[0]!.record_json));
+      assert.strictEqual(operation.controlGeneration, change === "rearm" ? 2 : 0);
+      assert.deepStrictEqual(
+        yield* sql`SELECT repair FROM workflow_attempts WHERE id=${input.attemptId}`,
+        [{ repair: change === "repair" ? 1 : 0 }],
+      );
+      const actualCommand = {
+        ...input.draft.admission.command,
+        operationFingerprint: operation.fingerprint,
+      };
+      assert.strictEqual(actualCommand.expectedVersion, change === "repair" ? 1 : 0);
+      assert.strictEqual(actualCommand.expectedGeneration, 0);
+      assert.deepStrictEqual(
+        yield* store.commitTransition({
+          runId: input.runId,
+          command: {
+            ...actualCommand,
+            fingerprint: WorkflowCanonicalHash.command(input.runId, actualCommand),
+          },
+          operation,
+          receiptId: input.receiptId,
+          externalFacts: admissionFacts,
+        }),
+        { kind: "replay", receiptId: input.receiptId },
+      );
+      assert.deepStrictEqual((yield* nativeBindingState).runs, before.runs);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  ["revoke", "finalize"],
+  ["revoke", "control"],
+  ["pause", "finalize"],
+  ["pause", "control"],
+  ["stop", "finalize"],
+  ["stop", "control"],
+] as const)(
+  "workflow native finalization preserves independent $0/$1-first commit order",
+  ([action, first]) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const directory = yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "native-finalize-order-")),
+          ),
+          (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
+        );
+        const filename = NodePath.join(directory, "state.sqlite");
+        yield* Effect.gen(function* () {
+          const fixture = yield* workflowFinalizationFixture();
+          const { store, sql, selection } = fixture;
+          yield* sql`PRAGMA journal_mode=WAL`;
+          const sqlB = Context.get(
+            yield* Layer.build(Layer.fresh(NodeSqliteClient.layer({ filename }))),
+            SqlClient.SqlClient,
+          );
+          const other = yield* Store.makeCapturedNativeWorkflowRunStore(
+            sqlB,
+            fixture.config,
+            fixture.path,
+            fixture.identity,
+            fixture.policy,
+            fixture.coordinator,
+          );
+          const sessionsB = yield* AuthSessions.make.pipe(
+            Effect.provideService(SqlClient.SqlClient, sqlB),
+          );
+          const control =
+            action === "revoke"
+              ? sessionsB
+                  .revoke({
+                    sessionId: fixture.authority.sessionId,
+                    revokedAt: yield* DateTime.now,
+                  })
+                  .pipe(Effect.asVoid)
+              : nativeClaimControl("workflow", other, action).pipe(
+                  Effect.provideService(SqlClient.SqlClient, sqlB),
+                );
+          const subscription = yield* store.subscribeChanges;
+          if (first === "control") {
+            yield* control;
+            const before = yield* nativeBindingState;
+            assert.notStrictEqual(
+              (yield* store.finalizeWorkflowNativeIntent(selection)).kind,
+              "finalized",
+            );
+            assert.deepStrictEqual(yield* nativeBindingState, before);
+            assert.deepStrictEqual(yield* sqlB`SELECT * FROM workflow_attempts`, []);
+          } else {
+            const result = yield* store.finalizeWorkflowNativeIntent(selection);
+            assert.strictEqual(result.kind, "finalized");
+            yield* PubSub.take(subscription);
+            yield* control;
+            const before = yield* nativeBindingState;
+            const otherSubscription = yield* other.subscribeChanges;
+            assert.deepStrictEqual(yield* other.finalizeWorkflowNativeIntent(selection), {
+              ...result,
+              kind: "replay",
+            });
+            assert.deepStrictEqual(yield* nativeBindingState, before);
+            assert.strictEqual((yield* PubSub.takeUpTo(otherSubscription, 10)).length, 0);
+            assert.strictEqual((yield* sqlB`SELECT * FROM workflow_attempts`).length, 1);
+          }
+          assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+        }).pipe(
+          Effect.provide(
+            Store.layer.pipe(Layer.provideMerge(NodeSqliteClient.layer({ filename }))),
+          ),
+        );
+      }),
+    ),
+);
+
+it.effect.each([false, true])(
+  "workflow native finalization has one independent writer winner with second=%s",
+  (second) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const directory = yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "native-finalize-winner-")),
+          ),
+          (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
+        );
+        const filename = NodePath.join(directory, "state.sqlite");
+        yield* Effect.gen(function* () {
+          const fixture = yield* workflowFinalizationFixture();
+          const sqlB = Context.get(
+            yield* Layer.build(Layer.fresh(NodeSqliteClient.layer({ filename }))),
+            SqlClient.SqlClient,
+          );
+          const other = yield* Store.makeCapturedNativeWorkflowRunStore(
+            sqlB,
+            fixture.config,
+            fixture.path,
+            fixture.identity,
+            fixture.policy,
+            fixture.coordinator,
+          );
+          const first = second ? other : fixture.store;
+          const next = second ? fixture.store : other;
+          const subscription = yield* first.subscribeChanges;
+          const nextSubscription = yield* next.subscribeChanges;
+          const result = yield* first.finalizeWorkflowNativeIntent(fixture.selection);
+          assert.strictEqual(result.kind, "finalized");
+          yield* PubSub.take(subscription);
+          const before = yield* nativeBindingState;
+          assert.deepStrictEqual(yield* next.finalizeWorkflowNativeIntent(fixture.selection), {
+            ...result,
+            kind: "replay",
+          });
+          assert.deepStrictEqual(yield* nativeBindingState, before);
+          assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+          assert.strictEqual((yield* PubSub.takeUpTo(nextSubscription, 10)).length, 0);
+        }).pipe(
+          Effect.provide(
+            Store.layer.pipe(Layer.provideMerge(NodeSqliteClient.layer({ filename }))),
+          ),
+        );
+      }),
+    ),
+);
+
+it.effect.each([
+  "attempt-missing",
+  "root-missing",
+  "attempt-identity",
+  "root-identity",
+  "run-identity",
+  "run-row",
+] as const)("workflow native finalization rejects invalid %s preparing snapshots", (change) =>
+  Effect.gen(function* () {
+    const { store, sql, selection } = yield* workflowFinalizationFixture();
+    if (change === "attempt-missing")
+      yield* sql`DELETE FROM orchestration_v2_projection_run_attempts`;
+    else if (change === "root-missing") yield* sql`DELETE FROM orchestration_v2_projection_nodes`;
+    else if (change === "attempt-identity")
+      yield* sql`UPDATE orchestration_v2_projection_run_attempts SET payload_json=json_set(payload_json,'$.rootNodeId','foreign-root')`;
+    else if (change === "root-identity")
+      yield* sql`UPDATE orchestration_v2_projection_nodes SET payload_json=json_set(payload_json,'$.providerThreadId','foreign-provider-thread')`;
+    else if (change === "run-identity")
+      yield* sql`UPDATE orchestration_v2_projection_runs SET payload_json=json_set(payload_json,'$.activeAttemptId','foreign-attempt')`;
+    else yield* sql`UPDATE orchestration_v2_projection_runs SET status='running'`;
+    const before = yield* nativeBindingState;
+    const subscription = yield* store.subscribeChanges;
+    assert.strictEqual(
+      (yield* Effect.flip(store.finalizeWorkflowNativeIntent(selection))).reason,
+      "integrity",
+    );
+    assert.deepStrictEqual(yield* nativeBindingState, before);
+    assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("workflow native finalization retains binding on live authority storage failure", () =>
+  Effect.gen(function* () {
+    const { store, sql, selection } = yield* workflowFinalizationFixture();
+    yield* sql`ALTER TABLE auth_sessions RENAME TO finalization_hidden_sessions`;
+    const before = yield* nativeBindingState;
+    const subscription = yield* store.subscribeChanges;
+    assert.strictEqual(
+      (yield* Effect.flip(store.finalizeWorkflowNativeIntent(selection))).reason,
+      "persistence",
+    );
+    assert.deepStrictEqual(yield* nativeBindingState, before);
+    assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    yield* sql`ALTER TABLE finalization_hidden_sessions RENAME TO auth_sessions`;
+  }).pipe(Effect.provide(layer)),
 );
