@@ -41,6 +41,10 @@ import { DevelopmentPlanHash } from "../developmentPlans/DevelopmentPlanHash.ts"
 import * as Store from "./WorkflowRunStore.ts";
 import * as Recovery from "./WorkflowRunRecovery.ts";
 import { WorkflowCanonicalHash } from "./WorkflowCanonicalHash.ts";
+import {
+  decodeNativeReservationLaunch,
+  decodeNativeReservationMaterial,
+} from "./WorkflowNativeReservationMaterial.ts";
 import { WorkflowRunPolicy } from "./WorkflowRunPolicy.ts";
 
 const hash = "a".repeat(64);
@@ -641,6 +645,356 @@ const reservation = (operation: WorkflowOperationV1, attemptId: string) => {
     externalFacts: admissionFacts,
   };
 };
+
+// Converts an already charged V2 reservation only in this isolated migrated database.
+const storedV3 = (
+  input: ReturnType<typeof reservation>,
+  changes: {
+    launch?: Record<string, unknown>;
+    material?: Record<string, unknown>;
+    markerHash?: string;
+  } = {},
+) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    assert.strictEqual((yield* store.reserveWorkflowNativeIntent(input)).kind, "reserved");
+    const launch = {
+      commandId: input.launchCommandId,
+      threadId: input.threadId,
+      projectId: input.projectId,
+      title: "Work",
+      modelSelection: { instanceId: "provider", model: "model" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      workspaceStrategy: { type: "root", branch: "main" },
+      initialMessage: { messageId: input.messageId, text: "Do the work", attachments: [] },
+      createdBy: "agent",
+      creationSource: "mcp",
+      ...changes.launch,
+    };
+    const { launchHash } = yield* decodeNativeReservationLaunch(launch);
+    const draft = {
+      ...input.draft,
+      version: 2,
+      material: { version: 1, launchHash: changes.markerHash ?? launchHash },
+    };
+    const fingerprint = WorkflowCanonicalHash.tagged("t3.workflow-native-launch-intent.v3", {
+      intentId: input.intentId,
+      workflowRunId: input.runId,
+      planningSessionId: null,
+      operationId: input.operationId,
+      attemptId: input.attemptId,
+      passId: null,
+      itemId: input.itemId,
+      chargeAttempt: 1,
+      repair: input.repair,
+      role: "implementation",
+      environmentId: input.environmentId,
+      projectId: input.projectId,
+      launchCommandId: input.launchCommandId,
+      threadId: input.threadId,
+      messageId: input.messageId,
+      draft,
+      receiptId: input.receiptId,
+    });
+    const material = {
+      version: 1,
+      intentId: input.intentId,
+      receiptId: input.receiptId,
+      intentFingerprint: fingerprint,
+      launch,
+      planningSession: null,
+      ...changes.material,
+    };
+    const { materialHash } = yield* decodeNativeReservationMaterial(material);
+    yield* sql`UPDATE workflow_native_launch_intents SET draft_json = ${json(draft)}, fingerprint = ${fingerprint} WHERE intent_id = ${input.intentId}`;
+    yield* sql`UPDATE workflow_native_intent_receipts SET fingerprint = ${fingerprint}, result_json = ${json({ intentId: input.intentId, fingerprint, materialVersion: 1, materialHash })} WHERE intent_id = ${input.intentId}`;
+    yield* sql`INSERT INTO workflow_native_reservation_material VALUES (${input.intentId}, ${json(material)}, ${materialHash})`;
+    return { draft, fingerprint, material, materialHash };
+  });
+
+it.effect("stored V3 workflow material provides custody and retains bytes through controls", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const input = reservation(operationFor("v3-op", "v3-attempt"), "v3-attempt");
+    yield* storedV3(input);
+    const before = yield* sql`SELECT draft_json, fingerprint FROM workflow_native_launch_intents`;
+    const receipt = yield* sql`SELECT * FROM workflow_native_intent_receipts`;
+    const material = yield* sql`SELECT * FROM workflow_native_reservation_material`;
+    const outbox = yield* sql`SELECT * FROM orchestration_v2_effect_outbox`;
+    assert.deepStrictEqual(yield* store.readThreadCustody({ threadId: input.threadId }), {
+      kind: "owned",
+      owner: { kind: "workflow_run", workflowRunId: run.id },
+    });
+    for (const [kind, version, generation] of [
+      ["pause", 1, 0],
+      ["resume", 2, 1],
+      ["stop", 3, 2],
+    ] as const) {
+      assert.strictEqual(
+        (yield* store.commitTransition({
+          runId: run.id,
+          command: {
+            ...command,
+            kind,
+            commandId: `v3-${kind}`,
+            expectedVersion: version,
+            expectedGeneration: generation,
+          },
+          externalFacts: admissionFacts,
+          receiptId: `v3-${kind}`,
+        })).kind,
+        "accepted",
+      );
+    }
+    assert.deepStrictEqual(yield* store.readThreadCustody({ threadId: input.threadId }), {
+      kind: "owned",
+      owner: { kind: "workflow_run", workflowRunId: run.id },
+    });
+    assert.deepStrictEqual(
+      yield* sql`SELECT draft_json, fingerprint FROM workflow_native_launch_intents`,
+      before,
+    );
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_intent_receipts`, receipt);
+    assert.deepStrictEqual(
+      yield* sql`SELECT * FROM workflow_native_reservation_material`,
+      material,
+    );
+    assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_effect_outbox`, outbox);
+    const owner = parse(
+      (yield* sql<{ record_json: string }>`SELECT record_json FROM workflow_runs`)[0]!.record_json,
+    ) as typeof run;
+    assert.strictEqual(owner.allowance.attemptsConsumed, 1);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  "missing",
+  "malformed",
+  "swapped",
+  "material-hash",
+  "marker-hash",
+  "marker-removed",
+  "intent-id",
+  "receipt-id",
+  "intent-fingerprint",
+  "planning-owner",
+  "launch-command",
+  "launch-thread",
+  "launch-message",
+  "launch-project",
+  "provider",
+  "model",
+  "receipt",
+  "receipt-hash",
+  "downgrade",
+] as const)("stored V3 rejects %s before custody or control writes", (scenario) =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const input = reservation(operationFor("invalid-v3-op", "invalid-v3"), "invalid-v3");
+    const launch =
+      scenario === "launch-command"
+        ? { commandId: "other-command" }
+        : scenario === "launch-thread"
+          ? { threadId: "other-thread" }
+          : scenario === "launch-message"
+            ? {
+                initialMessage: {
+                  messageId: "other-message",
+                  text: "Do the work",
+                  attachments: [],
+                },
+              }
+            : scenario === "launch-project"
+              ? { projectId: "other-project" }
+              : scenario === "provider"
+                ? { modelSelection: { instanceId: "other", model: "model" } }
+                : scenario === "model"
+                  ? { modelSelection: { instanceId: "provider", model: "other" } }
+                  : undefined;
+    const material =
+      scenario === "intent-id"
+        ? { intentId: "other-intent" }
+        : scenario === "receipt-id"
+          ? { receiptId: "other-receipt" }
+          : scenario === "intent-fingerprint"
+            ? { intentFingerprint: hash }
+            : scenario === "planning-owner"
+              ? { planningSession: session }
+              : undefined;
+    const fixture = yield* storedV3(input, {
+      ...(launch ? { launch } : {}),
+      ...(material ? { material } : {}),
+      ...(scenario === "marker-hash" ? { markerHash: hash } : {}),
+    });
+    if (scenario === "swapped") {
+      const otherRunId = decodeWorkflowRunId("other-run");
+      yield* store.createRun({
+        ...run,
+        id: otherRunId,
+        access: { origins: [{ ...destination, threadId: "other-thread" }] },
+      });
+      const original = operationFor("other-v3-op", "other-v3");
+      if (original.parameters.kind !== "stage_launch") throw new Error("expected stage launch");
+      const otherOperation = decodeOperation({
+        ...original,
+        owner: { kind: "workflow_run", workflowRunId: otherRunId },
+        parameters: { ...original.parameters, nativeThreadId: "other-thread" },
+      });
+      const otherInput = { ...reservation(otherOperation, "other-v3"), runId: otherRunId };
+      yield* storedV3(otherInput);
+      const foreign = (yield* sql<{
+        material_json: string;
+        material_hash: string;
+      }>`SELECT material_json, material_hash FROM workflow_native_reservation_material WHERE intent_id = ${otherInput.intentId}`)[0]!;
+      yield* sql`DROP TRIGGER workflow_native_reservation_material_update_guard`;
+      yield* sql`UPDATE workflow_native_reservation_material SET material_json = ${foreign.material_json}, material_hash = ${foreign.material_hash} WHERE intent_id = ${input.intentId}`;
+      yield* sql`CREATE TRIGGER workflow_native_reservation_material_update_guard BEFORE UPDATE ON workflow_native_reservation_material BEGIN SELECT RAISE(ABORT, 'workflow native reservation material is immutable'); END`;
+    }
+    if (scenario === "missing" || scenario === "malformed" || scenario === "material-hash") {
+      yield* sql`DROP TRIGGER workflow_native_reservation_material_update_guard`;
+      yield* sql`DROP TRIGGER workflow_native_reservation_material_delete_guard`;
+      if (scenario === "missing") yield* sql`DELETE FROM workflow_native_reservation_material`;
+      if (scenario === "malformed")
+        yield* sql`UPDATE workflow_native_reservation_material SET material_json = '{}'`;
+      if (scenario === "material-hash")
+        yield* sql`UPDATE workflow_native_reservation_material SET material_hash = ${hash}`;
+      yield* sql`CREATE TRIGGER workflow_native_reservation_material_update_guard BEFORE UPDATE ON workflow_native_reservation_material BEGIN SELECT RAISE(ABORT, 'workflow native reservation material is immutable'); END`;
+      yield* sql`CREATE TRIGGER workflow_native_reservation_material_delete_guard BEFORE DELETE ON workflow_native_reservation_material BEGIN SELECT RAISE(ABORT, 'workflow native reservation material is immutable'); END`;
+    }
+    if (scenario === "receipt")
+      yield* sql`UPDATE workflow_native_intent_receipts SET result_json = ${json({ intentId: input.intentId, fingerprint: fixture.fingerprint })}`;
+    if (scenario === "receipt-hash")
+      yield* sql`UPDATE workflow_native_intent_receipts SET result_json = ${json({ intentId: input.intentId, fingerprint: fixture.fingerprint, materialVersion: 1, materialHash: hash })}`;
+    if (scenario === "marker-removed") {
+      const { material: _marker, ...withoutMarker } = fixture.draft;
+      yield* sql`UPDATE workflow_native_launch_intents SET draft_json = ${json(withoutMarker)}`;
+    }
+    if (scenario === "downgrade") {
+      const legacy = WorkflowCanonicalHash.tagged("t3.workflow-native-launch-intent.v2", {
+        intentId: input.intentId,
+        workflowRunId: input.runId,
+        planningSessionId: null,
+        operationId: input.operationId,
+        attemptId: input.attemptId,
+        passId: null,
+        itemId: input.itemId,
+        chargeAttempt: 1,
+        repair: input.repair,
+        role: "implementation",
+        environmentId: input.environmentId,
+        projectId: input.projectId,
+        launchCommandId: input.launchCommandId,
+        threadId: input.threadId,
+        messageId: input.messageId,
+        draft: input.draft,
+        receiptId: input.receiptId,
+      });
+      yield* sql`UPDATE workflow_native_launch_intents SET fingerprint = ${legacy}`;
+      yield* sql`UPDATE workflow_native_intent_receipts SET fingerprint = ${legacy}, result_json = ${json({ intentId: input.intentId, fingerprint: legacy })}`;
+    }
+    const beforeRun = yield* sql`SELECT * FROM workflow_runs`;
+    const beforeIntent = yield* sql`SELECT * FROM workflow_native_launch_intents`;
+    const beforeReceipt = yield* sql`SELECT * FROM workflow_native_intent_receipts`;
+    const beforeMaterial = yield* sql`SELECT * FROM workflow_native_reservation_material`;
+    assert.strictEqual(
+      (yield* Effect.flip(store.readThreadCustody({ threadId: input.threadId }))).reason,
+      "integrity",
+    );
+    assert.strictEqual(
+      (yield* Effect.flip(
+        store.commitTransition({
+          runId: run.id,
+          command: { ...command, commandId: "bad-v3-pause", expectedVersion: 1 },
+          externalFacts: admissionFacts,
+          receiptId: "bad-v3-pause",
+        }),
+      )).reason,
+      "integrity",
+    );
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_runs`, beforeRun);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_launch_intents`, beforeIntent);
+    assert.deepStrictEqual(
+      yield* sql`SELECT * FROM workflow_native_intent_receipts`,
+      beforeReceipt,
+    );
+    assert.deepStrictEqual(
+      yield* sql`SELECT * FROM workflow_native_reservation_material`,
+      beforeMaterial,
+    );
+    assert.strictEqual((yield* sql`SELECT * FROM workflow_command_receipts`).length, 0);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("stored V3 unknown custody remains readable without control eligibility", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const input = reservation(operationFor("unknown-v3-op", "unknown-v3"), "unknown-v3");
+    yield* storedV3(input);
+    yield* sql`UPDATE workflow_native_launch_intents SET state = 'unknown', boot_id = 'boot', worker_id = 'worker'`;
+    assert.deepStrictEqual(yield* store.readThreadCustody({ threadId: input.threadId }), {
+      kind: "owned",
+      owner: { kind: "workflow_run", workflowRunId: run.id },
+    });
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("stored V3 material SQL failures map to persistence", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const input = reservation(operationFor("sql-v3-op", "sql-v3"), "sql-v3");
+    yield* storedV3(input);
+    yield* sql`DROP TABLE workflow_native_reservation_material`;
+    assert.strictEqual(
+      (yield* Effect.flip(store.readThreadCustody({ threadId: input.threadId }))).reason,
+      "persistence",
+    );
+    assert.strictEqual(
+      (yield* Effect.flip(
+        store.commitTransition({
+          runId: run.id,
+          command: { ...command, commandId: "sql-v3-pause", expectedVersion: 1 },
+          externalFacts: admissionFacts,
+          receiptId: "sql-v3-pause",
+        }),
+      )).reason,
+      "persistence",
+    );
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("unanchored material does not promote a legacy workflow reservation", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const input = reservation(operationFor("old-material-op", "old-material"), "old-material");
+    yield* store.reserveWorkflowNativeIntent(input);
+    yield* sql`INSERT INTO workflow_native_reservation_material VALUES (${input.intentId}, '{}', ${hash})`;
+    assert.strictEqual(
+      (yield* store.readThreadCustody({ threadId: input.threadId })).kind,
+      "owned",
+    );
+    assert.strictEqual(
+      (yield* store.commitTransition({
+        runId: run.id,
+        command: { ...command, commandId: "old-material-pause", expectedVersion: 1 },
+        externalFacts: admissionFacts,
+        receiptId: "old-material-pause",
+      })).kind,
+      "accepted",
+    );
+  }).pipe(Effect.provide(layer)),
+);
 
 it.effect.each(["dispatching", "unknown"] as const)(
   "workflow pause retains native %s custody",
@@ -3961,6 +4315,38 @@ it.effect.each([
       },
       before,
     );
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("planning material V3 remains unsupported by custody and controls", () =>
+  Effect.gen(function* () {
+    const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+    const store = yield* Store.WorkflowRunStore;
+    const sql = yield* SqlClient.SqlClient;
+    yield* begin(store, session);
+    const input = planningReservation(admissionInput(binding, "unsupported-v3"));
+    yield* store.reservePlanningNativeIntent(input);
+    const marked = { ...input.draft, version: 2, material: { version: 1, launchHash: hash } };
+    yield* sql`UPDATE workflow_native_launch_intents SET draft_json = ${json(marked)} WHERE intent_id = ${input.intentId}`;
+    assert.strictEqual(
+      (yield* Effect.flip(store.readThreadCustody({ threadId: input.threadId }))).reason,
+      "integrity",
+    );
+    const before = yield* sql`SELECT * FROM workflow_planning_sessions`;
+    assert.strictEqual(
+      (yield* Effect.flip(
+        store.controlPlanning({
+          sessionId: session.id,
+          expectedVersion: 1,
+          action: "pause",
+          now: facts.now,
+          context,
+          command: { commandId: "unsupported-v3-pause", receiptId: "unsupported-v3-pause" },
+        }),
+      )).reason,
+      "integrity",
+    );
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_planning_sessions`, before);
   }).pipe(Effect.provide(layer)),
 );
 
