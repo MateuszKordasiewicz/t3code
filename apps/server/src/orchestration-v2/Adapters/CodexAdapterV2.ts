@@ -43,6 +43,7 @@ import {
 } from "@t3tools/contracts";
 import { SKILL_MENTION_PATTERN } from "@t3tools/shared/composerInlineTokens";
 import { AgentScope } from "@t3tools/shared/AgentScope";
+import { WorkflowCanonicalHash } from "../../workflowRuns/WorkflowCanonicalHash.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import {
   COMPUTER_USE_TOOL_SOURCE,
@@ -1610,6 +1611,275 @@ export const makeCodexAppServerLaunch = Effect.fn("CodexAdapterV2.makeCodexAppSe
     });
   },
 );
+
+type ControlledCodexLaunchInput = Parameters<typeof makeCodexAppServerLaunch>[0];
+
+function controlledLaunchString(value: unknown, empty = false): value is string {
+  return (
+    typeof value === "string" &&
+    (empty || value.length > 0) &&
+    value.isWellFormed() &&
+    !value.includes("\0")
+  );
+}
+
+function controlledLaunchProperties(value: unknown, environment = false) {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    ((!environment || value !== process.env) &&
+      Object.getPrototypeOf(value) !== Object.prototype &&
+      Object.getPrototypeOf(value) !== null)
+  )
+    throw new Error("Invalid controlled launch data");
+  const result: Record<string, unknown> = {};
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (
+      typeof key !== "string" ||
+      !descriptor?.enumerable ||
+      !("value" in descriptor) ||
+      key === "__proto__"
+    )
+      throw new Error("Invalid controlled launch data");
+    result[key] = descriptor.value;
+  }
+  return result;
+}
+
+function ownControlledLaunchEnvironment(value: unknown) {
+  const data = controlledLaunchProperties(value, true);
+  const result: NodeJS.ProcessEnv = {};
+  for (const [key, entry] of Object.entries(data)) {
+    if (
+      !controlledLaunchString(key) ||
+      key.includes("=") ||
+      (entry !== undefined && !controlledLaunchString(entry, true))
+    )
+      throw new Error("Invalid controlled launch environment");
+    result[key] = entry;
+  }
+  return result;
+}
+
+function ownControlledLaunchInput(value: ControlledCodexLaunchInput): ControlledCodexLaunchInput {
+  const data = controlledLaunchProperties(value);
+  const keys = new Set(["command", "args", "cwd", "env", "extendEnv", "threadId"]);
+  if (
+    Object.keys(data).some((key) => !keys.has(key)) ||
+    !controlledLaunchString(data.command) ||
+    !Array.isArray(data.args)
+  )
+    throw new Error("Invalid controlled launch input");
+  WorkflowCanonicalHash.assertCanonical(data.args);
+  if (
+    !data.args.every((arg) => controlledLaunchString(arg, true)) ||
+    (data.cwd !== undefined && !controlledLaunchString(data.cwd)) ||
+    (data.threadId !== undefined && !controlledLaunchString(data.threadId)) ||
+    (data.extendEnv !== undefined && typeof data.extendEnv !== "boolean")
+  )
+    throw new Error("Invalid controlled launch input");
+  return Object.freeze({
+    command: data.command,
+    args: Object.freeze([...data.args]),
+    ...(data.cwd === undefined ? {} : { cwd: data.cwd }),
+    ...(data.threadId === undefined ? {} : { threadId: data.threadId }),
+    ...(data.extendEnv === undefined ? {} : { extendEnv: data.extendEnv }),
+    ...(data.env === undefined
+      ? {}
+      : { env: Object.freeze(ownControlledLaunchEnvironment(data.env)) }),
+  });
+}
+
+// Construction errors must not carry private creation arguments or environment values.
+const redactControlledLaunchFailure = <A, E, R>(work: Effect.Effect<A, E, R>) =>
+  work.pipe(
+    Effect.catchCause((cause) => {
+      const interrupts = cause.reasons.filter(Cause.isInterruptReason);
+      const failure = new CodexErrors.CodexAppServerSpawnError({
+        cause: new Error("Controlled launch unavailable"),
+      });
+      return Effect.failCause(
+        Cause.fromReasons([
+          ...interrupts,
+          ...(cause.reasons.some((reason) => !Cause.isInterruptReason(reason))
+            ? [Cause.makeFailReason(failure)]
+            : []),
+        ]),
+      );
+    }),
+  );
+
+const prepareOwnedControlledCodexLaunch = Effect.fn("CodexAdapterV2.prepareControlledLaunch")(
+  function* (input: ControlledCodexLaunchInput) {
+    const path = yield* Path.Path;
+    const hostEnvironment = yield* HostProcess.Environment;
+    const hostCwd = yield* HostProcess.WorkingDirectory;
+    const owned = yield* Effect.try({
+      try: () => {
+        if (
+          // oxlint-disable-next-line t3code/no-global-process-runtime -- The image must match Node's actual spawner platform, including when command-resolution references are overridden.
+          process.platform !== "linux" ||
+          process.release.name !== "node" ||
+          process.permission !== undefined ||
+          !path.isAbsolute(hostCwd)
+        )
+          throw new Error("Unsupported controlled launch runtime");
+        const host = ownControlledLaunchEnvironment(hostEnvironment);
+        const environment =
+          input.env === undefined
+            ? host
+            : input.extendEnv === true
+              ? { ...host, ...input.env }
+              : { ...input.env };
+        for (const key of Object.keys(environment))
+          if (environment[key] === undefined) delete environment[key];
+        if (environment.NODE_V8_COVERAGE === undefined)
+          // @effect-diagnostics-next-line processEnvInEffect:off -- Node injects its actual ambient value even with an explicit Effect environment.
+          environment.NODE_V8_COVERAGE = process.env.NODE_V8_COVERAGE ?? "";
+        return {
+          cwd: path.resolve(hostCwd, input.cwd ?? "."),
+          env: Object.freeze(ownControlledLaunchEnvironment(environment)),
+        };
+      },
+      catch: () =>
+        new CodexErrors.CodexAppServerSpawnError({
+          cause: new Error("Controlled launch unavailable"),
+        }),
+    });
+    const launch = yield* makeCodexAppServerLaunch({ ...input, ...owned, extendEnv: false });
+    const privateLaunch = yield* Effect.try({
+      try: () => {
+        if (
+          launch.command._tag !== "StandardCommand" ||
+          launch.command.options.shell !== false ||
+          !path.isAbsolute(launch.command.command)
+        )
+          throw new Error("Unsupported controlled launch command");
+        const executable = launch.command.command;
+        const args = [...launch.command.args];
+        WorkflowCanonicalHash.assertCanonical(args);
+        if (
+          !controlledLaunchString(executable) ||
+          !args.every((arg) => controlledLaunchString(arg, true))
+        )
+          throw new Error("Unsupported controlled launch command");
+        const image = {
+          v: 1,
+          platform: "linux",
+          runtime: { kind: "node", version: process.versions.node },
+          executable,
+          args,
+          cwd: owned.cwd,
+          environment: Object.entries(owned.env).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+          spawn: {
+            shell: false,
+            extendEnv: false,
+            detached: true,
+            windowsHide: false,
+            stdin: { stream: "pipe", encoding: "utf-8", endOnDone: false },
+            stdout: "pipe",
+            stderr: "pipe",
+            additionalFds: [],
+          },
+          cleanup: { killSignal: "SIGTERM", forceKillAfter: null },
+        };
+        const creationInputHash = WorkflowCanonicalHash.tagged(
+          "t3.provider-creation-input.v1",
+          image,
+        );
+        const command = ChildProcess.make(executable, Object.freeze(args), {
+          cwd: owned.cwd,
+          env: owned.env,
+          extendEnv: false,
+          shell: false,
+          detached: true,
+          windowsHide: false,
+          stdin: Object.freeze({ stream: "pipe", endOnDone: false }),
+          stdout: "pipe",
+          stderr: "pipe",
+          killSignal: "SIGTERM",
+        });
+        Object.freeze(command.options);
+        Object.freeze(command.args);
+        Object.freeze(command);
+        return { command, creationInputHash };
+      },
+      catch: () =>
+        new CodexErrors.CodexAppServerSpawnError({
+          cause: new Error("Controlled launch unavailable"),
+        }),
+    });
+    let consumed = false;
+    const openOnce = Effect.fn("CodexAdapterV2.openPreparedControlledLaunch")(function* <A, E, R>(
+      pending: Effect.Effect<A, E, R>,
+    ) {
+      if (consumed)
+        return yield* new CodexErrors.CodexAppServerSpawnError({
+          cause: new Error("Controlled launch already consumed"),
+        });
+      consumed = true;
+      return yield* pending;
+    }, redactControlledLaunchFailure);
+    return Object.freeze({
+      creationInputHash: privateLaunch.creationInputHash,
+      ...(launch.unit === undefined ? {} : { unit: launch.unit }),
+      ...(launch.custody === undefined ? {} : { custody: launch.custody }),
+      open: <E>(options: CodexClient.CodexAppServerControlledClientOptions<E>) => {
+        const captured = Result.try({
+          try: () => {
+            const data = controlledLaunchProperties(options);
+            const keys = new Set([
+              "wrapper",
+              "onOutcome",
+              "logger",
+              "logIncoming",
+              "logOutgoing",
+              "testSinkTimeoutMs",
+            ]);
+            if (
+              Object.keys(data).some((key) => !keys.has(key)) ||
+              typeof data.wrapper !== "function" ||
+              typeof data.onOutcome !== "function" ||
+              (data.logger !== undefined && typeof data.logger !== "function") ||
+              (data.logIncoming !== undefined && typeof data.logIncoming !== "boolean") ||
+              (data.logOutgoing !== undefined && typeof data.logOutgoing !== "boolean") ||
+              (data.testSinkTimeoutMs !== undefined &&
+                (typeof data.testSinkTimeoutMs !== "number" ||
+                  !Number.isFinite(data.testSinkTimeoutMs)))
+            )
+              throw new Error("Invalid controlled launch options");
+            return CodexClient.makeControlledChildProcessClient(
+              privateLaunch.command,
+              data as unknown as CodexClient.CodexAppServerControlledClientOptions<E>,
+            );
+          },
+          catch: () =>
+            new CodexErrors.CodexAppServerSpawnError({
+              cause: new Error("Controlled launch unavailable"),
+            }),
+        });
+        return openOnce(
+          Result.isFailure(captured) ? Effect.fail(captured.failure) : captured.success,
+        );
+      },
+    });
+  },
+  redactControlledLaunchFailure,
+);
+
+export const prepareControlledCodexAppServerLaunch = (input: ControlledCodexLaunchInput) => {
+  const owned = Result.try({
+    try: () => ownControlledLaunchInput(input),
+    catch: () =>
+      new CodexErrors.CodexAppServerSpawnError({
+        cause: new Error("Controlled launch unavailable"),
+      }),
+  });
+  return Result.isFailure(owned)
+    ? redactControlledLaunchFailure(Effect.fail(owned.failure))
+    : prepareOwnedControlledCodexLaunch(owned.success);
+};
 
 export const makeCodexAppServerSpawnCommand = Effect.fn(
   "CodexAdapterV2.makeCodexAppServerSpawnCommand",

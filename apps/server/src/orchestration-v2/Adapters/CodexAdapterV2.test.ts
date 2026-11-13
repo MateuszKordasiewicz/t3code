@@ -78,6 +78,8 @@ import * as ModelManifest from "../../provider/ModelManifest.ts";
 import * as PortScanner from "../../preview/PortScanner.ts";
 import { resolveProviderCompatibility } from "../../provider/providerCompatibility.ts";
 import * as CodexAdapterV2 from "./CodexAdapterV2.ts";
+import { WorkflowCanonicalHash } from "../../workflowRuns/WorkflowCanonicalHash.ts";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { withCodexReplayChildMetadata } from "./CodexAdapterV2.testkit.ts";
 import * as CodexAdapterV2Testkit from "./CodexAdapterV2.testkit.ts";
 
@@ -11226,4 +11228,462 @@ it.live(
       yield* Effect.result(client.ownedProcess.awaitExit);
       assert.isFalse(yield* client.ownedProcess.isRunning);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.live(
+  "owns the complete prepared creation image through the real controlled child constructor",
+  () =>
+    Effect.gen(function* () {
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const path = yield* Path.Path;
+      const cwd = path.resolve(import.meta.dirname);
+      const fs = yield* FileSystem.FileSystem;
+      const nodeEnvironment = process.env;
+      const changedCoverage = yield* fs.makeTempDirectoryScoped({
+        prefix: "t3-creation-coverage-",
+      });
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          const previous = nodeEnvironment.NODE_V8_COVERAGE;
+          delete nodeEnvironment.NODE_V8_COVERAGE;
+          return previous;
+        }),
+        (previous) =>
+          Effect.sync(() => {
+            if (previous === undefined) delete nodeEnvironment.NODE_V8_COVERAGE;
+            else nodeEnvironment.NODE_V8_COVERAGE = previous;
+          }),
+      );
+      const env = { CREATION_SENTINEL: "original" };
+      const script = `require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const r=JSON.parse(line);process.stdout.write(JSON.stringify({id:r.id,result:{userAgent:JSON.stringify({cwd:process.cwd(),env:process.env}),codexHome:process.cwd(),platformFamily:"unix",platformOs:"linux"}})+'\\n')})`;
+      const args = ["-e", script];
+      let wraps = 0;
+      let spawns = 0;
+      let observedHash = "";
+      const custody = Object.freeze({
+        bind: () => Effect.undefined,
+        stopAndObserve: () => Effect.undefined,
+      });
+      const pending = CodexAdapterV2.prepareControlledCodexAppServerLaunch({
+        command: process.execPath,
+        args,
+        cwd,
+        env,
+      });
+      args[1] = "throw new Error('mutated argv')";
+      env.CREATION_SENTINEL = "mutated environment";
+      const prepared = yield* pending.pipe(
+        Effect.provideService(AgentScope, {
+          ...AgentScope.defaultValue(),
+          wrap: (input) => {
+            wraps++;
+            return Effect.succeed({
+              command: input.command,
+              args: input.args,
+              unit: "prepared.scope",
+              custody,
+            });
+          },
+        }),
+      );
+      yield* Effect.sync(() => {
+        nodeEnvironment.NODE_V8_COVERAGE = changedCoverage;
+      });
+      assert.strictEqual(wraps, 1);
+      assert.strictEqual(spawns, 0);
+      assert.strictEqual(prepared.unit, "prepared.scope");
+      assert.strictEqual(prepared.custody, custody);
+      assert.isTrue(Object.isFrozen(prepared));
+      assert.deepStrictEqual(Object.keys(prepared).toSorted(), [
+        "creationInputHash",
+        "custody",
+        "open",
+        "unit",
+      ]);
+      assert.notInclude(JSON.stringify(prepared), "original");
+      const recording = ChildProcessSpawner.make((command) =>
+        Effect.gen(function* () {
+          spawns++;
+          assert.strictEqual(command._tag, "StandardCommand");
+          if (command._tag !== "StandardCommand")
+            return yield* Effect.die("unexpected fixture pipeline");
+          assert.strictEqual(command.options.extendEnv, false);
+          assert.strictEqual(command.options.shell, false);
+          assert.strictEqual(command.options.detached, true);
+          assert.strictEqual(command.options.windowsHide, false);
+          assert.strictEqual(command.options.killSignal, "SIGTERM");
+          assert.isUndefined(command.options.forceKillAfter);
+          assert.isUndefined(command.options.additionalFds);
+          assert.deepStrictEqual(command.options.stdin, { stream: "pipe", endOnDone: false });
+          assert.strictEqual(command.options.stdout, "pipe");
+          assert.strictEqual(command.options.stderr, "pipe");
+          observedHash = WorkflowCanonicalHash.tagged("t3.provider-creation-input.v1", {
+            v: 1,
+            platform: "linux",
+            runtime: { kind: "node", version: process.versions.node },
+            executable: command.command,
+            args: command.args,
+            cwd: command.options.cwd,
+            environment: Object.entries(command.options.env!).sort(([a], [b]) =>
+              a < b ? -1 : a > b ? 1 : 0,
+            ),
+            spawn: {
+              shell: false,
+              extendEnv: false,
+              detached: true,
+              windowsHide: false,
+              stdin: { stream: "pipe", encoding: "utf-8", endOnDone: false },
+              stdout: "pipe",
+              stderr: "pipe",
+              additionalFds: [],
+            },
+            cleanup: { killSignal: "SIGTERM", forceKillAfter: null },
+          });
+          return yield* spawner.spawn(command);
+        }),
+      );
+      const scope = yield* Effect.acquireRelease(Scope.make("sequential"), (scope) =>
+        Scope.close(scope, Exit.void),
+      );
+      const open = prepared.open({
+        wrapper: (_frame, submit) => submit(),
+        onOutcome: () => Effect.void,
+      });
+      const client = yield* open.pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, recording),
+        Scope.provide(scope),
+      );
+      assert.strictEqual(observedHash, prepared.creationInputHash);
+      assert.isTrue(yield* client.ownedProcess.isRunning);
+      const response = yield* client.request("initialize", {
+        clientInfo: { name: "creation-image", version: "1" },
+      });
+      assert.deepStrictEqual(JSON.parse(response.userAgent), {
+        cwd,
+        env: { CREATION_SENTINEL: "original", NODE_V8_COVERAGE: "" },
+      });
+      for (const repeat of [
+        open,
+        prepared.open({ wrapper: (_frame, submit) => submit(), onOutcome: () => Effect.void }),
+      ]) {
+        const result = yield* Effect.result(
+          repeat.pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, recording),
+            Scope.provide(scope),
+          ),
+        );
+        assert.strictEqual(result._tag, "Failure");
+        if (result._tag === "Failure")
+          assert.strictEqual(result.failure._tag, "CodexAppServerSpawnError");
+      }
+      assert.strictEqual(spawns, 1);
+      yield* client.quiesceOutput;
+      yield* Scope.close(scope, Exit.void);
+      yield* Effect.result(client.ownedProcess.awaitExit);
+      assert.isFalse(yield* client.ownedProcess.isRunning);
+      const failedLaunch = yield* CodexAdapterV2.prepareControlledCodexAppServerLaunch({
+        command: process.execPath,
+        args: ["-e", "process.stdin.resume()"],
+        env: { NODE_V8_COVERAGE: "" },
+      });
+      const failedHandles = yield* Queue.unbounded<ChildProcessSpawner.ChildProcessHandle>();
+      const failedSpawner = ChildProcessSpawner.make((command) =>
+        spawner.spawn(command).pipe(Effect.tap((handle) => Queue.offer(failedHandles, handle))),
+      );
+      const failedOpen = failedLaunch.open({
+        wrapper: (_frame, submit) => submit(),
+        onOutcome: () => Effect.void,
+        testSinkTimeoutMs: 0,
+      });
+      const failed = yield* Effect.result(
+        failedOpen.pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, failedSpawner),
+        ),
+      );
+      assert.strictEqual(failed._tag, "Failure");
+      if (failed._tag === "Failure")
+        assert.strictEqual(failed.failure._tag, "CodexAppServerSpawnError");
+      const failedHandle = yield* Queue.take(failedHandles);
+      yield* Effect.result(failedHandle.exitCode);
+      assert.isFalse(yield* failedHandle.isRunning);
+      assert.strictEqual((yield* Effect.result(failedOpen))._tag, "Failure");
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("pins complete environment semantics and every final creation input in its digest", () =>
+  Effect.gen(function* () {
+    const host = { KEEP: "host-value", REMOVE: "host-remove", NODE_V8_COVERAGE: "" };
+    const base = { command: "/absolute/provider", args: ["first", ""], cwd: "relative" };
+    const prepare = (
+      input: Parameters<typeof CodexAdapterV2.prepareControlledCodexAppServerLaunch>[0],
+      suffix = "",
+    ) =>
+      CodexAdapterV2.prepareControlledCodexAppServerLaunch(input).pipe(
+        Effect.provideService(HostProcess.Environment, host),
+        Effect.provideService(HostProcess.WorkingDirectory, "/captured"),
+        Effect.provideService(AgentScope, {
+          ...AgentScope.defaultValue(),
+          wrap: (input) =>
+            Effect.succeed({ command: input.command, args: [...input.args, suffix] }),
+        }),
+      );
+    const digest = (
+      environment: Record<string, string>,
+      overrides: { executable?: string; args?: readonly string[]; cwd?: string } = {},
+    ) =>
+      WorkflowCanonicalHash.tagged("t3.provider-creation-input.v1", {
+        v: 1,
+        platform: "linux",
+        runtime: { kind: "node", version: process.versions.node },
+        executable: overrides.executable ?? base.command,
+        args: overrides.args ?? [...base.args, ""],
+        cwd: overrides.cwd ?? "/captured/relative",
+        environment: Object.entries(environment).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+        spawn: {
+          shell: false,
+          extendEnv: false,
+          detached: true,
+          windowsHide: false,
+          stdin: { stream: "pipe", encoding: "utf-8", endOnDone: false },
+          stdout: "pipe",
+          stderr: "pipe",
+          additionalFds: [],
+        },
+        cleanup: { killSignal: "SIGTERM", forceKillAfter: null },
+      });
+    for (const [input, expected] of [
+      [base, { ...host }],
+      [
+        { ...base, env: { OWN: "credential-sentinel", NODE_V8_COVERAGE: "" } },
+        { OWN: "credential-sentinel", NODE_V8_COVERAGE: "" },
+      ],
+      [
+        { ...base, env: { OWN: "overlay", REMOVE: undefined }, extendEnv: true },
+        { KEEP: "host-value", OWN: "overlay", NODE_V8_COVERAGE: "" },
+      ],
+    ] as const) {
+      const cap = yield* prepare(input);
+      assert.strictEqual(cap.creationInputHash, digest(expected));
+      assert.isUndefined(cap.unit);
+      assert.isUndefined(cap.custody);
+      assert.notInclude(JSON.stringify(cap), "credential-sentinel");
+    }
+    const initial = yield* prepare(base);
+    const reordered = yield* prepare({
+      ...base,
+      env: { NODE_V8_COVERAGE: "", REMOVE: "host-remove", KEEP: "host-value" },
+    });
+    assert.strictEqual(initial.creationInputHash, reordered.creationInputHash);
+    host.KEEP = "changed-after-preparation";
+    assert.strictEqual(
+      initial.creationInputHash,
+      digest({ KEEP: "host-value", REMOVE: "host-remove", NODE_V8_COVERAGE: "" }),
+    );
+    let captured = false;
+    const recording = ChildProcessSpawner.make((command) => {
+      assert.strictEqual(command._tag, "StandardCommand");
+      if (command._tag === "StandardCommand")
+        assert.strictEqual(command.options.env?.KEEP, "host-value");
+      captured = true;
+      return Effect.die(new Error("Fixture observes creation without a child"));
+    });
+    const opened = yield* Effect.result(
+      initial
+        .open({ wrapper: (_frame, submit) => submit(), onOutcome: () => Effect.void })
+        .pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, recording)),
+    );
+    assert.strictEqual(opened._tag, "Failure");
+    assert.isTrue(captured);
+    for (const cap of [
+      yield* prepare(base),
+      yield* prepare({ ...base, cwd: "/different" }),
+      yield* prepare({ ...base, command: "/different/provider" }),
+      yield* prepare({ ...base, args: ["different"] }),
+      yield* prepare(base, "different-wrapper-arg"),
+    ])
+      assert.notStrictEqual(cap.creationInputHash, initial.creationInputHash);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("rejects malformed prepared launch data without evaluating getters or wrapping", () =>
+  Effect.gen(function* () {
+    let getters = 0;
+    let wraps = 0;
+    const getter = {
+      command: process.execPath,
+      get args() {
+        getters++;
+        return ["secret-argument"];
+      },
+    };
+    const environment = {
+      get SECRET() {
+        getters++;
+        return "secret-argument";
+      },
+    };
+    const invalid = [
+      getter,
+      { command: process.execPath, args: [], env: environment },
+      { command: process.execPath, args: Array(1) },
+      { command: process.execPath, args: [undefined] },
+      { command: process.execPath, args: [], [Symbol("invalid")]: true },
+      Object.assign(Object.create({ inherited: true }), { command: process.execPath, args: [] }),
+      { command: process.execPath, args: [], unknown: true },
+      { command: process.execPath, args: ["bad\uD800"] },
+      { command: process.execPath, args: ["bad\0"] },
+      { command: process.execPath, args: [], env: { "": "secret-argument" } },
+      { command: process.execPath, args: [], env: { "BAD=NAME": "secret-argument" } },
+      { command: process.execPath, args: [], env: JSON.parse('{"__proto__":"secret-argument"}') },
+      { command: process.execPath, args: [], env: { SECRET: 1 } },
+    ];
+    for (const input of invalid) {
+      const result = yield* Effect.result(
+        CodexAdapterV2.prepareControlledCodexAppServerLaunch(
+          input as unknown as Parameters<
+            typeof CodexAdapterV2.prepareControlledCodexAppServerLaunch
+          >[0],
+        ).pipe(
+          Effect.provideService(AgentScope, {
+            ...AgentScope.defaultValue(),
+            wrap: () => {
+              wraps++;
+              throw new Error("Unexpected wrap");
+            },
+          }),
+        ),
+      );
+      assert.strictEqual(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.strictEqual(result.failure._tag, "CodexAppServerSpawnError");
+        assert.notInclude(JSON.stringify(result.failure), "secret-argument");
+      }
+    }
+    assert.strictEqual(getters, 0);
+    assert.strictEqual(wraps, 0);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each(["failure", "interrupt"] as const)(
+  "consumes concurrent prepared opens after %s",
+  (outcome) =>
+    Effect.gen(function* () {
+      const cap = yield* CodexAdapterV2.prepareControlledCodexAppServerLaunch({
+        command: process.execPath,
+        args: [],
+        env: { NODE_V8_COVERAGE: "" },
+      });
+      let spawns = 0;
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const recording = ChildProcessSpawner.make(() =>
+        Effect.gen(function* () {
+          spawns++;
+          yield* Deferred.succeed(entered, undefined);
+          yield* Deferred.await(release);
+          return yield* Effect.die(new Error("secret-constructor-argument"));
+        }),
+      );
+      const open = cap.open({
+        wrapper: (_frame, submit) => submit(),
+        onOutcome: () => Effect.void,
+      });
+      const first = yield* Effect.forkChild(
+        open.pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, recording)),
+      );
+      yield* Deferred.await(entered);
+      assert.strictEqual(
+        (yield* Effect.result(
+          cap.open({ wrapper: (_frame, submit) => submit(), onOutcome: () => Effect.void }),
+        ))._tag,
+        "Failure",
+      );
+      if (outcome === "interrupt") yield* Fiber.interrupt(first);
+      else yield* Deferred.succeed(release, undefined);
+      const exit = yield* Fiber.await(first);
+      assert.isTrue(Exit.isFailure(exit));
+      if (Exit.isFailure(exit)) {
+        if (outcome === "interrupt") assert.isTrue(Cause.hasInterrupts(exit.cause));
+        else {
+          assert.notInclude(Cause.pretty(exit.cause), "secret-constructor-argument");
+          assert.isTrue(
+            exit.cause.reasons.some(
+              (reason) =>
+                Cause.isFailReason(reason) && reason.error._tag === "CodexAppServerSpawnError",
+            ),
+          );
+        }
+      }
+      assert.strictEqual((yield* Effect.result(open))._tag, "Failure");
+      assert.strictEqual(spawns, 1);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each(["relative-host-cwd", "unresolved-executable", "shell-backed"] as const)(
+  "rejects a %s prepared creation image before spawning",
+  (shape) =>
+    Effect.gen(function* () {
+      const result = yield* Effect.result(
+        CodexAdapterV2.prepareControlledCodexAppServerLaunch({
+          command: process.execPath,
+          args: [],
+          env: { NODE_V8_COVERAGE: "" },
+        }),
+      );
+      assert.strictEqual(result._tag, "Failure");
+      if (result._tag === "Failure")
+        assert.strictEqual(result.failure._tag, "CodexAppServerSpawnError");
+    }).pipe(
+      Effect.provideService(
+        HostProcess.WorkingDirectory,
+        shape === "relative-host-cwd" ? "relative" : "/captured",
+      ),
+      Effect.provideService(HostProcess.Platform, shape === "shell-backed" ? "win32" : "linux"),
+      Effect.provideService(AgentScope, {
+        ...AgentScope.defaultValue(),
+        wrap: () =>
+          Effect.succeed({
+            command: shape === "shell-backed" ? "/tmp/provider.cmd" : "unresolved-provider",
+            args: [],
+          }),
+      }),
+      Effect.provideService(
+        ChildProcessSpawner.ChildProcessSpawner,
+        ChildProcessSpawner.make(() => Effect.die("Unexpected provider spawn")),
+      ),
+      Effect.provide(NodeServices.layer),
+    ),
+);
+
+it.effect("consumes invalid prepared open options without invoking their getters or spawning", () =>
+  Effect.gen(function* () {
+    const cap = yield* CodexAdapterV2.prepareControlledCodexAppServerLaunch({
+      command: process.execPath,
+      args: [],
+    });
+    let getters = 0;
+    const invalid = cap.open({
+      get wrapper(): CodexClient.CodexAppServerControlledClientOptions<CodexError.CodexAppServerFrameSubmissionError>["wrapper"] {
+        getters++;
+        return (_frame, submit) => submit();
+      },
+      onOutcome: () => Effect.void,
+    });
+    assert.strictEqual(getters, 0);
+    assert.strictEqual((yield* Effect.result(invalid))._tag, "Failure");
+    assert.strictEqual(
+      (yield* Effect.result(
+        cap.open({ wrapper: (_frame, submit) => submit(), onOutcome: () => Effect.void }),
+      ))._tag,
+      "Failure",
+    );
+    assert.strictEqual(getters, 0);
+  }).pipe(
+    Effect.scoped,
+    Effect.provideService(
+      ChildProcessSpawner.ChildProcessSpawner,
+      ChildProcessSpawner.make(() => Effect.die("Unexpected provider spawn")),
+    ),
+    Effect.provide(NodeServices.layer),
+  ),
 );
