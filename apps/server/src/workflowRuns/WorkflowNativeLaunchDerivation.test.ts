@@ -6,6 +6,9 @@ import * as NodeSqlite from "node:sqlite";
 import * as NodePathService from "@effect/platform-node/NodePath";
 import { assert, it } from "@effect/vitest";
 import {
+  CommandId,
+  ThreadId,
+  RunId,
   OrchestrationV2AppThreadJson,
   OrchestrationV2RunJson,
   OrchestrationV2ConversationMessageJson,
@@ -18,6 +21,18 @@ import {
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
+import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as Option from "effect/Option";
+import * as Stream from "effect/Stream";
+import * as Statement from "effect/sql/Statement";
+import * as EventSink from "../orchestration-v2/EventSink.ts";
+import * as EffectOutbox from "../orchestration-v2/EffectOutbox.ts";
+import * as EventStore from "../orchestration-v2/EventStore.ts";
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+import * as ApplicationEvents from "../persistence/OrchestrationEventStore.ts";
 import * as Digest from "effect/crypto/Digest";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -249,30 +264,24 @@ type DerivedFixture = Effect.Success<
 >;
 type ProofVerifier = Effect.Success<ReturnType<typeof makeNativeCommandProofVerifier>>;
 const fixtureTime = "2026-11-01T00:00:00.000Z";
-const decodeFixtureThread = Schema.decodeUnknownEffect(OrchestrationV2AppThreadJson);
 const encodeFixtureThread = Schema.encodeEffect(
   Schema.fromJsonString(OrchestrationV2AppThreadJson),
 );
-const decodeFixtureRun = Schema.decodeUnknownEffect(OrchestrationV2RunJson);
 const encodeFixtureRun = Schema.encodeEffect(Schema.fromJsonString(OrchestrationV2RunJson));
-const decodeFixtureMessage = Schema.decodeUnknownEffect(OrchestrationV2ConversationMessageJson);
 const encodeFixtureMessage = Schema.encodeEffect(
   Schema.fromJsonString(OrchestrationV2ConversationMessageJson),
 );
 const decodeFixtureEvent = Schema.decodeUnknownEffect(OrchestrationV2DomainEventJson);
 const encodeFixtureEvent = Schema.encodeEffect(OrchestrationV2DomainEventJson);
 const decodeFixtureJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
+const decodeFixtureEffect = Schema.decodeUnknownSync(EffectOutbox.OrchestrationEffectRequestV2);
 
-const seedNativeProofs = Effect.fn("test.seedNativeProofs")(function* (
-  sql: SqlClient.SqlClient,
-  verifier: ProofVerifier,
+const nativeDecision = Effect.fn("test.nativeDecision")(function* (
   derived: DerivedFixture,
   phase: "claim" | "message",
 ) {
   const launch = derived.reservation.material.launch;
   const command = phase === "claim" ? derived.claimCommand : derived.messageCommand;
-  const hint = { intentId: derived.reservation.intentId, phase };
-  const proof = yield* verifier.prepareInTransaction(command, hint);
   const modelSelection = { instanceId: "provider", model: "model" };
   const thread = {
     id: launch.threadId,
@@ -328,42 +337,58 @@ const seedNativeProofs = Effect.fn("test.seedNativeProofs")(function* (
     createdAt: fixtureTime,
     updatedAt: fixtureTime,
   };
-  const threadJson = yield* encodeFixtureThread(yield* decodeFixtureThread(thread));
-  const runJson = yield* encodeFixtureRun(yield* decodeFixtureRun(nativeRun));
-  const messageJson = yield* encodeFixtureMessage(yield* decodeFixtureMessage(message));
-  const events =
+  const payloads =
     phase === "claim"
       ? [
           {
-            sequence: 1,
             id: "claim-event",
             type: command.type === "thread.create" ? "thread.created" : "thread.metadata-updated",
             payload: thread,
           },
         ]
       : [
-          { sequence: 2, id: "run-event", type: "run.created", payload: nativeRun },
-          { sequence: 3, id: "message-event", type: "message.updated", payload: message },
+          { id: "run-event", type: "run.created", payload: nativeRun },
+          { id: "message-event", type: "message.updated", payload: message },
         ];
+  const events = yield* Effect.forEach(payloads, (event) =>
+    decodeFixtureEvent({ ...event, threadId: launch.threadId, occurredAt: fixtureTime }),
+  );
+  return {
+    command,
+    hint: { intentId: derived.reservation.intentId, phase },
+    acceptedAt: DateTime.makeUnsafe(fixtureTime),
+    events,
+    effects: [] as Array<EffectOutbox.PendingOrchestrationEffectV2>,
+  };
+});
+
+const seedNativeProofs = Effect.fn("test.seedNativeProofs")(function* (
+  sql: SqlClient.SqlClient,
+  verifier: ProofVerifier,
+  derived: DerivedFixture,
+  phase: "claim" | "message",
+) {
+  const launch = derived.reservation.material.launch;
+  const decision = yield* nativeDecision(derived, phase);
+  const { command, hint, events } = decision;
+  const proof = yield* verifier.prepareInTransaction(command, hint);
   const sequence = phase === "claim" ? 1 : 3;
   yield* sql`INSERT INTO orchestration_command_receipts (command_id,aggregate_kind,aggregate_id,accepted_at,result_sequence,status,error,command_type) VALUES (${command.commandId},'thread',${launch.threadId},${fixtureTime},${sequence},'accepted',NULL,${command.type})`;
   yield* sql`INSERT INTO workflow_native_command_proofs (command_id,intent_id,phase,proof_json,proof_hash) VALUES (${command.commandId},${hint.intentId},${phase},${proof.proofJson},${proof.proofHash})`;
-  if (phase === "claim") {
-    yield* sql`INSERT INTO orchestration_v2_projection_threads (thread_id,project_id,title,default_provider,runtime_mode,interaction_mode,created_at,updated_at,payload_json) VALUES (${launch.threadId},${launch.projectId},'Thread','provider','full-access','default',${fixtureTime},${fixtureTime},${threadJson})`;
-  } else {
-    yield* sql`INSERT INTO orchestration_v2_projection_runs (run_id,thread_id,ordinal,provider,status,requested_at,payload_json) VALUES ('actual-t3-run',${launch.threadId},7,'provider','preparing',${fixtureTime},${runJson})`;
-    yield* sql`INSERT INTO orchestration_v2_projection_messages (message_id,thread_id,run_id,role,streaming,created_at,updated_at,payload_json) VALUES (${launch.initialMessage.messageId},${launch.threadId},'actual-t3-run','user',0,${fixtureTime},${fixtureTime},${messageJson})`;
-  }
-  for (const fixture of events) {
-    const decoded = yield* decodeFixtureEvent({
-      id: fixture.id,
-      threadId: launch.threadId,
-      occurredAt: fixtureTime,
-      type: fixture.type,
-      payload: fixture.payload,
-    });
-    const encoded = yield* encodeFixtureEvent(decoded);
-    yield* sql`INSERT INTO orchestration_events (sequence,event_id,aggregate_kind,stream_id,stream_version,event_type,occurred_at,command_id,actor_kind,payload_json,metadata_json,application_event_version) VALUES (${fixture.sequence},${fixture.id},'thread',${launch.threadId},${fixture.sequence},${fixture.type},${fixtureTime},${command.commandId},'client',${json(encoded.payload)},'{}',2)`;
+  for (const [index, event] of events.entries()) {
+    if (event.type === "thread.created" || event.type === "thread.metadata-updated") {
+      const threadJson = yield* encodeFixtureThread(event.payload);
+      yield* sql`INSERT INTO orchestration_v2_projection_threads (thread_id,project_id,title,default_provider,runtime_mode,interaction_mode,created_at,updated_at,payload_json) VALUES (${launch.threadId},${launch.projectId},'Thread','provider','full-access','default',${fixtureTime},${fixtureTime},${threadJson})`;
+    } else if (event.type === "run.created") {
+      const runJson = yield* encodeFixtureRun(event.payload);
+      yield* sql`INSERT INTO orchestration_v2_projection_runs (run_id,thread_id,ordinal,provider,status,requested_at,payload_json) VALUES ('actual-t3-run',${launch.threadId},7,'provider','preparing',${fixtureTime},${runJson})`;
+    } else if (event.type === "message.updated") {
+      const messageJson = yield* encodeFixtureMessage(event.payload);
+      yield* sql`INSERT INTO orchestration_v2_projection_messages (message_id,thread_id,run_id,role,streaming,created_at,updated_at,payload_json) VALUES (${launch.initialMessage.messageId},${launch.threadId},'actual-t3-run','user',0,${fixtureTime},${fixtureTime},${messageJson})`;
+    }
+    const encoded = yield* encodeFixtureEvent(event);
+    const eventSequence = phase === "claim" ? 1 : index + 2;
+    yield* sql`INSERT INTO orchestration_events (sequence,event_id,aggregate_kind,stream_id,stream_version,event_type,occurred_at,command_id,actor_kind,payload_json,metadata_json,application_event_version) VALUES (${eventSequence},${event.id},'thread',${launch.threadId},${eventSequence},${event.type},${fixtureTime},${command.commandId},'client',${json(encoded.payload)},'{}',2)`;
   }
   return proof;
 });
@@ -1585,5 +1610,478 @@ it.effect.each([false, true])(
         }),
       );
       yield* sql`PRAGMA foreign_keys = ON`;
+    }).pipe(Effect.provide(testLayer())),
+);
+
+const nativeWriter = Effect.gen(function* () {
+  const captured = yield* EventSink.makeCapturedNativeEventInfrastructure(
+    yield* SqlClient.SqlClient,
+    yield* ServerConfig,
+    yield* Path.Path,
+  );
+  const sink = Context.get(captured, EventSink.EventSinkV2);
+  assert.isDefined(sink.commitNativeCommand);
+  assert.isDefined(sink.replayNativeCommand);
+  return { captured, sink, commit: sink.commitNativeCommand!, replay: sink.replayNativeCommand! };
+});
+
+const workflowDecision = (reuse = false) =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    yield* seedProject;
+    const input = basicInput();
+    yield* (yield* Store.WorkflowRunStore).reserveWorkflowNativeIntent({
+      ...input,
+      launch: { ...input.launch, reuseExistingThread: reuse },
+    });
+    const sql = yield* SqlClient.SqlClient;
+    const derived = yield* sql.withTransaction(
+      (yield* Derivation.WorkflowNativeLaunchDerivation).deriveInTransaction({
+        intentId: input.intentId,
+      }),
+    );
+    return {
+      derived,
+      claim: yield* nativeDecision(derived, "claim"),
+      message: yield* nativeDecision(derived, "message"),
+    };
+  });
+
+it.effect.each([false, true])(
+  "atomically commits and hydrates native workflow phases with reuse=%s",
+  (reuse) =>
+    Effect.gen(function* () {
+      const { claim, message } = yield* workflowDecision(reuse);
+      const { captured, commit, replay } = yield* nativeWriter;
+      const sql = yield* SqlClient.SqlClient;
+      assert.deepStrictEqual(yield* replay(claim), { kind: "absent" });
+      assert.instanceOf(yield* Effect.flip(commit(message)), EventSink.EventSinkWriteError);
+      const claimed = yield* commit(claim);
+      assert.isTrue(claimed.committed);
+      const partial = yield* replay(message);
+      assert.deepStrictEqual(partial, { kind: "absent" });
+      const dispatched = yield* commit(message);
+      assert.isTrue(dispatched.committed);
+      assert.strictEqual(dispatched.storedEvents.length, 2);
+      assert.isTrue(DateTime.isDateTime(dispatched.receipt.acceptedAt));
+      const replayed = yield* replay(message);
+      assert.deepStrictEqual(replayed, {
+        kind: "verified",
+        receipt: dispatched.receipt,
+        storedEvents: dispatched.storedEvents,
+      });
+      const retry = yield* commit({
+        ...message,
+        effects: [
+          {
+            id: "unused-replay-effect",
+            commandId: message.command.commandId,
+            threadId: message.command.threadId,
+            request: { type: "terminal.cleanup" },
+          },
+        ],
+      });
+      assert.deepStrictEqual(retry, { ...dispatched, committed: false });
+      assert.lengthOf(yield* sql`SELECT * FROM workflow_native_command_proofs`, 2);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_effect_outbox`, []);
+      const projections = Context.get(captured, ProjectionStore.ProjectionStoreV2);
+      assert.strictEqual(
+        (yield* projections.getThreadProjection(message.command.threadId)).runs[0]?.status,
+        "preparing",
+      );
+      assert.deepStrictEqual(
+        yield* Effect.flip(
+          replay({ command: { ...message.command, text: "different" }, hint: message.hint }),
+        ),
+        new EventSink.EventSinkWriteError({
+          commandId: message.command.commandId,
+          eventCount: 0,
+          cause: new NativeCommandProofError({ reason: "integrity" }),
+        }),
+      );
+    }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect("commits native proof from genuine planning reservation material", () =>
+  Effect.gen(function* () {
+    const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+    yield* seedProject;
+    const store = yield* Store.WorkflowRunStore;
+    yield* store.beginPlanning({
+      session,
+      now: facts.now,
+      context,
+      command: { commandId: "begin", receiptId: "begin-receipt" },
+    });
+    const input = planningReservation(admissionInput(binding, "native-writer"));
+    yield* store.reservePlanningNativeIntent(input);
+    const sql = yield* SqlClient.SqlClient;
+    const derived = yield* sql.withTransaction(
+      (yield* Derivation.WorkflowNativeLaunchDerivation).deriveInTransaction({
+        intentId: input.intentId,
+      }),
+    );
+    const { commit, replay } = yield* nativeWriter;
+    for (const phase of ["claim", "message"] as const) {
+      const plan = yield* nativeDecision(derived, phase);
+      const result = yield* commit(plan);
+      assert.isTrue(result.committed);
+      assert.deepStrictEqual(yield* replay(plan), {
+        kind: "verified",
+        receipt: result.receipt,
+        storedEvents: result.storedEvents,
+      });
+    }
+    assert.deepStrictEqual(
+      yield* sql`SELECT phase FROM workflow_native_command_proofs ORDER BY phase`,
+      [{ phase: "claim" }, { phase: "message" }],
+    );
+    assert.strictEqual((yield* store.getPlanning({ sessionId: session.id })).consumed.passes, 1);
+  }).pipe(Effect.provide(testLayer())),
+);
+
+const nativePublication = (
+  captured: Effect.Success<typeof nativeWriter>["captured"],
+  afterSequence = 0,
+) =>
+  Effect.gen(function* () {
+    const ready = yield* Deferred.make<void>();
+    const observeReplay: Statement.Transformer = (statement) => {
+      const [query] = statement.compile();
+      return /FROM orchestration_events/.test(query) && /WHERE sequence >/.test(query)
+        ? Deferred.succeed(ready, undefined).pipe(Effect.as(statement))
+        : Effect.succeed(statement);
+    };
+    const publication = yield* Context.get(captured, ApplicationEvents.OrchestrationEventStore)
+      .streamApplicationEvents({ afterSequence })
+      .pipe(
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.provideService(Statement.CurrentTransformer, observeReplay),
+        Effect.forkScoped({ startImmediately: true }),
+      );
+    yield* Deferred.await(ready);
+    return publication;
+  });
+
+const nativeCounts = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  return yield* sql`SELECT
+    (SELECT COUNT(*) FROM workflow_native_command_proofs) AS proofs,
+    (SELECT COUNT(*) FROM orchestration_command_receipts) AS receipts,
+    (SELECT COUNT(*) FROM orchestration_events) AS events,
+    (SELECT COUNT(*) FROM orchestration_v2_projection_threads) AS threads,
+    (SELECT COUNT(*) FROM orchestration_v2_projection_runs) AS runs,
+    (SELECT COUNT(*) FROM orchestration_v2_projection_messages) AS messages,
+    (SELECT COUNT(*) FROM orchestration_v2_effect_outbox) AS effects`;
+});
+
+it.effect("rolls back native proof failure without publication, wakeup or cancellation", () =>
+  Effect.gen(function* () {
+    const { claim, message } = yield* workflowDecision();
+    const { captured, commit, replay } = yield* nativeWriter;
+    const sql = yield* SqlClient.SqlClient;
+    const outbox = Context.get(captured, EffectOutbox.EffectOutboxV2);
+    yield* outbox.enqueue([
+      {
+        id: "pending-cleanup",
+        commandId: claim.command.commandId,
+        threadId: claim.command.threadId,
+        request: { type: "terminal.cleanup" },
+      },
+    ]);
+    const plan = {
+      ...claim,
+      effects: [
+        {
+          id: "native-effect",
+          commandId: claim.command.commandId,
+          threadId: claim.command.threadId,
+          request: { type: "thread-title.generate", kind: { type: "regenerate" } },
+        } satisfies EffectOutbox.PendingOrchestrationEffectV2,
+      ],
+      cancelUnsettledEffects: {
+        effectTypes: ["terminal.cleanup" as const],
+        reason: "native cancellation",
+      },
+    };
+    const before = yield* nativeCounts;
+    const publication = yield* nativePublication(captured);
+    const wake = yield* outbox.awaitAvailable.pipe(Effect.forkScoped({ startImmediately: true }));
+    const cancellation = yield* outbox
+      .awaitCancellation("pending-cleanup")
+      .pipe(Effect.forkScoped({ startImmediately: true }));
+    yield* sql`CREATE TRIGGER injected_proof_failure BEFORE INSERT ON workflow_native_command_proofs BEGIN SELECT RAISE(ABORT, 'injected proof failure'); END`;
+    assert.instanceOf(yield* Effect.flip(commit(plan)), EventSink.EventSinkWriteError);
+    assert.deepStrictEqual(yield* nativeCounts, before);
+    assert.strictEqual(Option.getOrThrow(yield* outbox.get("pending-cleanup")).status, "pending");
+    assert.isUndefined(publication.pollUnsafe());
+    assert.isUndefined(wake.pollUnsafe());
+    assert.isUndefined(cancellation.pollUnsafe());
+    yield* sql`DROP TRIGGER injected_proof_failure`;
+    const result = yield* commit(plan);
+    assert.isTrue(result.committed);
+    assert.strictEqual(result.cancelledEffectCount, 1);
+    assert.strictEqual(
+      (yield* Fiber.join(publication))[0]?.sequence,
+      result.receipt.resultSequence,
+    );
+    yield* Fiber.join(wake);
+    yield* Fiber.join(cancellation);
+    yield* outbox.awaitAvailable;
+    yield* outbox.clearCancellation("pending-cleanup");
+    const noCancellation = yield* outbox
+      .awaitCancellation("pending-cleanup")
+      .pipe(Effect.forkScoped({ startImmediately: true }));
+    const noWake = yield* outbox.awaitAvailable.pipe(Effect.forkScoped({ startImmediately: true }));
+    const nextPublication = yield* nativePublication(captured, result.receipt.resultSequence);
+    assert.deepStrictEqual(yield* replay(claim), {
+      kind: "verified",
+      receipt: result.receipt,
+      storedEvents: result.storedEvents,
+    });
+    assert.isFalse((yield* commit(plan)).committed);
+    assert.isUndefined(noCancellation.pollUnsafe());
+    assert.isUndefined(noWake.pollUnsafe());
+    assert.isUndefined(nextPublication.pollUnsafe());
+    const dispatched = yield* commit(message);
+    assert.strictEqual(
+      (yield* Fiber.join(nextPublication))[0]?.sequence,
+      dispatched.storedEvents[0]?.sequence,
+    );
+    assert.lengthOf(
+      yield* Context.get(captured, EventStore.EventStoreV2)
+        .readByCommandId({ commandId: message.command.commandId })
+        .pipe(Stream.runCollect),
+      2,
+    );
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect("owns native command, hint and complete decision data before execution", () =>
+  Effect.gen(function* () {
+    const { claim } = yield* workflowDecision();
+    const { captured, commit, replay } = yield* nativeWriter;
+    const outbox = Context.get(captured, EffectOutbox.EffectOutboxV2);
+    yield* outbox.enqueue([
+      {
+        id: "old-effect",
+        commandId: claim.command.commandId,
+        threadId: claim.command.threadId,
+        request: { type: "terminal.cleanup" },
+      },
+    ]);
+    const actual = { ...claim.command };
+    const hint = { ...claim.hint };
+    const effect: EffectOutbox.PendingOrchestrationEffectV2 = {
+      id: "owned-effect",
+      commandId: claim.command.commandId,
+      threadId: claim.command.threadId,
+      request: { type: "thread-title.generate", kind: { type: "regenerate" } },
+      availableAt: DateTime.makeUnsafe(fixtureTime),
+    };
+    const cancelUnsettledEffects = {
+      effectTypes: ["terminal.cleanup" as const],
+      reason: "original reason",
+    };
+    const queued = commit({
+      ...claim,
+      command: actual,
+      hint,
+      effects: [effect],
+      cancelUnsettledEffects,
+    });
+    const replayQueued = replay({ command: actual, hint });
+    Object.assign(actual, { commandId: "mutated-command", threadId: "mutated-thread" });
+    Object.assign(hint, { intentId: "mutated-intent", phase: "message" });
+    Object.assign(claim.events[0]!.payload, { title: "mutated title" });
+    claim.events.length = 0;
+    Object.assign(effect, {
+      id: "mutated-effect",
+      availableAt: DateTime.makeUnsafe("2026-12-01T00:00:00Z"),
+    });
+    Object.assign(effect.request, { type: "provider-turn.start", runId: "different-run" });
+    cancelUnsettledEffects.effectTypes.length = 0;
+    cancelUnsettledEffects.reason = "mutated reason";
+    const result = yield* queued;
+    assert.isTrue(result.committed);
+    assert.strictEqual(result.receipt.commandId, "launch-attempt");
+    const event = result.storedEvents[0]?.event;
+    assert.strictEqual(event?.type, "thread.created");
+    if (event?.type === "thread.created") assert.strictEqual(event.payload.title, "Thread");
+    const storedEffect = Option.getOrThrow(yield* outbox.get("owned-effect"));
+    assert.strictEqual(storedEffect.request.type, "thread-title.generate");
+    assert.strictEqual(storedEffect.availableAt, fixtureTime);
+    assert.strictEqual(
+      Option.getOrThrow(yield* outbox.get("old-effect")).lastError,
+      "original reason",
+    );
+    assert.deepStrictEqual(yield* replayQueued, {
+      kind: "verified",
+      receipt: result.receipt,
+      storedEvents: result.storedEvents,
+    });
+    assert.deepStrictEqual(
+      yield* (yield* SqlClient.SqlClient)`SELECT command_id FROM workflow_native_command_proofs`,
+      [{ command_id: "launch-attempt" }],
+    );
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect("denies native conflicts, invalid decisions and inherited transactions", () =>
+  Effect.gen(function* () {
+    const { claim } = yield* workflowDecision();
+    const { sink, commit, replay, captured } = yield* nativeWriter;
+    const sql = yield* SqlClient.SqlClient;
+    const original = yield* nativeCounts;
+    for (const action of [
+      sql.withTransaction(commit(claim)).pipe(Effect.asVoid),
+      sql.withTransaction(replay(claim)).pipe(Effect.asVoid),
+      sink.withProviderBatch(commit(claim)).pipe(Effect.asVoid),
+      sink.withProviderBatch(replay(claim)).pipe(Effect.asVoid),
+    ]) {
+      assert.instanceOf(yield* Effect.flip(action), EventSink.EventSinkWriteError);
+      assert.deepStrictEqual(yield* nativeCounts, original);
+    }
+    const cleanup: EffectOutbox.PendingOrchestrationEffectV2 = {
+      id: "collision",
+      commandId: claim.command.commandId,
+      threadId: claim.command.threadId,
+      request: { type: "terminal.cleanup" },
+    };
+    const plans = [
+      { ...claim, events: [] },
+      { ...claim, events: [], effects: [cleanup] },
+      { ...claim, effects: [cleanup, cleanup] },
+      {
+        ...claim,
+        events: claim.events.map((event) => ({
+          ...event,
+          threadId: ThreadId.make("other-thread"),
+        })),
+      },
+      {
+        ...claim,
+        effects: [
+          {
+            ...cleanup,
+            request: decodeFixtureEffect({
+              type: "provider-turn.restart",
+              providerSessionId: "session",
+              providerThreadId: "thread",
+              providerTurnId: "turn",
+              interruptedAttemptId: "attempt",
+              runId: "run",
+            }),
+          },
+        ],
+      },
+      { ...claim, effects: [{ ...cleanup, commandId: CommandId.make("other-command") }] },
+      { ...claim, effects: [{ ...cleanup, threadId: ThreadId.make("other-thread") }] },
+      {
+        ...claim,
+        effects: [
+          {
+            ...cleanup,
+            request: { type: "provider-turn.start" as const, runId: RunId.make("run") },
+          },
+        ],
+      },
+      {
+        ...claim,
+        effects: [
+          {
+            ...cleanup,
+            request: { type: "provider-runtime.continue" as const, sourceRunId: RunId.make("run") },
+          },
+        ],
+      },
+      {
+        ...claim,
+        events: claim.events.flatMap((event) =>
+          event.type === "thread.created"
+            ? [{ ...event, type: "thread.metadata-updated" as const }]
+            : [],
+        ),
+      },
+    ];
+    for (const plan of plans) {
+      assert.instanceOf(yield* Effect.flip(commit(plan)), EventSink.EventSinkWriteError);
+      assert.deepStrictEqual(yield* nativeCounts, original);
+    }
+    const outbox = Context.get(captured, EffectOutbox.EffectOutboxV2);
+    yield* outbox.enqueue([cleanup]);
+    const collisionCounts = yield* nativeCounts;
+    assert.instanceOf(
+      yield* Effect.flip(commit({ ...claim, effects: [cleanup] })),
+      EventSink.EventSinkWriteError,
+    );
+    assert.deepStrictEqual(yield* nativeCounts, collisionCounts);
+    const ordinary = yield* sink.commitCommand({
+      commandId: claim.command.commandId,
+      threadId: claim.command.threadId,
+      commandType: claim.command.type,
+      acceptedAt: claim.acceptedAt,
+      events: claim.events,
+      effects: [],
+    });
+    assert.isTrue(ordinary.committed);
+    assert.instanceOf(yield* Effect.flip(commit(claim)), EventSink.EventSinkWriteError);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_command_proofs`, []);
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect.each([false, true])(
+  "validates native insert-loser protocol with stored proof=%s",
+  (complete) =>
+    Effect.gen(function* () {
+      const { derived, claim } = yield* workflowDecision();
+      const { captured, commit } = yield* nativeWriter;
+      const sql = yield* SqlClient.SqlClient;
+      const verifier = yield* makeNativeCommandProofVerifier(
+        sql,
+        yield* ServerConfig,
+        yield* Path.Path,
+      );
+      let inserted = false;
+      const beforeReserve: Statement.Transformer = (statement) => {
+        const [query] = statement.compile();
+        if (
+          !inserted &&
+          /INSERT INTO orchestration_command_receipts/.test(query) &&
+          /ON CONFLICT/.test(query)
+        ) {
+          inserted = true;
+          const competitor = complete
+            ? seedNativeProofs(sql, verifier, derived, "claim").pipe(Effect.asVoid)
+            : sql`INSERT INTO orchestration_command_receipts (command_id,aggregate_kind,aggregate_id,accepted_at,result_sequence,status,error,command_type) VALUES (${claim.command.commandId},'thread',${claim.command.threadId},${fixtureTime},1,'accepted',NULL,${claim.command.type})`.pipe(
+                Effect.asVoid,
+              );
+          return competitor.pipe(Effect.as(statement), Effect.orDie);
+        }
+        return Effect.succeed(statement);
+      };
+      const publication = yield* nativePublication(captured);
+      const wake = yield* Context.get(captured, EffectOutbox.EffectOutboxV2).awaitAvailable.pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      const action = commit(claim).pipe(
+        Effect.provideService(Statement.CurrentTransformer, beforeReserve),
+      );
+      if (complete) {
+        const result = yield* action;
+        assert.isFalse(result.committed);
+        assert.lengthOf(result.storedEvents, 1);
+        assert.isTrue(DateTime.isDateTime(result.storedEvents[0]!.event.occurredAt));
+        assert.lengthOf(yield* sql`SELECT * FROM workflow_native_command_proofs`, 1);
+      } else {
+        assert.instanceOf(yield* Effect.flip(action), EventSink.EventSinkWriteError);
+        assert.deepStrictEqual(yield* nativeCounts, [
+          { proofs: 0, receipts: 0, events: 0, threads: 0, runs: 0, messages: 0, effects: 0 },
+        ]);
+      }
+      assert.isTrue(inserted);
+      assert.isUndefined(publication.pollUnsafe());
+      assert.isUndefined(wake.pollUnsafe());
     }).pipe(Effect.provide(testLayer())),
 );
