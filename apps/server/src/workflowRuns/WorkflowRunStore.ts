@@ -198,7 +198,7 @@ const makeStore = Effect.fnUntraced(function* (
   const checkWorkflowAuthority = Effect.fn("WorkflowRunStore.checkNativeAuthority")(function* (
     material: Material,
     operation: WorkflowOperationV1,
-    owner: WorkflowRunV1,
+    owner: Pick<WorkflowRunV1 | S, "origin" | "access">,
   ) {
     if (material.version !== 2) return true;
     if (
@@ -467,8 +467,9 @@ const makeStore = Effect.fnUntraced(function* (
   };
   type PlanningNativeInput = PlanningNativeBase &
     (
-      | { readonly materialVersion?: never; readonly launch?: never }
-      | { readonly materialVersion: 1; readonly launch: unknown }
+      | { readonly materialVersion?: never; readonly launch?: never; readonly authority?: never }
+      | { readonly materialVersion: 1; readonly launch: unknown; readonly authority?: never }
+      | { readonly materialVersion: 2; readonly launch: unknown; readonly authority: unknown }
     );
   const validatePlanningNativeIntent = Effect.fn("WorkflowRunStore.validatePlanningNativeIntent")(
     function* (input: Omit<PlanningNativeBase, "now">) {
@@ -592,26 +593,30 @@ const makeStore = Effect.fnUntraced(function* (
     input: Omit<PlanningNativeBase, "now" | "draft">,
     draft: unknown,
     receiptId: string,
+    authority = false,
   ) =>
-    WorkflowCanonicalHash.tagged("t3.workflow-native-launch-intent.v3", {
-      intentId: input.intentId,
-      workflowRunId: null,
-      planningSessionId: input.sessionId,
-      operationId: input.operationId,
-      attemptId: null,
-      passId: input.passId,
-      itemId: null,
-      chargeAttempt: 0,
-      repair: input.role === "repair",
-      role: input.role,
-      environmentId: input.environmentId,
-      projectId: input.projectId,
-      launchCommandId: input.launchCommandId,
-      threadId: input.threadId,
-      messageId: input.messageId,
-      draft,
-      receiptId,
-    });
+    WorkflowCanonicalHash.tagged(
+      authority ? "t3.workflow-native-launch-intent.v4" : "t3.workflow-native-launch-intent.v3",
+      {
+        intentId: input.intentId,
+        workflowRunId: null,
+        planningSessionId: input.sessionId,
+        operationId: input.operationId,
+        attemptId: null,
+        passId: input.passId,
+        itemId: null,
+        chargeAttempt: 0,
+        repair: input.role === "repair",
+        role: input.role,
+        environmentId: input.environmentId,
+        projectId: input.projectId,
+        launchCommandId: input.launchCommandId,
+        threadId: input.threadId,
+        messageId: input.messageId,
+        draft,
+        receiptId,
+      },
+    );
   const verifyStoredPlanningIntent = Effect.fn("WorkflowRunStore.verifyStoredPlanningIntent")(
     function* (
       input: Omit<PlanningNativeBase, "now" | "draft">,
@@ -628,14 +633,20 @@ const makeStore = Effect.fnUntraced(function* (
         try: () => {
           WorkflowCanonicalHash.assertCanonical(storedDraft);
           const draft = storedDraft as PlanningNativeBase["draft"] & {
-            material?: { version: number; launchHash: string };
+            material?: { version: number; launchHash: string; authorityHash?: string };
           };
-          if ((draft.version as number) !== 2) return { draft, marked: false as const };
+          const authority = (draft.version as number) === 3;
+          if ((draft.version as number) !== 2 && !authority)
+            return { draft, marked: false as const };
           if (
             Object.keys(draft).sort().join() !== "admission,kind,material,operation,pass,version" ||
             !draft.material ||
-            Object.keys(draft.material).sort().join() !== "launchHash,version" ||
-            draft.material.version !== 1 ||
+            Object.keys(draft.material).sort().join() !==
+              (authority ? "authorityHash,launchHash,version" : "launchHash,version") ||
+            draft.material.version !== (authority ? 2 : 1) ||
+            (authority &&
+              (typeof draft.material.authorityHash !== "string" ||
+                !/^[0-9a-f]{64}$/.test(draft.material.authorityHash))) ||
             !/^[0-9a-f]{64}$/.test(draft.material.launchHash)
           )
             throw new Error();
@@ -643,6 +654,7 @@ const makeStore = Effect.fnUntraced(function* (
           return {
             draft: { ...base, version: 1 as const },
             marked: true as const,
+            authority,
             marker: material,
           };
         },
@@ -659,9 +671,10 @@ const makeStore = Effect.fnUntraced(function* (
       )
         return yield* planningError("integrity");
       let result: object;
+      let retainedMaterial: Material | undefined;
       if (info.marked) {
         const fingerprint = yield* Effect.try({
-          try: () => planningV3Fingerprint(input, storedDraft, receipt.receipt_id),
+          try: () => planningV3Fingerprint(input, storedDraft, receipt.receipt_id, info.authority),
           catch: () => planningError("integrity"),
         });
         if (fingerprint !== receipt.fingerprint) return yield* planningError("integrity");
@@ -674,13 +687,19 @@ const makeStore = Effect.fnUntraced(function* (
           try: () => parse(rows[0]!.material_json),
           catch: () => planningError("integrity"),
         });
-        const { material, launchHash, materialHash } = yield* decodeNativeReservationMaterial(
-          raw,
-        ).pipe(Effect.mapError(() => planningError("integrity")));
+        const { material, launchHash, materialHash, authorityHash } =
+          yield* decodeNativeReservationMaterial(raw).pipe(
+            Effect.mapError(() => planningError("integrity")),
+          );
         const snapshot = material.planningSession;
         const launch = material.launch;
         if (
-          material.version !== 1 ||
+          material.version !== (info.authority ? 2 : 1) ||
+          (material.version === 2 &&
+            (authorityHash !== info.marker.authorityHash ||
+              material.authority.environmentId !== input.environmentId ||
+              snapshot?.origin.kind !== "human" ||
+              material.authority.subject !== snapshot.origin.id)) ||
           !snapshot ||
           material.intentId !== input.intentId ||
           material.receiptId !== receipt.receipt_id ||
@@ -714,7 +733,13 @@ const makeStore = Effect.fnUntraced(function* (
           (input.role === "repair" && snapshot.consumed.repairRounds < 1)
         )
           return yield* planningError("integrity");
-        result = { intentId: input.intentId, fingerprint, materialVersion: 1, materialHash };
+        retainedMaterial = material;
+        result = {
+          intentId: input.intentId,
+          fingerprint,
+          materialVersion: material.version,
+          materialHash,
+        };
       } else {
         if (validated.fingerprint !== receipt.fingerprint) return yield* planningError("integrity");
         result = { intentId: input.intentId, fingerprint: receipt.fingerprint };
@@ -724,7 +749,7 @@ const makeStore = Effect.fnUntraced(function* (
         catch: () => planningError("integrity"),
       });
       if (!matches) return yield* planningError("integrity");
-      return { ...validated, marked: info.marked };
+      return { ...validated, marked: info.marked, material: retainedMaterial };
     },
   );
   const validatePlanningRevision = Effect.fn("WorkflowRunStore.validatePlanningRevision")(
@@ -775,12 +800,19 @@ const makeStore = Effect.fnUntraced(function* (
           const snapshot = { ...copy, draft: structuredClone(copy.draft) };
           if (!Object.hasOwn(copy, "launch")) return snapshot;
           WorkflowCanonicalHash.assertCanonical(copy.launch);
-          return { ...snapshot, launch: structuredClone(copy.launch) };
+          return {
+            ...snapshot,
+            launch: structuredClone(copy.launch),
+            ...(Object.hasOwn(copy, "authority")
+              ? { authority: structuredClone(copy.authority) }
+              : {}),
+          };
         },
         catch: () => planningError("invalid"),
       });
       const {
         pass,
+        operation,
         params,
         context,
         fingerprint: legacyFingerprint,
@@ -790,7 +822,12 @@ const makeStore = Effect.fnUntraced(function* (
       const { draft } = input;
       const hasVersion = Object.hasOwn(input, "materialVersion");
       const hasLaunch = Object.hasOwn(input, "launch");
-      if (hasVersion !== hasLaunch || (hasVersion && input.materialVersion !== 1))
+      const hasAuthority = Object.hasOwn(input, "authority");
+      if (
+        hasVersion !== hasLaunch ||
+        (hasVersion && input.materialVersion !== 1 && input.materialVersion !== 2) ||
+        hasAuthority !== (input.materialVersion === 2)
+      )
         return yield* planningError("invalid");
       const retained = yield* Effect.gen(function* () {
         if (!hasVersion) return null;
@@ -806,12 +843,31 @@ const makeStore = Effect.fnUntraced(function* (
           launch.modelSelection.model !== pass.provider.model
         )
           return yield* planningError("integrity");
-        const persistedDraft = { ...draft, version: 2, material: { version: 1, launchHash } };
+        const authorized =
+          input.materialVersion === 2
+            ? yield* decodeNativeReservationAuthority(input.authority).pipe(
+                Effect.mapError(() => planningError("integrity")),
+              )
+            : null;
+        const persistedDraft = {
+          ...draft,
+          version: authorized ? 3 : 2,
+          material: authorized
+            ? { version: 2, launchHash, authorityHash: authorized.authorityHash }
+            : { version: 1, launchHash },
+        };
         const fingerprint = yield* Effect.try({
-          try: () => planningV3Fingerprint(input, persistedDraft, command.receiptId),
+          try: () =>
+            planningV3Fingerprint(input, persistedDraft, command.receiptId, authorized !== null),
           catch: () => planningError("integrity"),
         });
-        return { launch, persistedDraft, fingerprint, persistedDraftJson: encode(persistedDraft) };
+        return {
+          launch,
+          authorized,
+          persistedDraft,
+          fingerprint,
+          persistedDraftJson: encode(persistedDraft),
+        };
       });
       const fingerprint = retained?.fingerprint ?? legacyFingerprint;
       const result = yield* planningTransaction(
@@ -925,7 +981,10 @@ const makeStore = Effect.fnUntraced(function* (
               currentVersion: current.recordVersion,
             });
           if (current.status !== "active") return yield* planningError("ineligible");
-          if (!isWorkflowTimestampAfter(current.limits.deadline, input.now))
+          const currentNow = retained.authorized
+            ? DateTime.formatIso(yield* DateTime.now)
+            : input.now;
+          if (!isWorkflowTimestampAfter(current.limits.deadline, currentNow))
             return yield* planningError("deadline");
           if (
             input.generation !== current.controlGeneration ||
@@ -976,19 +1035,26 @@ const makeStore = Effect.fnUntraced(function* (
           )
             return yield* planningError("integrity");
           const decodedMaterial = yield* decodeNativeReservationMaterial({
-            version: 1,
+            version: retained.authorized ? 2 : 1,
+            ...(retained.authorized ? { authority: retained.authorized.authority } : {}),
             intentId: input.intentId,
             receiptId: command.receiptId,
             intentFingerprint: fingerprint,
             launch: retained.launch,
             planningSession: decodedUpdated,
           }).pipe(Effect.mapError(() => planningError("integrity")));
+          if (
+            !(yield* checkWorkflowAuthority(decodedMaterial.material, operation, current).pipe(
+              Effect.mapError(() => planningError("storage")),
+            ))
+          )
+            return yield* planningError("unauthorized");
           const ownerJson = encode(decodedUpdated);
           const materialJson = encode(decodedMaterial.material);
           const receiptJson = encode({
             intentId: input.intentId,
             fingerprint,
-            materialVersion: 1,
+            materialVersion: decodedMaterial.material.version,
             materialHash: decodedMaterial.materialHash,
           });
           const changed =
@@ -1753,9 +1819,12 @@ const makeStore = Effect.fnUntraced(function* (
         } else if (input.action === "resume") {
           if (value.status !== "paused") return yield* planningError("ineligible");
           if (claimed || unknown) return yield* planningError("custody");
-          if (!isWorkflowTimestampAfter(value.limits.deadline, input.now))
-            return yield* planningError("deadline");
           const held = intents.filter(({ row }) => row.state === "reserved" && row.held === 1);
+          const currentNow = held.some(({ material }) => material?.version === 2)
+            ? DateTime.formatIso(yield* DateTime.now)
+            : input.now;
+          if (!isWorkflowTimestampAfter(value.limits.deadline, currentNow))
+            return yield* planningError("deadline");
           if (
             intents.some(({ row }) => row.state === "reserved" && row.held !== 1) ||
             value.consumed.passes < held.length ||
@@ -1769,6 +1838,13 @@ const makeStore = Effect.fnUntraced(function* (
             return yield* planningError("limit");
           for (const intent of held) {
             const { row, pass, params, same } = intent;
+            if (
+              intent.material?.version === 2 &&
+              !(yield* checkWorkflowAuthority(intent.material, intent.operation, value).pipe(
+                Effect.mapError(() => planningError("storage")),
+              ))
+            )
+              return yield* planningError("unauthorized");
             if (pass.binding.planId !== value.planId || !same(params.limits, value.limits))
               return yield* planningError("integrity");
             if (
@@ -4326,7 +4402,15 @@ const makeStore = Effect.fnUntraced(function* (
         return Effect.fail(integrity());
       }
     },
-    reservePlanningNativeIntent,
+    reservePlanningNativeIntent: (input: PlanningNativeInput) => {
+      if (input.materialVersion !== 2) return reservePlanningNativeIntent(input);
+      try {
+        WorkflowCanonicalHash.assertCanonical(input);
+        return reservePlanningNativeIntent(structuredClone(input));
+      } catch {
+        return Effect.fail(planningError("invalid"));
+      }
+    },
     readThreadCustody,
     readNativeReservationInTransaction,
     readRecoveryCustodyInTransaction,
