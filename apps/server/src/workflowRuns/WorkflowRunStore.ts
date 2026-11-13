@@ -4743,6 +4743,12 @@ const makeStore = Effect.fnUntraced(function* (
   ) {
     if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
       return yield* integrity();
+    if (
+      nativeBinding &&
+      (input.bootId !== nativeBinding.coordinator.bootId ||
+        input.workerId !== nativeBinding.coordinator.workerId)
+    )
+      return { kind: "stale" as const };
     const result = yield* inTransaction(
       Effect.gen(function* () {
         const reservation = yield* readNativeReservationInTransaction({ intentId: input.intentId });

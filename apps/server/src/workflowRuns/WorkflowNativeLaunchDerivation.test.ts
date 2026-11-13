@@ -67,6 +67,8 @@ import {
   snapshotNativeInput,
 } from "./WorkflowNativeCommandSnapshot.ts";
 import * as Store from "./WorkflowRunStore.ts";
+import * as NativeLaunch from "../orchestration-v2/WorkflowNativeLaunchService.ts";
+import * as PubSub from "effect/PubSub";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import { DispatchModeLimit } from "../orchestration-v2/DispatchModeLimit.ts";
@@ -2933,5 +2935,412 @@ it.effect.each(["workflow", "planning"] as const)(
         ),
       );
       assert.deepStrictEqual(yield* nativeCounts, before);
+    }).pipe(Effect.provide(testLayer())),
+);
+
+const decodeProducedOperation = Schema.decodeEffect(Schema.fromJsonString(WorkflowOperationV1));
+
+const nativeLaunchProducer = Effect.fn("test.nativeLaunchProducer")(function* (
+  fixture: Effect.Success<ReturnType<typeof controlledNativeFixture>>,
+  coordinator = fixture.authority.coordinator,
+  store = fixture.store,
+  config = fixture.config,
+) {
+  return yield* NativeLaunch.make(coordinator).pipe(
+    Effect.provideService(Store.WorkflowRunStore, store),
+    Effect.provide(fixture.runtime),
+    Effect.provideService(SqlClient.SqlClient, fixture.sql),
+    Effect.provideService(ServerConfig, config),
+    Effect.provide(NodePathService.layerPosix),
+  );
+});
+const producerSelection = (
+  fixture: Effect.Success<ReturnType<typeof controlledNativeFixture>>,
+) => ({
+  intentId: fixture.input.intentId,
+  expectedFingerprint: fixture.derived.reservation.fingerprint,
+  expectedOwnerVersion: 1,
+  expectedGeneration: 0,
+});
+
+it.effect.each([
+  ["workflow", false],
+  ["workflow", true],
+  ["planning", false],
+  ["planning", true],
+] as const)(
+  "native launch producer owns a real $0 operation claim with reuse=$1",
+  ([kind, reuse]) =>
+    Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture(kind, reuse, false, 2);
+      const producer = yield* nativeLaunchProducer(fixture);
+      const before = (yield* fixture.sql<{
+        sequence: number;
+      }>`SELECT COALESCE(MAX(sequence),0) AS sequence FROM orchestration_events`)[0]!.sequence;
+      const publication = yield* observeAuthorizedSink(
+        Context.get(fixture.runtime, EventSink.EventSinkV2),
+        before,
+      );
+      const result = yield* producer.claimReservedIntent(producerSelection(fixture));
+      assert.isTrue(Object.isFrozen(result));
+      assert.isTrue(Object.isFrozen(result.native));
+      assert.isTrue(Object.isFrozen(result.executionClaim));
+      const operations = yield* fixture.sql<{
+        record_json: string;
+      }>`SELECT record_json FROM workflow_operations`;
+      assert.strictEqual(operations.length, 1);
+      const operation = yield* decodeProducedOperation(operations[0]!.record_json);
+      assert.deepStrictEqual(result.executionClaim, {
+        operationId: operation.id,
+        expectedFingerprint: operation.fingerprint,
+        expectedGeneration: operation.controlGeneration,
+        bootId: operation.claim!.bootId,
+        workerId: operation.claim!.workerId,
+      });
+      assert.strictEqual(operation.status, "claimed");
+      const intent = yield* fixture.sql.withTransaction(
+        fixture.store.readNativeReservationInTransaction({ intentId: fixture.input.intentId }),
+      );
+      assert.strictEqual(intent.state, "finalized");
+      assert.strictEqual(intent.finalizedOperationId, operation.id);
+      assert.strictEqual(intent.nativeRunId, result.native.runId);
+      assert.strictEqual(result.native.threadId, fixture.input.threadId);
+      assert.strictEqual(
+        (yield* fixture.sql`SELECT * FROM workflow_native_command_proofs`).length,
+        2,
+      );
+      assert.deepStrictEqual(
+        yield* fixture.sql`SELECT status FROM orchestration_v2_projection_runs`,
+        [{ status: "preparing" }],
+      );
+      assert.deepStrictEqual(yield* fixture.sql`SELECT * FROM orchestration_v2_effect_outbox`, []);
+      assert.deepStrictEqual(
+        yield* fixture.sql`SELECT * FROM orchestration_v2_submission_transports`,
+        [],
+      );
+      assert.deepStrictEqual(
+        yield* fixture.sql`SELECT * FROM orchestration_v2_submission_attempts`,
+        [],
+      );
+      const published = yield* Fiber.join(publication);
+      assert.isTrue(published.length > 0 && published[0]!.sequence > before);
+      if (kind === "workflow")
+        assert.strictEqual(
+          (yield* fixture.sql<{
+            consumed: number;
+          }>`SELECT json_extract(record_json,'$.allowance.attemptsConsumed') AS consumed FROM workflow_runs WHERE id='run'`)[0]!
+            .consumed,
+          1,
+        );
+      else
+        assert.strictEqual(
+          (yield* fixture.store.getPlanning({ sessionId: session.id })).consumed.passes,
+          1,
+        );
+      assert.instanceOf(
+        yield* Effect.flip(producer.claimReservedIntent(producerSelection(fixture))),
+        NativeLaunch.WorkflowNativeLaunchError,
+      );
+      assert.strictEqual((yield* fixture.sql`SELECT * FROM workflow_operations`).length, 1);
+    }).pipe(Effect.provide(testLayer())),
+);
+
+const producerDatabaseSnapshot = Effect.fn("test.producerDatabaseSnapshot")(function* (
+  sql: SqlClient.SqlClient,
+) {
+  const tables = yield* sql<{
+    name: string;
+  }>`SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`;
+  const result: Record<string, readonly unknown[]> = {};
+  for (const table of tables)
+    result[table.name] = yield* sql.unsafe(`SELECT * FROM "${table.name.replaceAll('"', '""')}"`);
+  return result;
+});
+
+it.effect.each([
+  ["workflow", "revoke"],
+  ["planning", "revoke"],
+  ["workflow", "pause"],
+  ["planning", "stop"],
+  ["workflow", "deadline"],
+  ["workflow", "material"],
+  ["planning", "legacy"],
+] as const)("native launch producer preserves $0 state after $1 refusal", ([kind, change]) =>
+  Effect.gen(function* () {
+    const fixture = yield* controlledNativeFixture(kind, false, false, change === "legacy" ? 1 : 2);
+    const producer = yield* nativeLaunchProducer(fixture);
+    if (change === "revoke") yield* fixture.sessions.revoke(fixture.reference.sessionId);
+    if (change === "pause" || change === "stop") yield* controlNativeFixture(fixture, change);
+    if (change === "deadline")
+      yield* TestClock.setTime(DateTime.makeUnsafe("2026-12-02T00:00:00Z").epochMilliseconds);
+    if (change === "material")
+      yield* fixture.sql`UPDATE workflow_native_launch_intents SET draft_json='{}'`;
+    const subscription = yield* fixture.store.subscribeChanges;
+    const before = yield* producerDatabaseSnapshot(fixture.sql);
+    const sink = Context.get(fixture.runtime, EventSink.EventSinkV2);
+    const sequence = (yield* fixture.sql<{
+      sequence: number;
+    }>`SELECT COALESCE(MAX(sequence),0) AS sequence FROM orchestration_events`)[0]!.sequence;
+    const publication = yield* observeAuthorizedSink(sink, sequence);
+    const error = yield* Effect.flip(producer.claimReservedIntent(producerSelection(fixture)));
+    assert.instanceOf(error, NativeLaunch.WorkflowNativeLaunchError);
+    assert.deepStrictEqual(yield* producerDatabaseSnapshot(fixture.sql), before);
+    assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    assert.isUndefined(publication.pollUnsafe());
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect.each(["captured-sql", "captured-batch", "foreign-batch"] as const)(
+  "native launch producer refuses inherited %s before any mutation",
+  (boundary) =>
+    Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture("workflow", false, false, 2);
+      const producer = yield* nativeLaunchProducer(fixture);
+      const foreign = yield* Layer.build(
+        Layer.fresh(NodeSqliteClient.layer({ filename: ":memory:" })),
+      );
+      const otherSql = Context.get(foreign, SqlClient.SqlClient);
+      yield* runMigrations().pipe(Effect.provideService(SqlClient.SqlClient, otherSql));
+      const otherGraph = yield* EventSink.makeCapturedEventInfrastructure(otherSql);
+      const otherSink = Context.get(otherGraph, EventSink.EventSinkV2);
+      const sink = Context.get(fixture.runtime, EventSink.EventSinkV2);
+      const subscription = yield* fixture.store.subscribeChanges;
+      const before = yield* producerDatabaseSnapshot(fixture.sql);
+      const otherBefore = yield* producerDatabaseSnapshot(otherSql);
+      const publication = yield* observeAuthorizedSink(sink);
+      const action = producer.claimReservedIntent(producerSelection(fixture));
+      const result =
+        boundary === "captured-sql"
+          ? yield* Effect.result(fixture.sql.withTransaction(action))
+          : boundary === "captured-batch"
+            ? yield* Effect.result(sink.withProviderBatch(action))
+            : yield* Effect.result(otherSink.withProviderBatch(action));
+      assert.strictEqual(result._tag, "Failure");
+      if (result._tag === "Failure")
+        assert.instanceOf(result.failure, NativeLaunch.WorkflowNativeLaunchError);
+      assert.deepStrictEqual(yield* producerDatabaseSnapshot(fixture.sql), before);
+      assert.deepStrictEqual(yield* producerDatabaseSnapshot(otherSql), otherBefore);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+      assert.isUndefined(publication.pollUnsafe());
+    }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "native launch producer permits one concurrent %s claim",
+  (kind) =>
+    Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture(kind, false, false, 2);
+      const producer = yield* nativeLaunchProducer(fixture);
+      const results = yield* Effect.all(
+        [
+          Effect.result(producer.claimReservedIntent(producerSelection(fixture))),
+          Effect.result(producer.claimReservedIntent(producerSelection(fixture))),
+        ],
+        { concurrency: "unbounded" },
+      );
+      assert.strictEqual(results.filter((result) => result._tag === "Success").length, 1);
+      assert.strictEqual(results.filter((result) => result._tag === "Failure").length, 1);
+      assert.strictEqual(
+        (yield* fixture.sql`SELECT * FROM workflow_operations WHERE status='claimed'`).length,
+        1,
+      );
+      assert.strictEqual(
+        (yield* fixture.sql`SELECT * FROM workflow_native_command_proofs`).length,
+        2,
+      );
+      assert.deepStrictEqual(yield* fixture.sql`SELECT * FROM orchestration_v2_effect_outbox`, []);
+    }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect.each(["message", "finalization", "operation"] as const)(
+  "native launch producer retains committed evidence after a real %s failure",
+  (phase) =>
+    Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture("workflow", false, false, 2);
+      const producer = yield* nativeLaunchProducer(fixture);
+      if (phase === "message")
+        yield* fixture.sql`CREATE TRIGGER reject_producer_phase BEFORE INSERT ON workflow_native_command_proofs WHEN NEW.phase='message' BEGIN SELECT RAISE(ABORT,'injected message proof failure'); END`;
+      else if (phase === "finalization")
+        yield* fixture.sql`CREATE TRIGGER reject_producer_phase BEFORE INSERT ON workflow_operations BEGIN SELECT RAISE(ABORT,'injected finalization failure'); END`;
+      else
+        yield* fixture.sql`CREATE TRIGGER reject_producer_phase BEFORE UPDATE ON workflow_operations WHEN NEW.status='claimed' BEGIN SELECT RAISE(ABORT,'injected operation claim failure'); END`;
+      const error = yield* Effect.flip(producer.claimReservedIntent(producerSelection(fixture)));
+      assert.instanceOf(error, NativeLaunch.WorkflowNativeLaunchError);
+      assert.strictEqual(error.stage, phase === "message" ? "message-command" : phase);
+      assert.strictEqual(
+        (yield* fixture.sql`SELECT * FROM workflow_native_command_proofs`).length,
+        phase === "message" ? 1 : 2,
+      );
+      const intents = yield* fixture.sql<{
+        state: string;
+        native_run_id: string | null;
+      }>`SELECT state,native_run_id FROM workflow_native_launch_intents`;
+      assert.strictEqual(intents[0]!.state, phase === "operation" ? "finalized" : "dispatching");
+      assert.strictEqual(intents[0]!.native_run_id === null, phase === "message");
+      assert.deepStrictEqual(
+        yield* fixture.sql`SELECT * FROM workflow_operations WHERE status='claimed'`,
+        [],
+      );
+      assert.deepStrictEqual(yield* fixture.sql`SELECT * FROM orchestration_v2_effect_outbox`, []);
+      const retained = yield* producerDatabaseSnapshot(fixture.sql);
+      assert.instanceOf(
+        yield* Effect.flip(producer.claimReservedIntent(producerSelection(fixture))),
+        NativeLaunch.WorkflowNativeLaunchError,
+      );
+      assert.deepStrictEqual(yield* producerDatabaseSnapshot(fixture.sql), retained);
+    }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "native launch producer does not upgrade a post-finalization %s owner version",
+  (kind) =>
+    Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture(kind, false, false, 2);
+      const observed = yield* Deferred.make<void>();
+      const store = {
+        ...fixture.store,
+        claim: (input: Parameters<typeof fixture.store.claim>[0]) =>
+          Effect.gen(function* () {
+            assert.strictEqual(input.expectedOwnerVersion, 1);
+            assert.strictEqual(input.expectedGeneration, 0);
+            if (kind === "workflow")
+              yield* fixture.sql`UPDATE workflow_runs SET record_version=record_version+1,record_json=json_set(record_json,'$.recordVersion',record_version+1)`;
+            else
+              yield* fixture.sql`UPDATE workflow_planning_sessions SET record_version=record_version+1,record_json=json_set(record_json,'$.recordVersion',record_version+1)`;
+            yield* Deferred.succeed(observed, undefined);
+            return yield* fixture.store.claim(input);
+          }),
+      };
+      const producer = yield* nativeLaunchProducer(fixture, fixture.authority.coordinator, store);
+      const error = yield* Effect.flip(producer.claimReservedIntent(producerSelection(fixture)));
+      yield* Deferred.await(observed);
+      assert.strictEqual(error.stage, "operation");
+      assert.strictEqual(error.reason, "stale");
+      assert.deepStrictEqual(
+        yield* fixture.sql`SELECT status,generation FROM workflow_operations`,
+        [{ status: "pending", generation: 0 }],
+      );
+      assert.deepStrictEqual(yield* fixture.sql`SELECT state FROM workflow_native_launch_intents`, [
+        { state: "finalized" },
+      ]);
+      assert.strictEqual(
+        (yield* fixture.sql`SELECT * FROM workflow_native_command_proofs`).length,
+        2,
+      );
+      assert.deepStrictEqual(yield* fixture.sql`SELECT * FROM orchestration_v2_effect_outbox`, []);
+    }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect("native launch producer retains an actual unknown binding after authority changes", () =>
+  Effect.gen(function* () {
+    const fixture = yield* controlledNativeFixture("workflow", false, false, 2);
+    const store = {
+      ...fixture.store,
+      bindNativeIntent: (input: Parameters<typeof fixture.store.bindNativeIntent>[0]) =>
+        fixture.sessions
+          .revoke(fixture.reference.sessionId)
+          .pipe(Effect.andThen(fixture.store.bindNativeIntent(input))),
+    };
+    const producer = yield* nativeLaunchProducer(fixture, fixture.authority.coordinator, store);
+    const error = yield* Effect.flip(producer.claimReservedIntent(producerSelection(fixture)));
+    assert.strictEqual(error.stage, "binding");
+    assert.strictEqual(error.reason, "reconciliation_required");
+    const intents = yield* fixture.sql<{
+      state: string;
+      native_run_id: string | null;
+    }>`SELECT state,native_run_id FROM workflow_native_launch_intents`;
+    assert.strictEqual(intents[0]!.state, "unknown");
+    assert.isString(intents[0]!.native_run_id);
+    assert.strictEqual(
+      (yield* fixture.sql`SELECT * FROM workflow_native_command_proofs`).length,
+      2,
+    );
+    assert.deepStrictEqual(yield* fixture.sql`SELECT * FROM workflow_operations`, []);
+    assert.deepStrictEqual(yield* fixture.sql`SELECT * FROM orchestration_v2_effect_outbox`, []);
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect(
+  "native launch producer owns its coordinator, graph, normalization and request before execution",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture("workflow", false, false, 2);
+      const coordinator = { ...fixture.authority.coordinator };
+      const config = { ...fixture.config };
+      const construction = NativeLaunch.make(coordinator).pipe(
+        Effect.provide(fixture.runtime),
+        Effect.provideService(SqlClient.SqlClient, fixture.sql),
+        Effect.provideService(ServerConfig, config),
+        Effect.provide(NodePathService.layerPosix),
+      );
+      coordinator.workerId = "changed-before-construction-runs";
+      const producer = yield* construction;
+      config.baseDir = "/changed-after-construction";
+      const captured = Context.make(NativeLaunch.WorkflowNativeLaunchService, producer);
+      const input = producerSelection(fixture);
+      const pending = Context.get(
+        captured,
+        NativeLaunch.WorkflowNativeLaunchService,
+      ).claimReservedIntent(input);
+      input.expectedFingerprint = "f".repeat(64);
+      input.expectedOwnerVersion = 99;
+      input.expectedGeneration = 99;
+      input.intentId = "different-intent";
+      const result = yield* pending.pipe(
+        Effect.provideService(Store.WorkflowRunStore, {
+          ...fixture.store,
+          claimNativeIntent: () => Effect.die("Ambient Store must not replace captured graph"),
+        }),
+      );
+      assert.deepStrictEqual(
+        {
+          bootId: result.executionClaim.bootId,
+          workerId: result.executionClaim.workerId,
+          generation: result.executionClaim.expectedGeneration,
+        },
+        { ...fixture.authority.coordinator, generation: 0 },
+      );
+      assert.strictEqual(result.native.threadId, fixture.input.threadId);
+      const proofs = yield* fixture.sql<{
+        proof_json: string;
+      }>`SELECT proof_json FROM workflow_native_command_proofs`;
+      for (const row of proofs)
+        assert.strictEqual(
+          JSON.parse(row.proof_json).normalization.scratchRoot,
+          (yield* Path.Path).resolve(fixture.config.baseDir, "scratch"),
+        );
+    }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect(
+  "native launch producer refuses malformed selectors without evaluating getters or changing records",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture("workflow", false, false, 2);
+      const producer = yield* nativeLaunchProducer(fixture);
+      let getters = 0;
+      const base = producerSelection(fixture);
+      const getter = {
+        ...base,
+        get intentId() {
+          getters++;
+          return base.intentId;
+        },
+      };
+      const before = yield* producerDatabaseSnapshot(fixture.sql);
+      const subscription = yield* fixture.store.subscribeChanges;
+      for (const input of [
+        getter,
+        { ...base, expectedGeneration: -1 },
+        { ...base, expectedOwnerVersion: 0.5 },
+        { ...base, expectedFingerprint: base.expectedFingerprint + "\n" },
+        { ...base, bootId: "forged" },
+      ]) {
+        const error = yield* Effect.flip(producer.claimReservedIntent(input));
+        assert.strictEqual(error.reason, "invalid");
+      }
+      assert.strictEqual(getters, 0);
+      assert.deepStrictEqual(yield* producerDatabaseSnapshot(fixture.sql), before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
     }).pipe(Effect.provide(testLayer())),
 );

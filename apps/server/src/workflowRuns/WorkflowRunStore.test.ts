@@ -13421,3 +13421,23 @@ it.effect.each(["node", "subagent", "absent"] as const)(
       assert.deepStrictEqual(yield* rawReservationState, before);
     }).pipe(Effect.provide(layerWithOutbox)),
 );
+
+it.effect.each(["workflow", "planning"] as const)(
+  "native-bound %s intent claim refuses a different coordinator before writing",
+  (kind) =>
+    Effect.gen(function* () {
+      const fixture = yield* nativeBindingFixture(kind, false, 2, false);
+      const selected = { ...fixture.selection, expectedOwnerVersion: 1, ...fixture.coordinator };
+      const before = yield* nativeBindingState;
+      const subscription = yield* fixture.store.subscribeChanges;
+      for (const changed of [{ bootId: "foreign-boot" }, { workerId: "foreign-worker" }]) {
+        assert.deepStrictEqual(
+          yield* fixture.store.claimNativeIntent({ ...selected, ...changed }),
+          { kind: "stale" },
+        );
+        assert.deepStrictEqual(yield* nativeBindingState, before);
+        assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+      }
+      assert.strictEqual((yield* fixture.store.claimNativeIntent(selected)).kind, "claimed");
+    }).pipe(Effect.provide(layer)),
+);
