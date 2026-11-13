@@ -4413,14 +4413,15 @@ it.effect("recovery custody validates allocated sessions and follows every alloc
     yield* sql`UPDATE orchestration_v2_projection_provider_threads SET status = 'active', payload_json = ${json({ ...owned, id: "owned-allocation", status: "active" })} WHERE provider_thread_id = 'owned-allocation'`;
     assert.strictEqual((yield* Effect.flip(read)).reason, "integrity");
     yield* sql`DELETE FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id = 'owned-allocation'`;
-    yield* sql`INSERT INTO orchestration_v2_projection_nodes (node_id, thread_id, root_node_id, kind, status, payload_json) VALUES ('owner-node', ${input.threadId}, 'owner-node', 'agent', 'running', '{}')`;
+    yield* seedPhysicalNode("owner-node", input.threadId);
     yield* sql`UPDATE orchestration_v2_projection_provider_threads SET thread_id = NULL, owner_node_id = 'owner-node', payload_json = ${json({ ...allocation, appThreadId: null, ownerNodeId: "owner-node" })}`;
     assert.deepStrictEqual(yield* read, { kind: "owned" });
     yield* sql`DELETE FROM orchestration_v2_projection_nodes`;
     assert.strictEqual((yield* Effect.flip(read)).reason, "integrity");
     yield* sql`UPDATE orchestration_v2_projection_provider_threads SET owner_node_id = NULL, payload_json = ${json({ ...allocation, appThreadId: null })}`;
     assert.strictEqual((yield* Effect.flip(read)).reason, "integrity");
-    yield* sql`INSERT INTO orchestration_v2_projection_subagents (subagent_id, thread_id, parent_node_id, provider, provider_thread_id, origin, status, updated_at, payload_json) VALUES ('subagent', ${input.threadId}, 'parent', 'provider', 'allocated-thread', 'native', 'running', '2026-11-01T00:00:00Z', '{}')`;
+    yield* seedPhysicalNode("parent", input.threadId);
+    yield* seedPhysicalSubagent("subagent", input.threadId, "parent", "allocated-thread");
     assert.deepStrictEqual(yield* read, { kind: "owned" });
     yield* sql`DELETE FROM orchestration_v2_projection_subagents`;
     yield* sql`UPDATE orchestration_v2_projection_provider_threads SET thread_id = 'ordinary', payload_json = ${json(allocation)}`;
@@ -4511,7 +4512,7 @@ it.effect("recovery custody validates selected provider threads and follows thei
     assert.deepStrictEqual(yield* snapshot, before);
     assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
 
-    yield* sql`INSERT INTO orchestration_v2_projection_nodes (node_id, thread_id, root_node_id, kind, status, payload_json) VALUES ('owner-node', ${input.threadId}, 'owner-node', 'agent', 'running', '{}')`;
+    yield* seedPhysicalNode("owner-node", input.threadId);
     const byNode = { ...reference, appThreadId: null, ownerNodeId: "owner-node" };
     yield* sql`UPDATE orchestration_v2_projection_provider_threads SET thread_id = NULL, owner_node_id = 'owner-node', payload_json = ${json(byNode)} WHERE provider_thread_id = 'selected'`;
     assert.deepStrictEqual(yield* read(["selected"]), { kind: "owned" });
@@ -4520,13 +4521,14 @@ it.effect("recovery custody validates selected provider threads and follows thei
     const unattributed = { ...reference, appThreadId: null };
     yield* sql`UPDATE orchestration_v2_projection_provider_threads SET owner_node_id = NULL, payload_json = ${json(unattributed)} WHERE provider_thread_id = 'selected'`;
     assert.strictEqual((yield* Effect.flip(read(["selected"]))).reason, "integrity");
-    yield* sql`INSERT INTO orchestration_v2_projection_subagents (subagent_id, thread_id, parent_node_id, provider, provider_thread_id, origin, status, updated_at, payload_json) VALUES ('selected-subagent', ${input.threadId}, 'parent', 'provider', 'selected', 'native', 'running', '2026-11-01T00:00:00Z', '{}')`;
+    yield* seedPhysicalNode("parent", input.threadId);
+    yield* seedPhysicalSubagent("selected-subagent", input.threadId, "parent", "selected");
     assert.deepStrictEqual(yield* read(["selected"]), { kind: "owned" });
     yield* sql`DELETE FROM orchestration_v2_projection_subagents WHERE subagent_id = 'selected-subagent'`;
     const ordinary = { ...reference, appThreadId: "ordinary" };
     yield* sql`UPDATE orchestration_v2_projection_provider_threads SET thread_id = 'ordinary', payload_json = ${json(ordinary)} WHERE provider_thread_id = 'selected'`;
     assert.deepStrictEqual(yield* read(["selected"]), { kind: "ordinary" });
-    yield* sql`INSERT INTO orchestration_v2_projection_provider_sessions (provider_session_id, thread_id, provider, driver, provider_instance_id, status, updated_at, payload_json) VALUES ('selected-session', NULL, 'provider', 'codex', 'provider', 'running', '2026-11-01T00:00:00Z', '{}')`;
+    yield* seedPhysicalSession("selected-session");
     yield* sql`INSERT INTO orchestration_v2_projection_provider_session_bindings VALUES ('selected-session', ${input.threadId})`;
     const shared = { ...ordinary, providerSessionId: "selected-session" };
     yield* sql`UPDATE orchestration_v2_projection_provider_threads SET provider_session_id = 'selected-session', payload_json = ${json(shared)} WHERE provider_thread_id = 'selected'`;
@@ -12512,7 +12514,7 @@ const seedPhysicalSession = Effect.fn("test.seedPhysicalSession")(function* (
     updatedAt: facts.now,
     lastError: null,
   };
-  yield* sql`INSERT INTO orchestration_v2_projection_provider_sessions ${sql.insert({ provider_session_id: id, thread_id: threadId, provider: instance, driver: "codex", provider_instance_id: instance, status: value.status, model: value.model, updated_at: value.updatedAt, payload_json: json(value) })}`;
+  yield* sql`INSERT INTO orchestration_v2_projection_provider_sessions ${sql.insert({ provider_session_id: id, thread_id: threadId, provider: instance, driver: "codex", provider_instance_id: instance, status: value.status, updated_at: value.updatedAt, payload_json: json(value) })}`;
 });
 const seedPhysicalNode = Effect.fn("test.seedPhysicalNode")(function* (
   id: string,
@@ -12807,7 +12809,7 @@ it.effect.each([
       yield* sql`UPDATE orchestration_v2_projection_provider_threads SET provider_instance_id='wrong-instance' WHERE provider_thread_id='selected-provider'`;
     if (variant === "wrong-session-shadow") {
       yield* seedPhysicalSession("selected-session");
-      yield* sql`UPDATE orchestration_v2_projection_provider_sessions SET model='wrong-model' WHERE provider_session_id='selected-session'`;
+      yield* sql`UPDATE orchestration_v2_projection_provider_sessions SET driver='claude' WHERE provider_session_id='selected-session'`;
     }
     if (variant === "wrong-ref-driver")
       yield* sql`UPDATE orchestration_v2_projection_provider_threads SET payload_json=${json({ ...value, nativeThreadRef: { driver: "claude", nativeId: "selected-native", strength: "strong" } })} WHERE provider_thread_id='selected-provider'`;
@@ -13051,4 +13053,371 @@ it.effect("physical custody keeps a remote child identity separate from a local 
       "reserved",
     );
   }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+const prepareLogicalCustodyOwner = Effect.fn("test.prepareLogicalCustodyOwner")(function* (
+  owner: "workflow" | "planning",
+) {
+  const store = yield* Store.WorkflowRunStore;
+  if (owner === "workflow") {
+    yield* setupAdmission;
+    const input = reservation(
+      operationFor("logical-owner-op", "logical-owner-attempt"),
+      "logical-owner-attempt",
+    );
+    yield* store.reserveWorkflowNativeIntent(input);
+    return input.threadId;
+  }
+  const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+  yield* begin(store, session);
+  const input = planningReservation(admissionInput(binding, "logical-owner"));
+  yield* store.reservePlanningNativeIntent(input);
+  return input.threadId;
+});
+
+it.effect.each(["workflow", "planning"] as const)(
+  "ordinary custody finds %s ownership through a native alias with an empty physical ledger",
+  (owner) =>
+    Effect.gen(function* () {
+      const ownedThread = yield* prepareLogicalCustodyOwner(owner);
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      yield* seedPhysicalSession("ordinary-session");
+      yield* seedPhysicalSession("owned-session");
+      yield* seedPhysicalProvider(
+        physicalProvider(
+          "ordinary-provider",
+          "ordinary-thread",
+          "ordinary-session",
+          "shared-native",
+        ),
+      );
+      yield* seedPhysicalProvider(
+        physicalProvider("owned-provider", ownedThread, "owned-session", "shared-native"),
+      );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_submission_transports`, []);
+      const subscription = yield* store.subscribeChanges;
+      const before = yield* rawReservationState;
+      assert.deepStrictEqual(
+        yield* sql.withTransaction(
+          store.readRecoveryCustodyInTransaction({
+            threadId: "ordinary-thread",
+            providerSessionIds: [],
+            providerThreadIds: ["ordinary-provider"],
+          }),
+        ),
+        { kind: "owned" },
+      );
+      assert.deepStrictEqual(yield* rawReservationState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect("ordinary custody owns its selected seeds before returning an Effect", () =>
+  Effect.gen(function* () {
+    const ownedThread = yield* prepareLogicalCustodyOwner("workflow");
+    const store = yield* Store.WorkflowRunStore;
+    const sql = yield* SqlClient.SqlClient;
+    const input = { threadId: ownedThread, providerSessionIds: [] as string[] };
+    const observation = store.readRecoveryCustodyInTransaction(input);
+    input.threadId = ThreadId.make("ordinary-thread");
+    assert.deepStrictEqual(yield* sql.withTransaction(observation), { kind: "owned" });
+    yield* seedPhysicalProvider(physicalProvider("owned-provider", ownedThread, null, null));
+    const providers = ["owned-provider"];
+    const selected = store.readRecoveryCustodyInTransaction({
+      threadId: "ordinary-thread",
+      providerSessionIds: [],
+      providerThreadIds: providers,
+    });
+    providers.length = 0;
+    assert.deepStrictEqual(yield* sql.withTransaction(selected), { kind: "owned" });
+  }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+const seedPhysicalSubagent = Effect.fn("test.seedPhysicalSubagent")(function* (
+  id: string,
+  threadId: string,
+  parentNodeId: string,
+  providerThreadId: string | null,
+  childThreadId: string | null = null,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const value = {
+    id,
+    threadId,
+    runId: null,
+    parentNodeId,
+    origin: "provider_native",
+    createdBy: "agent",
+    driver: "codex",
+    providerInstanceId: "provider",
+    providerThreadId,
+    childThreadId,
+    nativeTaskRef: null,
+    prompt: "Work",
+    title: null,
+    model: null,
+    status: "completed",
+    result: null,
+    startedAt: null,
+    completedAt: null,
+    updatedAt: facts.now,
+  };
+  yield* sql`INSERT INTO orchestration_v2_projection_subagents ${sql.insert({ subagent_id: id, thread_id: threadId, run_id: null, parent_node_id: parentNodeId, provider: "provider", driver: "codex", provider_instance_id: "provider", provider_thread_id: providerThreadId, child_thread_id: childThreadId, origin: value.origin, status: value.status, started_at: null, completed_at: null, updated_at: value.updatedAt, payload_json: json(value) })}`;
+});
+
+it.effect("ordinary custody has no physical-table dependency or public mode override", () =>
+  Effect.gen(function* () {
+    const ownedThread = yield* prepareLogicalCustodyOwner("workflow");
+    const store = yield* Store.WorkflowRunStore;
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`DROP TABLE orchestration_v2_submission_attempts`;
+    yield* sql`DROP TABLE orchestration_v2_submission_transports`;
+    const input = {
+      threadId: ownedThread,
+      providerSessionIds: [],
+      purpose: "physical",
+      environmentId: "foreign",
+    };
+    assert.deepStrictEqual(
+      yield* sql.withTransaction(store.readRecoveryCustodyInTransaction(input)),
+      { kind: "owned" },
+    );
+    assert.deepStrictEqual(
+      yield* sql.withTransaction(
+        store.readRecoveryCustodyInTransaction({
+          threadId: "ordinary-thread",
+          providerSessionIds: [],
+        }),
+      ),
+      { kind: "ordinary" },
+    );
+  }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect("ordinary custody rejects non-data seeds synchronously without invoking getters", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const store = yield* Store.WorkflowRunStore;
+    const sql = yield* SqlClient.SqlClient;
+    for (const explicitUndefined of [false, true]) {
+      const input = { threadId: "ordinary-thread", providerSessionIds: [] };
+      if (explicitUndefined) Reflect.set(input, "providerThreadIds", undefined);
+      assert.deepStrictEqual(
+        yield* sql.withTransaction(store.readRecoveryCustodyInTransaction(input)),
+        { kind: "ordinary" },
+      );
+    }
+    let calls = 0;
+    const getter = Object.defineProperty({ providerSessionIds: [] }, "threadId", {
+      enumerable: true,
+      get() {
+        calls += 1;
+        return "thread";
+      },
+    });
+    const cycle: Record<string, unknown> = { threadId: "thread", providerSessionIds: [] };
+    cycle.self = cycle;
+    const optionalGetter = Object.defineProperty(
+      { threadId: "thread", providerSessionIds: [] },
+      "providerThreadIds",
+      {
+        enumerable: true,
+        get() {
+          calls += 1;
+          return undefined;
+        },
+      },
+    );
+    for (const input of [
+      getter,
+      optionalGetter,
+      cycle,
+      { threadId: "thread", providerSessionIds: [undefined] },
+    ]) {
+      const effect = store.readRecoveryCustodyInTransaction(
+        input as Parameters<typeof store.readRecoveryCustodyInTransaction>[0],
+      );
+      assert.strictEqual(calls, 0);
+      assert.strictEqual((yield* Effect.flip(sql.withTransaction(effect))).reason, "integrity");
+    }
+    assert.strictEqual(calls, 0);
+  }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect(
+  "ordinary alias denial reaches the controlled primitive under the actual writer with zero Sink bytes",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const directory = yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "ordinary-alias-primitive-")),
+          ),
+          (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
+        );
+        const filename = NodePath.join(directory, "state.sqlite");
+        const fileLayer = Layer.merge(Store.layer, EffectOutbox.layer).pipe(
+          Layer.provideMerge(NodeSqliteClient.layer({ filename })),
+        );
+        yield* Effect.gen(function* () {
+          const ownedThread = yield* prepareLogicalCustodyOwner("workflow");
+          const store = yield* Store.WorkflowRunStore;
+          const sql = yield* SqlClient.SqlClient;
+          yield* seedPhysicalSession("ordinary-session");
+          yield* seedPhysicalSession("owned-session");
+          yield* seedPhysicalProvider(
+            physicalProvider(
+              "ordinary-provider",
+              "ordinary-thread",
+              "ordinary-session",
+              "shared-native",
+            ),
+          );
+          yield* seedPhysicalProvider(
+            physicalProvider("owned-provider", ownedThread, "owned-session", "shared-native"),
+          );
+          const other = yield* Effect.acquireRelease(
+            Effect.sync(() => {
+              const db = new NodeSqlite.DatabaseSync(filename);
+              db.exec("PRAGMA busy_timeout=0");
+              return db;
+            }),
+            (db) => Effect.sync(() => db.close()),
+          );
+          const incoming = yield* Queue.unbounded<Uint8Array>();
+          const outcomes = yield* Queue.unbounded<CodexProtocol.CodexAppServerFrameOutcome>();
+          let writes = 0;
+          let checked = false;
+          const spawner = ChildProcessSpawner.make(() =>
+            Effect.succeed(
+              ChildProcessSpawner.makeHandle({
+                pid: ChildProcessSpawner.ProcessId(999999996),
+                exitCode: Effect.never,
+                isRunning: Effect.succeed(true),
+                kill: () => Effect.void,
+                unref: Effect.succeed(Effect.void),
+                stdin: Sink.forEach((bytes: Uint8Array) =>
+                  Effect.gen(function* () {
+                    writes += 1;
+                    const request = JSON.parse(new TextDecoder().decode(bytes));
+                    yield* Queue.offer(
+                      incoming,
+                      new TextEncoder().encode(
+                        `${JSON.stringify({ id: request.id, result: {} })}\n`,
+                      ),
+                    );
+                  }),
+                ),
+                stdout: Stream.fromQueue(incoming),
+                stderr: Stream.empty,
+                all: Stream.empty,
+                getInputFd: () => Sink.drain,
+                getOutputFd: () => Stream.empty,
+              }),
+            ),
+          );
+          const client = yield* CodexClient.makeControlledChildProcessClient(
+            ChildProcess.make("ordinary-alias-fixture"),
+            {
+              wrapper: (frame, submit) =>
+                sql.withTransaction(
+                  Effect.gen(function* () {
+                    assert.strictEqual(frame.method, "turn/start");
+                    assert.strictEqual(
+                      (JSON.parse(frame.encoded) as { params: { threadId: string } }).params
+                        .threadId,
+                      "shared-native",
+                    );
+                    yield* Effect.sync(() =>
+                      assert.throws(() => other.exec("BEGIN IMMEDIATE"), /locked/),
+                    );
+                    checked = true;
+                    const custody = yield* store.readRecoveryCustodyInTransaction({
+                      threadId: "ordinary-thread",
+                      providerSessionIds: ["ordinary-session"],
+                      providerThreadIds: ["ordinary-provider"],
+                    });
+                    if (custody.kind === "owned")
+                      return yield* new CodexErrors.CodexAppServerFrameSubmissionError({
+                        outcome: "not_submitted",
+                        reason: "wrapper",
+                      });
+                    return yield* submit();
+                  }),
+                ),
+              onOutcome: (outcome) => Queue.offer(outcomes, outcome).pipe(Effect.asVoid),
+            },
+          ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
+          const before = yield* rawReservationState;
+          const subscription = yield* store.subscribeChanges;
+          const result = yield* Effect.result(
+            client.raw.request(
+              "turn/start",
+              { threadId: "shared-native", input: [{ type: "text", text: "Work" }] },
+              "ordinary-alias-selection",
+            ),
+          );
+          assert.strictEqual(result._tag, "Failure");
+          if (result._tag === "Failure")
+            assert.strictEqual(result.failure._tag, "CodexAppServerFrameSubmissionError");
+          assert.isTrue(checked);
+          assert.strictEqual(writes, 0);
+          const outcome = yield* Queue.take(outcomes);
+          assert.strictEqual(outcome.outcome, "not_submitted");
+          yield* Effect.sync(() => other.exec("BEGIN IMMEDIATE; ROLLBACK"));
+          assert.deepStrictEqual(yield* rawReservationState, before);
+          assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+        }).pipe(Effect.provide(fileLayer));
+      }),
+    ),
+);
+
+it.effect.each(["node", "subagent", "absent"] as const)(
+  "ordinary custody resolves a %s hierarchy parent separately from a required owner",
+  (parent) =>
+    Effect.gen(function* () {
+      const ownedThread = yield* prepareLogicalCustodyOwner("workflow");
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      yield* seedPhysicalNode("local-node", "ordinary-thread");
+      yield* sql`UPDATE orchestration_v2_projection_nodes SET parent_node_id='parent-meta',provider_thread_id='historical-provider',payload_json=json_set(payload_json,'$.parentNodeId','parent-meta','$.providerThreadId','historical-provider','$.runtimeRequestId','request','$.checkpointScopeId','checkpoint') WHERE node_id='local-node'`;
+      yield* seedPhysicalProvider(
+        physicalProvider(
+          "selected-provider",
+          "ordinary-thread",
+          null,
+          null,
+          "provider",
+          "local-node",
+        ),
+      );
+      if (parent === "node") yield* seedPhysicalNode("parent-meta", ownedThread);
+      if (parent === "subagent")
+        yield* seedPhysicalSubagent("parent-meta", ownedThread, "older-parent", null);
+      const before = yield* rawReservationState;
+      assert.deepStrictEqual(
+        yield* sql.withTransaction(
+          store.readRecoveryCustodyInTransaction({
+            threadId: "ordinary-thread",
+            providerSessionIds: [],
+            providerThreadIds: ["selected-provider"],
+          }),
+        ),
+        { kind: parent === "absent" ? "ordinary" : "owned" },
+      );
+      assert.strictEqual(
+        (yield* Effect.flip(
+          sql.withTransaction(
+            store.readRecoveryCustodyInTransaction({
+              threadId: "ordinary-thread",
+              providerSessionIds: [],
+              providerThreadIds: ["selected-provider", "historical-provider"],
+            }),
+          ),
+        )).reason,
+        "integrity",
+      );
+      assert.deepStrictEqual(yield* rawReservationState, before);
+    }).pipe(Effect.provide(layerWithOutbox)),
 );

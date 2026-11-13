@@ -278,20 +278,46 @@ const makeStore = Effect.fnUntraced(function* (
       yield* sql`SELECT 1 FROM orchestration_v2_effect_outbox WHERE thread_id = ${threadId} AND status = 'running' AND effect_type IN ('provider-turn.start', 'provider-turn.restart', 'provider-runtime.continue') LIMIT 1`;
     return rows.length > 0;
   });
-  const readSubmissionCustodyInTransaction = Effect.fn(
-    "WorkflowRunStore.readSubmissionCustodyInTransaction",
-  )(
-    function* (environmentId: string, threadId: string) {
+  // Public readers own the span; both purposes share the captured projection traversal.
+  const walkResourceCustodyInTransaction = Effect.fnUntraced(
+    function* (
+      input:
+        | { purpose: "physical"; environmentId: string; threadId: string }
+        | {
+            purpose: "workflow";
+            threadId: string;
+            providerSessionIds: readonly string[];
+            providerThreadIds?: readonly string[];
+          },
+    ) {
+      const environmentId = input.purpose === "physical" ? input.environmentId : "";
+      const threadId = input.threadId;
       if (Option.isNone(yield* Effect.serviceOption(sql.transactionService)))
         return yield* integrity();
       const validId = (value: unknown): value is string =>
         typeof value === "string" && value.trim().length > 0 && value.isWellFormed();
-      if (!validId(environmentId) || !validId(threadId)) return yield* integrity();
-      const present =
-        yield* sql`SELECT 1 FROM orchestration_v2_submission_transports WHERE environment_id=${environmentId} LIMIT 1`;
-      if (!present.length) return false;
+      if (!validId(threadId)) return yield* integrity();
+      if (input.purpose === "physical") {
+        if (!validId(environmentId)) return yield* integrity();
+        const present =
+          yield* sql`SELECT 1 FROM orchestration_v2_submission_transports WHERE environment_id=${environmentId} LIMIT 1`;
+        if (!present.length) return false;
+      } else if (
+        !Array.isArray(input.providerSessionIds) ||
+        !input.providerSessionIds.every(validId) ||
+        (input.providerThreadIds !== undefined &&
+          (!Array.isArray(input.providerThreadIds) || !input.providerThreadIds.every(validId)))
+      )
+        return yield* integrity();
       type Row = Readonly<Record<string, unknown>>;
-      type Kind = "thread" | "session" | "provider" | "node" | "subagent";
+      type Kind =
+        | "thread"
+        | "session"
+        | "provider"
+        | "provider-reference"
+        | "node"
+        | "parent"
+        | "subagent";
       type Native = { driver: string; instance: string; id: string };
       type Work = { kind: Kind; id: string } | { kind: "native"; native: Native };
       const work: Work[] = [];
@@ -471,11 +497,17 @@ const makeStore = Effect.fnUntraced(function* (
         return value;
       });
       queue("thread", threadId);
+      if (input.purpose === "workflow") {
+        for (const id of input.providerSessionIds) queueSession(id);
+        for (const id of input.providerThreadIds ?? []) queue("provider", id);
+      }
       for (let index = 0; index < work.length; index++) {
         const selected = work[index]!;
         if (selected.kind === "thread") {
-          if (yield* transportHistory("opening_thread_id", selected.id)) return true;
-          if (yield* attemptHistory({ field: "thread_id", id: selected.id })) return true;
+          if (input.purpose === "physical") {
+            if (yield* transportHistory("opening_thread_id", selected.id)) return true;
+            if (yield* attemptHistory({ field: "thread_id", id: selected.id })) return true;
+          }
           const sessions =
             yield* sql`SELECT provider_session_id FROM orchestration_v2_projection_provider_sessions WHERE thread_id=${selected.id} UNION ALL SELECT provider_session_id FROM orchestration_v2_projection_provider_session_bindings WHERE thread_id=${selected.id}`;
           for (const row of sessions)
@@ -489,7 +521,9 @@ const makeStore = Effect.fnUntraced(function* (
           for (const row of children)
             if (!queue("subagent", row.subagent_id)) return yield* integrity();
         } else if (selected.kind === "session") {
-          if (yield* transportHistory("provider_session_id", selected.id)) return true;
+          if (input.purpose === "physical") {
+            if (yield* transportHistory("provider_session_id", selected.id)) return true;
+          }
           const rows =
             yield* sql`SELECT * FROM orchestration_v2_projection_provider_sessions WHERE provider_session_id=${selected.id}`;
           const peers =
@@ -500,6 +534,15 @@ const makeStore = Effect.fnUntraced(function* (
             if (peers.length || !references.length) return yield* integrity();
             for (const row of references) {
               const value = yield* providerData(row);
+              if (
+                input.purpose === "workflow" &&
+                value.appThreadId === null &&
+                value.ownerNodeId === null
+              ) {
+                const attribution =
+                  yield* sql`SELECT subagent_id FROM orchestration_v2_projection_subagents WHERE provider_thread_id=${value.id} LIMIT 1`;
+                if (!attribution.length) return yield* integrity();
+              }
               if (
                 value.status !== "not_loaded" ||
                 value.nativeThreadRef !== null ||
@@ -515,6 +558,7 @@ const makeStore = Effect.fnUntraced(function* (
           } else {
             if (rows.length !== 1 || !rows[0]) return yield* integrity();
             const row = rows[0];
+            // The projection writer keeps model only in payload, not the legacy SQL column.
             const value = yield* decodeSubmissionSession(row.payload_json, {
               onExcessProperty: "error",
             }).pipe(Effect.mapError(integrity));
@@ -524,7 +568,6 @@ const makeStore = Effect.fnUntraced(function* (
                 driver: value.driver,
                 provider_instance_id: value.providerInstanceId,
                 status: value.status,
-                model: value.model,
               }) ||
               !sameTime(row.updated_at, value.updatedAt) ||
               !queueSession(value.id, {
@@ -538,10 +581,15 @@ const makeStore = Effect.fnUntraced(function* (
           for (const row of peers) if (!queue("thread", row.thread_id)) return yield* integrity();
           for (const row of references)
             if (!queue("provider", row.provider_thread_id)) return yield* integrity();
-        } else if (selected.kind === "provider") {
-          if (yield* attemptHistory({ field: "provider_thread_id", id: selected.id })) return true;
+        } else if (selected.kind === "provider" || selected.kind === "provider-reference") {
+          if (input.purpose === "physical") {
+            if (yield* attemptHistory({ field: "provider_thread_id", id: selected.id }))
+              return true;
+          }
           const rows =
             yield* sql`SELECT * FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id=${selected.id}`;
+          // Historical nodes can retain an ID without a current provider-thread projection.
+          if (rows.length === 0 && selected.kind === "provider-reference") continue;
           if (rows.length !== 1 || !rows[0]) return yield* integrity();
           const value = yield* providerData(rows[0]);
           if (
@@ -569,6 +617,14 @@ const makeStore = Effect.fnUntraced(function* (
             return yield* integrity();
           const children =
             yield* sql`SELECT subagent_id FROM orchestration_v2_projection_subagents WHERE provider_thread_id=${selected.id}`;
+          if (
+            input.purpose === "workflow" &&
+            input.providerThreadIds?.includes(value.id) &&
+            value.appThreadId === null &&
+            value.ownerNodeId === null &&
+            children.length === 0
+          )
+            return yield* integrity();
           for (const row of children)
             if (!queue("subagent", row.subagent_id)) return yield* integrity();
         } else if (selected.kind === "node") {
@@ -591,15 +647,13 @@ const makeStore = Effect.fnUntraced(function* (
               status: value.status,
               provider_thread_id: value.providerThreadId,
               provider_turn_id: value.providerTurnId,
-              runtime_request_id: value.runtimeRequestId,
-              checkpoint_scope_id: value.checkpointScopeId,
             }) ||
             !sameTime(row.started_at, value.startedAt) ||
             !sameTime(row.completed_at, value.completedAt) ||
             !queue("thread", value.threadId) ||
-            !queueNullable("provider", value.providerThreadId) ||
-            !queueNullable("node", value.parentNodeId) ||
-            !queue("node", value.rootNodeId)
+            !queueNullable("provider-reference", value.providerThreadId) ||
+            !queueNullable("parent", value.parentNodeId) ||
+            !queue("parent", value.rootNodeId)
           )
             return yield* integrity();
           const references =
@@ -609,6 +663,16 @@ const makeStore = Effect.fnUntraced(function* (
           const children =
             yield* sql`SELECT subagent_id FROM orchestration_v2_projection_subagents WHERE parent_node_id=${selected.id}`;
           for (const row of children)
+            if (!queue("subagent", row.subagent_id)) return yield* integrity();
+        } else if (selected.kind === "parent") {
+          // Hierarchy IDs can name a node or subagent, and older parent records may be absent.
+          const nodes =
+            yield* sql`SELECT node_id FROM orchestration_v2_projection_nodes WHERE node_id=${selected.id}`;
+          const subagents =
+            yield* sql`SELECT subagent_id FROM orchestration_v2_projection_subagents WHERE subagent_id=${selected.id}`;
+          if (nodes.length > 1 || subagents.length > 1) return yield* integrity();
+          for (const row of nodes) if (!queue("node", row.node_id)) return yield* integrity();
+          for (const row of subagents)
             if (!queue("subagent", row.subagent_id)) return yield* integrity();
         } else if (selected.kind === "subagent") {
           const rows =
@@ -635,15 +699,17 @@ const makeStore = Effect.fnUntraced(function* (
             !sameTime(row.completed_at, value.completedAt) ||
             !sameTime(row.updated_at, value.updatedAt) ||
             !queue("thread", value.threadId) ||
-            !queue("node", value.parentNodeId) ||
-            !queueNullable("provider", value.providerThreadId)
+            !queue("parent", value.parentNodeId) ||
+            !queueNullable("provider-reference", value.providerThreadId)
           )
             return yield* integrity();
           if (value.remoteChild === undefined) {
             if (!queueNullable("thread", value.childThreadId)) return yield* integrity();
           } else if (value.childThreadId !== null) return yield* integrity();
         } else if (selected.kind === "native") {
-          if (yield* attemptHistory(selected.native)) return true;
+          if (input.purpose === "physical") {
+            if (yield* attemptHistory(selected.native)) return true;
+          }
           let cursor = "";
           for (;;) {
             const candidates =
@@ -665,11 +731,26 @@ const makeStore = Effect.fnUntraced(function* (
           }
         }
       }
+      if (input.purpose === "workflow") {
+        let owned = false;
+        for (const selected of work) {
+          if (selected.kind !== "thread") continue;
+          const custody = yield* readThreadCustodyInTransaction(selected.id);
+          if (custody.kind === "owned") owned = true;
+        }
+        return owned;
+      }
       return false;
     },
     Effect.mapError((error) =>
       isStoreError(error) ? error : new WorkflowRunStoreError({ reason: "persistence" }),
     ),
+  );
+
+  const readSubmissionCustodyInTransaction = Effect.fn(
+    "WorkflowRunStore.readSubmissionCustodyInTransaction",
+  )((environmentId: string, threadId: string) =>
+    walkResourceCustodyInTransaction({ purpose: "physical", environmentId, threadId }),
   );
 
   const inTransaction = <A, E, R>(work: Effect.Effect<A, E, R>) =>
@@ -3273,137 +3354,22 @@ const makeStore = Effect.fnUntraced(function* (
   );
   const readRecoveryCustodyInTransaction = Effect.fn(
     "WorkflowRunStore.readRecoveryCustodyInTransaction",
-  )(
-    function* (input: {
-      readonly threadId: string;
-      readonly providerSessionIds: readonly string[];
-      readonly providerThreadIds?: readonly string[];
-    }) {
-      if (Option.isNone(yield* Effect.serviceOption(sql.transactionService)))
-        return yield* integrity();
-      const validId = (id: unknown): id is string => typeof id === "string" && id.length > 0;
-      if (
-        !validId(input.threadId) ||
-        !input.providerSessionIds.every(validId) ||
-        !(input.providerThreadIds ?? []).every(validId)
-      )
-        return yield* integrity();
-      const sessionIds = new Set(input.providerSessionIds);
-      const threads = new Set([input.threadId]);
-      const bindings = yield* sql<{
-        provider_session_id: string;
-      }>`SELECT provider_session_id FROM orchestration_v2_projection_provider_session_bindings WHERE thread_id = ${input.threadId}`;
-      const direct = yield* sql<{
-        provider_session_id: string;
-      }>`SELECT provider_session_id FROM orchestration_v2_projection_provider_sessions WHERE thread_id = ${input.threadId}`;
-      for (const row of [...bindings, ...direct]) {
-        if (!validId(row.provider_session_id)) return yield* integrity();
-        sessionIds.add(row.provider_session_id);
-      }
-      type ReferenceRow = {
-        provider_thread_id: string;
-        thread_id: string | null;
-        owner_node_id: string | null;
-        provider_session_id: string | null;
-        status: string;
-        driver: string | null;
-        provider_instance_id: string | null;
-        payload_json: string;
-      };
-      const collectReference = Effect.fn("WorkflowRunStore.collectRecoveryReference")(function* (
-        row: ReferenceRow,
-        pristine: boolean,
-      ) {
-        const reference = yield* decodeRecoveryProviderThread(row.payload_json).pipe(
-          Effect.mapError(integrity),
-        );
-        if (
-          reference.id !== row.provider_thread_id ||
-          reference.appThreadId !== row.thread_id ||
-          reference.ownerNodeId !== row.owner_node_id ||
-          reference.providerSessionId !== row.provider_session_id ||
-          reference.status !== row.status ||
-          reference.driver !== row.driver ||
-          reference.providerInstanceId !== row.provider_instance_id ||
-          (pristine &&
-            (reference.status !== "not_loaded" ||
-              reference.nativeThreadRef !== null ||
-              reference.nativeConversationHeadRef !== null ||
-              (reference.pendingBackgroundTasks?.length ?? 0) !== 0))
-        )
-          return yield* integrity();
-        let attributed = false;
-        if (reference.appThreadId !== null) {
-          if (!validId(reference.appThreadId)) return yield* integrity();
-          threads.add(reference.appThreadId);
-          attributed = true;
-        }
-        if (reference.ownerNodeId !== null) {
-          const nodes = yield* sql<{
-            thread_id: string;
-          }>`SELECT thread_id FROM orchestration_v2_projection_nodes WHERE node_id = ${reference.ownerNodeId}`;
-          if (nodes.length !== 1 || !validId(nodes[0]?.thread_id)) return yield* integrity();
-          threads.add(nodes[0].thread_id);
-          attributed = true;
-        }
-        const subagents = yield* sql<{
-          thread_id: string;
-        }>`SELECT thread_id FROM orchestration_v2_projection_subagents WHERE provider_thread_id = ${reference.id}`;
-        for (const subagent of subagents) {
-          if (!validId(subagent.thread_id)) return yield* integrity();
-          threads.add(subagent.thread_id);
-          attributed = true;
-        }
-        if (!attributed) return yield* integrity();
-        return reference;
-      });
-      for (const id of new Set(input.providerThreadIds ?? [])) {
-        const rows =
-          yield* sql<ReferenceRow>`SELECT provider_thread_id, thread_id, owner_node_id, provider_session_id, status, driver, provider_instance_id, payload_json FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id = ${id}`;
-        if (rows.length !== 1 || !rows[0]) return yield* integrity();
-        const reference = yield* collectReference(rows[0], false);
-        if (reference.providerSessionId !== null) {
-          if (!validId(reference.providerSessionId)) return yield* integrity();
-          sessionIds.add(reference.providerSessionId);
-        }
-      }
-      for (const id of sessionIds) {
-        const peers = yield* sql<{
-          thread_id: string;
-        }>`SELECT thread_id FROM orchestration_v2_projection_provider_session_bindings WHERE provider_session_id = ${id}`;
-        const sessions = yield* sql<{
-          thread_id: string | null;
-        }>`SELECT thread_id FROM orchestration_v2_projection_provider_sessions WHERE provider_session_id = ${id}`;
-        if (sessions.length === 0) {
-          if (peers.length) return yield* integrity();
-          const references =
-            yield* sql<ReferenceRow>`SELECT provider_thread_id, thread_id, owner_node_id, provider_session_id, status, driver, provider_instance_id, payload_json FROM orchestration_v2_projection_provider_threads WHERE provider_session_id = ${id}`;
-          if (!references.length) return yield* integrity();
-          for (const row of references) yield* collectReference(row, true);
-          continue;
-        }
-        if (sessions.length !== 1 || !sessions[0]) return yield* integrity();
-        const threadId = sessions[0].thread_id;
-        if (threadId !== null) {
-          if (!validId(threadId)) return yield* integrity();
-          threads.add(threadId);
-        }
-        for (const peer of peers) {
-          if (!validId(peer.thread_id)) return yield* integrity();
-          threads.add(peer.thread_id);
-        }
-      }
-      let owned = false;
-      for (const threadId of threads) {
-        const custody = yield* readThreadCustodyInTransaction(threadId);
-        if (custody.kind === "owned") owned = true;
-      }
-      return owned ? { kind: "owned" as const } : { kind: "ordinary" as const };
-    },
-    Effect.mapError((error) =>
-      isStoreError(error) ? error : new WorkflowRunStoreError({ reason: "persistence" }),
-    ),
-  );
+  )(function* (input: {
+    readonly threadId: string;
+    readonly providerSessionIds: readonly string[];
+    readonly providerThreadIds?: readonly string[];
+  }) {
+    const owned = yield* walkResourceCustodyInTransaction({
+      purpose: "workflow",
+      threadId: input.threadId,
+      providerSessionIds: input.providerSessionIds,
+      ...(input.providerThreadIds === undefined
+        ? {}
+        : { providerThreadIds: input.providerThreadIds }),
+    });
+    return owned ? { kind: "owned" as const } : { kind: "ordinary" as const };
+  });
+
   const reserveWorkflowNativeIntent = Effect.fn("WorkflowRunStore.reserveWorkflowNativeIntent")(
     function* (request: WorkflowNativeInput) {
       const input = yield* Effect.try({
@@ -6592,7 +6558,26 @@ const makeStore = Effect.fnUntraced(function* (
     },
     readThreadCustody,
     readNativeReservationInTransaction,
-    readRecoveryCustodyInTransaction,
+    readRecoveryCustodyInTransaction: (
+      input: Parameters<typeof readRecoveryCustodyInTransaction>[0],
+    ) => {
+      try {
+        const optional = Object.getOwnPropertyDescriptor(input, "providerThreadIds");
+        let data = input;
+        if (optional?.enumerable && "value" in optional && optional.value === undefined) {
+          const { providerThreadIds: _absent, ...descriptors } =
+            Object.getOwnPropertyDescriptors(input);
+          data = Object.create(Object.getPrototypeOf(input), descriptors) as typeof input;
+        }
+        WorkflowCanonicalHash.assertCanonical(data);
+        const owned = structuredClone(data);
+        Object.freeze(owned.providerSessionIds);
+        if (owned.providerThreadIds !== undefined) Object.freeze(owned.providerThreadIds);
+        return readRecoveryCustodyInTransaction(Object.freeze(owned));
+      } catch {
+        return Effect.fail(integrity());
+      }
+    },
     subscribeChanges,
     listPending,
     claim: (input: Parameters<typeof claim>[0]) => claim({ ...input }),

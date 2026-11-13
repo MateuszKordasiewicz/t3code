@@ -58,6 +58,7 @@ import * as ProjectStore from "./ProjectStore.ts";
 import { toPersistenceSqlError } from "../persistence/Errors.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as WorkflowRunStore from "../workflowRuns/WorkflowRunStore.ts";
+import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as CheckpointService from "./CheckpointService.ts";
 import type { PendingOrchestrationEffectV2 } from "./EffectOutbox.ts";
 import * as EventSink from "./EventSink.ts";
@@ -975,16 +976,31 @@ it.effect.each([
       updatedAt: "2026-11-01T00:00:00Z",
     });
     const primary = providerThread(providerThreadId, threadId);
-    yield* sql`INSERT INTO orchestration_v2_projection_provider_threads (provider_thread_id, thread_id, owner_node_id, provider, driver, provider_instance_id, provider_session_id, status, updated_at, payload_json) VALUES (${providerThreadId}, ${threadId}, NULL, 'codex', 'codex', ${providerInstanceId}, ${providerSessionId}, 'not_loaded', '2026-11-01T00:00:00Z', ${JSON.stringify(primary)})`;
+    yield* sql`INSERT INTO orchestration_v2_projection_provider_threads (provider_thread_id, thread_id, owner_node_id, provider, driver, provider_instance_id, provider_session_id, status, first_run_ordinal, last_run_ordinal, updated_at, payload_json) VALUES (${providerThreadId}, ${threadId}, NULL, 'codex', 'codex', ${providerInstanceId}, ${providerSessionId}, ${primary.status}, 1, 1, '2026-11-01T00:00:00Z', ${JSON.stringify(primary)})`;
     if (evidence === "related-provider") {
       const related = {
         ...providerThread(relatedProviderThreadId, peer),
         providerSessionId: ProviderSessionId.make("session:related-owned"),
       };
-      yield* sql`INSERT INTO orchestration_v2_projection_provider_threads (provider_thread_id, thread_id, owner_node_id, provider, driver, provider_instance_id, provider_session_id, status, updated_at, payload_json) VALUES (${relatedProviderThreadId}, ${peer}, NULL, 'codex', 'codex', ${providerInstanceId}, ${related.providerSessionId}, 'not_loaded', '2026-11-01T00:00:00Z', ${JSON.stringify(related)})`;
+      yield* sql`INSERT INTO orchestration_v2_projection_provider_threads (provider_thread_id, thread_id, owner_node_id, provider, driver, provider_instance_id, provider_session_id, status, first_run_ordinal, last_run_ordinal, updated_at, payload_json) VALUES (${relatedProviderThreadId}, ${peer}, NULL, 'codex', 'codex', ${providerInstanceId}, ${related.providerSessionId}, ${related.status}, 1, 1, '2026-11-01T00:00:00Z', ${JSON.stringify(related)})`;
     }
+    const seedSession = (id: string) => {
+      const value = {
+        id,
+        driver: "codex",
+        providerInstanceId,
+        status: "running",
+        cwd: "/workspace",
+        model: "model",
+        capabilities: CodexProviderCapabilitiesV2,
+        createdAt: "2026-11-01T00:00:00Z",
+        updatedAt: "2026-11-01T00:00:00Z",
+        lastError: null,
+      };
+      return sql`INSERT INTO orchestration_v2_projection_provider_sessions (provider_session_id,thread_id,provider,driver,provider_instance_id,status,updated_at,payload_json) VALUES (${id},NULL,'codex','codex',${providerInstanceId},'running','2026-11-01T00:00:00Z',${JSON.stringify(value)})`;
+    };
     if (evidence === "shared") {
-      yield* sql`INSERT INTO orchestration_v2_projection_provider_sessions (provider_session_id, thread_id, provider, status, updated_at, payload_json) VALUES (${providerSessionId}, NULL, 'codex', 'running', '2026-11-01T00:00:00Z', '{}')`;
+      yield* seedSession(providerSessionId);
       yield* sql`INSERT INTO orchestration_v2_projection_provider_session_bindings VALUES (${providerSessionId}, ${threadId})`;
       yield* sql`INSERT INTO orchestration_v2_projection_provider_session_bindings VALUES (${providerSessionId}, ${peer})`;
     }
@@ -1041,7 +1057,7 @@ it.effect.each([
         ),
       ),
     );
-    const error = yield* Effect.gen(function* () {
+    const result = yield* Effect.gen(function* () {
       const service = yield* RunExecutionService.RunExecutionServiceV2;
       return yield* service.startRootRun({
         commandId: CommandId.make("command:direct-sql"),
@@ -1097,12 +1113,20 @@ it.effect.each([
           cwd: process.cwd(),
         },
       });
-    }).pipe(Effect.provide(layerTest), Effect.flip);
-    assert.equal(error._tag, "RunExecutionStartError");
-    if (evidence === "malformed" || evidence === "owned-and-invalid" || evidence === "read-error") {
-      assert.equal((error.cause as { _tag: string })._tag, "WorkflowRunStoreError");
-    } else assert.isUndefined(error.cause);
+    }).pipe(Effect.provide(layerTest), Effect.result);
     assert.deepEqual(yield* Ref.get(effects), []);
+    assert.equal(result._tag, "Failure");
+    if (result._tag === "Failure") {
+      const error = result.failure;
+      assert.equal(error._tag, "RunExecutionStartError");
+      if (
+        evidence === "malformed" ||
+        evidence === "owned-and-invalid" ||
+        evidence === "read-error"
+      ) {
+        assert.equal((error.cause as { _tag: string })._tag, "WorkflowRunStoreError");
+      } else assert.isUndefined(error.cause);
+    }
     assert.deepEqual(yield* snapshot, before);
   }).pipe(Effect.provide(custodyIntegration)),
 );

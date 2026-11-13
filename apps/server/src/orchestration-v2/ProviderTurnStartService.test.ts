@@ -2052,7 +2052,7 @@ effectIt.effect.each([
         createdAt: "2026-11-01T00:00:00Z",
         updatedAt: "2026-11-01T00:00:00Z",
       };
-      yield* sql`INSERT INTO orchestration_v2_projection_provider_threads (provider_thread_id, thread_id, owner_node_id, provider, driver, provider_instance_id, provider_session_id, status, updated_at, payload_json) VALUES ('new-provider-thread', ${thread}, NULL, 'codex', 'codex', 'codex-personal', 'new-provider-session', 'not_loaded', '2026-11-01T00:00:00Z', ${JSON.stringify(allocation)})`;
+      yield* sql`INSERT INTO orchestration_v2_projection_provider_threads (provider_thread_id, thread_id, owner_node_id, provider, driver, provider_instance_id, provider_session_id, status, first_run_ordinal, last_run_ordinal, updated_at, payload_json) VALUES ('new-provider-thread', ${thread}, NULL, 'codex', 'codex', 'codex-personal', 'new-provider-session', 'not_loaded', 2, 2, '2026-11-01T00:00:00Z', ${JSON.stringify(allocation)})`;
     } else {
       const session = {
         id: "new-provider-session",
@@ -2066,7 +2066,7 @@ effectIt.effect.each([
         updatedAt: "2026-11-01T00:00:00Z",
         lastError: null,
       };
-      yield* sql`INSERT INTO orchestration_v2_projection_provider_sessions (provider_session_id, thread_id, provider, status, updated_at, payload_json) VALUES ('new-provider-session', NULL, 'codex', 'running', '2026-11-01T00:00:00Z', ${JSON.stringify(session)})`;
+      yield* sql`INSERT INTO orchestration_v2_projection_provider_sessions (provider_session_id, thread_id, provider, driver, provider_instance_id, status, updated_at, payload_json) VALUES ('new-provider-session', NULL, 'codex', 'codex', 'codex-personal', 'running', '2026-11-01T00:00:00Z', ${JSON.stringify(session)})`;
       yield* sql`INSERT INTO orchestration_v2_projection_provider_session_bindings VALUES ('new-provider-session', ${thread})`;
     }
     if (evidence === "shared") {
