@@ -195,6 +195,10 @@ const CLEARED_TABLES: ReadonlyArray<string> = [
   "orchestration_v2_effect_outbox",
   "orchestration_v2_thread_launch_workflows",
   "orchestration_command_receipts",
+  "orchestration_v2_submission_transports",
+  "orchestration_v2_submission_attempts",
+  "workflow_runs",
+  "workflow_planning_sessions",
   "provider_session_runtime",
   "auth_sessions",
   "auth_pairing_links",
@@ -251,6 +255,8 @@ const copySourceSlice = Effect.fn("copyDevDbSourceSlice")(function* (sourcePath:
 
   yield* sql.withTransaction(
     Effect.gen(function* () {
+      // Published plans and revisions reference each other.
+      yield* sql`PRAGMA defer_foreign_keys = ON`;
       for (const table of tables) yield* sql.unsafe(table.sql).unprepared;
       if (filtered) {
         yield* sql`CREATE TEMP TABLE copied_threads (thread_id TEXT PRIMARY KEY)`;

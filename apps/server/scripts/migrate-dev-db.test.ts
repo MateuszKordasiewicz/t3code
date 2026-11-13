@@ -1,6 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -413,3 +414,200 @@ it.layer(NodeServices.layer)("migrate-dev-db", (it) => {
     }),
   );
 });
+
+const operationalWorkflowTables = [
+  "workflow_runs",
+  "workflow_planning_sessions",
+  "workflow_operations",
+  "workflow_planning_passes",
+  "workflow_attempts",
+  "workflow_role_results",
+  "workflow_acceptances",
+  "workflow_command_receipts",
+  "workflow_native_launch_intents",
+  "workflow_native_intent_receipts",
+  "workflow_native_reservation_material",
+  "workflow_native_command_proofs",
+  "workflow_planning_observations",
+  "workflow_planning_dispositions",
+  "workflow_planning_settlements",
+  "orchestration_v2_submission_transports",
+  "orchestration_v2_submission_attempts",
+] as const;
+const planContentTables = [
+  "workflow_plan_identities",
+  "workflow_revision_identities",
+  "development_plans",
+  "development_plan_source_packets",
+  "development_plan_revisions",
+  "development_plan_threads",
+  "development_plan_commands",
+] as const;
+
+const seedOperationalWorkflow = Effect.fn("test.seedOperationalWorkflowForDevCopy")(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const hash = "a".repeat(64);
+  const at = "2026-11-13T00:00:00.000Z";
+  yield* sql`INSERT INTO workflow_plan_identities VALUES ('seed-plan')`;
+  yield* sql`INSERT INTO workflow_revision_identities VALUES ('seed-plan','seed-revision',${hash},${hash})`;
+  yield* sql`INSERT INTO development_plans VALUES ('seed-plan','environment-kept','project-kept','Preserved plan',NULL,1,${at})`;
+  yield* sql`INSERT INTO development_plan_source_packets VALUES ('seed-plan',${hash},'{"source":"retained"}')`;
+  yield* sql`INSERT INTO development_plan_revisions VALUES ('seed-plan','seed-revision',${hash},${hash},'{"revision":"retained"}',${at})`;
+  yield* sql`INSERT INTO development_plan_threads VALUES ('seed-plan','stopped-thread')`;
+  yield* sql`INSERT INTO development_plan_commands VALUES ('seed-plan-command','seed-plan',${hash},'{"plan":"retained"}')`;
+  yield* sql`INSERT INTO workflow_runs VALUES ('seed-run','seed-plan','seed-revision',${hash},${hash},${hash},'active',0,0,'{}')`;
+  yield* sql`INSERT INTO workflow_planning_sessions VALUES ('seed-session','seed-plan',NULL,'active',0,0,'{}')`;
+  yield* sql`INSERT INTO workflow_operations(id,workflow_run_id,kind,fingerprint,status,generation,record_json) VALUES ('seed-work-operation','seed-run','stage_launch',${hash},'claimed',0,'{}')`;
+  yield* sql`INSERT INTO workflow_operations(id,planning_session_id,kind,fingerprint,status,generation,record_json) VALUES ('seed-plan-operation','seed-session','planning_pass',${hash},'claimed',0,'{}')`;
+  yield* sql`INSERT INTO workflow_attempts VALUES ('seed-work-attempt','seed-run','seed-work-operation','seed-item',0)`;
+  yield* sql`INSERT INTO workflow_role_results VALUES ('seed-result','seed-run','seed-work-operation','{}',0)`;
+  yield* sql`INSERT INTO workflow_acceptances VALUES ('seed-run','seed-acceptance','{}',0)`;
+  yield* sql`INSERT INTO workflow_command_receipts VALUES ('seed-work-command','seed-run',NULL,${hash},'seed-work-receipt','seed-work-operation','{}')`;
+  yield* sql`INSERT INTO workflow_planning_passes VALUES ('seed-pass','seed-session','seed-plan','seed-revision',${hash},${hash},'seed-plan-operation','stopped-thread','run-stopped-thread','{}')`;
+  yield* sql`INSERT INTO workflow_planning_observations VALUES ('seed-pass','seed-plan-operation','stopped-thread','run-stopped-thread','seed-terminal',${hash},'{}')`;
+  yield* sql`INSERT INTO workflow_planning_dispositions VALUES ('seed-pass','seed-finding','seed-pass','{}')`;
+  yield* sql`INSERT INTO workflow_planning_settlements VALUES ('seed-plan-operation',${hash},'{}')`;
+  yield* sql`INSERT INTO workflow_native_launch_intents(intent_id,workflow_run_id,operation_id,attempt_id,item_id,charge_attempt,repair,role,environment_id,project_id,launch_command_id,thread_id,message_id,fingerprint,draft_json,generation,state) VALUES ('seed-work-intent','seed-run','seed-work-operation','seed-work-attempt','seed-item',1,0,'writer','environment-kept','project-kept','seed-launch','stopped-thread','seed-message',${hash},'{}',0,'reserved')`;
+  yield* sql`INSERT INTO workflow_native_launch_intents(intent_id,planning_session_id,operation_id,pass_id,charge_attempt,repair,role,environment_id,project_id,launch_command_id,thread_id,message_id,fingerprint,draft_json,generation,state) VALUES ('seed-plan-intent','seed-session','seed-plan-operation','seed-pass',0,0,'planner','environment-kept','project-kept','seed-plan-launch','stopped-thread','seed-plan-message',${hash},'{}',0,'reserved')`;
+  for (const intent of ["seed-work-intent", "seed-plan-intent"]) {
+    yield* sql`INSERT INTO workflow_native_intent_receipts VALUES (${intent + "-command"},${intent + "-receipt"},${intent},${hash},'{}')`;
+    yield* sql`INSERT INTO workflow_native_reservation_material VALUES (${intent},'{}',${hash})`;
+  }
+  yield* sql`INSERT INTO orchestration_command_receipts(command_id,aggregate_kind,aggregate_id,accepted_at,result_sequence,status) VALUES ('seed-native-command','thread','stopped-thread',${at},1,'accepted')`;
+  yield* sql`INSERT INTO workflow_native_command_proofs VALUES ('seed-native-command','seed-work-intent','claim','{}',${hash})`;
+  yield* sql`INSERT INTO orchestration_v2_projection_run_attempts(attempt_id,thread_id,run_id,attempt_ordinal,root_node_id,provider,provider_thread_id,status,payload_json) VALUES ('seed-native-attempt','stopped-thread','run-stopped-thread',1,'seed-root','codex','seed-provider-thread','completed','{}')`;
+  for (const id of ["unbound", "settled"]) {
+    const unit = `t3code-codex-seed-${id}.scope`;
+    yield* sql`INSERT INTO orchestration_v2_submission_transports(format_version,transport_id,environment_id,project_id,opening_thread_id,driver,provider_instance_id,provider_session_id,host_boot_id,scope_namespace,proposed_unit,creation_context_json,creation_context_hash,creation_input_hash,created_at) VALUES (1,${id},'environment-kept','project-kept','stopped-thread','codex','seed-instance','session-shared','seed-host-boot','app-t3code-agents-main.slice',${unit},'{}',${hash},${hash},${at})`;
+    if (id === "settled") {
+      const binding = {
+        unit,
+        invocationId: "1".repeat(32),
+        controlGroup: `/fixture/${unit}`,
+        pid: 101,
+        pidStartTicks: "9007199254740993",
+      };
+      yield* sql`UPDATE orchestration_v2_submission_transports SET binding_json=${JSON.stringify(binding)},binding_hash=${hash},bound_at=${at} WHERE transport_id=${id}`;
+      yield* sql`INSERT INTO orchestration_v2_submission_attempts(format_version,attempt_id,transport_id,environment_id,project_id,thread_id,run_id,run_ordinal,root_node_id,provider_turn_ordinal,driver,provider_instance_id,provider_session_id,provider_thread_id,native_thread_id,method,selection_json,selection_hash,input_hash,frame_hash,request_id_json,created_at) VALUES (1,'seed-native-attempt',${id},'environment-kept','project-kept','stopped-thread','run-stopped-thread',1,'seed-root',1,'codex','seed-instance','session-shared','seed-provider-thread','seed-native-thread','turn/start','{}',${hash},${hash},${hash},'1',${at})`;
+      yield* sql`UPDATE orchestration_v2_submission_attempts SET local_outcome='unknown',local_reason='sink',local_observed_at=${at} WHERE attempt_id='seed-native-attempt'`;
+      yield* sql`UPDATE orchestration_v2_submission_transports SET settlement_json=${JSON.stringify({ binding, observation: "removed" })},settlement_hash=${hash},settled_at=${at} WHERE transport_id=${id}`;
+    }
+  }
+});
+
+const readWorkflowCopyState = Effect.fn("test.readWorkflowCopyState")(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const operational = yield* Effect.forEach(
+    operationalWorkflowTables,
+    (table) => sql`SELECT * FROM ${sql(table)}`,
+  );
+  const content = yield* Effect.forEach(
+    planContentTables,
+    (table) => sql`SELECT * FROM ${sql(table)}`,
+  );
+  const schema =
+    yield* sql`SELECT type,name,sql FROM sqlite_master WHERE name IN ('orchestration_v2_submission_transports','orchestration_v2_submission_attempts') OR name LIKE 'submission_%' OR name LIKE 'orchestration_v2_submission_%_guard' ORDER BY name`;
+  const history = yield* sql`SELECT * FROM effect_sql_migrations ORDER BY migration_id`;
+  return { operational, content, schema, history };
+});
+
+it.effect("copies plan content without retaining operational workflow or physical custody", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const sourceDir = yield* fs.makeTempDirectoryScoped({ prefix: "dev-workflow-custody-src-" });
+    const destDir = yield* fs.makeTempDirectoryScoped({ prefix: "dev-workflow-custody-dest-" });
+    const source = yield* createFixtureSource(sourceDir);
+    yield* withDatabase(source, seedOperationalWorkflow());
+    const before = yield* withDatabase(source, readWorkflowCopyState());
+    assert.isTrue(before.operational.every((rows) => rows.length > 0));
+    assert.isTrue(before.content.every((rows) => rows.length > 0));
+    const sourceBytes = yield* fs.readFile(source);
+    const result = yield* runMigrateDevDb(
+      { baseDir: destDir, source, projects: 5, threadsPerProject: 2 },
+      { sharedHome: sourceDir },
+    );
+    assert.deepStrictEqual(yield* fs.readFile(source), sourceBytes);
+    assert.deepStrictEqual(yield* withDatabase(source, readWorkflowCopyState()), before);
+    const copy = yield* withDatabase(result.databasePath, readWorkflowCopyState());
+    assert.isTrue(
+      copy.operational.every((rows) => rows.length === 0),
+      "dev copy must contain no operational workflow or process custody",
+    );
+    assert.deepStrictEqual(copy.content, before.content);
+    assert.deepStrictEqual(copy.schema, before.schema);
+    assert.deepStrictEqual(copy.history, before.history);
+    const threads = yield* withDatabase(
+      result.databasePath,
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        return yield* sql<{
+          readonly thread_id: string;
+        }>`SELECT thread_id FROM orchestration_v2_projection_threads ORDER BY thread_id`;
+      }),
+    );
+    assert.deepStrictEqual(
+      threads.map((row) => row.thread_id),
+      ["fork-thread", "settled-thread", "stopped-thread"],
+    );
+    assert.deepStrictEqual(result.executedMigrations, []);
+    assert.strictEqual(result.databasePath, path.join(destDir, "userdata", "statev2.sqlite"));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("keeps a published plan's current revision when omitting its execution owners", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const sourceDir = yield* fs.makeTempDirectoryScoped({ prefix: "dev-published-plan-src-" });
+    const destDir = yield* fs.makeTempDirectoryScoped({ prefix: "dev-published-plan-dest-" });
+    const source = yield* createFixtureSource(sourceDir);
+    yield* withDatabase(
+      source,
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* seedOperationalWorkflow();
+        yield* sql`UPDATE development_plans SET current_revision_id='seed-revision' WHERE plan_id='seed-plan'`;
+      }),
+    );
+    const before = yield* withDatabase(source, readWorkflowCopyState());
+    const bytes = yield* fs.readFile(source);
+    const result = yield* runMigrateDevDb(
+      { baseDir: destDir, source, projects: 5, threadsPerProject: 2 },
+      { sharedHome: sourceDir },
+    );
+    const copy = yield* withDatabase(result.databasePath, readWorkflowCopyState());
+    assert.deepStrictEqual(copy.content, before.content);
+    assert.isTrue(copy.operational.every((rows) => rows.length === 0));
+    assert.deepStrictEqual(yield* fs.readFile(source), bytes);
+    assert.deepStrictEqual(yield* withDatabase(source, readWorkflowCopyState()), before);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("rejects a dangling retained plan reference at the destination copy commit", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const sourceDir = yield* fs.makeTempDirectoryScoped({ prefix: "dev-dangling-plan-src-" });
+    const destDir = yield* fs.makeTempDirectoryScoped({ prefix: "dev-dangling-plan-dest-" });
+    const source = yield* createFixtureSource(sourceDir);
+    yield* withDatabase(
+      source,
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`PRAGMA foreign_keys = OFF`;
+        yield* sql`INSERT INTO development_plan_commands(command_id,plan_id,fingerprint,result_json) VALUES ('dangling-command','missing-plan',${"a".repeat(64)},'{}')`;
+      }),
+    );
+    const before = yield* fs.readFile(source);
+    const exit = yield* Effect.exit(
+      runMigrateDevDb(
+        { baseDir: destDir, source, projects: 5, threadsPerProject: 2 },
+        { sharedHome: sourceDir },
+      ),
+    );
+    assert.isTrue(Exit.isFailure(exit));
+    assert.include(String(exit), "FOREIGN KEY constraint failed");
+    assert.deepStrictEqual(yield* fs.readFile(source), before);
+    assert.isFalse(yield* fs.exists(path.join(destDir, "userdata", "statev2.sqlite")));
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
