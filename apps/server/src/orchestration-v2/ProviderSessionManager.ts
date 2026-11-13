@@ -56,6 +56,7 @@ import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 
+const isTurnStartError = Schema.is(ProviderAdapter.ProviderAdapterTurnStartError);
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_MAX_IDLE_PIN_MS = 4 * 60 * 60 * 1000;
 const RELEASE_SCOPE_CLOSE_TIMEOUT_MS = 30 * 1000;
@@ -240,7 +241,7 @@ interface LiveSessionEntry {
   readonly requestEventPermit: Semaphore.Semaphore;
   readonly scope: Scope.Closeable;
   readonly idleGeneration: number;
-  readonly busyTurns: ReadonlySet<string>;
+  readonly busyTurns: ReadonlyMap<string, ThreadId>;
   readonly idleFiber: Fiber.Fiber<void, never> | null;
   readonly pinnedSinceMs: number | null;
   readonly idleThreadUnloads: ReadonlyMap<ThreadId, IdleThreadUnload>;
@@ -998,7 +999,7 @@ export const layerWithOptions = (
               const own = input.keepIfBusyOtherThan;
               if (
                 own !== undefined &&
-                [...existing.busyTurns].some(
+                [...existing.busyTurns.keys()].some(
                   (turnKey) => !own.some((id) => turnKey.startsWith(busyTurnPrefix(id))),
                 )
               ) {
@@ -1508,6 +1509,7 @@ export const layerWithOptions = (
       const markBusy = (
         providerSessionId: ProviderSessionId,
         turnKey: string,
+        threadId: ThreadId,
         runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime,
       ) =>
         withActivityError(
@@ -1522,7 +1524,7 @@ export const layerWithOptions = (
               const updated = new Map(current);
               updated.set(key, {
                 ...entry,
-                busyTurns: new Set(entry.busyTurns).add(turnKey),
+                busyTurns: new Map(entry.busyTurns).set(turnKey, threadId),
                 idleFiber: null,
                 pinnedSinceMs: null,
               });
@@ -1538,25 +1540,27 @@ export const layerWithOptions = (
         providerSessionId: ProviderSessionId,
         providerThreadId: ProviderThreadId,
         runOrdinal: number,
+        runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime,
       ) =>
         withActivityError(
           providerSessionId,
           Effect.gen(function* () {
             const key = sessionKey(providerSessionId);
-            yield* Ref.update(sessions, (current) => {
+            const marked = yield* Ref.modify(sessions, (current) => {
               const entry = current.get(key);
-              if (entry === undefined) {
-                return current;
+              if (entry === undefined || entry.runtime !== runtime) {
+                return [false, current] as const;
               }
-              const busyTurns = new Set(entry.busyTurns);
+              const busyTurns = new Map(entry.busyTurns);
               busyTurns.delete(busyTurnKey(providerThreadId, runOrdinal));
               const updated = new Map(current);
               updated.set(key, {
                 ...entry,
                 busyTurns,
               });
-              return updated;
+              return [true, updated] as const;
             });
+            if (!marked) return;
             yield* scheduleIdleReleaseInternal(providerSessionId);
             yield* scheduleThreadUnload(providerSessionId, providerThreadId);
           }),
@@ -1564,7 +1568,7 @@ export const layerWithOptions = (
 
       const hasBusyTurn = (entry: LiveSessionEntry, providerThreadId: ProviderThreadId) => {
         const prefix = busyTurnPrefix(providerThreadId);
-        for (const turnKey of entry.busyTurns) {
+        for (const turnKey of entry.busyTurns.keys()) {
           if (turnKey.startsWith(prefix)) return true;
         }
         return false;
@@ -2078,7 +2082,6 @@ export const layerWithOptions = (
                 providerInstanceId: runtime.instanceId,
               }),
             ).pipe(
-              // Failed or stopped starts may omit turn.terminal; clear their turns so sessions can idle.
               Effect.andThen(
                 holdThreadLoaded({
                   providerSessionId,
@@ -2091,6 +2094,7 @@ export const layerWithOptions = (
                   markBusy(
                     providerSessionId,
                     busyTurnKey(input.providerThread.id, input.runOrdinal),
+                    input.threadId,
                     runtime,
                   ).pipe(
                     Effect.catchCause((cause) =>
@@ -2117,13 +2121,32 @@ export const layerWithOptions = (
                   ),
                   () =>
                     runtime.startTurn(input).pipe(turnMetrics("send", input.modelSelection.model)),
-                  (_, exit) =>
-                    Exit.isFailure(exit)
-                      ? observeActivity(
+                  (_, exit) => {
+                    if (Exit.isSuccess(exit)) return Effect.void;
+                    const uncertain = exit.cause.reasons.some((reason) => {
+                      if (!Cause.isFailReason(reason)) return false;
+                      const error = reason.error;
+                      return (
+                        isTurnStartError(error) &&
+                        error.submissionState === "unknown" &&
+                        error.driver === runtime.driver &&
+                        error.threadId === input.threadId &&
+                        error.runId === input.runId &&
+                        error.providerThreadId === input.providerThread.id
+                      );
+                    });
+                    return uncertain
+                      ? Effect.void
+                      : observeActivity(
                           providerSessionId,
-                          markIdle(providerSessionId, input.providerThread.id, input.runOrdinal),
-                        )
-                      : Effect.void,
+                          markIdle(
+                            providerSessionId,
+                            input.providerThread.id,
+                            input.runOrdinal,
+                            runtime,
+                          ),
+                        );
+                  },
                 ),
               ),
             ),
@@ -2243,6 +2266,7 @@ export const layerWithOptions = (
                     entry.runtime.providerSessionId,
                     event.providerThreadId,
                     event.runOrdinal,
+                    entry.runtime,
                   )
                 : metadataOnly
                   ? Effect.void
@@ -2529,7 +2553,7 @@ export const layerWithOptions = (
                 requestEventPermit: yield* Semaphore.make(1),
                 scope: sessionScope,
                 idleGeneration: 0,
-                busyTurns: new Set(),
+                busyTurns: new Map(),
                 idleFiber: null,
                 pinnedSinceMs: null,
                 idleThreadUnloads: new Map(),
@@ -2655,12 +2679,16 @@ export const layerWithOptions = (
           function* (input) {
             const entry = (yield* Ref.get(sessions)).get(sessionKey(input.providerSessionId));
             if (entry === undefined || !entry.supportsMultipleProviderThreads) return [];
+            const busyThreads = new Set(entry.busyTurns.values());
             return yield* Effect.filter(
-              [...entry.attachedThreadIds].filter((threadId) => threadId !== input.threadId),
-              (threadId) =>
+              [...new Set([...entry.attachedThreadIds, ...busyThreads])].filter(
+                (threadId) => threadId !== input.threadId,
+              ),
+              (threadId) => {
+                if (busyThreads.has(threadId)) return Effect.succeed(true);
                 // Runs, not the shell's activeRunId: the shell omits silent runs such as idle
                 // compaction. Background work outlives its run and still needs the process.
-                Effect.zipWith(
+                return Effect.zipWith(
                   projectionStore.getThreadRecords(threadId, ["runs"]),
                   projectionStore.getThreadShell(threadId),
                   ({ runs }, shell) =>
@@ -2669,7 +2697,8 @@ export const layerWithOptions = (
                 ).pipe(
                   // An unreadable thread may still be working; never kill it unseen.
                   Effect.orElseSucceed(() => true),
-                ),
+                );
+              },
             );
           },
         ),

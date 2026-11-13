@@ -338,6 +338,7 @@ export class ProviderAdapterTurnStartError extends Schema.TaggedError<ProviderAd
     threadId: ThreadId,
     providerThreadId: ProviderThreadId,
     runId: RunId,
+    submissionState: Schema.optional(Schema.Literal("unknown")),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {
