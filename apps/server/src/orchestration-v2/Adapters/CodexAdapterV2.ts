@@ -81,6 +81,7 @@ import type {
 } from "@t3tools/contracts";
 import * as CodexClient from "effect-codex-app-server/client";
 import * as CodexErrors from "effect-codex-app-server/errors";
+import type * as CodexProtocol from "effect-codex-app-server/protocol";
 import * as CodexSchema from "effect-codex-app-server/schema";
 import * as Cause from "effect/Cause";
 import * as Exit from "effect/Exit";
@@ -94,6 +95,8 @@ import * as FileSystem from "effect/FileSystem";
 import * as Function from "effect/Function";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Predicate from "effect/Predicate";
+import * as Result from "effect/Result";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
@@ -984,7 +987,39 @@ function validateCodexGoalObjective(objective: string) {
     : Effect.void;
 }
 
+const ControlledCodexSelection = Schema.Struct({
+  v: Schema.Literal(1),
+  kind: Schema.Literals(["start", "compact"]),
+  threadId: Schema.String,
+  runId: Schema.String,
+  runOrdinal: Schema.Int,
+  attemptId: Schema.String,
+  rootNodeId: Schema.String,
+  providerTurnOrdinal: Schema.Int,
+  providerInstanceId: Schema.String,
+  providerSessionId: Schema.String,
+  providerThreadId: Schema.String,
+  nativeThreadId: Schema.String,
+});
+type ControlledCodexSelection = typeof ControlledCodexSelection.Type;
+const encodeControlledSelection = Schema.encodeEffect(
+  Schema.fromJsonString(
+    ControlledCodexSelection.pipe(Schema.fieldsAssign({ invocation: Schema.Int })),
+  ),
+);
+
+type RestoreCodexOperation = <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
+
+interface ControlledCodexStartState {
+  readonly selection: string;
+  readonly method: "turn/start" | "thread/compact/start";
+  outcome?: CodexProtocol.CodexAppServerFrameOutcome["outcome"];
+  invalidFrame?: boolean;
+  rpcSettled: boolean;
+  nativeTurnId?: string;
+}
 interface PendingCodexRootTurn {
+  readonly control?: ControlledCodexStartState;
   readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
   readonly nativeThreadId: string;
   uncertain: boolean;
@@ -1429,6 +1464,17 @@ export interface CodexAppServerClientFactoryShape {
     ProviderAdapter.ProviderAdapterOpenSessionError,
     Scope.Scope
   >;
+  readonly openControlled?: (
+    input: Parameters<CodexAppServerClientFactoryShape["open"]>[0] & {
+      readonly onOutcome: (
+        outcome: CodexProtocol.CodexAppServerFrameOutcome,
+      ) => Effect.Effect<void>;
+    },
+  ) => Effect.Effect<
+    CodexClient.CodexAppServerControlledClient["Service"],
+    ProviderAdapter.ProviderAdapterOpenSessionError,
+    Scope.Scope
+  >;
 }
 
 export class CodexAppServerClientFactory extends Context.Service<
@@ -1803,14 +1849,240 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     }),
                 ),
               );
-        const client = yield* clientFactory.open({
+        const controlledMode = clientFactory.openControlled !== undefined;
+        const selectedSessionId = input.providerSessionId;
+        const selectedInstanceId = adapterOptions.instanceId;
+        let nextInvocation = 0;
+        const pendingRootTurns = yield* Ref.make(new Map<string, PendingCodexRootTurn>());
+        const reservePendingRootTurn = Effect.fn("CodexAdapterV2.reservePendingRootTurn")(
+          function* (
+            nativeThreadId: string,
+            turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+            selection?: ControlledCodexSelection,
+          ) {
+            if (controlledMode && !selection)
+              return yield* codexTurnStartError(
+                turnInput,
+                toProtocolError("Controlled starts require their actual selected identity."),
+              );
+            if (selection && !Number.isSafeInteger(nextInvocation + 1))
+              return yield* codexTurnStartError(
+                turnInput,
+                toProtocolError("Controlled start invocation limit reached."),
+              );
+            const encodedSelection = selection
+              ? yield* encodeControlledSelection({
+                  ...selection,
+                  invocation: ++nextInvocation,
+                }).pipe(Effect.mapError((cause) => codexTurnStartError(turnInput, cause)))
+              : undefined;
+            const record: PendingCodexRootTurn = {
+              input: turnInput,
+              nativeThreadId,
+              uncertain: false,
+              ...(selection && encodedSelection !== undefined
+                ? {
+                    control: {
+                      selection: encodedSelection,
+                      method:
+                        selection.kind === "start"
+                          ? ("turn/start" as const)
+                          : ("thread/compact/start" as const),
+                      rpcSettled: false,
+                    },
+                  }
+                : {}),
+            };
+            const selected = yield* Ref.modify(pendingRootTurns, (current) => {
+              const retained = current.get(nativeThreadId);
+              return retained && (retained.uncertain || retained.control !== undefined)
+                ? ([retained, current] as const)
+                : ([record, new Map(current).set(nativeThreadId, record)] as const);
+            });
+            if (selected !== record) {
+              const sameRun =
+                selected.input.threadId === turnInput.threadId &&
+                selected.input.providerThread.id === turnInput.providerThread.id &&
+                selected.input.runId === turnInput.runId &&
+                selected.input.runOrdinal === turnInput.runOrdinal &&
+                selected.input.attemptId === turnInput.attemptId &&
+                selected.input.rootNodeId === turnInput.rootNodeId;
+              return yield* new ProviderAdapter.ProviderAdapterTurnStartError({
+                driver: CODEX_PROVIDER,
+                threadId: turnInput.threadId,
+                providerThreadId: turnInput.providerThread.id,
+                runId: turnInput.runId,
+                ...(sameRun ? { submissionState: "unknown" as const } : {}),
+                cause: toProtocolError(
+                  "A previous start on this Codex thread has an uncertain submission. Wait for native evidence before starting another run.",
+                ),
+              });
+            }
+            return record;
+          },
+        );
+        const finishPendingRootTurn = Effect.fn("CodexAdapterV2.finishPendingRootTurn")(function* (
+          record: PendingCodexRootTurn,
+          exit: Exit.Exit<unknown, unknown>,
+          keepSuccess = false,
+        ) {
+          if (record.control) {
+            record.control.rpcSettled = true;
+          }
+          const turnInput = record.input;
+          const uncertain =
+            Exit.isFailure(exit) &&
+            exit.cause.reasons.some(
+              (reason) =>
+                Cause.isFailReason(reason) &&
+                isSelectedUncertainStartError(reason.error, turnInput),
+            );
+          yield* Ref.update(pendingRootTurns, (current) => {
+            if (current.get(record.nativeThreadId) !== record) return current;
+            if (record.control?.nativeTurnId !== undefined) {
+              const updated = new Map(current);
+              updated.delete(record.nativeThreadId);
+              return updated;
+            }
+            if (uncertain) {
+              record.uncertain = true;
+              return current;
+            }
+            if (keepSuccess && Exit.isSuccess(exit)) return current;
+            const updated = new Map(current);
+            updated.delete(record.nativeThreadId);
+            return updated;
+          });
+        });
+        const observeControlledOutcome = Effect.fn("CodexAdapterV2.observeControlledOutcome")(
+          function* (outcome: CodexProtocol.CodexAppServerFrameOutcome) {
+            if (outcome.frame.selection === null) return;
+            const decoded = Result.try(() => JSON.parse(outcome.frame.encoded) as unknown);
+            yield* Ref.update(pendingRootTurns, (current) => {
+              for (const record of current.values()) {
+                const control = record.control;
+                if (control?.selection !== outcome.frame.selection) continue;
+                const matches =
+                  Result.isSuccess(decoded) &&
+                  Predicate.hasProperty(decoded.success, "method") &&
+                  decoded.success.method === control.method &&
+                  outcome.frame.method === control.method &&
+                  Predicate.hasProperty(decoded.success, "params") &&
+                  Predicate.hasProperty(decoded.success.params, "threadId") &&
+                  decoded.success.params.threadId === record.nativeThreadId;
+                control.outcome = matches ? outcome.outcome : "unknown";
+                if (!matches) control.invalidFrame = true;
+                break;
+              }
+              return current;
+            });
+          },
+        );
+        const retainControlledSubmission = Effect.fn("CodexAdapterV2.retainControlledSubmission")(
+          function* (record: PendingCodexRootTurn, exit: Exit.Exit<unknown, unknown>) {
+            const control = record.control;
+            if (
+              !control ||
+              (!control.invalidFrame &&
+                (Exit.isSuccess(exit) ||
+                  control.outcome === undefined ||
+                  control.outcome === "not_submitted"))
+            )
+              return;
+            if (
+              Exit.isFailure(exit) &&
+              exit.cause.reasons.some(
+                (reason) =>
+                  Cause.isFailReason(reason) &&
+                  isSelectedUncertainStartError(reason.error, record.input),
+              )
+            )
+              return;
+            return yield* new ProviderAdapter.ProviderAdapterTurnStartError({
+              driver: CODEX_PROVIDER,
+              threadId: record.input.threadId,
+              providerThreadId: record.input.providerThread.id,
+              runId: record.input.runId,
+              submissionState: "unknown",
+              cause: Exit.isFailure(exit)
+                ? exit.cause
+                : "Controlled frame did not match selected identity.",
+            });
+          },
+        );
+        const captureControlledTurn = (
+          turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+          kind: ControlledCodexSelection["kind"],
+        ) =>
+          Result.try({
+            try: () => {
+              const thread = turnInput.providerThread;
+              const native = thread.nativeThreadRef;
+              if (
+                !native ||
+                typeof native.nativeId !== "string" ||
+                native.nativeId.length === 0 ||
+                native.driver !== CODEX_PROVIDER ||
+                thread.driver !== CODEX_PROVIDER ||
+                thread.providerInstanceId !== selectedInstanceId ||
+                thread.providerSessionId !== selectedSessionId ||
+                thread.appThreadId !== turnInput.threadId ||
+                turnInput.appThread.id !== turnInput.threadId ||
+                ![
+                  turnInput.threadId,
+                  turnInput.runId,
+                  turnInput.attemptId,
+                  turnInput.rootNodeId,
+                  thread.id,
+                  native.nativeId,
+                ].every((id) => typeof id === "string" && id.length > 0) ||
+                !Number.isSafeInteger(turnInput.runOrdinal) ||
+                turnInput.runOrdinal < 1 ||
+                !Number.isSafeInteger(turnInput.providerTurnOrdinal) ||
+                turnInput.providerTurnOrdinal < 1
+              )
+                throw toProtocolError(
+                  "Controlled start identity does not match its provider session.",
+                );
+              const owned = {
+                ...turnInput,
+                appThread: { ...turnInput.appThread },
+                providerThread: { ...thread, nativeThreadRef: { ...native } },
+              };
+              const selection: ControlledCodexSelection = Object.freeze({
+                v: 1,
+                kind,
+                threadId: owned.threadId,
+                runId: owned.runId,
+                runOrdinal: owned.runOrdinal,
+                attemptId: owned.attemptId,
+                rootNodeId: owned.rootNodeId,
+                providerTurnOrdinal: owned.providerTurnOrdinal,
+                providerInstanceId: selectedInstanceId,
+                providerSessionId: selectedSessionId,
+                providerThreadId: owned.providerThread.id,
+                nativeThreadId: native.nativeId,
+              });
+              return { input: owned, selection };
+            },
+            catch: (cause) => codexTurnStartError(turnInput, cause),
+          });
+        const openInput = {
           instanceId: adapterOptions.instanceId,
           threadId: input.threadId,
           providerSessionId: input.providerSessionId,
           runtimePolicy: input.runtimePolicy,
           settings: resolvedRuntime?.config ?? adapterOptions.settings,
           environment: resolvedRuntime?.environment ?? adapterOptions.environment,
-        });
+        };
+        const controlledClient =
+          clientFactory.openControlled === undefined
+            ? undefined
+            : yield* clientFactory.openControlled({
+                ...openInput,
+                onOutcome: observeControlledOutcome,
+              });
+        const client = controlledClient ?? (yield* clientFactory.open(openInput));
         const additionalContextByThread = yield* Ref.make(
           new Map<
             string,
@@ -1956,64 +2228,6 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             context.nativeTurnId,
           ).hasSubagents = true;
         };
-        const pendingRootTurns = yield* Ref.make(new Map<string, PendingCodexRootTurn>());
-        const reservePendingRootTurn = Effect.fn("CodexAdapterV2.reservePendingRootTurn")(
-          function* (
-            nativeThreadId: string,
-            turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
-          ) {
-            const record = { input: turnInput, nativeThreadId, uncertain: false };
-            const selected = yield* Ref.modify(pendingRootTurns, (current) => {
-              const retained = current.get(nativeThreadId);
-              return retained?.uncertain
-                ? ([retained, current] as const)
-                : ([record, new Map(current).set(nativeThreadId, record)] as const);
-            });
-            if (selected !== record) {
-              const sameRun =
-                selected.input.threadId === turnInput.threadId &&
-                selected.input.providerThread.id === turnInput.providerThread.id &&
-                selected.input.runId === turnInput.runId &&
-                selected.input.runOrdinal === turnInput.runOrdinal &&
-                selected.input.attemptId === turnInput.attemptId &&
-                selected.input.rootNodeId === turnInput.rootNodeId;
-              return yield* new ProviderAdapter.ProviderAdapterTurnStartError({
-                driver: CODEX_PROVIDER,
-                threadId: turnInput.threadId,
-                providerThreadId: turnInput.providerThread.id,
-                runId: turnInput.runId,
-                ...(sameRun ? { submissionState: "unknown" as const } : {}),
-                cause: toProtocolError(
-                  "A previous start on this Codex thread has an uncertain submission. Wait for native evidence before starting another run.",
-                ),
-              });
-            }
-            return record;
-          },
-        );
-        const finishPendingRootTurn = Effect.fn("CodexAdapterV2.finishPendingRootTurn")(function* (
-          record: PendingCodexRootTurn,
-          exit: Exit.Exit<unknown, unknown>,
-        ) {
-          const turnInput = record.input;
-          const uncertain =
-            Exit.isFailure(exit) &&
-            exit.cause.reasons.some(
-              (reason) =>
-                Cause.isFailReason(reason) &&
-                isSelectedUncertainStartError(reason.error, turnInput),
-            );
-          yield* Ref.update(pendingRootTurns, (current) => {
-            if (current.get(record.nativeThreadId) !== record) return current;
-            if (uncertain) {
-              record.uncertain = true;
-              return current;
-            }
-            const updated = new Map(current);
-            updated.delete(record.nativeThreadId);
-            return updated;
-          });
-        });
         const turnWaiters = yield* Ref.make(new Map<string, Deferred.Deferred<void, never>>());
         const subagentThreads = yield* Ref.make(new Map<string, CodexSubagentThreadContext>());
         const subagentSelections = new Map<string, Omit<ModelSelection, "instanceId">>();
@@ -4851,8 +5065,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 nativeTurnId: payload.turn.id,
                 startedAt: codexTimestamp(payload.turn.startedAt),
               });
+              if (pendingRootTurn.control) pendingRootTurn.control.nativeTurnId = payload.turn.id;
               yield* Ref.update(pendingRootTurns, (current) => {
                 if (current.get(payload.threadId) !== pendingRootTurn) return current;
+                if (pendingRootTurn.control && !pendingRootTurn.control.rpcSettled) return current;
                 const updated = new Map(current);
                 updated.delete(payload.threadId);
                 return updated;
@@ -6726,6 +6942,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         const retryCapacityFailure = Effect.fn("CodexAdapterV2.retryCapacityFailure")(function* (
           terminal: Parameters<typeof finalizeCodexTurn>[0],
         ) {
+          if (controlledMode) return false;
           const context = terminal.context;
           const code =
             terminal.failureErrorInfo == null
@@ -7076,21 +7293,25 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         const startNativeTurn = Effect.fn("CodexAdapterV2.startNativeTurn")(function* (
           turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
           codexInput: ReadonlyArray<CodexSchema.V2TurnStartParams__UserInput>,
+          selection?: ControlledCodexSelection,
+          restore: RestoreCodexOperation = Function.identity,
         ) {
-          const threadId = yield* getNativeThreadId(turnInput.providerThread);
-          const mcpSession = yield* mcpSessions.read(turnInput.threadId);
-          const turnStartParams = yield* buildCodexTurnStartParams({
-            nativeThreadId: threadId,
-            codexInput,
-            runtimePolicy: turnInput.runtimePolicy,
-            modelSelection: turnInput.modelSelection,
-            hasT3Mcp: mcpSession !== undefined,
-            browserToolsAvailable: mcpSession?.browserToolsAvailable ?? true,
-            deviceToolsAvailable: mcpSession?.capabilities?.has("device") ?? false,
-            omitServiceTier: adapterOptions.resolveRuntime !== undefined,
-            ...(turnInput.appContext === undefined ? {} : { appContext: turnInput.appContext }),
-          });
-          const pending = yield* reservePendingRootTurn(threadId, turnInput);
+          const threadId = yield* restore(getNativeThreadId(turnInput.providerThread));
+          const mcpSession = yield* restore(mcpSessions.read(turnInput.threadId));
+          const turnStartParams = yield* restore(
+            buildCodexTurnStartParams({
+              nativeThreadId: threadId,
+              codexInput,
+              runtimePolicy: turnInput.runtimePolicy,
+              modelSelection: turnInput.modelSelection,
+              hasT3Mcp: mcpSession !== undefined,
+              browserToolsAvailable: mcpSession?.browserToolsAvailable ?? true,
+              deviceToolsAvailable: mcpSession?.capabilities?.has("device") ?? false,
+              omitServiceTier: adapterOptions.resolveRuntime !== undefined,
+              ...(turnInput.appContext === undefined ? {} : { appContext: turnInput.appContext }),
+            }),
+          );
+          const pending = yield* reservePendingRootTurn(threadId, turnInput, selection);
           return yield* Effect.gen(function* () {
             yield* Ref.update(additionalContextByThread, (current) => {
               const next = new Map(current);
@@ -7104,9 +7325,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               ...(yield* Ref.get(settledTurns)),
               ...(yield* Ref.get(activeTurns)),
             ]);
-            const started = yield* client
-              .request("turn/start", turnStartParams)
-              .pipe(Effect.mapError((cause) => codexStartSubmissionError(turnInput, cause)));
+            const started = yield* restore(
+              controlledClient && pending.control
+                ? controlledClient.request("turn/start", turnStartParams, pending.control.selection)
+                : client.request("turn/start", turnStartParams),
+            ).pipe(Effect.mapError((cause) => codexStartSubmissionError(turnInput, cause)));
             const previousTurn =
               previousTurns.get(started.turn.id) ??
               (yield* Ref.get(activeTurns)).get(started.turn.id);
@@ -7120,6 +7343,13 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   "Codex returned a turn belonging to an earlier run. Stop the existing turn before retrying this message.",
               });
             }
+            if (pending.control?.nativeTurnId !== undefined) {
+              if (pending.control.nativeTurnId !== started.turn.id)
+                return yield* toProtocolError(
+                  "Codex response disagrees with its registered native start.",
+                );
+              return;
+            }
             // A turn/started notification may have registered and completed this turn already.
             if ((yield* Ref.get(pendingRootTurns)).get(threadId) !== pending) return;
             yield* registerRootTurn({
@@ -7128,7 +7358,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               startedAt: codexTimestamp(started.turn.startedAt),
               waitForNativeStart: started.turn.startedAt === null,
             });
-          }).pipe(Effect.onExit((exit) => finishPendingRootTurn(pending, exit)));
+            if (pending.control) pending.control.nativeTurnId = started.turn.id;
+          }).pipe(
+            Effect.onExit((exit) => retainControlledSubmission(pending, exit)),
+            Effect.onExit((exit) => finishPendingRootTurn(pending, exit)),
+          );
         });
 
         /**
@@ -7312,6 +7546,53 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           ),
         };
 
+        const compactNativeTurn = Effect.fn("CodexAdapterV2.compactThread")(function* (
+          turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+          selection?: ControlledCodexSelection,
+          restore: RestoreCodexOperation = Function.identity,
+        ) {
+          const threadId = yield* restore(getNativeThreadId(turnInput.providerThread));
+          const pending = yield* reservePendingRootTurn(threadId, turnInput, selection);
+          yield* restore(
+            controlledClient && pending.control
+              ? controlledClient.request(
+                  "thread/compact/start",
+                  { threadId },
+                  pending.control.selection,
+                )
+              : client.request("thread/compact/start", { threadId }),
+          ).pipe(
+            Effect.mapError((cause) => codexStartSubmissionError(turnInput, cause)),
+            Effect.onExit((exit) => retainControlledSubmission(pending, exit)),
+            Effect.onExit((exit) => finishPendingRootTurn(pending, exit, true)),
+          );
+        });
+
+        const startCapturedTurn = Effect.fn("CodexAdapterV2.startTurn")(
+          (
+            turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+            selection?: ControlledCodexSelection,
+          ) =>
+            controlledMode
+              ? Effect.uninterruptibleMask((restore) =>
+                  Effect.gen(function* () {
+                    const codexInput =
+                      turnInput.restartContinuationOfRunId === undefined
+                        ? yield* restore(toCodexInput(turnInput))
+                        : [];
+                    yield* startNativeTurn(turnInput, codexInput, selection, restore);
+                  }).pipe(Effect.mapError((cause) => codexTurnStartError(turnInput, cause))),
+                )
+              : Effect.gen(function* () {
+                  yield* startNativeTurn(
+                    turnInput,
+                    turnInput.restartContinuationOfRunId === undefined
+                      ? yield* toCodexInput(turnInput)
+                      : [],
+                  );
+                }).pipe(Effect.mapError((cause) => codexTurnStartError(turnInput, cause))),
+        );
+
         const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
           instanceId: adapterOptions.instanceId,
           driver: CODEX_PROVIDER,
@@ -7465,20 +7746,20 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 ),
               ),
           ),
-          compactThread: Effect.fn("CodexAdapterV2.compactThread")(
-            function* (turnInput) {
-              const threadId = yield* getNativeThreadId(turnInput.providerThread);
-              const pending = yield* reservePendingRootTurn(threadId, turnInput);
-              yield* client.request("thread/compact/start", { threadId }).pipe(
-                Effect.mapError((cause) => codexStartSubmissionError(turnInput, cause)),
-                Effect.onExit((exit) =>
-                  Exit.isFailure(exit) ? finishPendingRootTurn(pending, exit) : Effect.void,
-                ),
+          compactThread: (turnInput) => {
+            if (!controlledMode)
+              return compactNativeTurn(turnInput).pipe(
+                Effect.mapError((cause) => codexTurnStartError(turnInput, cause)),
               );
-            },
-            (effect, turnInput) =>
-              effect.pipe(Effect.mapError((cause) => codexTurnStartError(turnInput, cause))),
-          ),
+            const owned = captureControlledTurn(turnInput, "compact");
+            return Result.isFailure(owned)
+              ? Effect.fail(owned.failure)
+              : Effect.uninterruptibleMask((restore) =>
+                  compactNativeTurn(owned.success.input, owned.success.selection, restore).pipe(
+                    Effect.mapError((cause) => codexTurnStartError(owned.success.input, cause)),
+                  ),
+                );
+          },
           injectHistory: Effect.fn("CodexAdapterV2.injectHistory")(
             function* (input) {
               const threadId = yield* getNativeThreadId(input.providerThread);
@@ -7505,20 +7786,32 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 }),
             ),
           ),
-          startTurn: (turnInput) => {
+          // @effect-diagnostics-next-line effectFnOpportunity:off -- Own selected identities synchronously before returning the start Effect.
+          startTurn: (requestedInput) => {
+            const owned = controlledMode
+              ? captureControlledTurn(requestedInput, "start")
+              : undefined;
+            if (owned && Result.isFailure(owned)) return Effect.fail(owned.failure);
+            const turnInput =
+              owned && Result.isSuccess(owned) ? owned.success.input : requestedInput;
+            const selection =
+              owned && Result.isSuccess(owned) ? owned.success.selection : undefined;
             const goalCommand =
               turnInput.restartContinuationOfRunId === undefined
                 ? parseGoalCommand(turnInput.message)
                 : null;
-            if (goalCommand !== null) return runGoalCommand(turnInput, goalCommand);
-            return Effect.gen(function* () {
-              yield* startNativeTurn(
-                turnInput,
-                turnInput.restartContinuationOfRunId === undefined
-                  ? yield* toCodexInput(turnInput)
-                  : [],
-              );
-            }).pipe(Effect.mapError((cause) => codexTurnStartError(turnInput, cause)));
+            if (goalCommand !== null)
+              return controlledMode
+                ? Effect.fail(
+                    codexTurnStartError(
+                      turnInput,
+                      toProtocolError(
+                        "Controlled goal commands require a separately fenced continuation policy.",
+                      ),
+                    ),
+                  )
+                : runGoalCommand(turnInput, goalCommand);
+            return startCapturedTurn(turnInput, selection);
           },
           steerTurn: Effect.fn("CodexAdapterV2.steerTurn")(
             function* (turnInput) {

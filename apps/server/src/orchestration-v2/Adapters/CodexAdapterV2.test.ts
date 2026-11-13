@@ -36,6 +36,7 @@ import { assert, describe, it } from "@effect/vitest";
 import * as CodexClient from "effect-codex-app-server/client";
 import * as CodexReplay from "effect-codex-app-server/replay";
 import * as CodexError from "effect-codex-app-server/errors";
+import type * as CodexProtocol from "effect-codex-app-server/protocol";
 import type * as CodexSchema from "effect-codex-app-server/schema";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -479,6 +480,7 @@ describe("CodexAdapterV2 fork boundary", () => {
   );
 });
 
+const isControlledFrameFailure = Schema.is(CodexError.CodexAppServerFrameSubmissionError);
 const DEFAULT_CODEX_SETTINGS = Schema.decodeSync(CodexSettings)({});
 const CHATGPT_SHARING_LIMIT_MESSAGE =
   "stream disconnected before completion: The ChatGPT user has reached their Subscription Sharing usage limit. Ask the user to try again after their usage limit resets or use an API key instead.";
@@ -1378,6 +1380,700 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         awaitTerminal: (count: number) => changes.until(() => terminalEvents().length >= count),
       };
     });
+
+  const makeControlledAdapterHarness = Effect.fn("test.makeControlledAdapterHarness")(function* (
+    options: {
+      readonly autoReplyStarts?: boolean;
+      readonly wrapper?: CodexClient.CodexAppServerControlledClientOptions<CodexError.CodexAppServerFrameSubmissionError>["wrapper"];
+      readonly afterOutcome?: (
+        outcome: CodexProtocol.CodexAppServerFrameOutcome,
+      ) => Effect.Effect<void>;
+      readonly notificationsBeforeReply?: boolean;
+    } = {},
+  ) {
+    const inbound = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
+    const outbound = yield* Queue.unbounded<string>();
+    const frames = yield* Queue.unbounded<CodexProtocol.CodexAppServerControlledFrame>();
+    const outcomes = yield* Queue.unbounded<CodexProtocol.CodexAppServerFrameOutcome>();
+    type Message = {
+      readonly id: number;
+      readonly method: string;
+      readonly params: { readonly threadId?: string };
+    };
+    const writes = yield* Queue.unbounded<Message>();
+    const emit = (message: unknown) =>
+      Queue.offer(inbound, new TextEncoder().encode(JSON.stringify(message) + "\n")).pipe(
+        Effect.asVoid,
+      );
+    const terminal = (message: Message, status: "inProgress" | "completed") =>
+      emit({
+        method: status === "inProgress" ? "turn/started" : "turn/completed",
+        params: {
+          threadId: message.params.threadId,
+          turn: makeCodexReplayTurn({ id: `controlled-turn-${message.id}`, status }),
+        },
+      });
+    let threads = 0;
+    yield* Stream.fromQueue(outbound).pipe(
+      Stream.runForEach((encoded) =>
+        Effect.gen(function* () {
+          const message = JSON.parse(encoded) as Message;
+          if (message.method === "turn/start" || message.method === "thread/compact/start") {
+            yield* Queue.offer(writes, message);
+            if (options.autoReplyStarts === false) return;
+            if (options.notificationsBeforeReply) {
+              yield* terminal(message, "inProgress");
+              yield* terminal(message, "completed");
+            }
+            yield* emit({
+              id: message.id,
+              result:
+                message.method === "turn/start"
+                  ? {
+                      turn: makeCodexReplayTurn({
+                        id: `controlled-turn-${message.id}`,
+                        status: "inProgress",
+                      }),
+                    }
+                  : {},
+            });
+            return;
+          }
+          if (message.method === "initialized") return;
+          const response = codexReplayPreamble({
+            nativeThreadId: `controlled-native-${++threads}`,
+            nativeTurnId: "unused",
+            prompt: "unused",
+          }).find(
+            (entry) =>
+              entry.type === "emit_inbound" &&
+              entry.label === message.method &&
+              Predicate.hasProperty(entry.frame, "id"),
+          );
+          if (response?.type !== "emit_inbound" || !Predicate.isObject(response.frame))
+            return yield* Effect.die(`Unexpected controlled peer request ${message.method}`);
+          yield* emit({ ...response.frame, id: message.id });
+        }),
+      ),
+      Effect.forkScoped,
+    );
+    const exited = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
+    const spawner = ChildProcessSpawner.make((command) =>
+      Effect.gen(function* () {
+        assert.strictEqual(command._tag, "StandardCommand");
+        if (command._tag === "StandardCommand")
+          assert.deepEqual(command.options.stdin, { stream: "pipe", endOnDone: false });
+        yield* Effect.addFinalizer(() =>
+          Deferred.succeed(exited, ChildProcessSpawner.ExitCode(0)).pipe(Effect.asVoid),
+        );
+        return ChildProcessSpawner.makeHandle({
+          pid: ChildProcessSpawner.ProcessId(999999998),
+          exitCode: Deferred.await(exited),
+          isRunning: Deferred.isDone(exited).pipe(Effect.map((done) => !done)),
+          kill: () => Deferred.succeed(exited, ChildProcessSpawner.ExitCode(0)).pipe(Effect.asVoid),
+          unref: Effect.succeed(Effect.void),
+          stdin: Sink.forEach((chunk: Uint8Array) =>
+            Queue.offer(outbound, new TextDecoder().decode(chunk)).pipe(Effect.asVoid),
+          ),
+          stdout: Stream.fromQueue(inbound),
+          stderr: Stream.empty,
+          all: Stream.empty,
+          getInputFd: () => Sink.drain,
+          getOutputFd: () => Stream.empty,
+        });
+      }),
+    );
+    const clientFactory: CodexAdapterV2.CodexAppServerClientFactoryShape = {
+      open: () => Effect.die("Controlled adapter unexpectedly selected the legacy factory"),
+      openControlled: (
+        input: Parameters<CodexAdapterV2.CodexAppServerClientFactoryShape["open"]>[0] & {
+          readonly onOutcome: (
+            outcome: CodexProtocol.CodexAppServerFrameOutcome,
+          ) => Effect.Effect<void>;
+        },
+      ) =>
+        CodexClient.makeControlledChildProcessClient(ChildProcess.make("controlled-fixture"), {
+          wrapper: (frame, submit) =>
+            Effect.gen(function* () {
+              if (frame.method === "turn/start" || frame.method === "thread/compact/start")
+                yield* Queue.offer(frames, frame);
+              return yield* options.wrapper ? options.wrapper(frame, submit) : submit();
+            }),
+          onOutcome: (outcome) =>
+            input.onOutcome(outcome).pipe(
+              Effect.andThen(
+                Effect.gen(function* () {
+                  if (
+                    outcome.frame.method !== "turn/start" &&
+                    outcome.frame.method !== "thread/compact/start"
+                  )
+                    return;
+                  yield* Queue.offer(outcomes, outcome);
+                  if (options.afterOutcome) yield* options.afterOutcome(outcome);
+                }),
+              ),
+            ),
+        }).pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          Effect.mapError(
+            (cause) =>
+              new ProviderAdapter.ProviderAdapterOpenSessionError({
+                driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+                providerSessionId: input.providerSessionId,
+                cause,
+              }),
+          ),
+        ),
+    };
+    const adapter = yield* CodexAdapterV2.makeCodexAdapterV2({
+      instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
+      settings: DEFAULT_CODEX_SETTINGS,
+      environment: {},
+      clientFactory,
+      digest: yield* Digest.Digest,
+      fileSystem: yield* FileSystem.FileSystem,
+      idAllocator: yield* IdAllocator.IdAllocatorV2,
+      serverConfig: yield* ProviderReplayHarness.makeReplayServerConfig("controlled-adapter").pipe(
+        Effect.orDie,
+      ),
+      continuationRequests: { offer: () => Effect.void },
+    });
+    const runtime = yield* adapter.openSession({
+      threadId: ThreadId.make("factory-initial-thread"),
+      providerSessionId: ProviderSessionId.make("controlled-provider-session"),
+      modelSelection: CODEX_TEST_MODEL_SELECTION,
+      runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+    });
+    const events: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
+    const changes = yield* makeChangeSignal;
+    yield* runtime.events.pipe(
+      Stream.runForEach((event) =>
+        Effect.sync(() => {
+          events.push(event);
+        }).pipe(Effect.andThen(changes.notify)),
+      ),
+      Effect.forkScoped,
+    );
+    const ensure = (threadId: ThreadId) =>
+      runtime.ensureThread({
+        threadId,
+        modelSelection: CODEX_TEST_MODEL_SELECTION,
+        runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+      });
+    return {
+      runtime,
+      frames,
+      outcomes,
+      writes,
+      emit,
+      terminal,
+      ensure,
+      events,
+      awaitTerminal: (count: number) =>
+        changes.until(
+          () => events.filter((event) => event.type === "turn.terminal").length >= count,
+        ),
+    };
+  });
+
+  it.effect("controlled adapter keeps the actual immutable turn selection off wire", () =>
+    Effect.gen(function* () {
+      const peer = yield* makeControlledAdapterHarness();
+      const threadId = ThreadId.make("controlled-actual-thread");
+      const providerThread = yield* peer.ensure(threadId);
+      const input = makeCodexTestTurnInput({
+        threadId,
+        providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("controlled-actual-attempt"),
+        text: "work",
+      });
+      const nativeId = providerThread.nativeThreadRef!.nativeId;
+      const savedThread = {
+        ...providerThread,
+        nativeThreadRef: { ...providerThread.nativeThreadRef! },
+      };
+      const pending = peer.runtime.startTurn(input);
+      Object.assign(input, {
+        threadId: ThreadId.make("mutated-thread"),
+        runId: RunId.make("mutated-run"),
+      });
+      Object.assign(providerThread.nativeThreadRef!, { nativeId: "mutated-native" });
+      yield* pending;
+      const frame = yield* Queue.take(peer.frames);
+      const wire = yield* Queue.take(peer.writes);
+      assert.isString(frame.selection);
+      const selection = JSON.parse(frame.selection!) as Record<string, unknown>;
+      assert.strictEqual(selection.threadId, threadId);
+      assert.strictEqual(selection.runId, "run-controlled-actual-attempt");
+      assert.strictEqual(selection.nativeThreadId, nativeId);
+      assert.strictEqual(wire.params.threadId, nativeId);
+      assert.notInclude(JSON.stringify(wire), "invocation");
+      assert.notInclude(JSON.stringify(wire), "factory-initial-thread");
+      const otherId = ThreadId.make("controlled-sharing-thread");
+      const other = yield* peer.ensure(otherId);
+      const otherInput = makeCodexTestTurnInput({
+        threadId: otherId,
+        providerThread: other,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("controlled-other-attempt"),
+        text: "other",
+      });
+      yield* peer.runtime.startTurn(otherInput);
+      const otherFrame = yield* Queue.take(peer.frames);
+      const otherWire = yield* Queue.take(peer.writes);
+      const otherSelection = JSON.parse(otherFrame.selection!) as Record<string, unknown>;
+      assert.strictEqual(otherSelection.threadId, otherId);
+      assert.strictEqual(otherSelection.nativeThreadId, other.nativeThreadRef!.nativeId);
+      assert.strictEqual(otherSelection.providerSessionId, selection.providerSessionId);
+      assert.notEqual(otherSelection.providerThreadId, selection.providerThreadId);
+      assert.notEqual(otherSelection.invocation, selection.invocation);
+      yield* peer.terminal(wire, "completed");
+      yield* peer.terminal(otherWire, "completed");
+      yield* peer.awaitTerminal(2);
+      const compactInput = makeCodexTestTurnInput({
+        threadId,
+        providerThread: savedThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("controlled-compact-attempt"),
+        text: "/compact",
+      });
+      const compact = peer.runtime.compactThread!(compactInput);
+      Object.assign(compactInput, { runId: RunId.make("mutated-compact-run") });
+      yield* compact;
+      const compactFrame = yield* Queue.take(peer.frames);
+      const compactWire = yield* Queue.take(peer.writes);
+      const compactSelection = JSON.parse(compactFrame.selection!) as Record<string, unknown>;
+      assert.strictEqual(compactSelection.kind, "compact");
+      assert.strictEqual(compactSelection.runId, "run-controlled-compact-attempt");
+      assert.strictEqual(compactWire.params.threadId, nativeId);
+      assert.notEqual(compactSelection.invocation, selection.invocation);
+      yield* peer.terminal(compactWire, "inProgress");
+      yield* peer.terminal(compactWire, "completed");
+      yield* peer.awaitTerminal(3);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+        ),
+      ),
+    ),
+  );
+
+  it.effect(
+    "controlled adapter preserves interruption and exact uncertainty after submission",
+    () =>
+      Effect.gen(function* () {
+        const peer = yield* makeControlledAdapterHarness({ autoReplyStarts: false });
+        const threadId = ThreadId.make("controlled-interrupted-thread");
+        const providerThread = yield* peer.ensure(threadId);
+        const input = makeCodexTestTurnInput({
+          threadId,
+          providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("controlled-interrupted-attempt"),
+          text: "work",
+        });
+        const running = yield* peer.runtime
+          .startTurn(input)
+          .pipe(Effect.forkScoped({ startImmediately: true }));
+        const wire = yield* Queue.take(peer.writes);
+        const outcome = yield* Queue.take(peer.outcomes);
+        assert.strictEqual(outcome.outcome, "submitted");
+        yield* Fiber.interrupt(running);
+        const exit = yield* Fiber.await(running);
+        assert.isTrue(Exit.isFailure(exit));
+        if (Exit.isFailure(exit)) {
+          assert.isTrue(Cause.hasInterrupts(exit.cause));
+          assert.isTrue(
+            exit.cause.reasons.some(
+              (reason) =>
+                Cause.isFailReason(reason) &&
+                reason.error._tag === "ProviderAdapterTurnStartError" &&
+                reason.error.submissionState === "unknown" &&
+                reason.error.threadId === threadId &&
+                reason.error.runId === input.runId,
+            ),
+            Cause.pretty(exit.cause),
+          );
+        }
+        assert.isTrue(yield* peer.runtime.hasPendingBackgroundWork!);
+        yield* peer.terminal(wire, "inProgress");
+        yield* peer.terminal(wire, "completed");
+        yield* peer.awaitTerminal(1);
+        assert.isFalse(yield* peer.runtime.hasPendingBackgroundWork!);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+  );
+
+  it.effect(
+    "controlled adapter ignores a cancelled queue entry's late hook after replacement",
+    () =>
+      Effect.gen(function* () {
+        const release = yield* Deferred.make<void>();
+        const firstId = ThreadId.make("controlled-queue-first");
+        const peer = yield* makeControlledAdapterHarness({
+          wrapper: (frame, submit) =>
+            frame.selection !== null &&
+            (JSON.parse(frame.selection) as Record<string, unknown>).threadId === firstId
+              ? Deferred.await(release).pipe(Effect.andThen(submit()))
+              : submit(),
+        });
+        const firstThread = yield* peer.ensure(firstId);
+        const otherId = ThreadId.make("controlled-queue-other");
+        const otherThread = yield* peer.ensure(otherId);
+        const firstInput = makeCodexTestTurnInput({
+          threadId: firstId,
+          providerThread: firstThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("controlled-queue-first"),
+          text: "first",
+        });
+        const otherInput = makeCodexTestTurnInput({
+          threadId: otherId,
+          providerThread: otherThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("controlled-queue-cancelled"),
+          text: "cancelled",
+        });
+        const first = yield* peer.runtime
+          .startTurn(firstInput)
+          .pipe(Effect.forkScoped({ startImmediately: true }));
+        yield* Queue.take(peer.frames);
+        const queued = yield* peer.runtime
+          .startTurn(otherInput)
+          .pipe(Effect.forkScoped({ startImmediately: true }));
+        yield* Fiber.interrupt(queued);
+        const cancelled = yield* Fiber.await(queued);
+        assert.isTrue(Exit.isFailure(cancelled));
+        if (Exit.isFailure(cancelled)) {
+          assert.isTrue(Cause.hasInterrupts(cancelled.cause));
+          assert.isFalse(
+            cancelled.cause.reasons.some(
+              (reason) =>
+                Cause.isFailReason(reason) &&
+                reason.error._tag === "ProviderAdapterTurnStartError" &&
+                reason.error.submissionState === "unknown",
+            ),
+          );
+        }
+        const replacement = {
+          ...otherInput,
+          runId: RunId.make("controlled-queue-replacement"),
+          attemptId: RunAttemptId.make("controlled-queue-replacement"),
+          rootNodeId: NodeId.make("controlled-queue-replacement"),
+          runOrdinal: 2,
+        };
+        const next = yield* peer.runtime
+          .startTurn(replacement)
+          .pipe(Effect.forkScoped({ startImmediately: true }));
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(first);
+        yield* Fiber.join(next);
+        const outcomes = yield* Queue.takeN(peer.outcomes, 3);
+        assert.deepEqual(
+          outcomes.map((outcome) => outcome.outcome),
+          ["submitted", "not_submitted", "submitted"],
+        );
+        const cancelledSelection = JSON.parse(outcomes[1]!.frame.selection!) as Record<
+          string,
+          unknown
+        >;
+        const replacementSelection = JSON.parse(outcomes[2]!.frame.selection!) as Record<
+          string,
+          unknown
+        >;
+        assert.notEqual(cancelledSelection.invocation, replacementSelection.invocation);
+        assert.strictEqual(replacementSelection.runId, replacement.runId);
+        const writes = yield* Queue.takeN(peer.writes, 2);
+        assert.strictEqual(yield* Queue.size(peer.writes), 0);
+        yield* peer.terminal(writes[0]!, "completed");
+        yield* peer.terminal(writes[1]!, "completed");
+        yield* peer.awaitTerminal(2);
+        assert.deepEqual(
+          peer.events
+            .filter((event) => event.type === "turn.terminal")
+            .map((event) => event.runOrdinal),
+          [1, 2],
+        );
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+  );
+
+  it.effect.each(["reply", "interrupt"] as const)(
+    "controlled adapter does not revive a native turn completed before the %s exits",
+    (settlement) =>
+      Effect.gen(function* () {
+        const release = yield* Deferred.make<void>();
+        const hookEntered = yield* Deferred.make<void>();
+        const returned = yield* Deferred.make<void>();
+        const peer = yield* makeControlledAdapterHarness({
+          notificationsBeforeReply: true,
+          afterOutcome: () =>
+            Deferred.succeed(hookEntered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        });
+        const threadId = ThreadId.make("controlled-early-completed");
+        const providerThread = yield* peer.ensure(threadId);
+        const input = makeCodexTestTurnInput({
+          threadId,
+          providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("controlled-early-completed"),
+          text: "work",
+        });
+        const running = yield* peer.runtime
+          .startTurn(input)
+          .pipe(
+            Effect.ensuring(Deferred.succeed(returned, undefined)),
+            Effect.forkScoped({ startImmediately: true }),
+          );
+        yield* Deferred.await(hookEntered);
+        yield* peer.awaitTerminal(1);
+        assert.isFalse(yield* Deferred.isDone(returned));
+        const stopping =
+          settlement === "interrupt"
+            ? yield* Fiber.interrupt(running).pipe(Effect.forkScoped({ startImmediately: true }))
+            : undefined;
+        yield* Deferred.succeed(release, undefined);
+        if (stopping) yield* Fiber.join(stopping);
+        const exit = yield* Fiber.await(running);
+        if (settlement === "reply") assert.isTrue(Exit.isSuccess(exit));
+        else {
+          assert.isTrue(Exit.isFailure(exit));
+          if (Exit.isFailure(exit)) {
+            assert.isTrue(Cause.hasInterrupts(exit.cause));
+            assert.isTrue(
+              exit.cause.reasons.some(
+                (reason) =>
+                  Cause.isFailReason(reason) &&
+                  reason.error._tag === "ProviderAdapterTurnStartError" &&
+                  reason.error.submissionState === "unknown",
+              ),
+              Cause.pretty(exit.cause),
+            );
+          }
+        }
+        assert.lengthOf(
+          peer.events.filter(
+            (event) =>
+              event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+          ),
+          1,
+        );
+        assert.isFalse(yield* peer.runtime.hasPendingBackgroundWork!);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+  );
+
+  it.effect(
+    "controlled adapter refuses goals and does not automatically retry capacity failures",
+    () =>
+      Effect.gen(function* () {
+        const peer = yield* makeControlledAdapterHarness();
+        const threadId = ThreadId.make("controlled-policy-thread");
+        const providerThread = yield* peer.ensure(threadId);
+        const input = makeCodexTestTurnInput({
+          threadId,
+          providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("controlled-policy"),
+          text: "/goal do work",
+        });
+        const refusal = yield* peer.runtime.startTurn(input).pipe(Effect.flip);
+        assert.strictEqual(refusal._tag, "ProviderAdapterTurnStartError");
+        assert.strictEqual(yield* Queue.size(peer.frames), 0);
+        yield* peer.runtime.startTurn({ ...input, message: { ...input.message, text: "work" } });
+        yield* Queue.take(peer.frames);
+        const wire = yield* Queue.take(peer.writes);
+        yield* peer.emit({
+          method: "turn/completed",
+          params: {
+            threadId: wire.params.threadId,
+            turn: {
+              ...makeCodexReplayTurn({ id: `controlled-turn-${wire.id}`, status: "failed" }),
+              error: { message: "At capacity", codexErrorInfo: "serverOverloaded" },
+            },
+          },
+        });
+        yield* TestClock.adjust("2 seconds");
+        assert.strictEqual(yield* Queue.size(peer.frames), 0);
+        assert.strictEqual(yield* Queue.size(peer.writes), 0);
+        yield* peer.awaitTerminal(1);
+        assert.deepEqual(
+          peer.events
+            .filter((event) => event.type === "turn.terminal")
+            .map((event) => event.status),
+          ["failed"],
+        );
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+  );
+
+  it.effect.each(["wrapper", "hook"] as const)(
+    "controlled adapter preserves selected uncertainty on %s failure",
+    (stage) =>
+      Effect.gen(function* () {
+        const checked = yield* Deferred.make<void>();
+        const exit = yield* Effect.gen(function* () {
+          const peer = yield* makeControlledAdapterHarness({
+            autoReplyStarts: false,
+            wrapper: (frame, submit) =>
+              frame.selection !== null && stage === "wrapper"
+                ? submit().pipe(
+                    Effect.andThen(
+                      Effect.fail(
+                        new CodexError.CodexAppServerFrameSubmissionError({
+                          outcome: "unknown",
+                          reason: "wrapper",
+                        }),
+                      ),
+                    ),
+                  )
+                : submit(),
+            afterOutcome: () =>
+              stage === "hook" ? Effect.die("controlled fixture hook failure") : Effect.void,
+          });
+          const threadId = ThreadId.make(`controlled-${stage}-failure`);
+          const providerThread = yield* peer.ensure(threadId);
+          const input = makeCodexTestTurnInput({
+            threadId,
+            providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make(`controlled-${stage}-failure`),
+            text: "work",
+          });
+          const error = yield* peer.runtime.startTurn(input).pipe(Effect.flip);
+          assert.strictEqual(error._tag, "ProviderAdapterTurnStartError");
+          if (error._tag === "ProviderAdapterTurnStartError") {
+            assert.strictEqual(error.submissionState, "unknown");
+            assert.strictEqual(error.runId, input.runId);
+          }
+          assert.isTrue(yield* peer.runtime.hasPendingBackgroundWork!);
+          const wire = yield* Queue.take(peer.writes);
+          yield* peer.terminal(wire, "inProgress");
+          yield* peer.terminal(wire, "completed");
+          yield* peer.awaitTerminal(1);
+          assert.isFalse(yield* peer.runtime.hasPendingBackgroundWork!);
+          yield* Deferred.succeed(checked, undefined);
+        }).pipe(Effect.scoped, Effect.exit);
+        assert.isTrue(
+          yield* Deferred.isDone(checked),
+          Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "checks did not finish",
+        );
+        if (stage === "wrapper") assert.isTrue(Exit.isSuccess(exit));
+        else {
+          assert.isTrue(Exit.isFailure(exit));
+          if (Exit.isFailure(exit))
+            assert.isTrue(
+              exit.cause.reasons.some((reason) => {
+                if (
+                  !Cause.isDieReason(reason) ||
+                  !isControlledFrameFailure(reason.defect) ||
+                  reason.defect.reason !== "outcome_hook"
+                )
+                  return false;
+                const original = reason.defect.cause;
+                if (!Cause.isCause(original)) return false;
+                const defect = Cause.findDefect(original);
+                return (
+                  defect._tag === "Success" && defect.success === "controlled fixture hook failure"
+                );
+              }),
+              Cause.pretty(exit.cause),
+            );
+        }
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+  );
+
+  it.effect.each(["session", "thread", "native"] as const)(
+    "controlled adapter rejects a mismatched selected %s before output",
+    (field) =>
+      Effect.gen(function* () {
+        const peer = yield* makeControlledAdapterHarness();
+        const threadId = ThreadId.make("controlled-invalid-selection");
+        const providerThread = yield* peer.ensure(threadId);
+        if (field === "session")
+          Object.assign(providerThread, {
+            providerSessionId: ProviderSessionId.make("foreign-session"),
+          });
+        if (field === "thread")
+          Object.assign(providerThread, { appThreadId: ThreadId.make("foreign-thread") });
+        if (field === "native")
+          Object.assign(providerThread.nativeThreadRef!, { driver: "foreign-driver" });
+        const input = makeCodexTestTurnInput({
+          threadId,
+          providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("controlled-invalid-selection"),
+          text: "work",
+        });
+        const error = yield* peer.runtime.startTurn(input).pipe(Effect.flip);
+        assert.strictEqual(error._tag, "ProviderAdapterTurnStartError");
+        if (error._tag === "ProviderAdapterTurnStartError")
+          assert.isUndefined(error.submissionState);
+        assert.strictEqual(yield* Queue.size(peer.frames), 0);
+        assert.strictEqual(yield* Queue.size(peer.writes), 0);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+  );
 
   it.effect.each(
     (["turn/start", "thread/compact/start"] as const).flatMap((method) =>
