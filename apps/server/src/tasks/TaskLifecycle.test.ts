@@ -2,7 +2,12 @@ import { WorkTaskPersistedEvent } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import * as HashMap from "effect/HashMap";
 import { describe, expect, it } from "vite-plus/test";
-import { FoundationReplayConflict, reduceTaskFoundation } from "./TaskLifecycle.ts";
+import {
+  CustodyReplayConflict,
+  reduceTaskCustody,
+  FoundationReplayConflict,
+  reduceTaskFoundation,
+} from "./TaskLifecycle.ts";
 
 const decode = Schema.decodeUnknownSync(WorkTaskPersistedEvent);
 const definition = {
@@ -536,3 +541,401 @@ describe("foundation task replay", () => {
     expect(Array.from(initial.results)).toEqual([]);
   });
 });
+
+describe("custody task replay", () => {
+  it("preserves custody, debits, uncertain launches and concurrent wake evidence independently of foundation", () => {
+    const source = { kind: "run", sourceId: "work", resultRef: "result" };
+    const pending = { sources: [source], overflowThroughGeneration: null };
+    const allowance = { type: "configured", cap: 1, consumed: 0 };
+    const wake = {
+      reservationId: "reservation",
+      reservationCommandId: "launch",
+      managerGeneration: 1,
+      allowanceUnit: 1,
+      dirtyGeneration: 1,
+      acknowledgedGeneration: 0,
+    };
+    const payloads = [
+      { type: "task.manager-bound", ...identity },
+      {
+        type: "task.allowance-configured",
+        previous: { type: "unconfigured", consumed: 0 },
+        resulting: allowance,
+      },
+      {
+        type: "task.allowance-debited",
+        previous: allowance,
+        resulting: { ...allowance, consumed: 1 },
+        allowanceUnit: 1,
+      },
+      { type: "task.wake-source-recorded", source, reservationId: null, dirtyGeneration: 1 },
+      { type: "task.wake-reserved", ...wake, pending },
+      { type: "task.wake-claimed", ...wake, pending, messageId: "message", runId: "run" },
+      { type: "task.wake-claim-uncertain", ...wake, reason: "unknown launch outcome" },
+      {
+        type: "task.wake-source-recorded",
+        source: { ...source, sourceId: "later" },
+        reservationId: "reservation",
+        dirtyGeneration: 2,
+      },
+      {
+        type: "task.wake-acknowledged",
+        ...wake,
+        dirtyGeneration: 2,
+        acknowledgedGeneration: 1,
+        previousAcknowledgedGeneration: 0,
+        observedDirtyGeneration: 1,
+      },
+      { type: "task.manager-retired", ...identity },
+      { type: "task.manager-bound", managerThreadId: "replacement", managerGeneration: 2 },
+    ];
+    const events = payloads.map((payload, index) => custodyRecorded(index + 1, payload));
+    let state: ReturnType<typeof reduceTaskCustody> | undefined;
+    for (const event of events) {
+      state = reduceTaskCustody(state, event);
+      expect(reduceTaskCustody(state, event)).toBe(state);
+    }
+    expect(state!.allowance).toEqual({ ...allowance, consumed: 1 });
+    expect(state!.currentManagerGeneration).toBe(2);
+    expect(state!.acknowledgedGeneration).toBe(1);
+    expect(state!.dirtyGeneration).toBe(2);
+    expect(HashMap.size(state!.pendingSources)).toBe(1);
+    expect(HashMap.getUnsafe(state!.reservations, "reservation").uncertain).toBeDefined();
+    const foundation = replay([recorded(1, { type: "task.created", definition })]);
+    expect(HashMap.size(foundation.managers)).toBe(0);
+    expect(foundation.lastSequence).toBe(1);
+    const before = events
+      .slice(0, 5)
+      .reduce<ReturnType<typeof reduceTaskCustody> | undefined>(reduceTaskCustody, undefined)!;
+    expect(() =>
+      reduceTaskCustody(
+        before,
+        custodyRecorded(20, { ...payloads[5], runId: "other", allowanceUnit: 2 }),
+      ),
+    ).toThrow(CustodyReplayConflict);
+    expect(() =>
+      reduceTaskCustody(
+        state,
+        custodyRecorded(21, {
+          type: "task.manager-bound",
+          managerThreadId: "manager",
+          managerGeneration: 3,
+        }),
+      ),
+    ).toThrow(CustodyReplayConflict);
+    expect(() =>
+      reduceTaskCustody(
+        state,
+        custodyRecorded(22, {
+          type: "task.allowance-debited",
+          previous: allowance,
+          resulting: { ...allowance, consumed: 1 },
+          allowanceUnit: 1,
+        }),
+      ),
+    ).toThrow(CustodyReplayConflict);
+    expect(() =>
+      reduceTaskCustody(
+        before,
+        custodyRecorded(23, { ...payloads[8], previousAcknowledgedGeneration: 1 }),
+      ),
+    ).toThrow(CustodyReplayConflict);
+    expect(before.acknowledgedGeneration).toBe(0);
+    expect(before.dirtyGeneration).toBe(1);
+  });
+
+  it("rejects contradictory phases and identities while preserving top-up consumption and retired custody", () => {
+    const bound = custodyRecorded(1, { type: "task.manager-bound", ...identity });
+    const initial = reduceTaskCustody(undefined, bound);
+    expect(() =>
+      reduceTaskCustody(
+        initial,
+        custodyRecorded(2, {
+          type: "task.manager-bound",
+          managerThreadId: "other",
+          managerGeneration: 2,
+        }),
+      ),
+    ).toThrow(CustodyReplayConflict);
+    expect(() =>
+      reduceTaskCustody(
+        initial,
+        custodyRecorded(2, { type: "task.manager-retired", ...identity, managerThreadId: "other" }),
+      ),
+    ).toThrow(CustodyReplayConflict);
+    const allowance = { type: "configured", cap: 2, consumed: 0 };
+    const configured = reduceTaskCustody(
+      initial,
+      custodyRecorded(2, {
+        type: "task.allowance-configured",
+        previous: { type: "unconfigured", consumed: 0 },
+        resulting: allowance,
+      }),
+    );
+    const debited = reduceTaskCustody(
+      configured,
+      custodyRecorded(3, {
+        type: "task.allowance-debited",
+        previous: allowance,
+        resulting: { ...allowance, consumed: 1 },
+        allowanceUnit: 1,
+      }),
+    );
+    const topup = custodyRecorded(4, {
+      type: "task.allowance-topped-up",
+      attribution: { type: "user", subject: "human", sessionId: "session" },
+      previous: { ...allowance, consumed: 1 },
+      resulting: { ...allowance, cap: 3, consumed: 1 },
+    });
+    const topped = reduceTaskCustody(debited, topup);
+    expect(topped.allowance).toEqual({ ...allowance, cap: 3, consumed: 1 });
+    expect(reduceTaskCustody(topped, topup)).toBe(topped);
+    expect(debited.allowance).toEqual({ ...allowance, consumed: 1 });
+    const retired = reduceTaskCustody(
+      topped,
+      custodyRecorded(5, { type: "task.manager-retired", ...identity }),
+    );
+    expect(HashMap.getUnsafe(retired.managers, 1).retired).toBeDefined();
+    expect(() =>
+      reduceTaskCustody(
+        retired,
+        custodyRecorded(6, {
+          type: "task.manager-bound",
+          managerThreadId: "new",
+          managerGeneration: 1,
+        }),
+      ),
+    ).toThrow(CustodyReplayConflict);
+    expect(() =>
+      reduceTaskCustody(
+        retired,
+        custodyRecorded(6, { type: "task.manager-bound", ...identity, managerGeneration: 2 }),
+      ),
+    ).toThrow(CustodyReplayConflict);
+    const source = { kind: "run", sourceId: "source", resultRef: null };
+    const sourced = reduceTaskCustody(
+      retired,
+      custodyRecorded(6, {
+        type: "task.wake-source-recorded",
+        source,
+        reservationId: null,
+        dirtyGeneration: 1,
+      }),
+    );
+    const wake = {
+      reservationId: "wake",
+      reservationCommandId: "launch",
+      managerGeneration: 1,
+      allowanceUnit: 1,
+      dirtyGeneration: 1,
+      acknowledgedGeneration: 0,
+    };
+    expect(() =>
+      reduceTaskCustody(
+        sourced,
+        custodyRecorded(7, {
+          type: "task.wake-reserved",
+          ...wake,
+          pending: { sources: [source], overflowThroughGeneration: null },
+        }),
+      ),
+    ).toThrow(CustodyReplayConflict);
+    const active = reduceTaskCustody(
+      sourced,
+      custodyRecorded(7, {
+        type: "task.manager-bound",
+        managerThreadId: "replacement",
+        managerGeneration: 2,
+      }),
+    );
+    const reservedEvent = custodyRecorded(8, {
+      type: "task.wake-reserved",
+      ...wake,
+      managerGeneration: 2,
+      pending: { sources: [source], overflowThroughGeneration: null },
+    });
+    const reserved = reduceTaskCustody(active, reservedEvent);
+    expect(() =>
+      reduceTaskCustody(
+        active,
+        custodyRecorded(8, {
+          type: "task.wake-reserved",
+          ...wake,
+          managerGeneration: 2,
+          pending: { sources: [], overflowThroughGeneration: null },
+        }),
+      ),
+    ).toThrow(CustodyReplayConflict);
+    expect(() =>
+      reduceTaskCustody(
+        reserved,
+        custodyRecorded(9, {
+          type: "task.wake-reserved",
+          ...wake,
+          reservationId: "other",
+          managerGeneration: 2,
+          pending: { sources: [source], overflowThroughGeneration: null },
+        }),
+      ),
+    ).toThrow(CustodyReplayConflict);
+    expect(() =>
+      reduceTaskCustody(
+        reserved,
+        custodyRecorded(9, {
+          type: "task.wake-acknowledged",
+          ...wake,
+          managerGeneration: 2,
+          observedDirtyGeneration: 1,
+          previousAcknowledgedGeneration: 0,
+          acknowledgedGeneration: 1,
+        }),
+      ),
+    ).toThrow(CustodyReplayConflict);
+    const uncertain = reduceTaskCustody(
+      reserved,
+      custodyRecorded(9, {
+        type: "task.wake-claim-uncertain",
+        ...wake,
+        managerGeneration: 2,
+        reason: "launch unknown",
+      }),
+    );
+    expect(uncertain.allowance).toEqual(active.allowance);
+    expect(HashMap.getUnsafe(uncertain.pendingReservations, 2)).toBe("wake");
+    const confirmed = reduceTaskCustody(
+      uncertain,
+      custodyRecorded(10, {
+        type: "task.wake-claimed",
+        ...wake,
+        managerGeneration: 2,
+        messageId: "message",
+        runId: "run",
+        pending: { sources: [source], overflowThroughGeneration: null },
+      }),
+    );
+    expect(confirmed.allowance).toEqual(uncertain.allowance);
+    expect(HashMap.size(confirmed.debits)).toBe(1);
+    expect(HashMap.getUnsafe(confirmed.reservations, "wake").uncertain).toBeDefined();
+    const acknowledge = {
+      type: "task.wake-acknowledged",
+      ...wake,
+      managerGeneration: 2,
+      observedDirtyGeneration: 1,
+      previousAcknowledgedGeneration: 0,
+      acknowledgedGeneration: 1,
+    };
+    const acknowledgedEvent = custodyRecorded(11, acknowledge);
+    const acknowledged = reduceTaskCustody(confirmed, acknowledgedEvent);
+    expect(reduceTaskCustody(acknowledged, acknowledgedEvent)).toBe(acknowledged);
+    expect(() =>
+      reduceTaskCustody(
+        acknowledged,
+        custodyRecorded(12, { ...acknowledge, previousAcknowledgedGeneration: 1 }),
+      ),
+    ).toThrow(CustodyReplayConflict);
+    const source2 = { kind: "run", sourceId: "second", resultRef: null };
+    const concurrent = reduceTaskCustody(
+      reserved,
+      custodyRecorded(9, {
+        type: "task.wake-source-recorded",
+        source: source2,
+        reservationId: "wake",
+        dirtyGeneration: 2,
+      }),
+    );
+    const launched = reduceTaskCustody(
+      concurrent,
+      custodyRecorded(10, {
+        type: "task.wake-claimed",
+        ...wake,
+        managerGeneration: 2,
+        dirtyGeneration: 2,
+        messageId: "another-message",
+        runId: "another-run",
+        pending: { sources: [source, source2], overflowThroughGeneration: null },
+      }),
+    );
+    const firstAck = reduceTaskCustody(
+      launched,
+      custodyRecorded(11, { ...acknowledge, dirtyGeneration: 2, observedDirtyGeneration: 2 }),
+    );
+    const secondAck = reduceTaskCustody(
+      firstAck,
+      custodyRecorded(12, {
+        ...acknowledge,
+        dirtyGeneration: 2,
+        observedDirtyGeneration: 2,
+        previousAcknowledgedGeneration: 1,
+        acknowledgedGeneration: 2,
+      }),
+    );
+    expect(HashMap.size(secondAck.pendingSources)).toBe(0);
+    expect(secondAck.acknowledgedGeneration).toBe(2);
+    expect(launched.acknowledgedGeneration).toBe(0);
+    expect(HashMap.size(initial.reservations)).toBe(0);
+  });
+
+  it("retains bounded pending sources and overflow until their observed generation is acknowledged", () => {
+    let state = reduceTaskCustody(
+      undefined,
+      custodyRecorded(1, { type: "task.manager-bound", ...identity }),
+    );
+    for (let n = 1; n <= 40; n++)
+      state = reduceTaskCustody(
+        state,
+        custodyRecorded(n + 1, {
+          type: "task.wake-source-recorded",
+          source: { kind: "run", sourceId: `s${n}`, resultRef: null },
+          reservationId: null,
+          dirtyGeneration: n,
+        }),
+      );
+    expect(HashMap.size(state.pendingSources)).toBe(32);
+    expect(state.overflowThroughGeneration).toBe(40);
+    expect(HashMap.size(state.sources)).toBe(40);
+    const deduplicated = reduceTaskCustody(
+      state,
+      custodyRecorded(44, {
+        type: "task.wake-source-recorded",
+        source: { kind: "run", sourceId: "s1", resultRef: null },
+        reservationId: null,
+        dirtyGeneration: 1,
+      }),
+    );
+    expect(deduplicated.dirtyGeneration).toBe(40);
+    expect(HashMap.size(deduplicated.sources)).toBe(40);
+    expect(deduplicated.overflowThroughGeneration).toBe(40);
+
+    expect(() =>
+      reduceTaskCustody(
+        state,
+        custodyRecorded(45, {
+          type: "task.wake-source-recorded",
+          source: { kind: "run", sourceId: "s1", resultRef: "changed" },
+          reservationId: null,
+          dirtyGeneration: 41,
+        }),
+      ),
+    ).toThrow(CustodyReplayConflict);
+    expect(() =>
+      reduceTaskCustody(
+        state,
+        custodyRecorded(46, {
+          type: "task.wake-source-recorded",
+          source: { kind: "run", sourceId: "fresh", resultRef: null },
+          reservationId: null,
+          dirtyGeneration: 39,
+        }),
+      ),
+    ).toThrow(CustodyReplayConflict);
+  });
+});
+
+function custodyRecorded(sequence: number, event: object) {
+  const id = `custody-${sequence}`;
+  const commandId = `custody-command-${sequence}`;
+  return decode({
+    event: { ...base, id, commandId, ...event },
+    context: { sequence, eventId: id, occurredAt: base.occurredAt, commandId },
+  }) as Parameters<typeof reduceTaskCustody>[1];
+}
