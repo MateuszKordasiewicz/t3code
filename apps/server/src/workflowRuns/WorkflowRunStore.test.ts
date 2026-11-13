@@ -3664,6 +3664,15 @@ it.effect("recovery custody validates allocated sessions and follows every alloc
     yield* store.reserveWorkflowNativeIntent(input);
     const owned = { ...allocation, appThreadId: input.threadId };
     yield* sql`INSERT INTO orchestration_v2_projection_provider_threads (provider_thread_id, thread_id, owner_node_id, provider, driver, provider_instance_id, provider_session_id, status, updated_at, payload_json) VALUES ('owned-allocation', ${input.threadId}, NULL, 'provider', 'codex', 'provider', 'allocated', 'not_loaded', '2026-11-01T00:00:00Z', ${json({ ...owned, id: "owned-allocation" })})`;
+    const selectedInput = {
+      threadId: "unrelated",
+      providerSessionIds: [],
+      providerThreadIds: ["owned-allocation"],
+    };
+    assert.deepStrictEqual(
+      yield* sql.withTransaction(store.readRecoveryCustodyInTransaction(selectedInput)),
+      { kind: "owned" },
+    );
     const before = yield* rawReservationState;
     const referencesBefore = yield* sql`SELECT * FROM orchestration_v2_projection_provider_threads`;
     assert.deepStrictEqual(yield* read, { kind: "owned" });
@@ -3712,6 +3721,101 @@ it.effect("recovery custody validates allocated sessions and follows every alloc
     assert.strictEqual((yield* Effect.flip(read)).reason, "integrity");
     yield* sql`DELETE FROM orchestration_v2_projection_provider_session_bindings`;
     assert.deepStrictEqual(yield* read, { kind: "ordinary" });
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("recovery custody validates selected provider threads and follows their owners", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const store = yield* Store.WorkflowRunStore;
+    const sql = yield* SqlClient.SqlClient;
+    const input = reservation(operationFor("selected-owned", "selected-owned"), "selected-owned");
+    yield* store.reserveWorkflowNativeIntent(input);
+    const reference = {
+      id: "selected",
+      driver: "codex",
+      providerInstanceId: "provider",
+      providerSessionId: null,
+      appThreadId: input.threadId,
+      ownerNodeId: null,
+      nativeThreadRef: { driver: "codex", nativeId: "existing", strength: "strong" },
+      nativeConversationHeadRef: { driver: "codex", nativeId: "head", strength: "strong" },
+      status: "active",
+      firstRunOrdinal: null,
+      lastRunOrdinal: null,
+      handoffIds: [],
+      forkedFrom: null,
+      pendingBackgroundTasks: [{ kind: "command", taskId: "background" }],
+      createdAt: "2026-11-01T00:00:00Z",
+      updatedAt: "2026-11-01T00:00:00Z",
+    };
+    yield* sql`INSERT INTO orchestration_v2_projection_provider_threads (provider_thread_id, thread_id, owner_node_id, provider, driver, provider_instance_id, provider_session_id, status, updated_at, payload_json) VALUES ('selected', ${input.threadId}, NULL, 'provider', 'codex', 'provider', NULL, 'active', '2026-11-01T00:00:00Z', ${json(reference)})`;
+    yield* sql`INSERT INTO orchestration_v2_projection_provider_threads (provider_thread_id, thread_id, owner_node_id, provider, status, updated_at, payload_json) VALUES ('unrelated-bad', NULL, NULL, 'provider', 'active', '2026-11-01T00:00:00Z', '{}')`;
+    const read = (providerThreadIds: readonly string[]) => {
+      const selection = { threadId: "unrelated", providerSessionIds: [], providerThreadIds };
+      return sql.withTransaction(store.readRecoveryCustodyInTransaction(selection));
+    };
+    const subscription = yield* store.subscribeChanges;
+    const snapshot = Effect.gen(function* () {
+      return {
+        workflow: yield* rawReservationState,
+        references: yield* sql`SELECT * FROM orchestration_v2_projection_provider_threads`,
+        nodes: yield* sql`SELECT * FROM orchestration_v2_projection_nodes`,
+        subagents: yield* sql`SELECT * FROM orchestration_v2_projection_subagents`,
+        sessions: yield* sql`SELECT * FROM orchestration_v2_projection_provider_sessions`,
+        bindings: yield* sql`SELECT * FROM orchestration_v2_projection_provider_session_bindings`,
+        events: yield* sql`SELECT * FROM orchestration_events`,
+      };
+    });
+    const before = yield* snapshot;
+    assert.deepStrictEqual(yield* read(["selected", "selected"]), { kind: "owned" });
+    assert.deepStrictEqual(yield* read([]), { kind: "ordinary" });
+    assert.deepStrictEqual(
+      yield* sql.withTransaction(
+        store.readRecoveryCustodyInTransaction({ threadId: "unrelated", providerSessionIds: [] }),
+      ),
+      { kind: "ordinary" },
+    );
+    for (const ids of [["missing"], [""], ["selected", "missing"], ["selected", "unrelated-bad"]]) {
+      assert.strictEqual((yield* Effect.flip(read(ids))).reason, "integrity");
+    }
+    assert.deepStrictEqual(yield* snapshot, before);
+    assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+
+    yield* sql`INSERT INTO orchestration_v2_projection_nodes (node_id, thread_id, root_node_id, kind, status, payload_json) VALUES ('owner-node', ${input.threadId}, 'owner-node', 'agent', 'running', '{}')`;
+    const byNode = { ...reference, appThreadId: null, ownerNodeId: "owner-node" };
+    yield* sql`UPDATE orchestration_v2_projection_provider_threads SET thread_id = NULL, owner_node_id = 'owner-node', payload_json = ${json(byNode)} WHERE provider_thread_id = 'selected'`;
+    assert.deepStrictEqual(yield* read(["selected"]), { kind: "owned" });
+    yield* sql`DELETE FROM orchestration_v2_projection_nodes WHERE node_id = 'owner-node'`;
+    assert.strictEqual((yield* Effect.flip(read(["selected"]))).reason, "integrity");
+    const unattributed = { ...reference, appThreadId: null };
+    yield* sql`UPDATE orchestration_v2_projection_provider_threads SET owner_node_id = NULL, payload_json = ${json(unattributed)} WHERE provider_thread_id = 'selected'`;
+    assert.strictEqual((yield* Effect.flip(read(["selected"]))).reason, "integrity");
+    yield* sql`INSERT INTO orchestration_v2_projection_subagents (subagent_id, thread_id, parent_node_id, provider, provider_thread_id, origin, status, updated_at, payload_json) VALUES ('selected-subagent', ${input.threadId}, 'parent', 'provider', 'selected', 'native', 'running', '2026-11-01T00:00:00Z', '{}')`;
+    assert.deepStrictEqual(yield* read(["selected"]), { kind: "owned" });
+    yield* sql`DELETE FROM orchestration_v2_projection_subagents WHERE subagent_id = 'selected-subagent'`;
+    const ordinary = { ...reference, appThreadId: "ordinary" };
+    yield* sql`UPDATE orchestration_v2_projection_provider_threads SET thread_id = 'ordinary', payload_json = ${json(ordinary)} WHERE provider_thread_id = 'selected'`;
+    assert.deepStrictEqual(yield* read(["selected"]), { kind: "ordinary" });
+    yield* sql`INSERT INTO orchestration_v2_projection_provider_sessions (provider_session_id, thread_id, provider, driver, provider_instance_id, status, updated_at, payload_json) VALUES ('selected-session', NULL, 'provider', 'codex', 'provider', 'running', '2026-11-01T00:00:00Z', '{}')`;
+    yield* sql`INSERT INTO orchestration_v2_projection_provider_session_bindings VALUES ('selected-session', ${input.threadId})`;
+    const shared = { ...ordinary, providerSessionId: "selected-session" };
+    yield* sql`UPDATE orchestration_v2_projection_provider_threads SET provider_session_id = 'selected-session', payload_json = ${json(shared)} WHERE provider_thread_id = 'selected'`;
+    assert.deepStrictEqual(yield* read(["selected"]), { kind: "owned" });
+    for (const invalid of [
+      { ...shared, id: "mismatch" },
+      { ...shared, appThreadId: "mismatch" },
+      { ...shared, ownerNodeId: "mismatch" },
+      { ...shared, providerSessionId: "mismatch" },
+      { ...shared, status: "not_loaded" },
+      { ...shared, driver: "claude" },
+      { ...shared, providerInstanceId: "mismatch" },
+      {},
+    ]) {
+      yield* sql`UPDATE orchestration_v2_projection_provider_threads SET payload_json = ${json(invalid)} WHERE provider_thread_id = 'selected'`;
+      assert.strictEqual((yield* Effect.flip(read(["selected"]))).reason, "integrity");
+    }
+    assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
   }).pipe(Effect.provide(layer)),
 );
 

@@ -2230,11 +2230,16 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
     function* (input: {
       readonly threadId: string;
       readonly providerSessionIds: readonly string[];
+      readonly providerThreadIds?: readonly string[];
     }) {
       if (Option.isNone(yield* Effect.serviceOption(sql.transactionService)))
         return yield* integrity();
       const validId = (id: unknown): id is string => typeof id === "string" && id.length > 0;
-      if (!validId(input.threadId) || !input.providerSessionIds.every(validId))
+      if (
+        !validId(input.threadId) ||
+        !input.providerSessionIds.every(validId) ||
+        !(input.providerThreadIds ?? []).every(validId)
+      )
         return yield* integrity();
       const sessionIds = new Set(input.providerSessionIds);
       const threads = new Set([input.threadId]);
@@ -2248,6 +2253,73 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
         if (!validId(row.provider_session_id)) return yield* integrity();
         sessionIds.add(row.provider_session_id);
       }
+      type ReferenceRow = {
+        provider_thread_id: string;
+        thread_id: string | null;
+        owner_node_id: string | null;
+        provider_session_id: string | null;
+        status: string;
+        driver: string | null;
+        provider_instance_id: string | null;
+        payload_json: string;
+      };
+      const collectReference = Effect.fn("WorkflowRunStore.collectRecoveryReference")(function* (
+        row: ReferenceRow,
+        pristine: boolean,
+      ) {
+        const reference = yield* decodeRecoveryProviderThread(row.payload_json).pipe(
+          Effect.mapError(integrity),
+        );
+        if (
+          reference.id !== row.provider_thread_id ||
+          reference.appThreadId !== row.thread_id ||
+          reference.ownerNodeId !== row.owner_node_id ||
+          reference.providerSessionId !== row.provider_session_id ||
+          reference.status !== row.status ||
+          reference.driver !== row.driver ||
+          reference.providerInstanceId !== row.provider_instance_id ||
+          (pristine &&
+            (reference.status !== "not_loaded" ||
+              reference.nativeThreadRef !== null ||
+              reference.nativeConversationHeadRef !== null ||
+              (reference.pendingBackgroundTasks?.length ?? 0) !== 0))
+        )
+          return yield* integrity();
+        let attributed = false;
+        if (reference.appThreadId !== null) {
+          if (!validId(reference.appThreadId)) return yield* integrity();
+          threads.add(reference.appThreadId);
+          attributed = true;
+        }
+        if (reference.ownerNodeId !== null) {
+          const nodes = yield* sql<{
+            thread_id: string;
+          }>`SELECT thread_id FROM orchestration_v2_projection_nodes WHERE node_id = ${reference.ownerNodeId}`;
+          if (nodes.length !== 1 || !validId(nodes[0]?.thread_id)) return yield* integrity();
+          threads.add(nodes[0].thread_id);
+          attributed = true;
+        }
+        const subagents = yield* sql<{
+          thread_id: string;
+        }>`SELECT thread_id FROM orchestration_v2_projection_subagents WHERE provider_thread_id = ${reference.id}`;
+        for (const subagent of subagents) {
+          if (!validId(subagent.thread_id)) return yield* integrity();
+          threads.add(subagent.thread_id);
+          attributed = true;
+        }
+        if (!attributed) return yield* integrity();
+        return reference;
+      });
+      for (const id of new Set(input.providerThreadIds ?? [])) {
+        const rows =
+          yield* sql<ReferenceRow>`SELECT provider_thread_id, thread_id, owner_node_id, provider_session_id, status, driver, provider_instance_id, payload_json FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id = ${id}`;
+        if (rows.length !== 1 || !rows[0]) return yield* integrity();
+        const reference = yield* collectReference(rows[0], false);
+        if (reference.providerSessionId !== null) {
+          if (!validId(reference.providerSessionId)) return yield* integrity();
+          sessionIds.add(reference.providerSessionId);
+        }
+      }
       for (const id of sessionIds) {
         const peers = yield* sql<{
           thread_id: string;
@@ -2257,59 +2329,10 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
         }>`SELECT thread_id FROM orchestration_v2_projection_provider_sessions WHERE provider_session_id = ${id}`;
         if (sessions.length === 0) {
           if (peers.length) return yield* integrity();
-          const references = yield* sql<{
-            provider_thread_id: string;
-            thread_id: string | null;
-            owner_node_id: string | null;
-            provider_session_id: string;
-            status: string;
-            driver: string | null;
-            provider_instance_id: string | null;
-            payload_json: string;
-          }>`SELECT provider_thread_id, thread_id, owner_node_id, provider_session_id, status, driver, provider_instance_id, payload_json FROM orchestration_v2_projection_provider_threads WHERE provider_session_id = ${id}`;
+          const references =
+            yield* sql<ReferenceRow>`SELECT provider_thread_id, thread_id, owner_node_id, provider_session_id, status, driver, provider_instance_id, payload_json FROM orchestration_v2_projection_provider_threads WHERE provider_session_id = ${id}`;
           if (!references.length) return yield* integrity();
-          for (const row of references) {
-            const reference = yield* decodeRecoveryProviderThread(row.payload_json).pipe(
-              Effect.mapError(integrity),
-            );
-            if (
-              reference.id !== row.provider_thread_id ||
-              reference.appThreadId !== row.thread_id ||
-              reference.ownerNodeId !== row.owner_node_id ||
-              reference.providerSessionId !== id ||
-              row.provider_session_id !== id ||
-              reference.status !== row.status ||
-              reference.driver !== row.driver ||
-              reference.providerInstanceId !== row.provider_instance_id ||
-              reference.status !== "not_loaded" ||
-              reference.nativeThreadRef !== null ||
-              reference.nativeConversationHeadRef !== null ||
-              (reference.pendingBackgroundTasks?.length ?? 0) !== 0
-            )
-              return yield* integrity();
-            let attributed = false;
-            if (reference.appThreadId !== null) {
-              threads.add(reference.appThreadId);
-              attributed = true;
-            }
-            if (reference.ownerNodeId !== null) {
-              const nodes = yield* sql<{
-                thread_id: string;
-              }>`SELECT thread_id FROM orchestration_v2_projection_nodes WHERE node_id = ${reference.ownerNodeId}`;
-              if (nodes.length !== 1 || !validId(nodes[0]?.thread_id)) return yield* integrity();
-              threads.add(nodes[0].thread_id);
-              attributed = true;
-            }
-            const subagents = yield* sql<{
-              thread_id: string;
-            }>`SELECT thread_id FROM orchestration_v2_projection_subagents WHERE provider_thread_id = ${reference.id}`;
-            for (const subagent of subagents) {
-              if (!validId(subagent.thread_id)) return yield* integrity();
-              threads.add(subagent.thread_id);
-              attributed = true;
-            }
-            if (!attributed) return yield* integrity();
-          }
+          for (const row of references) yield* collectReference(row, true);
           continue;
         }
         if (sessions.length !== 1 || !sessions[0]) return yield* integrity();
