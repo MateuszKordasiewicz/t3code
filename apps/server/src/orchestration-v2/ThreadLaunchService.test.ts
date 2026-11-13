@@ -42,6 +42,7 @@ import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Statement from "effect/sql/Statement";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
@@ -1925,6 +1926,44 @@ it.effect.each(["failed", "interrupted"] as const)(
     }).pipe(Effect.provide(harness.layer));
   },
 );
+
+it.effect("keeps the message command id captured before its receipt lookup", () => {
+  const harness = makeHarness({ runSetup: () => Effect.never });
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const sql = yield* SqlClient.SqlClient;
+    const input = launchInput({
+      command: "command:launch:captured-message",
+      thread: "thread:launch:captured-message",
+      message: "Only once",
+    });
+    const commandId = CommandId.make(`${input.commandId}:initial-message`);
+    let mutated = false;
+    const mutate: Statement.Transformer = (statement) => {
+      const [query, parameters] = statement.compile();
+      return Effect.sync(() => {
+        if (
+          !mutated &&
+          query.includes("orchestration_command_receipts") &&
+          parameters.includes(commandId)
+        ) {
+          input.commandId = CommandId.make("command:launch:changed");
+          mutated = true;
+        }
+        return statement;
+      });
+    };
+    const launched = yield* launches
+      .launch(input)
+      .pipe(Effect.provideService(Statement.CurrentTransformer, mutate));
+    assert.isTrue(mutated);
+    const receipts = yield* sql<{
+      command_id: string;
+    }>`SELECT command_id FROM orchestration_command_receipts WHERE command_type = 'message.dispatch'`;
+    assert.deepStrictEqual(receipts, [{ command_id: commandId }]);
+    assert.equal(launched.projection.messages.length, 1);
+  }).pipe(Effect.provide(harness.layer));
+});
 
 it.effect("replays a server-allocated launch", () =>
   Effect.gen(function* () {
