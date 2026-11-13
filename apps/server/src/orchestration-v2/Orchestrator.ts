@@ -85,6 +85,10 @@ import {
   derivePendingBackgroundWork,
   pendingBackgroundTurnItems,
 } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
+import {
+  snapshotNativeInput,
+  type OwnedNativeInput,
+} from "../workflowRuns/WorkflowNativeCommandSnapshot.ts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -366,6 +370,8 @@ export interface OrchestratorV2DispatchResult {
   readonly replayed?: true;
 }
 
+type NativeDispatchHint = OwnedNativeInput["hint"];
+
 export interface OrchestratorV2Shape {
   readonly resumeQueuedRuns: Effect.Effect<number, OrchestratorV2Error>;
   readonly recoverDelegatedTasks: Effect.Effect<void>;
@@ -379,6 +385,7 @@ export interface OrchestratorV2Shape {
   readonly awaitRestartContinuation: (run: OrchestrationV2Run) => Effect.Effect<void>;
   readonly dispatch: (
     command: OrchestrationV2ServerCommand,
+    native?: NativeDispatchHint,
   ) => Effect.Effect<OrchestratorV2DispatchResult, OrchestratorV2Error>;
   readonly autoArmLimitRecovery: (input: {
     readonly commandId: CommandId;
@@ -13921,6 +13928,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const dispatchWithReceiptEffect = Effect.fn("orchestrationV2.dispatch.withReceipt")(function* (
     command: OrchestrationV2ServerCommand,
     sideChatIds: ReadonlyArray<ThreadId> = [],
+    native?: NativeDispatchHint,
   ): Effect.fn.Return<OrchestratorV2DispatchResult, OrchestratorV2Error> {
     yield* Effect.annotateCurrentSpan({
       "orchestration_v2.command_id": command.commandId,
@@ -13928,19 +13936,41 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       "orchestration_v2.thread_id": commandThreadId(command),
     });
 
-    const existingReceipt = yield* commandReceipts.getByCommandId(command.commandId).pipe(
-      Effect.mapError(
-        (cause) =>
-          new OrchestratorDispatchError({
-            commandId: command.commandId,
-            commandType: command.type,
-            cause,
-          }),
-      ),
-    );
+    const nativeCommit = eventSink.commitNativeCommand;
+    if (native !== undefined) {
+      const nativeReplay = eventSink.replayNativeCommand;
+      if (nativeCommit === undefined || nativeReplay === undefined) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: { reason: "unavailable", detail: "Native command proof capability unavailable." },
+        });
+      }
+      const existing = yield* nativeReplay({ command, hint: native }).pipe(
+        mapDispatchError(command),
+      );
+      if (existing.kind === "verified") {
+        return {
+          sequence: existing.receipt.resultSequence,
+          storedEvents: existing.storedEvents,
+          replayed: true,
+        } satisfies OrchestratorV2DispatchResult;
+      }
+    } else {
+      const existingReceipt = yield* commandReceipts.getByCommandId(command.commandId).pipe(
+        Effect.mapError(
+          (cause) =>
+            new OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause,
+            }),
+        ),
+      );
 
-    if (Option.isSome(existingReceipt)) {
-      return yield* replayCommandReceipt(command, existingReceipt.value);
+      if (Option.isSome(existingReceipt)) {
+        return yield* replayCommandReceipt(command, existingReceipt.value);
+      }
     }
 
     // Recheck under the lock; the user may have raised modes since sender preflight.
@@ -13996,6 +14026,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               organization,
             });
           }
+          if (native !== undefined) return yield* cause;
           const rejectedAt = yield* DateTime.now;
           const receipt = yield* eventSink
             .commitRejectedCommand({
@@ -14031,6 +14062,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ),
     );
 
+    if (native !== undefined && plan.events.length === 0) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: "Native command produced no domain events.",
+      });
+    }
     if (plan.events.length === 0 && plan.effects.length === 0) {
       // A settle that ended nothing still records its receipt: a replayed Stop
       // effect then finds it instead of settling work that appeared since.
@@ -14075,31 +14113,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       } satisfies OrchestratorV2DispatchResult;
     }
     const acceptedAt = plan.events.at(-1)?.occurredAt ?? (yield* DateTime.now);
-    const committed = yield* eventSink
-      .commitCommand({
-        commandId: command.commandId,
-        threadId: commandThreadId(command),
-        commandType: command.type,
-        acceptedAt,
-        events: plan.events,
-        effects: plan.effects,
-        ...(plan.cancelUnsettledEffects === undefined
-          ? {}
-          : { cancelUnsettledEffects: plan.cancelUnsettledEffects }),
-        ...(plan.updateDelegatedCompletionOnlyRunId === undefined
-          ? {}
-          : { updateDelegatedCompletionOnlyRunId: plan.updateDelegatedCompletionOnlyRunId }),
-      })
-      .pipe(
-        Effect.mapError(
-          (cause) =>
-            new OrchestratorDispatchError({
-              commandId: command.commandId,
-              commandType: command.type,
-              cause,
-            }),
-        ),
-      );
+    const decision = {
+      acceptedAt,
+      events: plan.events,
+      effects: plan.effects,
+      ...(plan.cancelUnsettledEffects === undefined
+        ? {}
+        : { cancelUnsettledEffects: plan.cancelUnsettledEffects }),
+      ...(plan.updateDelegatedCompletionOnlyRunId === undefined
+        ? {}
+        : { updateDelegatedCompletionOnlyRunId: plan.updateDelegatedCompletionOnlyRunId }),
+    };
+    const committed = yield* (
+      native === undefined
+        ? eventSink.commitCommand({
+            commandId: command.commandId,
+            threadId: commandThreadId(command),
+            commandType: command.type,
+            ...decision,
+          })
+        : nativeCommit!({ command, hint: native, ...decision })
+    ).pipe(mapDispatchError(command));
 
     if (committed.receipt.status === "rejected") {
       return yield* new OrchestratorCommandPreviouslyRejectedError({
@@ -14159,10 +14193,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   }, withCommandMetrics);
 
   // dispatchWithReceiptEffect owns the dispatch span; this wrapper selects the thread locks.
-  const dispatchWithReceipt = Effect.fnUntraced(function* (command: OrchestrationV2ServerCommand) {
+  const dispatchWithReceipt = Effect.fnUntraced(function* (
+    command: OrchestrationV2ServerCommand,
+    native?: NativeDispatchHint,
+  ) {
     const dispatch = threadDispatch.withLock(
       commandThreadId(command),
-      dispatchWithReceiptEffect(command),
+      dispatchWithReceiptEffect(command, [], native),
     );
     // A parent's lock comes before its side chats' locks, so a delete cascade and a side chat
     // fork or command never interleave. A fork from a side chat or onto an existing thread would
@@ -14185,7 +14222,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           Effect.flatMap((sideChatIds) =>
             sideChatIds.reduce(
               (locked, sideChatId) => threadDispatch.withLock(sideChatId, locked),
-              dispatchWithReceiptEffect(command, sideChatIds),
+              dispatchWithReceiptEffect(command, sideChatIds, native),
             ),
           ),
         ),
@@ -14495,7 +14532,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     awaitRestartContinuation: Effect.fn("OrchestratorV2.awaitRestartContinuation")(function (run) {
       return effectOutbox.awaitSettled(`effect:restart-continuation:${run.id}`).pipe(Effect.ignore);
     }),
-    dispatch: dispatchWithReceipt,
+    // @effect-diagnostics-next-line effectFnOpportunity:off -- native inputs must be owned synchronously before returning an Effect.
+    dispatch: (command, native) => {
+      if (native === undefined) return dispatchWithReceipt(command);
+      try {
+        const owned = snapshotNativeInput(command, native);
+        return dispatchWithReceipt(owned.command, owned.hint);
+      } catch (cause) {
+        return Effect.fail(
+          new OrchestratorDispatchError({
+            commandId: CommandId.make("command:invalid-native"),
+            commandType: "native.invalid",
+            cause,
+          }),
+        );
+      }
+    },
     autoArmLimitRecovery: Effect.fn("OrchestratorV2.autoArmLimitRecovery")(function (input) {
       return threadDispatch.withLock(
         input.threadId,

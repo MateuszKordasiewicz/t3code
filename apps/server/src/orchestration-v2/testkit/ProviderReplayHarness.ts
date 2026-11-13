@@ -13,7 +13,7 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import type * as Scope from "effect/Scope";
-import type * as SqlClient from "effect/sql/SqlClient";
+import * as SqlClient from "effect/sql/SqlClient";
 import type { MigrationError } from "effect/sql/Migrator";
 import type { SqlError } from "effect/sql/SqlError";
 
@@ -279,6 +279,7 @@ export function layerWithRegistry<Error>(
       SqlClient.SqlClient,
       MigrationError | PlatformError.PlatformError | SqlError
     >;
+    readonly nativeCommandProofs?: boolean;
     readonly runEffectWorker?: boolean;
     readonly runContinuationWorker?: boolean;
     readonly recoverOnStartup?: boolean;
@@ -323,23 +324,51 @@ export function layerWithRegistry<Error>(
       ),
     ),
   ).pipe(Layer.orDie);
-  const layerStores = Layer.mergeAll(
-    EventStore.layer,
-    ProjectionStore.layer,
-    ProjectStore.layer,
-    CommandReceiptStore.layer,
-    EffectOutbox.layer,
-    TurnItemPositionStore.layer,
-  ).pipe(Layer.provide(layerDatabase));
-  const layerEventSinkProvided = EventSink.layerFromStores.pipe(
-    Layer.provide(Layer.mergeAll(layerStores, layerDatabase)),
-  );
+  const layerNativePersistence = Layer.effectContext(
+    Effect.gen(function* () {
+      return yield* EventSink.makeCapturedNativeEventInfrastructure(
+        yield* SqlClient.SqlClient,
+        yield* ServerConfig.ServerConfig,
+        yield* Path.Path,
+      );
+    }),
+  ).pipe(Layer.provide(Layer.mergeAll(layerDatabase, layerServerConfig, NodeServices.layer)));
+  const layerStores: Layer.Layer<
+    | EventStore.EventStoreV2
+    | ProjectionStore.ProjectionStoreV2
+    | ProjectStore.ProjectStoreV2
+    | CommandReceiptStore.CommandReceiptStoreV2
+    | EffectOutbox.EffectOutboxV2
+    | TurnItemPositionStore.TurnItemPositionStoreV2,
+    MigrationError | PlatformError.PlatformError | SqlError
+  > =
+    options.nativeCommandProofs === true
+      ? layerNativePersistence
+      : Layer.mergeAll(
+          EventStore.layer,
+          ProjectionStore.layer,
+          ProjectStore.layer,
+          CommandReceiptStore.layer,
+          EffectOutbox.layer,
+          TurnItemPositionStore.layer,
+        ).pipe(Layer.provide(layerDatabase));
+  const layerEventSinkProvided: Layer.Layer<
+    EventSink.EventSinkV2,
+    MigrationError | PlatformError.PlatformError | SqlError
+  > =
+    options.nativeCommandProofs === true
+      ? layerNativePersistence
+      : EventSink.layerFromStores.pipe(Layer.provide(Layer.mergeAll(layerStores, layerDatabase)));
   const layerRuntime = RuntimePolicy.layerEnforcingCeiling.pipe(
     Layer.provide(Layer.merge(layerRuntimeBase, layerServerSettings)),
   );
-  const layerCommandReceiptStoreProvided = CommandReceiptStore.layer.pipe(
-    Layer.provide(layerDatabase),
-  );
+  const layerCommandReceiptStoreProvided: Layer.Layer<
+    CommandReceiptStore.CommandReceiptStoreV2,
+    MigrationError | PlatformError.PlatformError | SqlError
+  > =
+    options.nativeCommandProofs === true
+      ? layerNativePersistence
+      : CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase));
   const layerProviderEventIngestorProvided = ProviderEventIngestor.layer.pipe(
     Layer.provide(
       Layer.mergeAll(

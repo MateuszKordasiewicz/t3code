@@ -6,6 +6,10 @@ import * as NodeSqlite from "node:sqlite";
 import * as NodePathService from "@effect/platform-node/NodePath";
 import { assert, it } from "@effect/vitest";
 import {
+  MessageId,
+  OrchestrationV2Command,
+  ProviderInstanceId,
+  ProviderDriverKind,
   CommandId,
   ThreadId,
   RunId,
@@ -53,6 +57,12 @@ import {
   snapshotNativeInput,
 } from "./WorkflowNativeCommandSnapshot.ts";
 import * as Store from "./WorkflowRunStore.ts";
+import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
+import { DispatchModeLimit } from "../orchestration-v2/DispatchModeLimit.ts";
+import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
+import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
+import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { WorkflowCanonicalHash } from "./WorkflowCanonicalHash.ts";
 import { WorkflowRunPolicy } from "./WorkflowRunPolicy.ts";
 
@@ -275,6 +285,8 @@ const decodeFixtureEvent = Schema.decodeUnknownEffect(OrchestrationV2DomainEvent
 const encodeFixtureEvent = Schema.encodeEffect(OrchestrationV2DomainEventJson);
 const decodeFixtureJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeFixtureEffect = Schema.decodeUnknownSync(EffectOutbox.OrchestrationEffectRequestV2);
+const decodeOrchestratorFixtureCommand = Schema.decodeUnknownSync(OrchestrationV2Command);
+const isOrchestratorDispatchError = Schema.is(Orchestrator.OrchestratorDispatchError);
 
 const nativeDecision = Effect.fn("test.nativeDecision")(function* (
   derived: DerivedFixture,
@@ -2084,4 +2096,366 @@ it.effect.each([false, true])(
       assert.isUndefined(publication.pollUnsafe());
       assert.isUndefined(wake.pollUnsafe());
     }).pipe(Effect.provide(testLayer())),
+);
+
+const proofOrchestrator = Effect.fn("test.proofOrchestrator")(function* (
+  nativeCommandProofs = true,
+  capabilitiesGate: Effect.Effect<void> = Effect.void,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const adapter = {
+    instanceId: ProviderInstanceId.make("provider"),
+    driver: ProviderDriverKind.make("codex"),
+    getCapabilities: () => capabilitiesGate.pipe(Effect.as(CodexProviderCapabilitiesV2)),
+    planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
+    openSession: () => Effect.die("Native proof fixture must never open a provider session"),
+  } as ProviderAdapter.ProviderAdapterV2["Service"];
+  return yield* Layer.build(
+    Layer.fresh(
+      ProviderReplayHarness.layerWithRegistry(
+        { name: "native-command-proofs" },
+        ProviderAdapterRegistry.layerFromAdapters([adapter]),
+        {
+          databaseLayer: Layer.succeed(SqlClient.SqlClient, sql),
+          nativeCommandProofs,
+          runEffectWorker: false,
+          runContinuationWorker: false,
+          recoverOnStartup: false,
+        },
+      ),
+    ),
+  );
+});
+
+it.effect("refuses a native Orchestrator hint when the sink lacks proof capabilities", () =>
+  Effect.gen(function* () {
+    const { claim } = yield* workflowDecision();
+    const runtime = yield* proofOrchestrator(false);
+    const orchestrator = Context.get(runtime, Orchestrator.OrchestratorV2);
+    const before = yield* nativeCounts;
+    assert.instanceOf(
+      yield* Effect.flip(orchestrator.dispatch(claim.command, claim.hint)),
+      Orchestrator.OrchestratorDispatchError,
+    );
+    assert.deepStrictEqual(yield* nativeCounts, before);
+  }).pipe(Effect.provide(testLayer())),
+);
+
+const existingThreadCommand = (
+  derived: DerivedFixture,
+  commandId = "existing-thread",
+  threadId = derived.claimCommand.threadId,
+) => {
+  const launch = derived.reservation.material.launch;
+  return decodeOrchestratorFixtureCommand({
+    type: "thread.create",
+    commandId,
+    threadId,
+    projectId: launch.projectId,
+    title: launch.title,
+    modelSelection: launch.modelSelection,
+    runtimeMode: launch.runtimeMode,
+    interactionMode: launch.interactionMode,
+    branch: "main",
+    worktreePath: null,
+    createdBy: launch.createdBy,
+    creationSource: launch.creationSource,
+  });
+};
+
+it.effect.each([false, true])(
+  "dispatches real native workflow decisions and replays with reuse=%s",
+  (reuse) =>
+    Effect.gen(function* () {
+      const { derived } = yield* workflowDecision(reuse);
+      const runtime = yield* proofOrchestrator();
+      const orchestrator = Context.get(runtime, Orchestrator.OrchestratorV2);
+      const sink = Context.get(runtime, EventSink.EventSinkV2);
+      const sql = yield* SqlClient.SqlClient;
+      if (reuse) yield* orchestrator.dispatch(existingThreadCommand(derived));
+      const claimHint = { intentId: derived.reservation.intentId, phase: "claim" as const };
+      const messageHint = { ...claimHint, phase: "message" as const };
+      const claimed = yield* orchestrator.dispatch(derived.claimCommand, claimHint);
+      assert.strictEqual(
+        claimed.storedEvents[0]?.event.type,
+        reuse ? "thread.metadata-updated" : "thread.created",
+      );
+      const beforeMessage = yield* nativeCounts;
+      assert.instanceOf(
+        yield* Effect.flip(
+          orchestrator.dispatch(derived.messageCommand, messageHint).pipe(
+            Effect.provideService(DispatchModeLimit, {
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+            }),
+          ),
+        ),
+        Orchestrator.OrchestratorThreadAboveModeLimitError,
+      );
+      assert.deepStrictEqual(yield* nativeCounts, beforeMessage);
+      const dispatched = yield* orchestrator.dispatch(derived.messageCommand, messageHint);
+      const created = dispatched.storedEvents.find(
+        (stored) => stored.event.type === "run.created",
+      )?.event;
+      assert.strictEqual(created?.type, "run.created");
+      if (created?.type === "run.created") {
+        assert.strictEqual(created.payload.status, "preparing");
+        assert.strictEqual(created.payload.ordinal, 1);
+        assert.strictEqual(created.payload.userMessageId, derived.messageCommand.messageId);
+        assert.notStrictEqual(created.payload.id, "actual-t3-run");
+        assert.notStrictEqual(created.payload.id, derived.reservation.intentId);
+      }
+      assert.deepStrictEqual(yield* orchestrator.dispatch(derived.messageCommand, messageHint), {
+        ...dispatched,
+        replayed: true,
+      });
+      assert.deepStrictEqual(yield* orchestrator.dispatch(derived.claimCommand, claimHint), {
+        ...claimed,
+        replayed: true,
+      });
+      const replay = yield* sink.replayNativeCommand!({
+        command: derived.messageCommand,
+        hint: messageHint,
+      });
+      assert.strictEqual(replay.kind, "verified");
+      if (replay.kind === "verified") {
+        assert.deepStrictEqual(replay.storedEvents, dispatched.storedEvents);
+        assert.isTrue(DateTime.isDateTime(replay.receipt.acceptedAt));
+      }
+      assert.deepStrictEqual(
+        yield* sql`SELECT phase FROM workflow_native_command_proofs ORDER BY phase`,
+        [{ phase: "claim" }, { phase: "message" }],
+      );
+      assert.deepStrictEqual(
+        yield* sql`SELECT * FROM orchestration_v2_effect_outbox WHERE effect_type IN ('provider-turn.start','provider-turn.restart','provider-runtime.continue')`,
+        [],
+      );
+    }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect("dispatches both real native planning phases without charging a second pass", () =>
+  Effect.gen(function* () {
+    const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+    yield* seedProject;
+    const store = yield* Store.WorkflowRunStore;
+    yield* store.beginPlanning({
+      session,
+      now: facts.now,
+      context,
+      command: { commandId: "begin", receiptId: "begin-receipt" },
+    });
+    const input = planningReservation(admissionInput(binding, "orchestrator"));
+    yield* store.reservePlanningNativeIntent(input);
+    const sql = yield* SqlClient.SqlClient;
+    const derived = yield* sql.withTransaction(
+      (yield* Derivation.WorkflowNativeLaunchDerivation).deriveInTransaction({
+        intentId: input.intentId,
+      }),
+    );
+    const runtime = yield* proofOrchestrator();
+    const orchestrator = Context.get(runtime, Orchestrator.OrchestratorV2);
+    for (const [phase, command] of [
+      ["claim", derived.claimCommand],
+      ["message", derived.messageCommand],
+    ] as const) {
+      const hint = { intentId: input.intentId, phase };
+      const first = yield* orchestrator.dispatch(command, hint);
+      assert.isAbove(first.storedEvents.length, 0);
+      assert.deepStrictEqual(yield* orchestrator.dispatch(command, hint), {
+        ...first,
+        replayed: true,
+      });
+    }
+    assert.strictEqual((yield* store.getPlanning({ sessionId: session.id })).consumed.passes, 1);
+    assert.lengthOf(yield* sql`SELECT * FROM workflow_native_command_proofs`, 2);
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect("owns hinted commands and hint before returning the dispatch Effect", () =>
+  Effect.gen(function* () {
+    const { derived } = yield* workflowDecision();
+    const runtime = yield* proofOrchestrator();
+    const orchestrator = Context.get(runtime, Orchestrator.OrchestratorV2);
+    const actual = { ...derived.claimCommand };
+    const hint = { intentId: derived.reservation.intentId, phase: "claim" as const };
+    const queued = orchestrator.dispatch(actual, hint);
+    Object.assign(actual, {
+      commandId: "mutated-command",
+      threadId: "mutated-thread",
+      title: "Mutated",
+    });
+    Object.assign(hint, { intentId: "mutated-intent", phase: "message" });
+    const result = yield* queued;
+    const created = result.storedEvents[0]?.event;
+    assert.strictEqual(created?.type, "thread.created");
+    if (created?.type === "thread.created") {
+      assert.strictEqual(created.threadId, derived.claimCommand.threadId);
+      assert.strictEqual(created.payload.title, derived.reservation.material.launch.title);
+    }
+    const before = yield* nativeCounts;
+    const invalid = orchestrator.dispatch(derived.claimCommand, {
+      intentId: "bad",
+      phase: "message",
+    });
+    assert.instanceOf(yield* Effect.flip(invalid), Orchestrator.OrchestratorDispatchError);
+    assert.deepStrictEqual(yield* nativeCounts, before);
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect("native decision refusal leaves no rejected receipt for an occupied reuse target", () =>
+  Effect.gen(function* () {
+    const { derived } = yield* workflowDecision(true);
+    const runtime = yield* proofOrchestrator();
+    const orchestrator = Context.get(runtime, Orchestrator.OrchestratorV2);
+    const sql = yield* SqlClient.SqlClient;
+    yield* orchestrator.dispatch(existingThreadCommand(derived));
+    yield* orchestrator.dispatch({
+      ...derived.messageCommand,
+      commandId: CommandId.make("existing-message-command"),
+      messageId: MessageId.make("existing-message"),
+    });
+    const before = yield* nativeCounts;
+    assert.instanceOf(
+      yield* Effect.flip(
+        orchestrator.dispatch(derived.claimCommand, {
+          intentId: derived.reservation.intentId,
+          phase: "claim",
+        }),
+      ),
+      Orchestrator.OrchestratorDispatchError,
+    );
+    assert.deepStrictEqual(yield* nativeCounts, before);
+    assert.deepStrictEqual(
+      yield* sql`SELECT * FROM orchestration_command_receipts WHERE command_id = ${derived.claimCommand.commandId}`,
+      [],
+    );
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect(
+  "native dispatch refuses a global receipt committed by another thread during decision",
+  () =>
+    Effect.gen(function* () {
+      const { derived } = yield* workflowDecision();
+      const arrived = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let capabilityCalls = 0;
+      const gate = Effect.gen(function* () {
+        capabilityCalls += 1;
+        yield* Deferred.succeed(arrived, undefined);
+        yield* Deferred.await(release);
+      });
+      const runtime = yield* proofOrchestrator(true, gate);
+      const orchestrator = Context.get(runtime, Orchestrator.OrchestratorV2);
+      const sql = yield* SqlClient.SqlClient;
+      yield* orchestrator.dispatch(derived.claimCommand, {
+        intentId: derived.reservation.intentId,
+        phase: "claim",
+      });
+      const hint = { intentId: derived.reservation.intentId, phase: "message" as const };
+      const pending = yield* orchestrator
+        .dispatch(derived.messageCommand, hint)
+        .pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Deferred.await(arrived);
+      const otherThread = ThreadId.make("competing-thread");
+      const competing = yield* orchestrator.dispatch(
+        existingThreadCommand(derived, derived.messageCommand.commandId, otherThread),
+      );
+      const afterCompeting = yield* nativeCounts;
+      yield* Deferred.succeed(release, undefined);
+      const failure = yield* Effect.flip(Fiber.join(pending));
+      assert.instanceOf(failure, Orchestrator.OrchestratorDispatchError);
+      if (isOrchestratorDispatchError(failure))
+        assert.instanceOf(failure.cause, EventSink.EventSinkWriteError);
+      assert.deepStrictEqual(yield* nativeCounts, afterCompeting);
+      assert.deepStrictEqual(
+        yield* sql`SELECT aggregate_id, result_sequence, status FROM orchestration_command_receipts WHERE command_id = ${derived.messageCommand.commandId}`,
+        [{ aggregate_id: otherThread, result_sequence: competing.sequence, status: "accepted" }],
+      );
+      assert.deepStrictEqual(yield* sql`SELECT phase FROM workflow_native_command_proofs`, [
+        { phase: "claim" },
+      ]);
+      assert.deepStrictEqual(
+        yield* sql`SELECT stream_id, event_type FROM orchestration_events WHERE command_id = ${derived.messageCommand.commandId}`,
+        [{ stream_id: otherThread, event_type: "thread.created" }],
+      );
+      const callsBeforeReplay = capabilityCalls;
+      assert.instanceOf(
+        yield* Effect.flip(orchestrator.dispatch(derived.messageCommand, hint)),
+        Orchestrator.OrchestratorDispatchError,
+      );
+      assert.strictEqual(capabilityCalls, callsBeforeReplay);
+      assert.deepStrictEqual(yield* nativeCounts, afterCompeting);
+    }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect("real native message decision uses an owned copy of nested caller context", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    yield* seedProject;
+    const input = basicInput();
+    const launch = {
+      ...input.launch,
+      initialMessage: {
+        ...input.launch.initialMessage,
+        context: {
+          version: 1,
+          records: [
+            {
+              version: 1,
+              contextId: "opaque",
+              kind: "future-kind",
+              label: "Future",
+              payload: { nested: ["original"] },
+            },
+          ],
+        },
+      },
+    };
+    yield* (yield* Store.WorkflowRunStore).reserveWorkflowNativeIntent({ ...input, launch });
+    const sql = yield* SqlClient.SqlClient;
+    const derived = yield* sql.withTransaction(
+      (yield* Derivation.WorkflowNativeLaunchDerivation).deriveInTransaction({
+        intentId: input.intentId,
+      }),
+    );
+    const runtime = yield* proofOrchestrator();
+    const orchestrator = Context.get(runtime, Orchestrator.OrchestratorV2);
+    yield* orchestrator.dispatch(derived.claimCommand, {
+      intentId: input.intentId,
+      phase: "claim",
+    });
+    const ownedContext = structuredClone(derived.messageCommand.context);
+    if (ownedContext === undefined) throw new Error("fixture must have context");
+    const actual = { ...derived.messageCommand, context: ownedContext };
+    const hint = { intentId: input.intentId, phase: "message" as const };
+    const pending = orchestrator.dispatch(actual, hint);
+    const record = ownedContext.records[0];
+    if (record === undefined || !("payload" in record))
+      throw new Error("fixture must have opaque context");
+    const payload = record.payload;
+    if (typeof payload !== "object" || payload === null)
+      throw new Error("fixture must have nested context");
+    Object.assign(payload, { nested: ["mutated"] });
+    actual.text = "mutated text";
+    hint.intentId = "mutated-intent";
+    const result = yield* pending;
+    const message = result.storedEvents.find(
+      (stored) => stored.event.type === "message.updated",
+    )?.event;
+    assert.strictEqual(message?.type, "message.updated");
+    if (message?.type === "message.updated") {
+      assert.strictEqual(message.payload.text, launch.initialMessage.text);
+      assert.deepStrictEqual<unknown>(message.payload.context, launch.initialMessage.context);
+    }
+    const before = yield* nativeCounts;
+    assert.deepStrictEqual(
+      yield* orchestrator.dispatch(derived.messageCommand, {
+        intentId: input.intentId,
+        phase: "message",
+      }),
+      { ...result, replayed: true },
+    );
+    assert.deepStrictEqual(yield* nativeCounts, before);
+  }).pipe(Effect.provide(testLayer())),
 );
