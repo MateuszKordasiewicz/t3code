@@ -66,6 +66,7 @@ describe("V2 preview upgrade", () => {
         [84, "WorkflowNativeLaunchIntents"],
         [85, "WorkflowNativeThreadLookup"],
         [86, "WorkflowNativeReservationMaterial"],
+        [87, "WorkflowNativeCommandProofs"],
       ]);
       assert.deepStrictEqual(yield* runMigrations(), []);
       assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_legacy_imports`, imports);
@@ -175,6 +176,7 @@ describe("V2 preview upgrade", () => {
         [84, "WorkflowNativeLaunchIntents"],
         [85, "WorkflowNativeThreadLookup"],
         [86, "WorkflowNativeReservationMaterial"],
+        [87, "WorkflowNativeCommandProofs"],
       ]);
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
