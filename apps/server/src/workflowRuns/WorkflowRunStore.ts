@@ -878,7 +878,7 @@ const makeStore = Effect.fnUntraced(function* (
   );
   const mutatePreparation = Effect.fn("WorkflowRunStore.mutatePreparation")(function* (
     selected: PreparationJob.Selection,
-    action: "close" | "quiescing" | "unknown" | "settle",
+    action: "close" | "quiescing" | "unknown" | "settle" | "expose",
   ) {
     if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
       return yield* integrity();
@@ -900,7 +900,11 @@ const makeStore = Effect.fnUntraced(function* (
         yield* readPreparationParent(job.input);
         const now = DateTime.formatIso(yield* DateTime.now);
         let patch: Record<string, string | number>;
-        if (action === "close") {
+        if (action === "expose") {
+          if (job.state !== "active" || job.codeClosedAt !== null || job.processExposed)
+            return yield* stale();
+          patch = { process_exposed: 1 };
+        } else if (action === "close") {
           if (job.codeClosedAt !== null) return yield* stale();
           patch = { code_closed_at: now };
         } else if (action === "settle") {
@@ -940,7 +944,7 @@ const makeStore = Effect.fnUntraced(function* (
   });
   const ownPreparationMutation = (
     selected: PreparationJob.Selection,
-    action: "close" | "quiescing" | "unknown" | "settle",
+    action: "close" | "quiescing" | "unknown" | "settle" | "expose",
   ) => {
     try {
       return mutatePreparation(PreparationJob.ownSelection(selected), action);
@@ -6756,6 +6760,8 @@ const makeStore = Effect.fnUntraced(function* (
         return Effect.fail(integrity());
       }
     },
+    markPreparationProcessExposed: (selected: PreparationJob.Selection) =>
+      ownPreparationMutation(selected, "expose"),
     closePreparationCode: (selected: PreparationJob.Selection) =>
       ownPreparationMutation(selected, "close"),
     quiescePreparationJob: (

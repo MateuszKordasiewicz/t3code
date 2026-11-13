@@ -14045,3 +14045,56 @@ it.effect("preparation custody follows native aliases with an empty physical led
     assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_submission_transports`, []);
   }).pipe(Effect.provide(layerWithOutbox)),
 );
+
+it.effect(
+  "preparation exposure is an exact open-job CAS and forbids later code-only clearance",
+  () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const store = yield* Store.WorkflowRunStore;
+      const sql = yield* SqlClient.SqlClient;
+      let job = yield* acquirePreparation(preparationInput("thread", "exposed-job"));
+      const selected = preparationSelection(job);
+      const pending = store.markPreparationProcessExposed(selected);
+      selected.expectedVersion = 999;
+      const subscription = yield* store.subscribeChanges;
+      job = yield* pending;
+      assert.isTrue(job.processExposed);
+      assert.strictEqual(job.recordVersion, 1);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 1);
+      const before = yield* preparationState;
+      assert.strictEqual((yield* Effect.result(pending))._tag, "Failure");
+      assert.strictEqual(
+        (yield* Effect.result(store.markPreparationProcessExposed(preparationSelection(job))))._tag,
+        "Failure",
+      );
+      assert.deepStrictEqual(yield* preparationState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+      job = yield* store.quiescePreparationJob(preparationSelection(job), "unknown");
+      job = yield* store.closePreparationCode(preparationSelection(job));
+      const closed = yield* preparationState;
+      const clearance = yield* Effect.result(
+        store.settleCodeOnlyPreparation(preparationSelection(job)),
+      );
+      assert.strictEqual(clearance._tag, "Failure");
+      if (clearance._tag === "Failure") assert.strictEqual(clearance.failure.reason, "integrity");
+      assert.deepStrictEqual(yield* preparationState, closed);
+      for (const state of ["closed", "quiescing"] as const) {
+        let other = yield* acquirePreparation(preparationInput("thread", `not-open-${state}`));
+        other = yield* state === "closed"
+          ? store.closePreparationCode(preparationSelection(other))
+          : store.quiescePreparationJob(preparationSelection(other));
+        assert.strictEqual(
+          (yield* Effect.result(store.markPreparationProcessExposed(preparationSelection(other))))
+            ._tag,
+          "Failure",
+        );
+      }
+      assert.strictEqual(
+        (yield* Effect.result(
+          sql.withTransaction(store.markPreparationProcessExposed(preparationSelection(job))),
+        ))._tag,
+        "Failure",
+      );
+    }).pipe(Effect.provide(layerWithOutbox)),
+);

@@ -15,6 +15,7 @@ import {
   ComposerContextId,
   type ChatAttachment,
   CommandId,
+  EnvironmentId,
   DEFAULT_SERVER_SETTINGS,
   GitCommandError,
   MessageId,
@@ -38,16 +39,19 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as PubSub from "effect/PubSub";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Statement from "effect/sql/Statement";
 import * as TestClock from "effect/testing/TestClock";
+import * as Tracer from "effect/Tracer";
 
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as WorkflowRunStore from "../workflowRuns/WorkflowRunStore.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import { WorkflowCanonicalHash } from "../workflowRuns/WorkflowCanonicalHash.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as ProjectService from "../project/ProjectService.ts";
@@ -138,6 +142,10 @@ interface HarnessOptions {
   readonly serverSettings?: Parameters<typeof ServerSettings.layerTest>[0];
   readonly providers?: ReadonlyArray<ServerProvider>;
   readonly git?: Partial<GitWorkflow.GitWorkflowService["Service"]>;
+  readonly beforeProjectRead?: () => Effect.Effect<unknown>;
+  readonly beforeMessageDispatch?: Effect.Effect<unknown>;
+  readonly afterPreparationCodeClosed?: Effect.Effect<unknown>;
+  readonly beforeScratchProbe?: Effect.Effect<void, never, SqlClient.SqlClient>;
   readonly beforeCustodyRead?: (count: number) => Effect.Effect<void, never, SqlClient.SqlClient>;
   readonly beforePreparationSequenceRead?: (
     threadId: ThreadId,
@@ -199,12 +207,16 @@ function makeHarness(options: HarnessOptions = {}) {
       delete: () => Effect.die("unused"),
       listPage: () => Effect.die("unused"),
       getById: (id) =>
-        Effect.succeed(
-          id === projectId
-            ? Option.some(project)
-            : id === otherProjectId
-              ? Option.some(otherProject)
-              : Option.none(),
+        (options.beforeProjectRead?.() ?? Effect.void).pipe(
+          Effect.andThen(
+            Effect.succeed(
+              id === projectId
+                ? Option.some(project)
+                : id === otherProjectId
+                  ? Option.some(otherProject)
+                  : Option.none(),
+            ),
+          ),
         ),
       getByWorkspaceRoot: () => Effect.succeedSome(project),
       workspaceScanDirectory: () => Effect.die("unused"),
@@ -236,11 +248,24 @@ function makeHarness(options: HarnessOptions = {}) {
     layerServerSettings,
     ProviderRegistryMock.layer(options.providers),
     options.managedFolders ??
-      Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
-        namedProjectsRoot: "/projects",
-        isScratchProject: () => Effect.succeed(false),
-        folderForThread: () => Effect.succeedNone,
-      }),
+      Layer.effect(
+        ManagedProjectFolders.ManagedProjectFolders,
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          return ManagedProjectFolders.ManagedProjectFolders.of({
+            namedProjectsRoot: "/projects",
+            isScratchProject: () =>
+              (options.beforeScratchProbe ?? Effect.void).pipe(
+                Effect.provideService(SqlClient.SqlClient, sql),
+                Effect.as(false),
+              ),
+            folderForThread: () => Effect.succeedNone,
+            scratchRoot: Effect.succeedNone,
+            ensureScratchProject: Effect.die("unused"),
+            createNamedProject: () => Effect.die("unused"),
+          });
+        }),
+      ).pipe(Layer.provide(layerDatabase)),
   );
   const realWorkflowStore = WorkflowRunStore.layer.pipe(Layer.provide(layerDatabase));
   const layerWorkflowStore = Layer.effect(
@@ -251,6 +276,10 @@ function makeHarness(options: HarnessOptions = {}) {
       let reads = 0;
       return WorkflowRunStore.WorkflowRunStore.of({
         ...store,
+        closePreparationCode: (input) =>
+          store
+            .closePreparationCode(input)
+            .pipe(Effect.tap(() => options.afterPreparationCodeClosed ?? Effect.void)),
         readThreadCustody: (input) =>
           Effect.gen(function* () {
             reads++;
@@ -271,6 +300,12 @@ function makeHarness(options: HarnessOptions = {}) {
       const sql = yield* SqlClient.SqlClient;
       return ThreadManagement.ThreadManagementService.of({
         ...threads,
+        dispatch: (command) =>
+          command.type === "message.dispatch"
+            ? (options.beforeMessageDispatch ?? Effect.void).pipe(
+                Effect.andThen(threads.dispatch(command)),
+              )
+            : threads.dispatch(command),
         getThreadEventSequence: (threadId) =>
           Effect.gen(function* () {
             if (options.beforePreparationSequenceRead) {
@@ -291,6 +326,9 @@ function makeHarness(options: HarnessOptions = {}) {
         layerReceipts,
         IdAllocator.layer,
         layerWorkflowStore,
+        Layer.succeed(ServerEnvironment.ServerEnvironmentIdentity, {
+          getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
+        }),
       ),
     ),
   );
@@ -336,6 +374,9 @@ function makeHarness(options: HarnessOptions = {}) {
       layerOutbox,
       layerDatabase,
       layerExternalServices,
+      layerWorkflowStore,
+      layerReceipts,
+      IdAllocator.layer,
     ),
     createWorktree,
     removeWorktree,
@@ -380,7 +421,7 @@ function launchInput(input: {
 const custodyHash = "a".repeat(64);
 const decodeCustodyRun = Schema.decodeEffect(WorkflowRunV1);
 const decodeCustodyOperation = Schema.decodeEffect(WorkflowOperationV1);
-const seedCustody = (threadId: string, malformed = false) =>
+const seedCustody = (threadId: string, malformed = false, associate = true) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const run = yield* decodeCustodyRun({
@@ -443,11 +484,16 @@ const seedCustody = (threadId: string, malformed = false) =>
     const operation = { ...base, fingerprint: WorkflowCanonicalHash.operation(base) };
     yield* sql`INSERT INTO workflow_plan_identities VALUES ('custody-plan')`;
     yield* sql`INSERT INTO workflow_revision_identities VALUES ('custody-plan', 'revision', ${custodyHash}, ${custodyHash})`;
-    yield* sql`INSERT INTO workflow_runs VALUES ('custody-run', 'custody-plan', 'revision', ${custodyHash}, ${custodyHash}, ${custodyHash}, 'active', 0, 0, ${JSON.stringify(run)})`;
+    const retainedRun = associate
+      ? run
+      : { ...run, access: { origins: [{ environmentId: "environment", projectId, threadId }] } };
+    yield* sql`INSERT INTO workflow_runs VALUES ('custody-run', 'custody-plan', 'revision', ${custodyHash}, ${custodyHash}, ${custodyHash}, 'active', 0, 0, ${JSON.stringify(retainedRun)})`;
     const record = malformed
       ? JSON.stringify({ parameters: { nativeThreadId: threadId } })
       : JSON.stringify(operation);
-    yield* sql`INSERT INTO workflow_operations (id, workflow_run_id, kind, fingerprint, status, generation, record_json) VALUES ('custody-operation', 'custody-run', 'stage_launch', ${operation.fingerprint}, 'pending', 0, ${record})`;
+    if (associate)
+      yield* sql`INSERT INTO workflow_operations (id, workflow_run_id, kind, fingerprint, status, generation, record_json) VALUES ('custody-operation', 'custody-run', 'stage_launch', ${operation.fingerprint}, 'pending', 0, ${record})`;
+    return { run: retainedRun, operation };
   }).pipe(Effect.orDie);
 
 const nativeSnapshot = Effect.gen(function* () {
@@ -548,13 +594,17 @@ it.effect.each(["owned", "malformed", "read-error"] as const)(
         assert.equal(failure._tag, "ThreadLaunchError");
         if (failure._tag === "ThreadLaunchError") assert.equal(failure.operation, "update-thread");
       }
-      for (const command of ["custody-new", "custody-create"]) {
+      for (const command of ["custody-new"]) {
         const failure = yield* Effect.flip(
           launches.launch(launchInput({ command, thread: threadId })),
         );
         assert.equal(failure._tag, "ThreadLaunchError");
         if (failure._tag === "ThreadLaunchError") assert.equal(failure.operation, "update-thread");
       }
+      const history = yield* launches.launch(
+        launchInput({ command: "custody-create", thread: threadId }),
+      );
+      assert.isTrue(history.resumed);
       assert.equal(folderForThread.mock.calls.length, 0);
       const retry = yield* Effect.flip(
         launches.retryPreparation({
@@ -625,6 +675,13 @@ it.effect.each(["owned", "malformed", "read-error"] as const)(
         yield* sql`DELETE FROM workflow_operations WHERE id = 'custody-operation'`;
         const replay = yield* launches.launch(input);
         assert.isTrue(replay.resumed);
+        assert.equal(harness.createWorktree.mock.calls.length, 0);
+        const runId = projection.runs[0]!.id;
+        yield* launches.prepareRun({
+          commandId: CommandId.make(`${input.commandId}:fresh-preparation`),
+          threadId,
+          runId,
+        });
         const settled = yield* preparationSettled(threadId);
         assert.equal(settled.runs[0]?.status, "starting");
         assert.equal(harness.createWorktree.mock.calls.length, 1);
@@ -678,6 +735,12 @@ it.effect.each(["owned", "malformed", "read-error"] as const)(
           yield* sql`DELETE FROM workflow_operations WHERE id = 'custody-operation'`;
           const replay = yield* launches.launch(input);
           assert.isTrue(replay.resumed);
+          assert.equal(harness.createWorktree.mock.calls.length, 0);
+          yield* launches.prepareRun({
+            commandId: CommandId.make(`${input.commandId}:fresh-preparation`),
+            threadId,
+            runId: projection.runs[0]!.id,
+          });
           const settled = yield* preparationSettled(threadId);
           assert.equal(settled.runs[0]?.status, "starting");
           assert.equal(harness.createWorktree.mock.calls.length, 1);
@@ -2265,21 +2328,20 @@ it.effect("does not let a failing same-command caller strand a concurrent durabl
 
 it.effect("reports one concurrent same-command launch as new and the rest as resumed", () =>
   Effect.gen(function* () {
-    // Both launches read no receipt before either one claims the thread.
-    const arrived = yield* Ref.make(0);
-    const bothRead = yield* Deferred.make<void>();
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let folders = 0;
     const harness = makeHarness({
       managedFolders: Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
         namedProjectsRoot: "/projects",
         isScratchProject: () => Effect.succeed(false),
         folderForThread: () =>
-          Ref.updateAndGet(arrived, (count) => count + 1).pipe(
-            Effect.tap((count) =>
-              count === 2 ? Deferred.succeed(bothRead, undefined) : Effect.void,
-            ),
-            Effect.andThen(Deferred.await(bothRead)),
-            Effect.as(Option.none()),
-          ),
+          Effect.gen(function* () {
+            folders++;
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(release);
+            return Option.none();
+          }),
       }),
     });
     yield* Effect.gen(function* () {
@@ -2288,70 +2350,28 @@ it.effect("reports one concurrent same-command launch as new and the rest as res
         command: "command:launch:concurrent-resumed",
         thread: "thread:launch:concurrent-resumed",
       });
-      const results = yield* Effect.all([launches.launch(input), launches.launch(input)], {
-        concurrency: "unbounded",
-      });
-      assert.deepEqual(results.map((result) => result.resumed).sort(), [false, true]);
+      const first = yield* launches.launch(input).pipe(Effect.forkScoped);
+      yield* Deferred.await(entered);
+      const second = yield* launches.launch(input).pipe(Effect.forkScoped);
+      yield* Deferred.succeed(release, undefined);
+      const results = yield* Effect.all([Fiber.join(first), Fiber.join(second)]);
+      assert.deepStrictEqual(results.map((result) => result.resumed).sort(), [false, true]);
+      assert.strictEqual(folders, 1);
     }).pipe(Effect.provide(harness.layer));
   }),
 );
 
-it.effect(
-  "does not report a retry as resumed when the earlier attempt only claimed the thread",
-  () =>
-    Effect.gen(function* () {
-      const harness = makeHarness();
-      yield* Effect.gen(function* () {
-        const launches = yield* ThreadLaunch.ThreadLaunchService;
-        const threads = yield* ThreadManagement.ThreadManagementService;
-        const input = launchInput({
-          command: "command:launch:claimed-only",
-          thread: "thread:launch:claimed-only",
-          message: "Counted once",
-        });
-        yield* threads.dispatch({
-          type: "thread.create",
-          commandId: input.commandId,
-          threadId: input.threadId,
-          projectId: input.projectId,
-          title: input.title,
-          modelSelection: input.modelSelection,
-          runtimeMode: input.runtimeMode,
-          interactionMode: input.interactionMode,
-          branch: null,
-          worktreePath: null,
-          createdBy: input.createdBy,
-          creationSource: input.creationSource,
-        });
-        const retried = yield* launches.launch(input);
-        assert.isFalse(retried.resumed);
-        assert.isTrue((yield* launches.launch(input)).resumed);
-      }).pipe(Effect.provide(harness.layer));
-    }),
-);
-
-it.effect("schedules an accepted preparing message exactly once across concurrent retries", () =>
+it.effect("retains a claimed-only launch without resending from its old command", () =>
   Effect.gen(function* () {
-    const setupEntered = yield* Deferred.make<void>();
-    const allowSetup = yield* Deferred.make<void>();
-    const harness = makeHarness({
-      runSetup: () =>
-        Deferred.succeed(setupEntered, undefined).pipe(
-          Effect.andThen(Deferred.await(allowSetup)),
-          Effect.as({ status: "no-script" as const }),
-        ),
-    });
+    const harness = makeHarness();
     yield* Effect.gen(function* () {
       const launches = yield* ThreadLaunch.ThreadLaunchService;
       const threads = yield* ThreadManagement.ThreadManagementService;
       const input = launchInput({
-        command: "command:launch:accepted-before-fork",
-        thread: "thread:launch:accepted-before-fork",
-        message: "Resume preparation",
-        workspace: { type: "worktree", baseRef: "main" },
+        command: "command:launch:claimed-only",
+        thread: "thread:launch:claimed-only",
+        message: "Counted once",
       });
-      const messageId = MessageId.make("message:launch:accepted-before-fork");
-
       yield* threads.dispatch({
         type: "thread.create",
         commandId: input.commandId,
@@ -2366,31 +2386,88 @@ it.effect("schedules an accepted preparing message exactly once across concurren
         createdBy: input.createdBy,
         creationSource: input.creationSource,
       });
-      yield* threads.dispatch({
-        type: "message.dispatch",
-        commandId: CommandId.make(`${input.commandId}:initial-message`),
-        threadId: input.threadId,
-        messageId,
-        text: "Resume preparation",
-        attachments: [],
-        modelSelection: input.modelSelection,
-        dispatchMode: { type: "defer_start" },
-        createdBy: input.createdBy,
-        creationSource: input.creationSource,
-      });
-      const preparing = yield* threads.getThreadProjection(input.threadId);
-      assert.equal(preparing.runs[0]?.status, "preparing");
-
-      const [first, second] = yield* Effect.all([launches.launch(input), launches.launch(input)], {
-        concurrency: "unbounded",
-      });
-      yield* Deferred.await(setupEntered);
-      assert.isTrue(first.resumed);
-      assert.isTrue(second.resumed);
-      assert.equal(harness.runSetup.mock.calls.length, 1);
-      yield* Deferred.succeed(allowSetup, undefined);
+      const before = yield* nativeSnapshot;
+      const refused = yield* Effect.result(launches.launch(input));
+      assert.strictEqual(refused._tag, "Failure");
+      assert.deepStrictEqual(yield* nativeSnapshot, before);
+      assert.equal(harness.createWorktree.mock.calls.length, 0);
+      assert.equal(harness.runSetup.mock.calls.length, 0);
     }).pipe(Effect.provide(harness.layer));
   }),
+);
+
+it.effect(
+  "keeps accepted preparing message replay read-only before an explicit fresh preparation",
+  () =>
+    Effect.gen(function* () {
+      const setupEntered = yield* Deferred.make<void>();
+      const allowSetup = yield* Deferred.make<void>();
+      const harness = makeHarness({
+        runSetup: () =>
+          Deferred.succeed(setupEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(allowSetup)),
+            Effect.as({ status: "no-script" as const }),
+          ),
+      });
+      yield* Effect.gen(function* () {
+        const launches = yield* ThreadLaunch.ThreadLaunchService;
+        const threads = yield* ThreadManagement.ThreadManagementService;
+        const input = launchInput({
+          command: "command:launch:accepted-before-fork",
+          thread: "thread:launch:accepted-before-fork",
+          message: "Resume preparation",
+          workspace: { type: "worktree", baseRef: "main" },
+        });
+        const messageId = MessageId.make("message:launch:accepted-before-fork");
+
+        yield* threads.dispatch({
+          type: "thread.create",
+          commandId: input.commandId,
+          threadId: input.threadId,
+          projectId: input.projectId,
+          title: input.title,
+          modelSelection: input.modelSelection,
+          runtimeMode: input.runtimeMode,
+          interactionMode: input.interactionMode,
+          branch: null,
+          worktreePath: null,
+          createdBy: input.createdBy,
+          creationSource: input.creationSource,
+        });
+        yield* threads.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`${input.commandId}:initial-message`),
+          threadId: input.threadId,
+          messageId,
+          text: "Resume preparation",
+          attachments: [],
+          modelSelection: input.modelSelection,
+          dispatchMode: { type: "defer_start", workspaceStrategy: input.workspaceStrategy },
+          createdBy: input.createdBy,
+          creationSource: input.creationSource,
+        });
+        const preparing = yield* threads.getThreadProjection(input.threadId);
+        assert.equal(preparing.runs[0]?.status, "preparing");
+
+        const [first, second] = yield* Effect.all(
+          [launches.launch(input), launches.launch(input)],
+          {
+            concurrency: "unbounded",
+          },
+        );
+        assert.isTrue(first.resumed);
+        assert.isTrue(second.resumed);
+        assert.equal(harness.runSetup.mock.calls.length, 0);
+        yield* launches.prepareRun({
+          commandId: CommandId.make(`${input.commandId}:fresh-preparation`),
+          threadId: input.threadId,
+          runId: preparing.runs[0]!.id,
+        });
+        yield* Deferred.await(setupEntered);
+        assert.equal(harness.runSetup.mock.calls.length, 1);
+        yield* Deferred.succeed(allowSetup, undefined);
+      }).pipe(Effect.provide(harness.layer));
+    }),
 );
 
 it.effect("creates a strong provider-thread mapping for an imported native session", () => {
@@ -2951,3 +3028,555 @@ it.effect("replays an accepted send after the project disables the instance", ()
     }
   }).pipe(Effect.provide(Layer.mergeAll(harness.layer, layerFiles)));
 });
+
+it.effect("owns a committed preparation job before the earliest Scratch probe", () => {
+  const harness = makeHarness({
+    beforeScratchProbe: Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const jobs =
+        yield* sql`SELECT * FROM orchestration_v2_preparation_jobs WHERE thread_id='thread:earliest-custody'`;
+      assert.strictEqual(jobs.length, 1);
+      assert.strictEqual(jobs[0]!.state, "active");
+      assert.strictEqual(jobs[0]!.code_closed_at, null);
+      assert.strictEqual(jobs[0]!.process_exposed, 1);
+    }).pipe(Effect.orDie),
+  });
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    yield* launches.launch(
+      launchInput({
+        command: "command:earliest-custody",
+        thread: "thread:earliest-custody",
+        message: "prepare",
+        workspace: { type: "worktree", baseRef: "main", branch: "provided-branch" },
+      }),
+    );
+    yield* preparationSettled(ThreadId.make("thread:earliest-custody"));
+  }).pipe(Effect.provide(harness.layer));
+});
+
+const admissionDuringLaunch = (
+  store: WorkflowRunStore.WorkflowRunStore["Service"],
+  fixture: Effect.Success<ReturnType<typeof seedCustody>>,
+) =>
+  store.commitTransition({
+    runId: fixture.run.id,
+    command: {
+      kind: "admitAttempt",
+      commandId: "admit-during-launch",
+      fingerprint: custodyHash,
+      expectedVersion: 0,
+      expectedGeneration: 0,
+      expectedSpecHash: custodyHash,
+      operationId: fixture.operation.id,
+      operationFingerprint: fixture.operation.fingerprint,
+      attemptId: "attempt",
+      itemId: "item",
+      repair: false,
+    },
+    externalFacts: {
+      now: "2026-11-12T00:00:00Z",
+      authority: true,
+      custody: "none",
+      activeWriterCount: 0,
+      heldOperations: [],
+      capabilitiesCurrent: true,
+      compatibilityCurrent: true,
+      fingerprintCurrent: true,
+      originGrantCurrent: true,
+      orderedItemIds: ["item"],
+    },
+    operation: fixture.operation,
+    receiptId: "admit-during-launch-receipt",
+  });
+it.effect(
+  "launch graph admits the workflow control before ordinary preparation owns the thread",
+  () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const fixture = yield* seedCustody("thread:probe-association", false, false);
+      const store = yield* WorkflowRunStore.WorkflowRunStore;
+      assert.strictEqual((yield* admissionDuringLaunch(store, fixture)).kind, "accepted");
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+it.effect("the actual earliest launch probe fences a real workflow association before charge", () =>
+  Effect.gen(function* () {
+    let during: Effect.Effect<void> = Effect.die("probe was not initialized");
+    const harness = makeHarness({ beforeScratchProbe: Effect.suspend(() => during) });
+    yield* Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const store = yield* WorkflowRunStore.WorkflowRunStore;
+      const sql = yield* SqlClient.SqlClient;
+      const fixture = yield* seedCustody("thread:probe-association", false, false);
+      const subscription = yield* store.subscribeChanges;
+      during = Effect.gen(function* () {
+        yield* PubSub.takeUpTo(subscription, 10);
+        const before = yield* sql`SELECT * FROM workflow_runs`;
+        assert.deepStrictEqual(yield* admissionDuringLaunch(store, fixture), {
+          kind: "rejected",
+          reason: "custody",
+        });
+        assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_runs`, before);
+        assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_command_receipts`, []);
+        assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_operations`, []);
+        assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+      }).pipe(Effect.orDie);
+      yield* launches.launch(
+        launchInput({
+          command: "command:probe-association",
+          thread: "thread:probe-association",
+          message: "prepare",
+          workspace: { type: "worktree", baseRef: "main", branch: "provided" },
+        }),
+      );
+      yield* preparationSettled(ThreadId.make("thread:probe-association"));
+    }).pipe(Effect.provide(harness.layer));
+  }),
+);
+it.effect(
+  "launch code custody remains open through branch work after UI preparation completes",
+  () =>
+    Effect.gen(function* () {
+      const branchEntered = yield* Deferred.make<void>();
+      const releaseBranch = yield* Deferred.make<void>();
+      const codeClosed = yield* Deferred.make<void>();
+      const harness = makeHarness({
+        generateBranchName: () =>
+          Deferred.succeed(branchEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseBranch)),
+            Effect.as({ branch: "joined-branch" }),
+          ),
+        afterPreparationCodeClosed: Deferred.succeed(codeClosed, undefined),
+      });
+      yield* Effect.gen(function* () {
+        const launches = yield* ThreadLaunch.ThreadLaunchService;
+        const sql = yield* SqlClient.SqlClient;
+        const input = launchInput({
+          command: "command:joined-branch",
+          thread: "thread:joined-branch",
+          message: "prepare",
+          workspace: { type: "worktree", baseRef: "main" },
+        });
+        const launched = yield* launches.launch(input);
+        yield* Deferred.await(branchEntered);
+        const prepared = yield* preparationSettled(launched.threadId);
+        assert.strictEqual(prepared.runs[0]?.status, "starting");
+        const open =
+          (yield* sql`SELECT * FROM orchestration_v2_preparation_jobs WHERE entry_key=${`thread-launch:${input.commandId}`}`)[0]!;
+        assert.strictEqual(open.state, "active");
+        assert.strictEqual(open.code_closed_at, null);
+        assert.isFalse(yield* Deferred.isDone(codeClosed));
+        yield* Deferred.succeed(releaseBranch, undefined);
+        yield* Deferred.await(codeClosed);
+        const closed =
+          (yield* sql`SELECT * FROM orchestration_v2_preparation_jobs WHERE entry_key=${open.entry_key}`)[0]!;
+        assert.strictEqual(closed.state, "unknown");
+        assert.isNotNull(closed.code_closed_at);
+        assert.strictEqual(closed.settlement_json, null);
+        assert.strictEqual(harness.renameBranch.mock.calls.length, 1);
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+
+it.effect(
+  "ordinary launch owns normalized input before returning its Effect without invoking getters",
+  () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const sql = yield* SqlClient.SqlClient;
+      const input = launchInput({
+        command: "command:owned-input",
+        thread: "thread:owned-input",
+        message: "original",
+        workspace: { type: "worktree", baseRef: "main", branch: undefined },
+      });
+      const pending = launches.launch(input);
+      input.threadId = ThreadId.make("thread:changed-input");
+      input.initialMessage!.text = "changed";
+      const launched = yield* pending;
+      assert.strictEqual(launched.threadId, "thread:owned-input");
+      assert.strictEqual(launched.projection.messages[0]?.text, "original");
+      const jobs = yield* sql`SELECT * FROM orchestration_v2_preparation_jobs`;
+      assert.strictEqual(jobs.length, 1);
+      const identity = JSON.parse(jobs[0]!.request_identity_json as string);
+      assert.strictEqual(identity.request.request.threadId, "thread:owned-input");
+      assert.isFalse(Object.hasOwn(identity.request.request.workspaceStrategy, "branch"));
+      let reads = 0;
+      const getter = Object.defineProperty({ ...input }, "workspaceStrategy", {
+        enumerable: true,
+        get() {
+          reads++;
+          return { type: "root" };
+        },
+      });
+      assert.strictEqual((yield* Effect.result(launches.launch(getter)))._tag, "Failure");
+      assert.strictEqual(reads, 0);
+      yield* preparationSettled(launched.threadId);
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+it.effect(
+  "cancelling an exact duplicate waiter and rejecting a collision leave the real launch owner alive",
+  () =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let probes = 0;
+      const harness = makeHarness({
+        beforeScratchProbe: Effect.sync(() => {
+          probes++;
+        }).pipe(
+          Effect.andThen(Deferred.succeed(entered, undefined)),
+          Effect.andThen(Deferred.await(release)),
+        ),
+      });
+      yield* Effect.gen(function* () {
+        const launches = yield* ThreadLaunch.ThreadLaunchService;
+        const sql = yield* SqlClient.SqlClient;
+        const input = launchInput({
+          command: "command:waiter-cancel",
+          thread: "thread:waiter-cancel",
+          message: "prepare",
+          workspace: { type: "worktree", baseRef: "main", branch: "provided" },
+        });
+        const owner = yield* launches.launch(input).pipe(Effect.forkScoped);
+        yield* Deferred.await(entered);
+        const waiter = yield* launches.launch(input).pipe(Effect.forkScoped);
+        yield* Fiber.interrupt(waiter);
+        assert.isTrue(Exit.isFailure(yield* Fiber.await(waiter)));
+        const collision = yield* Effect.result(
+          launches.launch({ ...input, title: "different request" }),
+        );
+        assert.strictEqual(collision._tag, "Failure");
+        assert.strictEqual(probes, 1);
+        assert.strictEqual((yield* sql`SELECT * FROM orchestration_v2_preparation_jobs`).length, 1);
+        yield* Deferred.succeed(release, undefined);
+        const launched = yield* Fiber.join(owner);
+        assert.isFalse(launched.resumed);
+        assert.strictEqual((yield* launches.launch(input)).resumed, true);
+        assert.strictEqual(probes, 1);
+        yield* preparationSettled(launched.threadId);
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+it.effect.each(["failure", "interruption"] as const)(
+  "foreground owner %s retains history and completes duplicate coordination",
+  (kind) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let probes = 0;
+      const harness = makeHarness({
+        beforeScratchProbe: Effect.sync(() => {
+          probes++;
+        }).pipe(
+          Effect.andThen(Deferred.succeed(entered, undefined)),
+          Effect.andThen(Deferred.await(release)),
+          Effect.andThen(Effect.die("probe failed")),
+        ),
+      });
+      yield* Effect.gen(function* () {
+        const launches = yield* ThreadLaunch.ThreadLaunchService;
+        const sql = yield* SqlClient.SqlClient;
+        const input = launchInput({
+          command: `command:owner-${kind}`,
+          thread: `thread:owner-${kind}`,
+          message: "prepare",
+          workspace: { type: "worktree", baseRef: "main" },
+        });
+        const owner = yield* launches.launch(input).pipe(Effect.forkScoped);
+        yield* Deferred.await(entered);
+        const duplicate = yield* launches.launch(input).pipe(Effect.exit, Effect.forkScoped);
+        let outcome;
+        if (kind === "failure") {
+          yield* Deferred.succeed(release, undefined);
+          outcome = yield* Fiber.await(owner);
+        } else {
+          yield* Fiber.interrupt(owner);
+          outcome = yield* Fiber.await(owner);
+        }
+        assert.isTrue(Exit.isFailure(outcome));
+        assert.isTrue(Exit.isFailure(yield* Fiber.join(duplicate)));
+        assert.isTrue(Exit.isFailure(yield* launches.launch(input).pipe(Effect.exit)));
+        const jobs = yield* sql`SELECT * FROM orchestration_v2_preparation_jobs`;
+        assert.strictEqual(jobs.length, 1);
+        assert.strictEqual(jobs[0]!.state, "unknown");
+        assert.isNotNull(jobs[0]!.code_closed_at);
+        assert.strictEqual(probes, 1);
+        assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_command_receipts`, []);
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+it.effect("a reconstructed launch service cannot reacquire retained unknown history", () =>
+  Effect.gen(function* () {
+    let probes = 0;
+    const harness = makeHarness({
+      beforeScratchProbe: Effect.sync(() => {
+        probes++;
+      }).pipe(Effect.andThen(Effect.die("probe failed"))),
+    });
+    yield* Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const sql = yield* SqlClient.SqlClient;
+      const input = launchInput({
+        command: "command:reconstructed",
+        thread: "thread:reconstructed",
+        workspace: { type: "worktree", baseRef: "main" },
+      });
+      assert.isTrue(Exit.isFailure(yield* launches.launch(input).pipe(Effect.exit)));
+      const before = yield* sql`SELECT * FROM orchestration_v2_preparation_jobs`;
+      yield* Effect.gen(function* () {
+        const reconstructed = yield* ThreadLaunch.ThreadLaunchService;
+        assert.isTrue(Exit.isFailure(yield* reconstructed.launch(input).pipe(Effect.exit)));
+      }).pipe(
+        Effect.provide(
+          ThreadLaunch.layer.pipe(
+            Layer.provide(
+              Layer.succeed(ServerEnvironment.ServerEnvironmentIdentity, {
+                getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
+              }),
+            ),
+          ),
+        ),
+      );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_preparation_jobs`, before);
+      assert.strictEqual(probes, 1);
+    }).pipe(Effect.provide(harness.layer));
+  }),
+);
+it.effect("missing preparation storage refuses launch before a Scratch or folder effect", () => {
+  let probes = 0;
+  const harness = makeHarness({
+    beforeScratchProbe: Effect.sync(() => {
+      probes++;
+    }),
+  });
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`ALTER TABLE orchestration_v2_preparation_jobs RENAME TO unavailable_preparation_jobs`;
+    const result = yield* Effect.result(
+      launches.launch(
+        launchInput({
+          command: "command:missing-jobs",
+          thread: "thread:missing-jobs",
+          workspace: { type: "worktree", baseRef: "main" },
+        }),
+      ),
+    );
+    assert.strictEqual(result._tag, "Failure");
+    assert.strictEqual(probes, 0);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_command_receipts`, []);
+    assert.strictEqual(harness.createWorktree.mock.calls.length, 0);
+    assert.strictEqual(harness.runSetup.mock.calls.length, 0);
+  }).pipe(Effect.provide(harness.layer));
+});
+it.effect(
+  "native-alias custody refuses launch, direct preparation and retry before metadata writes",
+  () => {
+    let probes = 0;
+    const harness = makeHarness({
+      beforeScratchProbe: Effect.sync(() => {
+        probes++;
+      }),
+    });
+    return Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const sql = yield* SqlClient.SqlClient;
+      const target = ThreadId.make("thread:alias-preparation");
+      const owned = ThreadId.make("thread:alias-owned");
+      for (const threadId of [target, owned])
+        yield* threads.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`create:${threadId}`),
+          threadId,
+          projectId,
+          title: "alias",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdBy: "user",
+          creationSource: "web",
+          importedNativeThread: {
+            ref: {
+              driver: ProviderDriverKind.make("codex"),
+              nativeId: "shared-preparation-alias",
+              strength: "strong",
+            },
+          },
+        });
+      for (const threadId of [target, owned])
+        yield* threads.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`alias-message:${threadId}`),
+          threadId,
+          messageId: MessageId.make(`alias-message:${threadId}`),
+          text: "prepare",
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: "defer_start", workspaceStrategy: { type: "root" } },
+          createdBy: "user",
+          creationSource: "web",
+        });
+      const providers =
+        yield* sql`SELECT provider_thread_id,thread_id,payload_json FROM orchestration_v2_projection_provider_threads`;
+      assert.strictEqual(providers.length, 2);
+      for (const provider of providers) {
+        const value = JSON.parse(provider.payload_json as string);
+        if (value.nativeThreadRef === null) {
+          assert.strictEqual(provider.thread_id, target);
+          value.nativeThreadRef = {
+            driver: "codex",
+            nativeId: "shared-preparation-alias",
+            strength: "strong",
+          };
+          yield* sql`UPDATE orchestration_v2_projection_provider_threads SET payload_json=${JSON.stringify(value)} WHERE provider_thread_id=${provider.provider_thread_id}`;
+        }
+        if (value.providerSessionId !== null) {
+          const session = {
+            id: value.providerSessionId,
+            driver: value.driver,
+            providerInstanceId: value.providerInstanceId,
+            status: "ready",
+            cwd: "/repo",
+            model: "model",
+            capabilities: CodexProviderCapabilitiesV2,
+            createdAt: value.createdAt,
+            updatedAt: value.updatedAt,
+            lastError: null,
+          };
+          yield* sql`INSERT INTO orchestration_v2_projection_provider_sessions(provider_session_id,thread_id,provider,driver,provider_instance_id,status,updated_at,payload_json) VALUES (${session.id},${value.appThreadId},${session.providerInstanceId},${session.driver},${session.providerInstanceId},'ready',${session.updatedAt},${JSON.stringify(session)}) ON CONFLICT DO NOTHING`;
+        }
+        assert.strictEqual(value.nativeThreadRef.nativeId, "shared-preparation-alias");
+      }
+      const store = yield* WorkflowRunStore.WorkflowRunStore;
+      assert.deepStrictEqual(
+        yield* sql.withTransaction(
+          store.readRecoveryCustodyInTransaction({ threadId: target, providerSessionIds: [] }),
+        ),
+        { kind: "ordinary" },
+      );
+      yield* seedCustody(owned);
+      assert.deepStrictEqual(
+        yield* sql.withTransaction(
+          store.readRecoveryCustodyInTransaction({ threadId: target, providerSessionIds: [] }),
+        ),
+        { kind: "owned" },
+      );
+      const launch = yield* Effect.result(
+        launches.launch({
+          ...launchInput({
+            command: "command:alias-launch",
+            thread: target,
+            workspace: { type: "worktree", baseRef: "main" },
+          }),
+        }),
+      );
+      assert.strictEqual(launch._tag, "Failure");
+      if (launch._tag === "Failure") assert.include(String(launch.failure.cause), "custody");
+      const runId = (yield* threads.getThreadProjection(target)).runs[0]!.id;
+      const before = yield* nativeSnapshot;
+      yield* launches.prepareRun({
+        commandId: CommandId.make("command:alias-prepare"),
+        threadId: target,
+        runId,
+      });
+      const retry = yield* Effect.result(
+        launches.retryPreparation({
+          commandId: CommandId.make("command:alias-retry"),
+          threadId: target,
+          runId,
+        }),
+      );
+      assert.strictEqual(retry._tag, "Failure");
+      assert.deepStrictEqual(yield* nativeSnapshot, before);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_preparation_jobs`, []);
+      assert.strictEqual(probes, 0);
+      assert.strictEqual(harness.runSetup.mock.calls.length, 0);
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
+
+it.effect(
+  "a late-prefix duplicate joins the current owner instead of replaying a partial claim",
+  () =>
+    Effect.gen(function* () {
+      const prefixEntered = yield* Deferred.make<void>();
+      const releasePrefix = yield* Deferred.make<void>();
+      const ownerPaused = yield* Deferred.make<void>();
+      const releaseOwner = yield* Deferred.make<void>();
+      const joined = yield* Deferred.make<void>();
+      let reads = 0;
+      const harness = makeHarness({
+        beforeProjectRead: () =>
+          Effect.sync(() => ++reads).pipe(
+            Effect.flatMap((count) =>
+              count === 1
+                ? Deferred.succeed(prefixEntered, undefined).pipe(
+                    Effect.andThen(Deferred.await(releasePrefix)),
+                  )
+                : Effect.void,
+            ),
+          ),
+        beforeMessageDispatch: Deferred.succeed(ownerPaused, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseOwner)),
+          Effect.andThen(Effect.die("owned-message-failure")),
+        ),
+      });
+      const tracer = Tracer.make({
+        span(options) {
+          const span = new Tracer.NativeSpan(options);
+          if (span.name === "ThreadLaunchService.awaitLaunchOwner")
+            Deferred.doneUnsafe(joined, Effect.void);
+          return span;
+        },
+      });
+      yield* Effect.gen(function* () {
+        const launches = yield* ThreadLaunch.ThreadLaunchService;
+        const sql = yield* SqlClient.SqlClient;
+        const input = launchInput({
+          command: "command:late-prefix",
+          thread: "thread:late-prefix",
+          message: "prepare",
+        });
+        const peer = yield* launches.launch(input).pipe(Effect.forkScoped);
+        yield* Deferred.await(prefixEntered);
+        const owner = yield* launches.launch(input).pipe(Effect.forkScoped);
+        yield* Deferred.await(ownerPaused);
+        assert.strictEqual(
+          (yield* sql`SELECT * FROM orchestration_command_receipts WHERE command_id=${input.commandId}`)
+            .length,
+          1,
+        );
+        assert.strictEqual(
+          (yield* sql`SELECT * FROM orchestration_command_receipts WHERE command_id=${`${input.commandId}:initial-message`}`)
+            .length,
+          0,
+        );
+        yield* Deferred.succeed(releasePrefix, undefined);
+        const observation = yield* Effect.raceFirst(
+          Deferred.await(joined).pipe(Effect.as("joined")),
+          Fiber.await(peer).pipe(Effect.as("completed")),
+        );
+        assert.strictEqual(observation, "joined");
+        yield* Deferred.succeed(releaseOwner, undefined);
+        const ownerExit = yield* Fiber.await(owner);
+        const peerExit = yield* Fiber.await(peer);
+        assert.isTrue(Exit.isFailure(ownerExit));
+        assert.isTrue(Exit.isFailure(peerExit));
+        if (Exit.isFailure(ownerExit) && Exit.isFailure(peerExit)) {
+          assert.strictEqual(Cause.squash(ownerExit.cause), "owned-message-failure");
+          assert.strictEqual(Cause.squash(peerExit.cause), "owned-message-failure");
+        }
+      }).pipe(
+        Effect.provide(harness.layer),
+        Effect.withTracer(tracer),
+        Effect.withTracerEnabled(true),
+      );
+    }),
+);
