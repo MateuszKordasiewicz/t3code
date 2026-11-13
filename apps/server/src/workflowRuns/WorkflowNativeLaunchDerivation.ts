@@ -20,7 +20,7 @@ import type {
 import { WorkflowCanonicalHash } from "./WorkflowCanonicalHash.ts";
 import * as Store from "./WorkflowRunStore.ts";
 
-const make = Effect.gen(function* () {
+export const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const store = yield* Store.WorkflowRunStore;
   const config = yield* ServerConfig;

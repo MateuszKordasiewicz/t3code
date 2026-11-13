@@ -172,7 +172,7 @@ const isPlanningCommand = Schema.is(
 const isWriteContention = (error: unknown): boolean =>
   (error as { reason?: { _tag?: unknown } } | undefined)?.reason?._tag === "LockTimeoutError";
 
-const make = Effect.fn("WorkflowRunStore.make")(function* (
+export const make = Effect.fn("WorkflowRunStore.make")(function* (
   beforePublish: Effect.Effect<void> = Effect.void,
 ) {
   const changes = yield* Effect.acquireRelease(PubSub.sliding<void>(1), PubSub.shutdown);

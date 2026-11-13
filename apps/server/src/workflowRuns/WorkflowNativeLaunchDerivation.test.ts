@@ -5,15 +5,29 @@ import * as NodePath from "node:path";
 import * as NodeSqlite from "node:sqlite";
 import * as NodePathService from "@effect/platform-node/NodePath";
 import { assert, it } from "@effect/vitest";
-import { WorkflowOperationV1, WorkflowRunV1 } from "@t3tools/contracts";
+import {
+  PlanningPassV1,
+  PlanningSessionV1,
+  upgradeDevelopmentPlanDocumentV1,
+  WorkflowOperationV1,
+  WorkflowRunV1,
+} from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
+import * as Digest from "effect/crypto/Digest";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import { ServerConfig } from "../config.ts";
+import { DevelopmentPlanHash } from "../developmentPlans/DevelopmentPlanHash.ts";
 import { runMigrations } from "../persistence/Migrations.ts";
 import * as Derivation from "./WorkflowNativeLaunchDerivation.ts";
+import {
+  encodeNativeCommandProof,
+  makeNativeCommandProofVerifier,
+  NativeCommandProofError,
+} from "./WorkflowNativeCommandProof.ts";
 import {
   assertMatchesDerived,
   NativeCommandSnapshotError,
@@ -765,4 +779,514 @@ it.effect(
         ),
       );
     }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect(
+  "captures command, hint and config and serializes a fresh workflow candidate without writes",
+  () =>
+    Effect.gen(function* () {
+      yield* setupAdmission;
+      yield* seedProject;
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      const derivation = yield* Derivation.WorkflowNativeLaunchDerivation;
+      const path = yield* Path.Path;
+      const config = { ...(yield* ServerConfig), baseDir: "/config" };
+      const input = basicInput();
+      const launch = {
+        ...input.launch,
+        modelSelection: {
+          ...input.launch.modelSelection,
+          options: [{ id: "effort", value: "high" }],
+        },
+        initialMessage: {
+          ...input.launch.initialMessage,
+          context: {
+            version: 1,
+            records: [
+              {
+                version: 1,
+                contextId: "opaque",
+                kind: "custom",
+                label: "Opaque",
+                payload: { nested: ["original"] },
+              },
+            ],
+          },
+        },
+      };
+      yield* store.reserveWorkflowNativeIntent({ ...input, launch });
+      const derived = yield* sql.withTransaction(
+        derivation.deriveInTransaction({ intentId: input.intentId }),
+      );
+      const verifierEffect = makeNativeCommandProofVerifier(sql, config, path);
+      config.baseDir = "/mutated";
+      const verifier = yield* verifierEffect;
+      const command = structuredClone(derived.messageCommand);
+      const hint = { intentId: input.intentId, phase: "message" };
+      const prepared = verifier.prepareInTransaction(command, hint);
+      (command.context!.records[0] as { payload: { nested: string[] } }).payload.nested[0] =
+        "changed";
+      (command.modelSelection!.options![0] as { value: string }).value = "changed";
+      hint.intentId = "changed";
+      const result = yield* sql.withTransaction(prepared);
+      assert.isTrue(Object.isFrozen(result));
+      const proof = JSON.parse(result.proofJson);
+      assert.strictEqual(proof.intentId, input.intentId);
+      assert.strictEqual(proof.normalization.scratchRoot, "/config/scratch");
+      assert.strictEqual(proof.actualCommandHash, derived.expectedMessageCommandHash);
+      assert.deepStrictEqual(encodeNativeCommandProof(proof), result);
+      assert.strictEqual(
+        result.proofHash,
+        WorkflowCanonicalHash.tagged("t3.workflow-native-command-proof.v1", proof),
+      );
+      assert.strictEqual(proof.intentFingerprint, derived.reservation.fingerprint);
+      assert.strictEqual(proof.materialHash, derived.reservation.materialHash);
+      assert.strictEqual(proof.launchHash, derived.reservation.launchHash);
+      assert.strictEqual(proof.commandId, derived.messageCommand.commandId);
+      assert.strictEqual(proof.threadId, derived.messageCommand.threadId);
+      assert.strictEqual(proof.normalizationHash, derived.normalizationHash);
+      assert.strictEqual(
+        (yield* Effect.flip(
+          verifier.prepareInTransaction(derived.messageCommand, {
+            intentId: input.intentId,
+            phase: "message",
+          }),
+        )).reason,
+        "integrity",
+      );
+      assert.throws(() => {
+        (result as { proofJson: string }).proofJson = "changed";
+      });
+      assert.isFalse(Object.isFrozen(command));
+      assert.isFalse(Object.isFrozen(hint));
+      assert.strictEqual(
+        (yield* Effect.flip(
+          sql.withTransaction(
+            verifier.prepareInTransaction(command, { intentId: input.intentId, phase: "message" }),
+          ),
+        )).reason,
+        "conflict",
+      );
+      assert.strictEqual(
+        (yield* Effect.flip(verifier.prepareInTransaction({}, {}))).reason,
+        "invalid",
+      );
+      const rolledBack = yield* Effect.result(
+        sql.withTransaction(
+          Effect.gen(function* () {
+            yield* verifier.prepareInTransaction(derived.claimCommand, {
+              intentId: input.intentId,
+              phase: "claim",
+            });
+            return yield* Effect.fail("rollback");
+          }),
+        ),
+      );
+      assert.strictEqual(rolledBack._tag, "Failure");
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_command_proofs`, []);
+      yield* sql`DROP TABLE projection_projects`;
+      assert.strictEqual(
+        (yield* Effect.flip(
+          sql.withTransaction(
+            verifier.prepareInTransaction(derived.claimCommand, {
+              intentId: input.intentId,
+              phase: "claim",
+            }),
+          ),
+        )).reason,
+        "persistence",
+      );
+    }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect("strictly validates proof candidates without altering raw project roots", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    yield* seedProject;
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`UPDATE projection_projects SET workspace_root = '/old ' WHERE project_id = 'project'`;
+    const store = yield* Store.WorkflowRunStore;
+    const input = basicInput();
+    yield* store.reserveWorkflowNativeIntent(input);
+    const derivation = yield* Derivation.WorkflowNativeLaunchDerivation;
+    const derived = yield* sql.withTransaction(
+      derivation.deriveInTransaction({ intentId: input.intentId }),
+    );
+    const verifier = yield* makeNativeCommandProofVerifier(
+      sql,
+      yield* ServerConfig,
+      yield* Path.Path,
+    );
+    const result = yield* sql.withTransaction(
+      verifier.prepareInTransaction(derived.claimCommand, {
+        intentId: input.intentId,
+        phase: "claim",
+      }),
+    );
+    const proof = JSON.parse(result.proofJson);
+    assert.strictEqual(proof.normalization.project.workspaceRoot, "/old ");
+    const change = (fn: (value: typeof proof) => void) => {
+      const v = structuredClone(proof);
+      fn(v);
+      return v;
+    };
+    const invalid = [
+      change((v) => {
+        v.extra = true;
+      }),
+      change((v) => {
+        v.intentId = "";
+      }),
+      change((v) => {
+        v.commandId = " command ";
+      }),
+      change((v) => {
+        v.materialHash = "BAD";
+      }),
+      change((v) => {
+        v.phase = "message";
+      }),
+      change((v) => {
+        v.commandType = "thread.metadata.update";
+      }),
+      ...["workspaceRoot", "scratchRoot"].map((field) =>
+        change((v) => {
+          if (field === "workspaceRoot") v.normalization.project.workspaceRoot = "";
+          else v.normalization.scratchRoot = "";
+          v.normalizationHash = WorkflowCanonicalHash.tagged(
+            "t3.workflow-native-normalization.v1",
+            v.normalization,
+          );
+        }),
+      ),
+      change((v) => {
+        v.normalizationHash = hash;
+      }),
+      change((v) => {
+        v.normalization.workspace.effective = { type: "root", branch: "different" };
+        v.normalizationHash = WorkflowCanonicalHash.tagged(
+          "t3.workflow-native-normalization.v1",
+          v.normalization,
+        );
+      }),
+      change((v) => {
+        v.normalization.reuse.claimKind = "metadata-update";
+        v.normalizationHash = WorkflowCanonicalHash.tagged(
+          "t3.workflow-native-normalization.v1",
+          v.normalization,
+        );
+      }),
+      change((v) => {
+        v.normalization.extra = true;
+      }),
+      change((v) => {
+        v.extra = undefined;
+      }),
+      change((v) => {
+        v.extra = NaN;
+      }),
+      change((v) => {
+        Object.defineProperty(v, "extra", {
+          enumerable: true,
+          get() {
+            throw new Error("getter invoked");
+          },
+        });
+      }),
+    ];
+    for (const candidate of invalid)
+      assert.throws(() => encodeNativeCommandProof(candidate), NativeCommandProofError);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_command_proofs`, []);
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect(
+  "uses only the factory client when independent transactions and ambient services overlap",
+  () =>
+    Effect.gen(function* () {
+      yield* setupAdmission;
+      yield* seedProject;
+      const sqlA = yield* SqlClient.SqlClient;
+      const storeA = yield* Store.WorkflowRunStore;
+      const derivationA = yield* Derivation.WorkflowNativeLaunchDerivation;
+      const inputA = basicInput();
+      yield* storeA.reserveWorkflowNativeIntent(inputA);
+      const derivedA = yield* sqlA.withTransaction(
+        derivationA.deriveInTransaction({ intentId: inputA.intentId }),
+      );
+      const verifier = yield* makeNativeCommandProofVerifier(
+        sqlA,
+        yield* ServerConfig,
+        yield* Path.Path,
+      );
+      yield* Effect.gen(function* () {
+        yield* setupAdmission;
+        yield* seedProject;
+        const sqlB = yield* SqlClient.SqlClient;
+        const storeB = yield* Store.WorkflowRunStore;
+        assert.notStrictEqual(sqlA, sqlB);
+        const inputB = basicInput();
+        yield* storeB.reserveWorkflowNativeIntent({
+          ...inputB,
+          launch: { ...inputB.launch, title: "Foreign" },
+        });
+        yield* sqlB`UPDATE projection_projects SET workspace_root = '/foreign' WHERE project_id = 'project'`;
+        const foreign = yield* sqlB.withTransaction(
+          (yield* Derivation.WorkflowNativeLaunchDerivation).deriveInTransaction({
+            intentId: inputB.intentId,
+          }),
+        );
+        assert.notStrictEqual(foreign.reservation.materialHash, derivedA.reservation.materialHash);
+        assert.notStrictEqual(foreign.reservation.launchHash, derivedA.reservation.launchHash);
+        const hint = { intentId: inputA.intentId, phase: "claim" };
+        assert.strictEqual(
+          (yield* Effect.flip(
+            sqlB.withTransaction(verifier.prepareInTransaction(derivedA.claimCommand, hint)),
+          )).reason,
+          "integrity",
+        );
+        const candidate = yield* sqlA.withTransaction(
+          sqlB.withTransaction(verifier.prepareInTransaction(derivedA.claimCommand, hint)),
+        );
+        const proof = JSON.parse(candidate.proofJson);
+        assert.strictEqual(proof.normalization.project.workspaceRoot, "/old");
+        assert.strictEqual(proof.materialHash, derivedA.reservation.materialHash);
+        assert.strictEqual(proof.launchHash, derivedA.reservation.launchHash);
+        assert.deepStrictEqual(yield* sqlB`SELECT * FROM workflow_native_command_proofs`, []);
+        assert.deepStrictEqual(yield* sqlA`SELECT * FROM workflow_native_command_proofs`, []);
+      }).pipe(Effect.provide(Layer.fresh(testLayer())));
+    }).pipe(Effect.provide(testLayer())),
+);
+
+const session = Schema.decodeSync(PlanningSessionV1)({
+  schemaVersion: 1,
+  id: "session",
+  environmentId: "environment",
+  projectId: "project",
+  planId: "plan",
+  origin: { kind: "human", id: "human" },
+  request: "Plan the work",
+  mode: "ordinary",
+  allowedRoles: ["author"],
+  allowedProviders: [{ providerInstanceId: "provider", model: "model" }],
+  limits: { maxPasses: 2, maxRepairRounds: 1, deadline: "2026-12-01T00:00:00Z" },
+  consumed: { passes: 0, repairRounds: 0 },
+  controlGeneration: 0,
+  recordVersion: 0,
+  status: "active",
+  createdAt: "2026-11-01T00:00:00Z",
+  access: { origins: [] },
+});
+const context = {
+  actor: session.origin,
+  destination: { environmentId: session.environmentId, projectId: session.projectId },
+};
+
+const seedAdmission = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`PRAGMA foreign_keys = ON`;
+  yield* runMigrations();
+  const example = {
+    schemaVersion: 1,
+    planId: "plan",
+    revisionId: "revision",
+    environmentId: "environment",
+    projectId: "project",
+    title: "Example",
+    brief: "Outcome",
+    linkedThreadIds: [],
+    sources: [
+      {
+        id: "source",
+        kind: "thread_message",
+        environmentId: "environment",
+        projectId: "project",
+        threadId: "thread",
+        messageId: "message",
+        capturedAt: "2026-11-01T00:00:00Z",
+        attribution: "user",
+        bytesBase64: "WA==",
+        byteLength: 1,
+        sha256: "4b68ab3847feda7d6c62c1fbcbeebfa35eab7351ed5e78f4ddadea5df64b8015",
+      },
+    ],
+    sourceStatements: [
+      { id: "statement", sourceId: "source", startByte: 0, endByte: 1, text: "X" },
+    ],
+    requirements: [],
+  };
+  const { native } = yield* upgradeDevelopmentPlanDocumentV1({
+    bytes: new TextEncoder().encode(json(example)),
+    hashSourcePacket: DevelopmentPlanHash.sourcePacket,
+  });
+  const sourcePacketHash = DevelopmentPlanHash.sourcePacket(native.sourcePacket);
+  const revisionHash = DevelopmentPlanHash.revision(native.revision);
+  yield* sql`INSERT INTO workflow_plan_identities VALUES ('plan')`;
+  yield* sql`INSERT INTO development_plans VALUES ('plan', 'environment', 'project', 'Plan', NULL, 0, '2026-11-01T00:00:00Z')`;
+  yield* sql`INSERT INTO development_plan_source_packets VALUES ('plan', ${sourcePacketHash}, ${json(native.sourcePacket)})`;
+  yield* sql`INSERT INTO workflow_revision_identities VALUES ('plan', 'revision', ${revisionHash}, ${sourcePacketHash})`;
+  yield* sql`INSERT INTO development_plan_revisions VALUES ('plan', 'revision', ${revisionHash}, ${sourcePacketHash}, ${json(native.revision)}, '2026-11-01T00:00:00Z')`;
+  yield* sql`UPDATE development_plans SET current_revision_id = 'revision' WHERE plan_id = 'plan'`;
+  return {
+    planId: session.planId,
+    revisionId: "revision",
+    revisionSchemaVersion: 1 as const,
+    revisionHash,
+    sourcePacketHash,
+  };
+});
+const decodePassFixture = Schema.decodeSync(PlanningPassV1);
+const decodeOperationFixture = Schema.decodeSync(WorkflowOperationV1);
+const admissionInput = (
+  binding: Awaited<Effect.Success<typeof seedAdmission>>,
+  id: string,
+  owner = session,
+) => {
+  const pass = decodePassFixture({
+    schemaVersion: 1,
+    id: `pass-${id}`,
+    planningSessionId: owner.id,
+    role: "author",
+    provider: { providerInstanceId: "provider", model: "model" },
+    binding,
+    operationId: `operation-${id}`,
+    inputManifest: {
+      sources: [{ kind: "source", id: "source", sha256: binding.sourcePacketHash }],
+      references: [],
+      additionalContext: [],
+      access: { origins: [] },
+    },
+    status: "pending",
+    native: { threadId: `thread-${id}`, runId: `run-${id}` },
+    access: { origins: [] },
+  });
+  const operation = decodeOperationFixture({
+    schemaVersion: 1,
+    id: pass.operationId,
+    owner: { kind: "planning_session", planningSessionId: owner.id },
+    kind: "planning_pass",
+    parameters: {
+      kind: "planning_pass",
+      passId: pass.id,
+      binding,
+      role: pass.role,
+      provider: pass.provider,
+      limits: owner.limits,
+      inputManifestHash: WorkflowCanonicalHash.tagged(
+        "t3.planning-input-manifest.v1",
+        pass.inputManifest,
+      ),
+    },
+    fingerprint: hash,
+    origin: owner.origin,
+    destination: context.destination,
+    controlGeneration: owner.controlGeneration,
+    status: "pending",
+    access: { origins: [] },
+  });
+  return {
+    sessionId: owner.id,
+    expectedVersion: 0,
+    pass,
+    operation: { ...operation, fingerprint: WorkflowCanonicalHash.operation(operation) },
+    now: facts.now,
+    context,
+    command: { commandId: `command-${id}`, receiptId: `receipt-${id}` },
+  };
+};
+
+const planningReservation = (admission: ReturnType<typeof admissionInput>) => {
+  const { native: _native, ...pass } = admission.pass;
+  const {
+    fingerprint: _fingerprint,
+    controlGeneration: _generation,
+    status: _status,
+    claim: _claim,
+    outcome: _outcome,
+    nextDueAt: _nextDueAt,
+    ...operation
+  } = admission.operation;
+  return {
+    intentId: `intent-${pass.id}`,
+    sessionId: admission.sessionId,
+    operationId: operation.id,
+    passId: pass.id,
+    role: pass.role,
+    environmentId: admission.context.destination.environmentId,
+    projectId: admission.context.destination.projectId,
+    launchCommandId: `launch-${pass.id}`,
+    threadId: admission.pass.native!.threadId,
+    messageId: `message-${pass.id}`,
+    generation: admission.operation.controlGeneration,
+    materialVersion: 1 as const,
+    launch: {
+      commandId: `launch-${pass.id}`,
+      threadId: admission.pass.native!.threadId,
+      projectId: admission.context.destination.projectId,
+      title: "Planning",
+      modelSelection: { instanceId: pass.provider.providerInstanceId, model: pass.provider.model },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      workspaceStrategy: { type: "root", branch: "main" },
+      initialMessage: { messageId: `message-${pass.id}`, text: "Plan the work", attachments: [] },
+      createdBy: "agent",
+      creationSource: "mcp",
+    },
+    draft: {
+      version: 1 as const,
+      kind: "planning_pass" as const,
+      operation,
+      pass,
+      admission: {
+        sessionId: admission.sessionId,
+        expectedVersion: admission.expectedVersion,
+        context: admission.context,
+        command: admission.command,
+      },
+    },
+    now: admission.now,
+  };
+};
+
+it.effect("creates candidates from genuine planning material", () =>
+  Effect.gen(function* () {
+    const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+    yield* seedProject;
+    const store = yield* Store.WorkflowRunStore;
+    yield* store.beginPlanning({
+      session,
+      now: facts.now,
+      context,
+      command: { commandId: "begin", receiptId: "begin-receipt" },
+    });
+    const admission = admissionInput(binding, "proof");
+    const input = planningReservation(admission);
+    yield* store.reservePlanningNativeIntent(input);
+    const sql = yield* SqlClient.SqlClient;
+    const derived = yield* sql.withTransaction(
+      (yield* Derivation.WorkflowNativeLaunchDerivation).deriveInTransaction({
+        intentId: input.intentId,
+      }),
+    );
+    assert.strictEqual(derived.reservation.owner.kind, "planning_session");
+    const verifier = yield* makeNativeCommandProofVerifier(
+      sql,
+      yield* ServerConfig,
+      yield* Path.Path,
+    );
+    for (const [phase, command] of [
+      ["claim", derived.claimCommand],
+      ["message", derived.messageCommand],
+    ] as const) {
+      const candidate = yield* sql.withTransaction(
+        verifier.prepareInTransaction(command, { intentId: input.intentId, phase }),
+      );
+      const proof = JSON.parse(candidate.proofJson);
+      assert.strictEqual(proof.materialHash, derived.reservation.materialHash);
+      assert.strictEqual(proof.launchHash, derived.reservation.launchHash);
+      assert.strictEqual(proof.phase, phase);
+    }
+    assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_command_proofs`, []);
+  }).pipe(Effect.provide(testLayer())),
 );
