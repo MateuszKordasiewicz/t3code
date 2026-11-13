@@ -522,7 +522,7 @@ const readWorkflowCopyState = Effect.fn("test.readWorkflowCopyState")(function* 
     (table) => sql`SELECT * FROM ${sql(table)}`,
   );
   const schema =
-    yield* sql`SELECT type,name,sql FROM sqlite_master WHERE tbl_name IN ('orchestration_v2_submission_transports','orchestration_v2_submission_attempts','orchestration_v2_preparation_jobs','test_preparation_job_child') OR name LIKE 'submission_%' OR name LIKE 'orchestration_v2_submission_%_guard' ORDER BY name`;
+    yield* sql`SELECT type,name,sql FROM sqlite_master WHERE tbl_name IN ('orchestration_v2_submission_transports','orchestration_v2_submission_attempts','orchestration_v2_preparation_jobs','workflow_native_reservation_material','test_preparation_job_child') OR name LIKE 'submission_%' OR name LIKE 'orchestration_v2_submission_%_guard' ORDER BY name`;
   const history = yield* sql`SELECT * FROM effect_sql_migrations ORDER BY migration_id`;
   return { operational, content, schema, history };
 });
