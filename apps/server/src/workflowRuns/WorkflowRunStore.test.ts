@@ -7,6 +7,8 @@ import * as NodeSqlite from "node:sqlite";
 import { assert, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  CodexSettings,
+  MessageId,
   EventId,
   CheckpointScopeId,
   OrchestrationV2Command,
@@ -29,12 +31,24 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
 import * as Path from "effect/Path";
+import * as FileSystem from "effect/FileSystem";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
-import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import * as CodexAdapter from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
+import * as CodexClient from "effect-codex-app-server/client";
+import * as CodexErrors from "effect-codex-app-server/errors";
+import type * as CodexProtocol from "effect-codex-app-server/protocol";
+
+import { ChildProcess, ChildProcessSpawner } from "effect/process";
+import * as Sink from "effect/Sink";
+import * as Stream from "effect/Stream";
+import * as Queue from "effect/Queue";
 import * as NativeProtocol from "./WorkflowNativeCommandProtocol.ts";
 import * as Duration from "effect/Duration";
 import * as TestClock from "effect/testing/TestClock";
@@ -11597,18 +11611,25 @@ it.effect.each([
     }).pipe(Effect.provide(layer)),
 );
 
+const claimCarryCodexSettings = Schema.decodeSync(CodexSettings)({});
 const currentNativeExecutionFixture = Effect.fn("test.currentNativeExecutionFixture")(function* (
   kind: "workflow" | "planning",
+  rearm = false,
 ) {
-  const fixture = yield* nativeExecutionFixture(kind);
-  assert.strictEqual((yield* fixture.store.claim(fixture.claimInput)).kind, "claimed");
+  const fixture = yield* nativeExecutionFixture(kind, rearm);
+  const claimed = yield* fixture.store.claim(fixture.claimInput);
+  assert.strictEqual(claimed.kind, "claimed");
+  if (claimed.kind !== "claimed" || !claimed.operation.claim)
+    throw new Error("expected claimed native operation");
   return {
     ...fixture,
+    claimedOperation: claimed.operation,
     operationSelection: {
-      operationId: fixture.input.operationId,
-      expectedFingerprint: fixture.pendingOperation.fingerprint,
-      expectedGeneration: 0,
-      ...fixture.coordinator,
+      operationId: claimed.operation.id,
+      expectedFingerprint: claimed.operation.fingerprint,
+      expectedGeneration: claimed.operation.controlGeneration,
+      bootId: String(claimed.operation.claim.bootId),
+      workerId: String(claimed.operation.claim.workerId),
     },
   };
 });
@@ -11710,6 +11731,197 @@ const setCurrentNativeStage = Effect.fn("test.setCurrentNativeStage")(function* 
   });
   return { selectedRun, attempt, node, provider, scopeId };
 });
+
+it.effect.each([
+  ["workflow", false, "valid"],
+  ["workflow", true, "valid"],
+  ["planning", false, "valid"],
+  ["planning", true, "valid"],
+  ["workflow", false, "extra"],
+  ["workflow", false, "missing"],
+  ["workflow", false, "blank"],
+  ["workflow", false, "hash"],
+  ["workflow", false, "negative"],
+  ["workflow", false, "unsafe"],
+  ["workflow", false, "null"],
+  ["workflow", false, "undefined"],
+  ["workflow", false, "legacy"],
+] as const)(
+  "controlled frame pins actual post-CAS $0 claim with rearm=$1 and ref=$2",
+  ([kind, rearm, variant]) =>
+    Effect.gen(function* () {
+      const fixture = yield* currentNativeExecutionFixture(kind, rearm);
+      yield* setCurrentNativeStage(fixture, "starting", true);
+      const projection = yield* readCurrentNativeProjection(fixture);
+      const selectedRun = projection.runs[0]!;
+      const attempt = projection.attempts[0]!;
+      const root = projection.nodes.find((node) => node.id === attempt.rootNodeId)!;
+      const provider = projection.providerThreads[0]!;
+      if (provider.providerSessionId === null || provider.providerInstanceId === null)
+        throw new Error("selected provider identity missing");
+      const operation = fixture.claimedOperation;
+      if (!operation.claim) throw new Error("actual claim missing");
+      const executionClaim = {
+        operationId: operation.id,
+        expectedFingerprint: operation.fingerprint,
+        expectedGeneration: operation.controlGeneration,
+        bootId: operation.claim.bootId,
+        workerId: operation.claim.workerId,
+      };
+      const expected = { ...executionClaim };
+      const frames = yield* Queue.unbounded<CodexProtocol.CodexAppServerControlledFrame>();
+      let writes = 0;
+      const spawner = ChildProcessSpawner.make((command) =>
+        Effect.sync(() => {
+          assert.strictEqual(command._tag, "StandardCommand");
+          if (command._tag === "StandardCommand")
+            assert.deepEqual(command.options.stdin, { stream: "pipe", endOnDone: false });
+          return ChildProcessSpawner.makeHandle({
+            pid: ChildProcessSpawner.ProcessId(999999997),
+            exitCode: Effect.never,
+            isRunning: Effect.succeed(true),
+            kill: () => Effect.void,
+            unref: Effect.succeed(Effect.void),
+            stdin: Sink.forEach((_: Uint8Array) =>
+              Effect.sync(() => {
+                writes++;
+              }),
+            ),
+            stdout: Stream.never,
+            stderr: Stream.empty,
+            all: Stream.empty,
+            getInputFd: () => Sink.drain,
+            getOutputFd: () => Stream.empty,
+          });
+        }),
+      );
+      const openControlled: NonNullable<
+        CodexAdapter.CodexAppServerClientFactoryShape["openControlled"]
+      > = (input) =>
+        CodexClient.makeControlledChildProcessClient(ChildProcess.make("claim-carry-fixture"), {
+          wrapper: (frame) =>
+            Queue.offer(frames, frame).pipe(
+              Effect.andThen(
+                Effect.fail(
+                  new CodexErrors.CodexAppServerFrameSubmissionError({
+                    outcome: "not_submitted",
+                    reason: "wrapper",
+                  }),
+                ),
+              ),
+            ),
+          onOutcome: input.onOutcome,
+        }).pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          Effect.mapError(
+            (cause) =>
+              new ProviderAdapter.ProviderAdapterOpenSessionError({
+                driver: provider.driver,
+                providerSessionId: input.providerSessionId,
+                cause,
+              }),
+          ),
+        );
+      const adapter = yield* CodexAdapter.makeCodexAdapterV2({
+        instanceId: provider.providerInstanceId,
+        settings: claimCarryCodexSettings,
+        environment: {},
+        digest: yield* Digest.Digest,
+        fileSystem: yield* FileSystem.FileSystem,
+        idAllocator: yield* IdAllocator.IdAllocatorV2,
+        serverConfig: fixture.config,
+        continuationRequests: { offer: () => Effect.void },
+        clientFactory:
+          variant === "legacy"
+            ? {
+                open: (input) => openControlled({ ...input, onOutcome: () => Effect.void }),
+              }
+            : {
+                open: () => Effect.die("claim carry must use controlled client"),
+                openControlled,
+              },
+      });
+      const modelSelection = {
+        ...fixture.input.launch.modelSelection,
+        instanceId: provider.providerInstanceId,
+      };
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: "/work",
+      });
+      const runtime = yield* adapter.openSession({
+        threadId: selectedRun.threadId,
+        providerSessionId: provider.providerSessionId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const turnInput: ProviderAdapter.ProviderAdapterV2TurnInput = {
+        appThread: projection.thread,
+        threadId: selectedRun.threadId,
+        runId: selectedRun.id,
+        runOrdinal: selectedRun.ordinal,
+        providerTurnOrdinal: 1,
+        attemptId: attempt.id,
+        rootNodeId: root.id,
+        providerThread: provider,
+        message: {
+          messageId: MessageId.make("claim-carry-message"),
+          text: "claim carry",
+          attachments: [],
+          createdBy: "agent",
+          creationSource: "mcp",
+        },
+        modelSelection,
+        runtimePolicy,
+        executionClaim,
+      };
+      const before = yield* nativeBindingState;
+      const subscription = yield* fixture.store.subscribeChanges;
+      if (variant === "extra") Object.assign(executionClaim, { extra: true });
+      if (variant === "missing") Reflect.deleteProperty(executionClaim, "bootId");
+      if (variant === "blank") Object.assign(executionClaim, { bootId: " " });
+      if (variant === "hash") Object.assign(executionClaim, { expectedFingerprint: "not-a-hash" });
+      if (variant === "negative") Object.assign(executionClaim, { expectedGeneration: -1 });
+      if (variant === "unsafe")
+        Object.assign(executionClaim, { expectedGeneration: Number.MAX_SAFE_INTEGER + 1 });
+      if (variant === "null") Object.assign(turnInput, { executionClaim: null });
+      if (variant === "undefined") Object.assign(turnInput, { executionClaim: undefined });
+      const pending = runtime.startTurn(turnInput);
+      if (variant === "valid")
+        Object.assign(executionClaim, {
+          expectedGeneration: 999,
+          bootId: "mutated-boot",
+          workerId: "mutated-worker",
+        });
+      const denied = yield* pending.pipe(Effect.flip);
+      assert.strictEqual(denied._tag, "ProviderAdapterTurnStartError");
+      if (denied._tag === "ProviderAdapterTurnStartError")
+        assert.isUndefined(denied.submissionState);
+      if (variant === "valid") {
+        const frame = yield* Queue.take(frames);
+        const selection = parse(frame.selection!);
+        assert.isObject(selection);
+        assert.deepStrictEqual((selection as Record<string, unknown>).expectedClaim, expected);
+        assert.strictEqual(expected.expectedGeneration, rearm ? 2 : 0);
+        assert.notInclude(frame.encoded, "expectedClaim");
+        assert.notInclude(frame.encoded, expected.expectedFingerprint);
+      } else assert.strictEqual(yield* Queue.size(frames), 0);
+      assert.strictEqual(writes, 0);
+      assert.deepStrictEqual(yield* nativeBindingState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          layer,
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+        ),
+      ),
+    ),
+);
 
 it.effect.each([
   ["workflow", "starting"],

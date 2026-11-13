@@ -504,6 +504,14 @@ export interface ProviderAdapterV2EnsureThreadInput {
 }
 
 export interface ProviderAdapterV2TurnInput {
+  /** Server-only expected identity; it grants no permission and stays off the provider wire. */
+  readonly executionClaim?: {
+    readonly operationId: string;
+    readonly expectedFingerprint: string;
+    readonly expectedGeneration: number;
+    readonly bootId: string;
+    readonly workerId: string;
+  };
   readonly appThread: OrchestrationV2AppThread;
   readonly threadId: ThreadId;
   readonly runId: RunId;

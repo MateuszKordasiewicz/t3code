@@ -30,6 +30,7 @@ import {
 } from "../../provider/codexUsageLimits.ts";
 import {
   CodexSettings,
+  Sha256Hex,
   defaultInstanceIdForDriver,
   isOrchestrationV2WorkActive,
   type OrchestrationV2GoalCommand,
@@ -987,6 +988,15 @@ function validateCodexGoalObjective(objective: string) {
     : Effect.void;
 }
 
+const ControlledExecutionClaim = Schema.Struct({
+  operationId: Schema.NonEmptyString,
+  expectedFingerprint: Sha256Hex,
+  expectedGeneration: Schema.Int,
+  bootId: Schema.NonEmptyString,
+  workerId: Schema.NonEmptyString,
+});
+const decodeControlledExecutionClaim = Schema.decodeUnknownSync(ControlledExecutionClaim);
+
 const ControlledCodexSelection = Schema.Struct({
   v: Schema.Literal(1),
   kind: Schema.Literals(["start", "compact"]),
@@ -1000,6 +1010,7 @@ const ControlledCodexSelection = Schema.Struct({
   providerSessionId: Schema.String,
   providerThreadId: Schema.String,
   nativeThreadId: Schema.String,
+  expectedClaim: Schema.optionalKey(ControlledExecutionClaim),
 });
 type ControlledCodexSelection = typeof ControlledCodexSelection.Type;
 const encodeControlledSelection = Schema.encodeEffect(
@@ -2016,6 +2027,41 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         ) =>
           Result.try({
             try: () => {
+              let executionClaim: ProviderAdapter.ProviderAdapterV2TurnInput["executionClaim"];
+              if ("executionClaim" in turnInput) {
+                const provided = turnInput.executionClaim;
+                const keys =
+                  typeof provided === "object" && provided !== null
+                    ? Reflect.ownKeys(provided)
+                    : [];
+                if (
+                  keys.length !== 5 ||
+                  !keys.every(
+                    (key) =>
+                      typeof key === "string" &&
+                      [
+                        "operationId",
+                        "expectedFingerprint",
+                        "expectedGeneration",
+                        "bootId",
+                        "workerId",
+                      ].includes(key),
+                  )
+                )
+                  throw toProtocolError("Controlled execution claim has an invalid shape.");
+                const decoded = decodeControlledExecutionClaim(provided);
+                if (
+                  !Number.isSafeInteger(decoded.expectedGeneration) ||
+                  decoded.expectedGeneration < 0 ||
+                  ![decoded.operationId, decoded.bootId, decoded.workerId].every(
+                    (id) => id.trim().length > 0,
+                  )
+                )
+                  throw toProtocolError(
+                    "Controlled execution claim has invalid expected identity.",
+                  );
+                executionClaim = Object.freeze({ ...decoded });
+              }
               const thread = turnInput.providerThread;
               const native = thread.nativeThreadRef;
               if (
@@ -2046,6 +2092,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 );
               const owned = {
                 ...turnInput,
+                ...(executionClaim ? { executionClaim } : {}),
                 appThread: { ...turnInput.appThread },
                 providerThread: { ...thread, nativeThreadRef: { ...native } },
               };
@@ -2062,6 +2109,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 providerSessionId: selectedSessionId,
                 providerThreadId: owned.providerThread.id,
                 nativeThreadId: native.nativeId,
+                ...(executionClaim ? { expectedClaim: executionClaim } : {}),
               });
               return { input: owned, selection };
             },
@@ -7747,6 +7795,13 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               ),
           ),
           compactThread: (turnInput) => {
+            if (!controlledMode && "executionClaim" in turnInput)
+              return Effect.fail(
+                codexTurnStartError(
+                  turnInput,
+                  toProtocolError("Expected execution claims require a controlled transport."),
+                ),
+              );
             if (!controlledMode)
               return compactNativeTurn(turnInput).pipe(
                 Effect.mapError((cause) => codexTurnStartError(turnInput, cause)),
@@ -7788,6 +7843,13 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           ),
           // @effect-diagnostics-next-line effectFnOpportunity:off -- Own selected identities synchronously before returning the start Effect.
           startTurn: (requestedInput) => {
+            if (!controlledMode && "executionClaim" in requestedInput)
+              return Effect.fail(
+                codexTurnStartError(
+                  requestedInput,
+                  toProtocolError("Expected execution claims require a controlled transport."),
+                ),
+              );
             const owned = controlledMode
               ? captureControlledTurn(requestedInput, "start")
               : undefined;
