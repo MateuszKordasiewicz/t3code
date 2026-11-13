@@ -6,6 +6,10 @@ import * as NodeSqlite from "node:sqlite";
 import * as NodePathService from "@effect/platform-node/NodePath";
 import { assert, it } from "@effect/vitest";
 import {
+  OrchestrationV2AppThreadJson,
+  OrchestrationV2RunJson,
+  OrchestrationV2ConversationMessageJson,
+  OrchestrationV2DomainEventJson,
   PlanningPassV1,
   PlanningSessionV1,
   upgradeDevelopmentPlanDocumentV1,
@@ -239,6 +243,130 @@ const seedProject = Effect.gen(function* () {
   yield* sql`INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at) VALUES ('project', 'Project', '/old', '[]', '2026-11-01T00:00:00Z', '2026-11-01T00:00:00Z')`;
 });
 const basicInput = () => reservation(operationFor("operation", "attempt"), "attempt");
+
+type DerivedFixture = Effect.Success<
+  ReturnType<Derivation.WorkflowNativeLaunchDerivation["Service"]["deriveInTransaction"]>
+>;
+type ProofVerifier = Effect.Success<ReturnType<typeof makeNativeCommandProofVerifier>>;
+const fixtureTime = "2026-11-01T00:00:00.000Z";
+const decodeFixtureThread = Schema.decodeUnknownEffect(OrchestrationV2AppThreadJson);
+const encodeFixtureThread = Schema.encodeEffect(
+  Schema.fromJsonString(OrchestrationV2AppThreadJson),
+);
+const decodeFixtureRun = Schema.decodeUnknownEffect(OrchestrationV2RunJson);
+const encodeFixtureRun = Schema.encodeEffect(Schema.fromJsonString(OrchestrationV2RunJson));
+const decodeFixtureMessage = Schema.decodeUnknownEffect(OrchestrationV2ConversationMessageJson);
+const encodeFixtureMessage = Schema.encodeEffect(
+  Schema.fromJsonString(OrchestrationV2ConversationMessageJson),
+);
+const decodeFixtureEvent = Schema.decodeUnknownEffect(OrchestrationV2DomainEventJson);
+const encodeFixtureEvent = Schema.encodeEffect(OrchestrationV2DomainEventJson);
+const decodeFixtureJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
+
+const seedNativeProofs = Effect.fn("test.seedNativeProofs")(function* (
+  sql: SqlClient.SqlClient,
+  verifier: ProofVerifier,
+  derived: DerivedFixture,
+  phase: "claim" | "message",
+) {
+  const launch = derived.reservation.material.launch;
+  const command = phase === "claim" ? derived.claimCommand : derived.messageCommand;
+  const hint = { intentId: derived.reservation.intentId, phase };
+  const proof = yield* verifier.prepareInTransaction(command, hint);
+  const modelSelection = { instanceId: "provider", model: "model" };
+  const thread = {
+    id: launch.threadId,
+    projectId: launch.projectId,
+    title: "Thread",
+    providerInstanceId: "provider",
+    modelSelection,
+    createdBy: "user",
+    creationSource: "web",
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    branch: null,
+    worktreePath: null,
+    activeProviderThreadId: null,
+    lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: launch.threadId },
+    forkedFrom: null,
+    createdAt: fixtureTime,
+    updatedAt: fixtureTime,
+    archivedAt: null,
+    settledOverride: null,
+    settledAt: null,
+    lastVisitedAt: null,
+    deletedAt: null,
+  };
+  const nativeRun = {
+    id: "actual-t3-run",
+    threadId: launch.threadId,
+    ordinal: 7,
+    providerInstanceId: "provider",
+    modelSelection,
+    providerThreadId: "provider-thread",
+    userMessageId: launch.initialMessage.messageId,
+    rootNodeId: null,
+    activeAttemptId: null,
+    status: "preparing",
+    requestedAt: fixtureTime,
+    startedAt: null,
+    completedAt: null,
+    checkpointId: null,
+    contextHandoffId: null,
+  };
+  const message = {
+    createdBy: "user",
+    creationSource: "web",
+    id: launch.initialMessage.messageId,
+    threadId: launch.threadId,
+    runId: "actual-t3-run",
+    nodeId: null,
+    role: "user",
+    text: "fixture",
+    attachments: [],
+    streaming: false,
+    createdAt: fixtureTime,
+    updatedAt: fixtureTime,
+  };
+  const threadJson = yield* encodeFixtureThread(yield* decodeFixtureThread(thread));
+  const runJson = yield* encodeFixtureRun(yield* decodeFixtureRun(nativeRun));
+  const messageJson = yield* encodeFixtureMessage(yield* decodeFixtureMessage(message));
+  const events =
+    phase === "claim"
+      ? [
+          {
+            sequence: 1,
+            id: "claim-event",
+            type: command.type === "thread.create" ? "thread.created" : "thread.metadata-updated",
+            payload: thread,
+          },
+        ]
+      : [
+          { sequence: 2, id: "run-event", type: "run.created", payload: nativeRun },
+          { sequence: 3, id: "message-event", type: "message.updated", payload: message },
+        ];
+  const sequence = phase === "claim" ? 1 : 3;
+  yield* sql`INSERT INTO orchestration_command_receipts (command_id,aggregate_kind,aggregate_id,accepted_at,result_sequence,status,error,command_type) VALUES (${command.commandId},'thread',${launch.threadId},${fixtureTime},${sequence},'accepted',NULL,${command.type})`;
+  yield* sql`INSERT INTO workflow_native_command_proofs (command_id,intent_id,phase,proof_json,proof_hash) VALUES (${command.commandId},${hint.intentId},${phase},${proof.proofJson},${proof.proofHash})`;
+  if (phase === "claim") {
+    yield* sql`INSERT INTO orchestration_v2_projection_threads (thread_id,project_id,title,default_provider,runtime_mode,interaction_mode,created_at,updated_at,payload_json) VALUES (${launch.threadId},${launch.projectId},'Thread','provider','full-access','default',${fixtureTime},${fixtureTime},${threadJson})`;
+  } else {
+    yield* sql`INSERT INTO orchestration_v2_projection_runs (run_id,thread_id,ordinal,provider,status,requested_at,payload_json) VALUES ('actual-t3-run',${launch.threadId},7,'provider','preparing',${fixtureTime},${runJson})`;
+    yield* sql`INSERT INTO orchestration_v2_projection_messages (message_id,thread_id,run_id,role,streaming,created_at,updated_at,payload_json) VALUES (${launch.initialMessage.messageId},${launch.threadId},'actual-t3-run','user',0,${fixtureTime},${fixtureTime},${messageJson})`;
+  }
+  for (const fixture of events) {
+    const decoded = yield* decodeFixtureEvent({
+      id: fixture.id,
+      threadId: launch.threadId,
+      occurredAt: fixtureTime,
+      type: fixture.type,
+      payload: fixture.payload,
+    });
+    const encoded = yield* encodeFixtureEvent(decoded);
+    yield* sql`INSERT INTO orchestration_events (sequence,event_id,aggregate_kind,stream_id,stream_version,event_type,occurred_at,command_id,actor_kind,payload_json,metadata_json,application_event_version) VALUES (${fixture.sequence},${fixture.id},'thread',${launch.threadId},${fixture.sequence},${fixture.type},${fixtureTime},${command.commandId},'client',${json(encoded.payload)},'{}',2)`;
+  }
+  return proof;
+});
 
 it.effect(
   "derives frozen commands and detached opaque context inside the captured transaction",
@@ -1032,6 +1160,17 @@ it.effect(
           launch: { ...inputB.launch, title: "Foreign" },
         });
         yield* sqlB`UPDATE projection_projects SET workspace_root = '/foreign' WHERE project_id = 'project'`;
+        assert.strictEqual(
+          (yield* Effect.flip(
+            sqlB.withTransaction(
+              verifier.readStoredInTransaction(derivedA.claimCommand, {
+                intentId: inputA.intentId,
+                phase: "claim",
+              }),
+            ),
+          )).reason,
+          "integrity",
+        );
         const foreign = yield* sqlB.withTransaction(
           (yield* Derivation.WorkflowNativeLaunchDerivation).deriveInTransaction({
             intentId: inputB.intentId,
@@ -1288,5 +1427,163 @@ it.effect("creates candidates from genuine planning material", () =>
       assert.strictEqual(proof.phase, phase);
     }
     assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_command_proofs`, []);
+    yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* seedNativeProofs(sql, verifier, derived, "claim");
+        yield* seedNativeProofs(sql, verifier, derived, "message");
+        const result = yield* verifier.readStoredInTransaction(derived.messageCommand, {
+          intentId: input.intentId,
+          phase: "message",
+        });
+        assert.strictEqual(result.kind, "verified");
+        if (result.kind === "verified") assert.strictEqual(result.actualT3RunId, "actual-t3-run");
+      }),
+    );
   }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect.each([false, true])(
+  "verifies stored workflow protocol with reuse=%s and rejects partial histories",
+  (reuse) =>
+    Effect.gen(function* () {
+      yield* setupAdmission;
+      yield* seedProject;
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      const input = basicInput();
+      yield* store.reserveWorkflowNativeIntent({
+        ...input,
+        launch: { ...input.launch, reuseExistingThread: reuse },
+      });
+      const derived = yield* sql.withTransaction(
+        (yield* Derivation.WorkflowNativeLaunchDerivation).deriveInTransaction({
+          intentId: input.intentId,
+        }),
+      );
+      const verifier = yield* makeNativeCommandProofVerifier(
+        sql,
+        yield* ServerConfig,
+        yield* Path.Path,
+      );
+      const claimHint = { intentId: input.intentId, phase: "claim" } as const;
+      const messageHint = { intentId: input.intentId, phase: "message" } as const;
+      const readClaim = () => verifier.readStoredInTransaction(derived.claimCommand, claimHint);
+      const readMessage = () =>
+        verifier.readStoredInTransaction(derived.messageCommand, messageHint);
+      assert.strictEqual((yield* Effect.flip(readClaim())).reason, "integrity");
+      yield* sql`PRAGMA foreign_keys = OFF`;
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          assert.deepStrictEqual(yield* readClaim(), { kind: "absent" });
+          assert.strictEqual((yield* Effect.flip(readMessage())).reason, "integrity");
+          yield* sql`INSERT INTO orchestration_command_receipts (command_id,aggregate_kind,aggregate_id,accepted_at,result_sequence,status,error,command_type) VALUES (${derived.messageCommand.commandId},'thread',${input.threadId},${fixtureTime},3,'accepted',NULL,'message.dispatch')`;
+          assert.strictEqual((yield* Effect.flip(readClaim())).reason, "integrity");
+          yield* sql`DELETE FROM orchestration_command_receipts WHERE command_id = ${derived.messageCommand.commandId}`;
+          yield* sql`INSERT INTO orchestration_command_receipts (command_id,aggregate_kind,aggregate_id,accepted_at,result_sequence,status,error,command_type) VALUES (${derived.claimCommand.commandId},'thread',${input.threadId},${fixtureTime},1,'accepted',NULL,${derived.claimCommand.type})`;
+          assert.strictEqual((yield* Effect.flip(readClaim())).reason, "integrity");
+          yield* sql`DELETE FROM orchestration_command_receipts WHERE command_id = ${derived.claimCommand.commandId}`;
+          const claimFixture = yield* seedNativeProofs(sql, verifier, derived, "claim");
+          assert.strictEqual((yield* readClaim()).kind, "verified");
+          assert.deepStrictEqual(yield* readMessage(), { kind: "absent" });
+          yield* seedNativeProofs(sql, verifier, derived, "message");
+          const verified = yield* readMessage();
+          assert.strictEqual(verified.kind, "verified");
+          if (verified.kind === "verified")
+            assert.strictEqual(verified.actualT3RunId, "actual-t3-run");
+          yield* sql`UPDATE orchestration_events SET sequence = 4 WHERE event_id = 'claim-event'`;
+          yield* sql`UPDATE orchestration_command_receipts SET result_sequence = 4 WHERE command_id = ${derived.claimCommand.commandId}`;
+          assert.strictEqual((yield* Effect.flip(readMessage())).reason, "integrity");
+          yield* sql`UPDATE orchestration_events SET sequence = 1 WHERE event_id = 'claim-event'`;
+          yield* sql`UPDATE orchestration_command_receipts SET result_sequence = 1 WHERE command_id = ${derived.claimCommand.commandId}`;
+          const command = structuredClone(derived.messageCommand);
+          const hint = { ...messageHint };
+          const owned = verifier.readStoredInTransaction(command, hint);
+          (command as { threadId: string }).threadId = "changed";
+          (hint as { intentId: string }).intentId = "changed";
+          assert.strictEqual((yield* owned).kind, "verified");
+          assert.strictEqual(
+            (yield* Effect.flip(verifier.readStoredInTransaction(command, messageHint))).reason,
+            "conflict",
+          );
+          assert.strictEqual(
+            (yield* Effect.flip(verifier.readStoredInTransaction({}, {}))).reason,
+            "invalid",
+          );
+          yield* sql`SAVEPOINT fixture_phase`;
+          yield* sql`DROP TRIGGER workflow_native_command_proofs_delete_guard`;
+          yield* sql`DROP TRIGGER workflow_native_command_proofs_update_guard`;
+          yield* sql`DELETE FROM workflow_native_command_proofs WHERE command_id = ${derived.messageCommand.commandId}`;
+          yield* sql`UPDATE workflow_native_command_proofs SET phase = 'message' WHERE command_id = ${derived.claimCommand.commandId}`;
+          assert.strictEqual((yield* Effect.flip(readClaim())).reason, "integrity");
+          yield* sql`ROLLBACK TO fixture_phase`;
+          yield* sql`RELEASE fixture_phase`;
+          yield* sql`UPDATE projection_projects SET workspace_root = '/changed' WHERE project_id = 'project'`;
+          assert.strictEqual((yield* Effect.flip(readMessage())).reason, "conflict");
+          yield* sql`UPDATE projection_projects SET workspace_root = '/old' WHERE project_id = 'project'`;
+          yield* sql`UPDATE orchestration_command_receipts SET status = 'rejected' WHERE command_id = ${derived.claimCommand.commandId}`;
+          assert.strictEqual((yield* Effect.flip(readMessage())).reason, "integrity");
+          yield* sql`UPDATE orchestration_command_receipts SET status = 'accepted' WHERE command_id = ${derived.claimCommand.commandId}`;
+          yield* sql`UPDATE orchestration_command_receipts SET aggregate_kind = 'project' WHERE command_id = ${derived.messageCommand.commandId}`;
+          assert.strictEqual((yield* Effect.flip(readClaim())).reason, "conflict");
+          yield* sql`UPDATE orchestration_command_receipts SET aggregate_kind = 'thread' WHERE command_id = ${derived.messageCommand.commandId}`;
+          const guards = yield* sql<{
+            name: string;
+            sql: string;
+          }>`SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'workflow_native_command_proofs'`;
+          yield* sql`DROP TRIGGER workflow_native_command_proofs_update_guard`;
+          yield* sql`DROP TRIGGER workflow_native_command_proofs_delete_guard`;
+          yield* sql`UPDATE workflow_native_command_proofs SET command_id = 'unexpected-id' WHERE command_id = ${derived.claimCommand.commandId}`;
+          assert.strictEqual((yield* Effect.flip(readClaim())).reason, "integrity");
+          yield* sql`UPDATE workflow_native_command_proofs SET command_id = ${derived.claimCommand.commandId} WHERE command_id = 'unexpected-id'`;
+          yield* sql`UPDATE workflow_native_command_proofs SET intent_id = 'other-intent' WHERE command_id = ${derived.claimCommand.commandId}`;
+          assert.strictEqual((yield* Effect.flip(readClaim())).reason, "conflict");
+          yield* sql`UPDATE workflow_native_command_proofs SET intent_id = ${input.intentId} WHERE command_id = ${derived.claimCommand.commandId}`;
+          yield* sql`DELETE FROM orchestration_command_receipts WHERE command_id = ${derived.claimCommand.commandId}`;
+          assert.strictEqual((yield* Effect.flip(readClaim())).reason, "integrity");
+          yield* sql`INSERT INTO orchestration_command_receipts (command_id,aggregate_kind,aggregate_id,accepted_at,result_sequence,status,error,command_type) VALUES (${derived.claimCommand.commandId},'thread',${input.threadId},${fixtureTime},1,'accepted',NULL,${derived.claimCommand.type})`;
+          yield* sql`UPDATE workflow_native_command_proofs SET proof_hash = ${"b".repeat(64)} WHERE command_id = ${derived.claimCommand.commandId}`;
+          assert.strictEqual((yield* Effect.flip(readClaim())).reason, "integrity");
+          yield* sql`UPDATE workflow_native_command_proofs SET proof_hash = ${claimFixture.proofHash} WHERE command_id = ${derived.claimCommand.commandId}`;
+          const changedProof = (yield* decodeFixtureJson(claimFixture.proofJson)) as {
+            materialHash: string;
+            commandId: string;
+            normalization: { project: { workspaceRoot: string } };
+            normalizationHash: string;
+          };
+          changedProof.commandId = "unexpected-proof-command";
+          const changedId = encodeNativeCommandProof(changedProof);
+          yield* sql`UPDATE workflow_native_command_proofs SET proof_json = ${changedId.proofJson}, proof_hash = ${changedId.proofHash} WHERE command_id = ${derived.claimCommand.commandId}`;
+          assert.strictEqual((yield* Effect.flip(readClaim())).reason, "integrity");
+          changedProof.commandId = derived.claimCommand.commandId;
+          changedProof.materialHash = "b".repeat(64);
+          const changedMaterial = encodeNativeCommandProof(changedProof);
+          yield* sql`UPDATE workflow_native_command_proofs SET proof_json = ${changedMaterial.proofJson}, proof_hash = ${changedMaterial.proofHash} WHERE command_id = ${derived.claimCommand.commandId}`;
+          assert.strictEqual((yield* Effect.flip(readClaim())).reason, "integrity");
+          changedProof.materialHash = derived.reservation.materialHash;
+          changedProof.normalization.project.workspaceRoot = "/different";
+          changedProof.normalizationHash = WorkflowCanonicalHash.tagged(
+            "t3.workflow-native-normalization.v1",
+            changedProof.normalization,
+          );
+          const changedNormalization = encodeNativeCommandProof(changedProof);
+          yield* sql`UPDATE workflow_native_command_proofs SET proof_json = ${changedNormalization.proofJson}, proof_hash = ${changedNormalization.proofHash} WHERE command_id = ${derived.claimCommand.commandId}`;
+          assert.strictEqual((yield* Effect.flip(readClaim())).reason, "conflict");
+          yield* sql`UPDATE workflow_native_command_proofs SET proof_json = ${claimFixture.proofJson}, proof_hash = ${claimFixture.proofHash} WHERE command_id = ${derived.claimCommand.commandId}`;
+          yield* sql`DELETE FROM workflow_native_command_proofs WHERE command_id = ${derived.claimCommand.commandId}`;
+          assert.strictEqual((yield* Effect.flip(readClaim())).reason, "integrity");
+          yield* sql`DELETE FROM orchestration_command_receipts WHERE command_id = ${derived.claimCommand.commandId}`;
+          assert.strictEqual((yield* Effect.flip(readClaim())).reason, "integrity");
+          yield* sql`DELETE FROM orchestration_command_receipts WHERE command_id = ${derived.messageCommand.commandId}`;
+          assert.strictEqual((yield* Effect.flip(readClaim())).reason, "integrity");
+          for (const guard of guards.filter(
+            (g) => g.name !== "workflow_native_command_proofs_insert_guard",
+          ))
+            yield* sql.unsafe(guard.sql);
+          yield* sql`ALTER TABLE workflow_native_command_proofs RENAME TO fixture_hidden_proofs`;
+          assert.strictEqual((yield* Effect.flip(readClaim())).reason, "persistence");
+          yield* sql`ALTER TABLE fixture_hidden_proofs RENAME TO workflow_native_command_proofs`;
+        }),
+      );
+      yield* sql`PRAGMA foreign_keys = ON`;
+    }).pipe(Effect.provide(testLayer())),
 );

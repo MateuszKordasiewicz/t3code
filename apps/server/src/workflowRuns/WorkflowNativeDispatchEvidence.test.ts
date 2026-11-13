@@ -15,7 +15,10 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import { runMigrations } from "../persistence/Migrations.ts";
-import { readNativeDispatchEvidence } from "./WorkflowNativeDispatchEvidence.ts";
+import {
+  readNativeDispatchEvidence,
+  readNativeEvidenceStrict,
+} from "./WorkflowNativeDispatchEvidence.ts";
 
 const ids = {
   launchCommandId: "launch",
@@ -300,4 +303,65 @@ it.live("rejects another client's transaction and invalid retained ids", () =>
       );
     }),
   ),
+);
+
+it.live(
+  "strictly verifies claim events and preserves SQL errors while the legacy reader fails closed",
+  () =>
+    withDatabase((sql) =>
+      sql.withTransaction(
+        Effect.gen(function* () {
+          yield* seed(sql);
+          assert.strictEqual(
+            (yield* readNativeEvidenceStrict(sql, { ...ids, phase: "message" })).kind,
+            "verified",
+          );
+          yield* sql`UPDATE orchestration_command_receipts SET command_type = 'thread.create' WHERE command_id = ${commandId}`;
+          assert.strictEqual(
+            (yield* readNativeEvidenceStrict(sql, { ...ids, phase: "message" })).kind,
+            "conflict",
+          );
+          yield* sql`UPDATE orchestration_command_receipts SET command_type = 'message.dispatch', result_sequence = 4 WHERE command_id = ${commandId}`;
+          assert.strictEqual(
+            (yield* readNativeEvidenceStrict(sql, { ...ids, phase: "message" })).kind,
+            "conflict",
+          );
+          yield* sql`UPDATE orchestration_command_receipts SET result_sequence = 5 WHERE command_id = ${commandId}`;
+          const selection = {
+            ...ids,
+            phase: "claim" as const,
+            claimType: "thread.create" as const,
+          };
+          yield* sql`INSERT INTO orchestration_command_receipts (command_id,aggregate_kind,aggregate_id,accepted_at,result_sequence,status,error,command_type) VALUES ('launch','thread','thread',${time},6,'accepted',NULL,'thread.create')`;
+          yield* sql`INSERT INTO orchestration_events (sequence,event_id,aggregate_kind,stream_id,stream_version,event_type,occurred_at,command_id,actor_kind,payload_json,metadata_json,application_event_version) VALUES (6,'claim-event','thread','thread',5,'thread.created',${time},'launch','client',${threadJson},'{}',2)`;
+          assert.strictEqual((yield* readNativeEvidenceStrict(sql, selection)).kind, "verified");
+          yield* sql`UPDATE orchestration_events SET event_type = 'thread.metadata-updated' WHERE event_id = 'claim-event'`;
+          assert.strictEqual((yield* readNativeEvidenceStrict(sql, selection)).kind, "missing");
+          yield* sql`UPDATE orchestration_command_receipts SET command_type = 'thread.metadata.update' WHERE command_id = 'launch'`;
+          assert.strictEqual(
+            (yield* readNativeEvidenceStrict(sql, {
+              ...selection,
+              claimType: "thread.metadata.update",
+            })).kind,
+            "verified",
+          );
+          yield* sql`UPDATE orchestration_events SET stream_id = 'foreign-thread' WHERE event_id = 'claim-event'`;
+          assert.strictEqual(
+            (yield* readNativeEvidenceStrict(sql, {
+              ...selection,
+              claimType: "thread.metadata.update",
+            })).kind,
+            "conflict",
+          );
+          yield* sql`DROP TABLE orchestration_events`;
+          assert.isTrue(
+            (yield* Effect.result(readNativeEvidenceStrict(sql, { ...ids, phase: "message" })))
+              ._tag === "Failure",
+          );
+          assert.deepStrictEqual(yield* readNativeDispatchEvidence(sql, ids), {
+            kind: "conflict",
+          });
+        }),
+      ),
+    ),
 );

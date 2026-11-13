@@ -16,6 +16,7 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as SqlError from "effect/sql/SqlError";
 import { CommandReceiptV2 } from "../orchestration-v2/CommandReceiptStore.ts";
 
 const decodeReceipt = Schema.decodeUnknownEffect(
@@ -82,9 +83,13 @@ type EventRow = {
   readonly application_event_version: number;
 };
 
-// Caller must establish a writable workflow transaction; this client's tag does not prove writer mode.
-export const readNativeDispatchEvidence = Effect.fn("WorkflowNativeDispatchEvidence.read")(
-  function* (sql: SqlClient.SqlClient, ids: RetainedIds) {
+type Selection = RetainedIds & {
+  readonly phase: "claim" | "message";
+  readonly claimType?: "thread.create" | "thread.metadata.update";
+};
+
+const readStrict = Effect.fn("WorkflowNativeDispatchEvidence.readStrict")(
+  function* (sql: SqlClient.SqlClient, ids: Selection) {
     if (Option.isNone(yield* Effect.serviceOption(sql.transactionService))) return conflict;
     if (
       ![ids?.launchCommandId, ids?.threadId, ids?.messageId, ids?.projectId].every(
@@ -92,7 +97,10 @@ export const readNativeDispatchEvidence = Effect.fn("WorkflowNativeDispatchEvide
       )
     )
       return conflict;
-    const commandId = `${ids.launchCommandId}:initial-message`;
+    const commandId =
+      ids.phase === "claim" ? ids.launchCommandId : `${ids.launchCommandId}:initial-message`;
+    const commandType = ids.phase === "claim" ? ids.claimType : "message.dispatch";
+    if (!commandType) return conflict;
     const receipts = yield* sql<{
       aggregate_kind: string;
       aggregate_id: string;
@@ -119,12 +127,18 @@ export const readNativeDispatchEvidence = Effect.fn("WorkflowNativeDispatchEvide
       receipt.aggregate_id !== ids.threadId ||
       receipt.status !== "accepted" ||
       receipt.error !== null ||
-      receipt.command_type !== "message.dispatch" ||
+      receipt.command_type !== commandType ||
       !positiveSequence(receipt.result_sequence)
     )
       return conflict;
     const rows =
       yield* sql<EventRow>`SELECT sequence, event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, command_id, payload_json, metadata_json, application_event_version FROM orchestration_events WHERE command_id = ${commandId} ORDER BY sequence`;
+    let selectedClaim:
+      | {
+          readonly threadId: string;
+          readonly payload: { readonly id: string; readonly projectId: string };
+        }
+      | undefined;
     let selectedRun: Extract<OrchestrationV2DomainEventJson, { type: "run.created" }> | undefined;
     let selectedMessage:
       | Extract<OrchestrationV2DomainEventJson, { type: "message.updated" }>
@@ -150,6 +164,25 @@ export const readNativeDispatchEvidence = Effect.fn("WorkflowNativeDispatchEvide
         occurredAt: row.occurred_at,
         ...metadata,
       });
+      const claimEventType =
+        ids.claimType === "thread.create" ? "thread.created" : "thread.metadata-updated";
+      if (ids.phase === "claim") {
+        if (row.event_type !== claimEventType) continue;
+        const payload = yield* decodeJson(row.payload_json);
+        const event = yield* decodeEvent({
+          id: row.event_id,
+          threadId: row.stream_id,
+          occurredAt: row.occurred_at,
+          type: row.event_type,
+          payload,
+          ...metadata,
+        });
+        if (event.type !== "thread.created" && event.type !== "thread.metadata-updated")
+          return conflict;
+        if (selectedClaim !== undefined) return conflict;
+        selectedClaim = event;
+        continue;
+      }
       if (row.event_type !== "run.created" && row.event_type !== "message.updated") continue;
       const payload = yield* decodeJson(row.payload_json);
       if (
@@ -174,6 +207,41 @@ export const readNativeDispatchEvidence = Effect.fn("WorkflowNativeDispatchEvide
         if (selectedMessage !== undefined) return conflict;
         selectedMessage = event;
       } else return conflict;
+    }
+    if (ids.phase === "claim") {
+      if (lastSequence < receipt.result_sequence || selectedClaim === undefined) return missing;
+      if (
+        selectedClaim.threadId !== ids.threadId ||
+        selectedClaim.payload.id !== ids.threadId ||
+        selectedClaim.payload.projectId !== ids.projectId
+      )
+        return conflict;
+      const projects = yield* sql<{
+        project_id: string;
+      }>`SELECT project_id FROM projection_projects WHERE project_id = ${ids.projectId}`;
+      const threads = yield* sql<{
+        thread_id: string;
+        project_id: string;
+        payload_json: string;
+      }>`SELECT thread_id, project_id, payload_json FROM orchestration_v2_projection_threads WHERE thread_id = ${ids.threadId}`;
+      if (!projects[0] || !threads[0]) return missing;
+      const thread = yield* decodeThread(threads[0].payload_json);
+      if (
+        projects.length !== 1 ||
+        projects[0].project_id !== ids.projectId ||
+        threads.length !== 1 ||
+        threads[0].thread_id !== ids.threadId ||
+        threads[0].project_id !== ids.projectId ||
+        thread.id !== ids.threadId ||
+        thread.projectId !== ids.projectId
+      )
+        return conflict;
+      return {
+        kind: "verified",
+        receiptSequence: receipt.result_sequence,
+        receipt: { commandId, ...receipt },
+        events: rows,
+      } as const;
     }
     if (
       selectedRun !== undefined &&
@@ -270,7 +338,41 @@ export const readNativeDispatchEvidence = Effect.fn("WorkflowNativeDispatchEvide
       kind: "verified",
       actualT3RunId: actualRunId,
       receiptSequence: receipt.result_sequence,
+      receipt: { commandId, ...receipt },
+      events: rows,
     } as const;
   },
-  Effect.orElseSucceed(() => conflict),
+  Effect.catchIf(
+    (error) => !SqlError.isSqlError(error),
+    () => Effect.succeed(conflict),
+  ),
 );
+
+// Snapshot IDs before the first SQL yield and use the supplied client's transaction.
+export function readNativeEvidenceStrict(sql: SqlClient.SqlClient, ids: Selection) {
+  return readStrict(sql, { ...ids });
+}
+
+const readLegacy = Effect.fn("WorkflowNativeDispatchEvidence.read")(function (
+  sql: SqlClient.SqlClient,
+  ids: RetainedIds,
+) {
+  return readNativeEvidenceStrict(sql, { ...ids, phase: "message" }).pipe(
+    Effect.map((result) =>
+      result.kind === "verified" && "actualT3RunId" in result
+        ? {
+            kind: "verified" as const,
+            actualT3RunId: result.actualT3RunId,
+            receiptSequence: result.receiptSequence,
+          }
+        : result.kind === "verified"
+          ? conflict
+          : result,
+    ),
+    Effect.orElseSucceed(() => conflict),
+  );
+});
+
+export function readNativeDispatchEvidence(sql: SqlClient.SqlClient, ids: RetainedIds) {
+  return readLegacy(sql, { ...ids });
+}
