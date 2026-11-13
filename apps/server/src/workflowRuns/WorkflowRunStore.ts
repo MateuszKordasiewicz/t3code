@@ -1,4 +1,6 @@
 import {
+  EnvironmentId,
+  ProjectId,
   PlanningSessionV1,
   PlanningPassV1,
   decodeDevelopmentPlanRevisionV1,
@@ -10,10 +12,12 @@ import {
   decodeWorkflowRoleResultV1,
   decodeWorkflowRunV1,
   WorkflowOperationV1,
+  WorkflowRunV1,
   OrchestrationV2ProviderThreadJson,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Digest from "effect/crypto/Digest";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -26,8 +30,12 @@ import { WorkflowCanonicalHash } from "./WorkflowCanonicalHash.ts";
 import {
   decodeNativeReservationLaunch,
   decodeNativeReservationMaterial,
+  decodeNativeReservationAuthority,
 } from "./WorkflowNativeReservationMaterial.ts";
 import { WorkflowRunPolicy } from "./WorkflowRunPolicy.ts";
+import * as ExecutionAuthority from "./WorkflowExecutionAuthority.ts";
+import type { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
+import type { ManagedPolicy } from "../policy/ManagedPolicy.ts";
 
 type PolicyInput = Parameters<typeof WorkflowRunPolicy.decide>[0];
 type Command = PolicyInput["command"];
@@ -172,8 +180,14 @@ const isPlanningCommand = Schema.is(
 const isWriteContention = (error: unknown): boolean =>
   (error as { reason?: { _tag?: unknown } } | undefined)?.reason?._tag === "LockTimeoutError";
 
-export const make = Effect.fn("WorkflowRunStore.make")(function* (
+type Material = Effect.Success<ReturnType<typeof decodeNativeReservationMaterial>>["material"];
+type CurrentAuthority = Effect.Success<
+  ReturnType<typeof ExecutionAuthority.makeCapturedWorkflowExecutionAuthority>
+>;
+// Public constructors own the construction span; this helper is shared by their two capability sets.
+const makeStore = Effect.fnUntraced(function* (
   beforePublish: Effect.Effect<void> = Effect.void,
+  currentAuthority?: CurrentAuthority,
 ) {
   const changes = yield* Effect.acquireRelease(PubSub.sliding<void>(1), PubSub.shutdown);
   const notify = beforePublish.pipe(
@@ -181,6 +195,43 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
     Effect.asVoid,
   );
   const sql = yield* SqlClient.SqlClient;
+  const checkWorkflowAuthority = Effect.fn("WorkflowRunStore.checkNativeAuthority")(function* (
+    material: Material,
+    operation: WorkflowOperationV1,
+    owner: WorkflowRunV1,
+  ) {
+    if (material.version !== 2) return true;
+    if (
+      !currentAuthority ||
+      owner.origin.kind !== "human" ||
+      material.authority.subject !== owner.origin.id ||
+      material.authority.environmentId !== operation.destination.environmentId
+    )
+      return false;
+    const destination = {
+      environmentId: EnvironmentId.make(operation.destination.environmentId),
+      projectId: ProjectId.make(operation.destination.projectId),
+      ...(material.launch.reuseExistingThread === true
+        ? { threadId: material.launch.threadId }
+        : {}),
+    };
+    return yield* currentAuthority
+      .checkNativeAgentInTransaction({
+        reference: material.authority,
+        destination,
+        origins: [...owner.access.origins, ...operation.access.origins],
+        runtimeMode: material.launch.runtimeMode,
+      })
+      .pipe(
+        Effect.as(true),
+        Effect.catch((error) =>
+          error.reason === "persistence"
+            ? Effect.fail(new WorkflowRunStoreError({ reason: "persistence" }))
+            : Effect.succeed(false),
+        ),
+      );
+  });
+
   // Shares the reservation transaction's span and writer connection.
   const runningNativeEffect = Effect.fnUntraced(function* (threadId: string) {
     const rows =
@@ -629,6 +680,7 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
         const snapshot = material.planningSession;
         const launch = material.launch;
         if (
+          material.version !== 1 ||
           !snapshot ||
           material.intentId !== input.intentId ||
           material.receiptId !== receipt.receipt_id ||
@@ -1914,8 +1966,9 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
   };
   type WorkflowNativeInput = WorkflowNativeBase &
     (
-      | { readonly materialVersion?: never; readonly launch?: never }
-      | { readonly materialVersion: 1; readonly launch: unknown }
+      | { readonly materialVersion?: never; readonly launch?: never; readonly authority?: never }
+      | { readonly materialVersion: 1; readonly launch: unknown; readonly authority?: never }
+      | { readonly materialVersion: 2; readonly launch: unknown; readonly authority: unknown }
     );
   const validateWorkflowNativeIntent = Effect.fn("WorkflowRunStore.validateWorkflowNativeIntent")(
     function* (input: Omit<WorkflowNativeBase, "externalFacts">) {
@@ -2058,14 +2111,20 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
         try: () => {
           WorkflowCanonicalHash.assertCanonical(storedDraft);
           const draft = storedDraft as WorkflowNativeInput["draft"] & {
-            material?: { version: number; launchHash: string };
+            material?: { version: number; launchHash: string; authorityHash?: string };
           };
-          if ((draft.version as number) !== 2) return { draft, marked: false as const };
+          if ((draft.version as number) !== 2 && (draft.version as number) !== 3)
+            return { draft, marked: false as const };
+          const authority = (draft.version as number) === 3;
           if (
             Object.keys(draft).sort().join() !== "admission,kind,material,operation,version" ||
             !draft.material ||
-            Object.keys(draft.material).sort().join() !== "launchHash,version" ||
-            draft.material.version !== 1 ||
+            Object.keys(draft.material).sort().join() !==
+              (authority ? "authorityHash,launchHash,version" : "launchHash,version") ||
+            draft.material.version !== (authority ? 2 : 1) ||
+            (authority &&
+              (typeof draft.material.authorityHash !== "string" ||
+                !/^[0-9a-f]{64}$/.test(draft.material.authorityHash))) ||
             typeof draft.material.launchHash !== "string" ||
             !/^[0-9a-f]{64}$/.test(draft.material.launchHash)
           )
@@ -2074,6 +2133,7 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
           return {
             draft: { ...base, version: 1 as const },
             marked: true as const,
+            authority,
             marker: material,
           };
         },
@@ -2087,30 +2147,36 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
         !receipt.receipt_id
       )
         return yield* integrity();
-      let format: "legacyV1" | "receiptV2" | "materialV3";
+      let format: "legacyV1" | "receiptV2" | "materialV3" | "authorityV4";
+      let retainedMaterial: Material | undefined;
       let result: object;
       if (draftInfo.marked) {
         const fingerprint = yield* Effect.try({
           try: () =>
-            WorkflowCanonicalHash.tagged("t3.workflow-native-launch-intent.v3", {
-              intentId: input.intentId,
-              workflowRunId: input.runId,
-              planningSessionId: null,
-              operationId: input.operationId,
-              attemptId: input.attemptId,
-              passId: null,
-              itemId: input.itemId,
-              chargeAttempt: 1,
-              repair: input.repair,
-              role: "implementation",
-              environmentId: input.environmentId,
-              projectId: input.projectId,
-              launchCommandId: input.launchCommandId,
-              threadId: input.threadId,
-              messageId: input.messageId,
-              draft: storedDraft,
-              receiptId: input.receiptId,
-            }),
+            WorkflowCanonicalHash.tagged(
+              draftInfo.authority
+                ? "t3.workflow-native-launch-intent.v4"
+                : "t3.workflow-native-launch-intent.v3",
+              {
+                intentId: input.intentId,
+                workflowRunId: input.runId,
+                planningSessionId: null,
+                operationId: input.operationId,
+                attemptId: input.attemptId,
+                passId: null,
+                itemId: input.itemId,
+                chargeAttempt: 1,
+                repair: input.repair,
+                role: "implementation",
+                environmentId: input.environmentId,
+                projectId: input.projectId,
+                launchCommandId: input.launchCommandId,
+                threadId: input.threadId,
+                messageId: input.messageId,
+                draft: storedDraft,
+                receiptId: input.receiptId,
+              },
+            ),
           catch: integrity,
         });
         if (fingerprint !== receipt.fingerprint) return yield* integrity();
@@ -2123,12 +2189,17 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
           try: () => parse(rows[0]!.material_json),
           catch: integrity,
         });
-        const { material, launchHash, materialHash } = yield* decodeNativeReservationMaterial(
-          raw,
-        ).pipe(Effect.mapError(integrity));
+        const { material, launchHash, materialHash, authorityHash } =
+          yield* decodeNativeReservationMaterial(raw).pipe(Effect.mapError(integrity));
         const launch = material.launch;
         const params = validated.operation.parameters;
         if (
+          material.version !== (draftInfo.authority ? 2 : 1) ||
+          (material.version === 2 &&
+            (authorityHash !== draftInfo.marker.authorityHash ||
+              material.authority.environmentId !== input.environmentId ||
+              validated.operation.origin.kind !== "human" ||
+              material.authority.subject !== validated.operation.origin.id)) ||
           material.planningSession !== null ||
           material.intentId !== input.intentId ||
           material.receiptId !== input.receiptId ||
@@ -2144,8 +2215,14 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
           launch.modelSelection.model !== params.provider.model
         )
           return yield* integrity();
-        format = "materialV3";
-        result = { intentId: input.intentId, fingerprint, materialVersion: 1, materialHash };
+        format = draftInfo.authority ? "authorityV4" : "materialV3";
+        retainedMaterial = material;
+        result = {
+          intentId: input.intentId,
+          fingerprint,
+          materialVersion: material.version,
+          materialHash,
+        };
       } else {
         if (receipt.fingerprint === validated.fingerprint) format = "receiptV2";
         else if (receipt.fingerprint === validated.legacyFingerprint) format = "legacyV1";
@@ -2157,7 +2234,12 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
         catch: integrity,
       });
       if (!matches) return yield* integrity();
-      return { format, operation: validated.operation, draft: draftInfo.draft };
+      return {
+        format,
+        operation: validated.operation,
+        draft: draftInfo.draft,
+        material: retainedMaterial,
+      };
     },
   );
   type CustodyOwner = WorkflowOperationV1["owner"];
@@ -2579,7 +2661,7 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
         typeof draft !== "object" ||
         draft === null ||
         !("version" in draft) ||
-        draft.version !== 2
+        (draft.version !== 2 && draft.version !== 3)
       )
         return yield* integrity();
       const receipts = yield* sql<{
@@ -2780,7 +2862,11 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
           const snapshot = { ...copy, draft: structuredClone(copy.draft) };
           if (!Object.hasOwn(copy, "launch")) return snapshot;
           WorkflowCanonicalHash.assertCanonical(copy.launch);
-          return { ...snapshot, launch: structuredClone(copy.launch) };
+          return {
+            ...snapshot,
+            launch: structuredClone(copy.launch),
+            ...(copy.materialVersion === 2 ? { authority: structuredClone(copy.authority) } : {}),
+          };
         },
         catch: integrity,
       });
@@ -2793,7 +2879,11 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
         } = yield* validateWorkflowNativeIntent(input);
         const hasVersion = Object.hasOwn(input, "materialVersion");
         const hasLaunch = Object.hasOwn(input, "launch");
-        if (hasVersion !== hasLaunch || (hasVersion && input.materialVersion !== 1))
+        if (
+          hasVersion !== hasLaunch ||
+          (hasVersion && input.materialVersion !== 1 && input.materialVersion !== 2) ||
+          Object.hasOwn(input, "authority") !== (input.materialVersion === 2)
+        )
           return yield* integrity();
         const retained = yield* Effect.gen(function* () {
           if (!hasVersion) return null;
@@ -2811,32 +2901,50 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
             launch.modelSelection.model !== params.provider.model
           )
             return yield* integrity();
-          const persistedDraft = { ...draft, version: 2, material: { version: 1, launchHash } };
+          const grant =
+            input.materialVersion === 2
+              ? yield* decodeNativeReservationAuthority(input.authority).pipe(
+                  Effect.mapError(integrity),
+                )
+              : undefined;
+          const persistedDraft = {
+            ...draft,
+            version: grant ? 3 : 2,
+            material: grant
+              ? { version: 2, launchHash, authorityHash: grant.authorityHash }
+              : { version: 1, launchHash },
+          };
           const fingerprint = yield* Effect.try({
             try: () =>
-              WorkflowCanonicalHash.tagged("t3.workflow-native-launch-intent.v3", {
-                intentId: input.intentId,
-                workflowRunId: input.runId,
-                planningSessionId: null,
-                operationId: input.operationId,
-                attemptId: input.attemptId,
-                passId: null,
-                itemId: input.itemId,
-                chargeAttempt: 1,
-                repair: input.repair,
-                role: "implementation",
-                environmentId: input.environmentId,
-                projectId: input.projectId,
-                launchCommandId: input.launchCommandId,
-                threadId: input.threadId,
-                messageId: input.messageId,
-                draft: persistedDraft,
-                receiptId: input.receiptId,
-              }),
+              WorkflowCanonicalHash.tagged(
+                grant
+                  ? "t3.workflow-native-launch-intent.v4"
+                  : "t3.workflow-native-launch-intent.v3",
+                {
+                  intentId: input.intentId,
+                  workflowRunId: input.runId,
+                  planningSessionId: null,
+                  operationId: input.operationId,
+                  attemptId: input.attemptId,
+                  passId: null,
+                  itemId: input.itemId,
+                  chargeAttempt: 1,
+                  repair: input.repair,
+                  role: "implementation",
+                  environmentId: input.environmentId,
+                  projectId: input.projectId,
+                  launchCommandId: input.launchCommandId,
+                  threadId: input.threadId,
+                  messageId: input.messageId,
+                  draft: persistedDraft,
+                  receiptId: input.receiptId,
+                },
+              ),
             catch: integrity,
           });
           const decoded = yield* decodeNativeReservationMaterial({
-            version: 1,
+            version: grant ? 2 : 1,
+            ...(grant ? { authority: grant.authority } : {}),
             intentId: input.intentId,
             receiptId: input.receiptId,
             intentFingerprint: fingerprint,
@@ -2923,7 +3031,8 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
             }),
             receipt,
           );
-          if ((verified.format === "materialV3") !== (retained !== null)) return yield* integrity();
+          if (["materialV3", "authorityV4"].includes(verified.format) !== (retained !== null))
+            return yield* integrity();
           return {
             kind: "replay" as const,
             receiptId: receipt.receipt_id,
@@ -2971,6 +3080,14 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
           )
         )
           return yield* integrity();
+        const currentNow =
+          retained.material.version === 2
+            ? DateTime.formatIso(yield* DateTime.now)
+            : input.externalFacts.now;
+        if (retained.material.version === 2) {
+          if (!(yield* checkWorkflowAuthority(retained.material, operation, run)))
+            return { kind: "rejected" as const, reason: "unauthorized" as const };
+        }
         if (input.generation !== run.controlGeneration)
           return { kind: "rejected" as const, reason: "stale" as const };
         const operations = yield* sql<{
@@ -3013,7 +3130,7 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
           return yield* integrity();
         const index = ordered?.indexOf(input.itemId);
         const facts: Facts = {
-          now: input.externalFacts.now,
+          now: currentNow,
           authority: input.externalFacts.authority === true,
           capabilitiesCurrent: input.externalFacts.capabilitiesCurrent === true,
           compatibilityCurrent: input.externalFacts.compatibilityCurrent === true,
@@ -3085,7 +3202,7 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
           yield* sql`INSERT INTO workflow_native_reservation_material (intent_id, material_json, material_hash) VALUES (${input.intentId}, ${retained.materialJson}, ${retained.materialHash}) RETURNING intent_id`;
         if (material.length !== 1) return yield* integrity();
         const receipt =
-          yield* sql`INSERT INTO workflow_native_intent_receipts (command_id, receipt_id, intent_id, fingerprint, result_json) VALUES (${command.commandId}, ${input.receiptId}, ${input.intentId}, ${fingerprint}, ${encode({ intentId: input.intentId, fingerprint, materialVersion: 1, materialHash: retained.materialHash })}) RETURNING receipt_id`;
+          yield* sql`INSERT INTO workflow_native_intent_receipts (command_id, receipt_id, intent_id, fingerprint, result_json) VALUES (${command.commandId}, ${input.receiptId}, ${input.intentId}, ${fingerprint}, ${encode({ intentId: input.intentId, fingerprint, materialVersion: retained.material.version, materialHash: retained.materialHash })}) RETURNING receipt_id`;
         if (receipt.length !== 1) return yield* integrity();
         return {
           kind: "reserved" as const,
@@ -3576,7 +3693,13 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
             draft.admission.command.expectedVersion >= run.recordVersion
           )
             return yield* integrity();
-          return { row, draft, operation: validated.operation, receipt };
+          return {
+            row,
+            draft,
+            operation: validated.operation,
+            receipt,
+            material: validated.material,
+          };
         }),
       );
       const heldNative = intents.filter(({ row }) => row.state === "reserved" && row.held === 1);
@@ -3585,6 +3708,10 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
         run.allowance.repairRoundsConsumed < intents.filter(({ row }) => row.repair === 1).length
       )
         return yield* integrity();
+      const currentNativeNow =
+        command.kind === "resume" && heldNative.some((intent) => intent.material?.version === 2)
+          ? DateTime.formatIso(yield* DateTime.now)
+          : undefined;
       if (command.kind === "resume") {
         if (
           intents.some(({ row }) => row.state === "reserved" && row.held !== 1) ||
@@ -3602,6 +3729,11 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
         )
           return { kind: "rejected" as const, reason: "custody" as const };
         for (const intent of heldNative) {
+          if (
+            intent.material?.version === 2 &&
+            !(yield* checkWorkflowAuthority(intent.material, intent.operation, run))
+          )
+            return { kind: "rejected" as const, reason: "unauthorized" as const };
           const conflicts =
             yield* sql`SELECT 1 FROM workflow_native_launch_intents WHERE thread_id = ${intent.row.thread_id} AND intent_id <> ${intent.row.intent_id} AND state <> 'cancelled' AND (workflow_run_id IS NULL OR workflow_run_id <> ${run.id}) UNION ALL SELECT 1 FROM workflow_operations WHERE json_extract(record_json, '$.parameters.nativeThreadId') = ${intent.row.thread_id} AND (workflow_run_id IS NULL OR workflow_run_id <> ${run.id} OR planning_session_id IS NOT NULL) UNION ALL SELECT 1 FROM workflow_planning_passes WHERE native_thread_id = ${intent.row.thread_id}`;
           if (conflicts.length) return { kind: "rejected" as const, reason: "custody" as const };
@@ -3643,6 +3775,7 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
         );
       const facts: Facts = {
         ...externalFacts,
+        ...(currentNativeNow === undefined ? {} : { now: currentNativeNow }),
         custody:
           operations.some((o) => o.status === "unknown") ||
           nativeCustody.some((intent) => intent.state === "unknown")
@@ -4183,7 +4316,16 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
     controlPlanning,
     recordRoleResult,
     commitTransition,
-    reserveWorkflowNativeIntent,
+    // V2 authority and admission inputs must be owned before returning the writer Effect.
+    reserveWorkflowNativeIntent: (input: WorkflowNativeInput) => {
+      if (input.materialVersion !== 2) return reserveWorkflowNativeIntent(input);
+      try {
+        WorkflowCanonicalHash.assertCanonical(input);
+        return reserveWorkflowNativeIntent(structuredClone(input));
+      } catch {
+        return Effect.fail(integrity());
+      }
+    },
     reservePlanningNativeIntent,
     readThreadCustody,
     readNativeReservationInTransaction,
@@ -4194,6 +4336,29 @@ export const make = Effect.fn("WorkflowRunStore.make")(function* (
     readRecovery,
     compareAndApplyRecovery,
   };
+});
+
+export const make = Effect.fn("WorkflowRunStore.make")(function* (
+  beforePublish: Effect.Effect<void> = Effect.void,
+) {
+  return yield* makeStore(beforePublish);
+});
+
+export const makeCapturedAuthorizedWorkflowRunStore = Effect.fn(
+  "WorkflowRunStore.makeCapturedAuthorized",
+)(function* (
+  sql: SqlClient.SqlClient,
+  identity: ServerEnvironmentIdentity["Service"],
+  policy: ManagedPolicy["Service"],
+) {
+  const authority = yield* ExecutionAuthority.makeCapturedWorkflowExecutionAuthority(
+    sql,
+    identity,
+    policy,
+  );
+  return yield* makeStore(Effect.void, authority).pipe(
+    Effect.provideService(SqlClient.SqlClient, sql),
+  );
 });
 
 export class WorkflowRunStore extends Context.Service<

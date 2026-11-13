@@ -318,4 +318,41 @@ describe("native reservation material", () => {
       yield* Effect.flip(decodeMaterial({ ...material, intentFingerprint: "bad" }));
     }),
   );
+  it.effect("retains versioned authority material without changing historical hashes", () =>
+    Effect.gen(function* () {
+      const authority = {
+        version: 1,
+        kind: "local-rpc-session",
+        provenance: "verified-session",
+        environmentId: "environment",
+        sessionId: "grant-session",
+        subject: "human",
+        method: "bearer-access-token",
+        observedScopes: ["orchestration:read", "orchestration:operate"],
+        expiresAt: "2026-12-01T00:00:00.000Z",
+        runtimeModeCeiling: null,
+        peerLink: false,
+        proofKeyThumbprint: null,
+      };
+      const input = { ...material, version: 2, authority };
+      const prior = yield* decodeMaterial(material);
+      const current = yield* decodeMaterial(input);
+      expect(current.material).toEqual(input);
+      expect(current.materialHash).toBe(
+        WorkflowCanonicalHash.tagged("t3.workflow-native-reservation-material.v2", input),
+      );
+      expect(current.authorityHash).toBe(
+        WorkflowCanonicalHash.tagged("t3.workflow-execution-authority.v1", authority),
+      );
+      expect(current.launchHash).toBe(prior.launchHash);
+      expect((yield* decodeMaterial(material)).materialHash).toBe(prior.materialHash);
+      for (const bad of [
+        { ...input, authority: { ...authority, token: "forbidden" } },
+        { ...input, authority: { ...authority, runtimeModeCeiling: "invalid" } },
+        { ...input, authority: { ...authority, observedScopes: ["unknown-scope"] } },
+        { ...input, version: 3 },
+      ])
+        yield* Effect.flip(decodeMaterial(bad));
+    }),
+  );
 });

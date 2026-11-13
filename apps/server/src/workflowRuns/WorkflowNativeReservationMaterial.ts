@@ -24,6 +24,8 @@ import {
 } from "@t3tools/contracts";
 import { stableStringify } from "@t3tools/shared/relaySigning";
 import * as Effect from "effect/Effect";
+import * as DateTime from "effect/DateTime";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import {
@@ -31,6 +33,7 @@ import {
   PENDING_ATTACHMENT_THREAD_SEGMENT,
 } from "../attachmentStore.ts";
 import { WorkflowCanonicalHash } from "./WorkflowCanonicalHash.ts";
+import { LocalRpcExecutionAuthority } from "./WorkflowExecutionAuthority.ts";
 
 const Launch = Schema.Struct({
   commandId: CommandId,
@@ -67,7 +70,7 @@ const Launch = Schema.Struct({
   delegatedFrom: Schema.optional(OrchestrationV2DelegatedFrom),
 });
 
-const Material = Schema.Struct({
+const MaterialV1 = Schema.Struct({
   version: Schema.Literal(1),
   intentId: Schema.NonEmptyString,
   receiptId: Schema.NonEmptyString,
@@ -75,6 +78,17 @@ const Material = Schema.Struct({
   launch: Launch,
   planningSession: Schema.NullOr(PlanningSessionV1),
 });
+
+const Material = Schema.Union([
+  MaterialV1,
+  Schema.Struct({
+    ...MaterialV1.fields,
+    version: Schema.Literal(2),
+    authority: LocalRpcExecutionAuthority,
+  }),
+]);
+const decodeAuthority = Schema.decodeUnknownEffect(LocalRpcExecutionAuthority);
+const encodeAuthority = Schema.encodeEffect(LocalRpcExecutionAuthority);
 
 const decodeLaunch = Schema.decodeUnknownEffect(Launch);
 const encodeLaunch = Schema.encodeEffect(Launch);
@@ -125,6 +139,19 @@ export const decodeNativeReservationLaunch = Effect.fn(
   };
 });
 
+export const decodeNativeReservationAuthority = Effect.fn(
+  "WorkflowNativeReservationMaterial.decodeAuthority",
+)(function* (input: unknown) {
+  yield* canonical(input);
+  const authority = yield* decodeAuthority(input, { onExcessProperty: "error" });
+  yield* fixedPoint(input, authority, yield* encodeAuthority(authority));
+  if (Option.isNone(DateTime.make(authority.expiresAt))) return yield* invalid();
+  return {
+    authority,
+    authorityHash: WorkflowCanonicalHash.tagged("t3.workflow-execution-authority.v1", authority),
+  };
+});
+
 export const decodeNativeReservationMaterial = Effect.fn(
   "WorkflowNativeReservationMaterial.decodeMaterial",
 )(function* (input: unknown) {
@@ -134,11 +161,18 @@ export const decodeNativeReservationMaterial = Effect.fn(
   yield* fixedPoint(input, material, encoded);
   if (material.planningSession !== null) yield* decodePlanningSessionV1(material.planningSession);
   const { launchHash } = yield* decodeNativeReservationLaunch(material.launch);
+  const authority =
+    material.version === 2
+      ? yield* decodeNativeReservationAuthority(material.authority)
+      : undefined;
   return {
     material,
     launchHash,
+    ...(authority === undefined ? {} : { authorityHash: authority.authorityHash }),
     materialHash: WorkflowCanonicalHash.tagged(
-      "t3.workflow-native-reservation-material.v1",
+      material.version === 1
+        ? "t3.workflow-native-reservation-material.v1"
+        : "t3.workflow-native-reservation-material.v2",
       material,
     ),
   };

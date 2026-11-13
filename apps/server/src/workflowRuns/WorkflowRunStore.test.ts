@@ -6,6 +6,7 @@ import * as NodeSqlite from "node:sqlite";
 
 import { assert, it } from "@effect/vitest";
 import {
+  EnvironmentId,
   CommandId,
   RunId,
   RunAttemptId,
@@ -21,6 +22,17 @@ import {
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
+import * as DateTime from "effect/DateTime";
+import * as TestClock from "effect/testing/TestClock";
+import * as Context from "effect/Context";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as ServerConfig from "../config.ts";
+import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import * as SessionStore from "../auth/SessionStore.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
+import * as ExecutionAuthority from "./WorkflowExecutionAuthority.ts";
 import * as Deferred from "effect/Deferred";
 import * as Digest from "effect/crypto/Digest";
 import * as Ref from "effect/Ref";
@@ -7823,4 +7835,291 @@ it.effect("competing workflow controls on separate connections have one complete
       );
     }),
   ),
+);
+
+const authorizedWorkflow = Effect.fn("test.authorizedWorkflow")(function* () {
+  yield* TestClock.setTime(DateTime.makeUnsafe(facts.now).epochMilliseconds);
+  yield* setupAdmission;
+  const sql = yield* SqlClient.SqlClient;
+  const current = { ...run, access: { origins: [destination] } };
+  yield* sql`UPDATE workflow_runs SET record_json = ${json(current)} WHERE id = ${run.id}`;
+  yield* sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at) VALUES ('project','Project','/work','[]',${facts.now},${facts.now})`;
+  const identity = {
+    getEnvironmentId: Effect.succeed(EnvironmentId.make(destination.environmentId)),
+  };
+  const platform = Layer.mergeAll(NodeServices.layer, NodeCrypto.layer);
+  const base = Layer.mergeAll(
+    Layer.succeed(SqlClient.SqlClient, sql),
+    Layer.succeed(ServerEnvironment.ServerEnvironmentIdentity, identity),
+    ManagedPolicy.layerTest(),
+    ServerConfig.layerTest(process.cwd(), { prefix: "workflow-authorized-store-" }),
+  ).pipe(Layer.provideMerge(platform));
+  const scope = yield* Layer.build(
+    Layer.fresh(
+      SessionStore.layer.pipe(
+        Layer.provideMerge(ServerSecretStore.layer.pipe(Layer.provideMerge(base))),
+      ),
+    ),
+  );
+  const sessions = Context.get(scope, SessionStore.SessionStore);
+  const issued = yield* sessions.issue({
+    subject: "human",
+    method: "bearer-access-token",
+    scopes: ["orchestration:read", "orchestration:operate"],
+  });
+  const authority = ExecutionAuthority.captureLocalRpcExecutionAuthority(
+    yield* sessions.verify(issued.token),
+    EnvironmentId.make(destination.environmentId),
+    "verified-session",
+  );
+  if (authority === undefined) throw new Error("expected authority");
+  const store = yield* Store.makeCapturedAuthorizedWorkflowRunStore(
+    sql,
+    identity,
+    Context.get(scope, ManagedPolicy.ManagedPolicy),
+  );
+  const input = {
+    ...reservation(operationFor("authority-op", "authority-attempt"), "authority-attempt"),
+    materialVersion: 2 as const,
+    authority,
+  };
+  return { store, sessions, input, authority };
+});
+
+it.effect(
+  "authorized workflow reservation retains V2 authority and replays without a second charge",
+  () =>
+    Effect.gen(function* () {
+      const { store, input, authority } = yield* authorizedWorkflow();
+      const sql = yield* SqlClient.SqlClient;
+      const ordinary = yield* Store.WorkflowRunStore;
+      assert.deepStrictEqual(yield* ordinary.reserveWorkflowNativeIntent(input), {
+        kind: "rejected",
+        reason: "unauthorized",
+      });
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_launch_intents`, []);
+      const first = yield* store.reserveWorkflowNativeIntent(input);
+      assert.strictEqual(first.kind, "reserved");
+      assert.deepStrictEqual(yield* ordinary.reserveWorkflowNativeIntent(input), {
+        ...first,
+        kind: "replay",
+      });
+      const retained = yield* sql.withTransaction(
+        ordinary.readNativeReservationInTransaction({ intentId: input.intentId }),
+      );
+      assert.strictEqual(retained.material.version, 2);
+      if (retained.material.version === 2)
+        assert.deepStrictEqual(retained.material.authority, authority);
+      assert.deepStrictEqual(yield* ordinary.readThreadCustody({ threadId: input.threadId }), {
+        kind: "owned",
+        owner: { kind: "workflow_run", workflowRunId: run.id },
+      });
+      const owner = parse(
+        (yield* sql<{ record_json: string }>`SELECT record_json FROM workflow_runs`)[0]!
+          .record_json,
+      ) as typeof run;
+      assert.strictEqual(owner.allowance.attemptsConsumed, 1);
+      assert.strictEqual(owner.allowance.deadline, run.allowance.deadline);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_operations`, []);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_attempts`, []);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect(
+  "authorized V2 workflow refuses revoked grants and writer-current deadline before charge",
+  () =>
+    Effect.gen(function* () {
+      const { store, sessions, input } = yield* authorizedWorkflow();
+      const sql = yield* SqlClient.SqlClient;
+      const snapshot = Effect.gen(function* () {
+        return {
+          owner: yield* sql`SELECT * FROM workflow_runs`,
+          intents: yield* sql`SELECT * FROM workflow_native_launch_intents`,
+          material: yield* sql`SELECT * FROM workflow_native_reservation_material`,
+          receipts: yield* sql`SELECT * FROM workflow_native_intent_receipts`,
+        };
+      });
+      const before = yield* snapshot;
+      yield* TestClock.setTime(DateTime.makeUnsafe("2026-12-02T00:00:00Z").epochMilliseconds);
+      assert.deepStrictEqual(yield* store.reserveWorkflowNativeIntent(input), {
+        kind: "rejected",
+        reason: "deadline",
+      });
+      assert.deepStrictEqual(yield* snapshot, before);
+      yield* TestClock.setTime(DateTime.makeUnsafe(facts.now).epochMilliseconds);
+      yield* sessions.revoke(input.authority.sessionId);
+      assert.deepStrictEqual(yield* store.reserveWorkflowNativeIntent(input), {
+        kind: "rejected",
+        reason: "unauthorized",
+      });
+      assert.deepStrictEqual(yield* snapshot, before);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect(
+  "retained V2 workflow pause and stop survive revocation while rearm needs live authority",
+  () =>
+    Effect.gen(function* () {
+      const { store, sessions, input } = yield* authorizedWorkflow();
+      const ordinary = yield* Store.WorkflowRunStore;
+      const sql = yield* SqlClient.SqlClient;
+      const reserved = yield* store.reserveWorkflowNativeIntent(input);
+      const control = (kind: "pause" | "resume" | "stop", version: number, generation: number) => ({
+        runId: run.id,
+        command: {
+          ...command,
+          kind,
+          commandId: `authority-${kind}-${version}`,
+          expectedVersion: version,
+          expectedGeneration: generation,
+        },
+        externalFacts: admissionFacts,
+        receiptId: `authority-${kind}`,
+      });
+      assert.strictEqual(
+        (yield* ordinary.commitTransition(control("pause", 1, 0))).kind,
+        "accepted",
+      );
+      const before = yield* sql`SELECT * FROM workflow_native_launch_intents`;
+      assert.deepStrictEqual(yield* ordinary.commitTransition(control("resume", 2, 1)), {
+        kind: "rejected",
+        reason: "unauthorized",
+      });
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_launch_intents`, before);
+      assert.strictEqual((yield* store.commitTransition(control("resume", 2, 1))).kind, "accepted");
+      assert.deepStrictEqual(
+        yield* sql`SELECT held,generation FROM workflow_native_launch_intents`,
+        [{ held: 0, generation: 2 }],
+      );
+      const pauseAgain = {
+        ...control("pause", 3, 2),
+        command: { ...control("pause", 3, 2).command, commandId: "second-pause" },
+        receiptId: "second-pause",
+      };
+      yield* ordinary.commitTransition(pauseAgain);
+      yield* TestClock.setTime(DateTime.makeUnsafe("2026-12-02T00:00:00Z").epochMilliseconds);
+      assert.deepStrictEqual(yield* store.commitTransition(control("resume", 4, 3)), {
+        kind: "rejected",
+        reason: "deadline",
+      });
+      yield* TestClock.setTime(DateTime.makeUnsafe(facts.now).epochMilliseconds);
+      yield* sessions.revoke(input.authority.sessionId);
+      assert.deepStrictEqual(yield* store.commitTransition(control("resume", 4, 3)), {
+        kind: "rejected",
+        reason: "unauthorized",
+      });
+      assert.strictEqual(
+        (yield* ordinary.commitTransition(control("stop", 4, 3))).kind,
+        "accepted",
+      );
+      assert.deepStrictEqual(yield* ordinary.reserveWorkflowNativeIntent(input), {
+        ...reserved,
+        kind: "replay",
+      });
+      assert.strictEqual(
+        (yield* sql.withTransaction(
+          ordinary.readNativeReservationInTransaction({ intentId: input.intentId }),
+        )).material.version,
+        2,
+      );
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect(
+  "V2 workflow cannot borrow another principal, narrow scopes or a missing reuse target",
+  () =>
+    Effect.gen(function* () {
+      const { store, sessions, input } = yield* authorizedWorkflow();
+      const sql = yield* SqlClient.SqlClient;
+      const other = yield* sessions.issue({
+        subject: "other-human",
+        method: "bearer-access-token",
+        scopes: ["orchestration:read", "orchestration:operate"],
+      });
+      const otherRef = ExecutionAuthority.captureLocalRpcExecutionAuthority(
+        yield* sessions.verify(other.token),
+        EnvironmentId.make(destination.environmentId),
+        "verified-session",
+      );
+      if (!otherRef) throw new Error("reference missing");
+      for (const authority of [
+        otherRef,
+        { ...input.authority, observedScopes: ["orchestration:read" as const] },
+        { ...input.authority, runtimeModeCeiling: "approval-required" as const },
+      ]) {
+        assert.deepStrictEqual(yield* store.reserveWorkflowNativeIntent({ ...input, authority }), {
+          kind: "rejected",
+          reason: "unauthorized",
+        });
+      }
+      assert.deepStrictEqual(
+        yield* store.reserveWorkflowNativeIntent({
+          ...input,
+          launch: { ...input.launch, reuseExistingThread: true },
+        }),
+        { kind: "rejected", reason: "unauthorized" },
+      );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_launch_intents`, []);
+      const owner = { ...run, access: { origins: [{ ...destination, threadId: input.threadId }] } };
+      yield* sql`UPDATE workflow_runs SET record_json = ${json(owner)}`;
+      assert.deepStrictEqual(yield* store.reserveWorkflowNativeIntent(input), {
+        kind: "rejected",
+        reason: "unauthorized",
+      });
+      const current = parse(
+        (yield* sql<{ record_json: string }>`SELECT record_json FROM workflow_runs`)[0]!
+          .record_json,
+      ) as typeof run;
+      assert.strictEqual(current.allowance.attemptsConsumed, 0);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect(
+  "V2 authority reservation rolls back all writes and owns the typed request before waiting",
+  () =>
+    Effect.gen(function* () {
+      const { store, input } = yield* authorizedWorkflow();
+      const sql = yield* SqlClient.SqlClient;
+      const subscription = yield* store.subscribeChanges;
+      const before = yield* sql`SELECT * FROM workflow_runs`;
+      yield* sql`CREATE TRIGGER reject_authority_material BEFORE INSERT ON workflow_native_reservation_material BEGIN SELECT RAISE(ABORT,'injected V2 material failure'); END`;
+      assert.strictEqual(
+        (yield* Effect.flip(store.reserveWorkflowNativeIntent(input))).reason,
+        "persistence",
+      );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_runs`, before);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_launch_intents`, []);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_reservation_material`, []);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_intent_receipts`, []);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+      yield* sql`DROP TRIGGER reject_authority_material`;
+      const mutable = {
+        ...input,
+        authority: { ...input.authority, observedScopes: [...input.authority.observedScopes] },
+        launch: { ...input.launch },
+        externalFacts: { ...input.externalFacts, orderedItemIds: ["item"] },
+      };
+      const pending = store.reserveWorkflowNativeIntent(mutable);
+      mutable.authority.observedScopes.length = 0;
+      mutable.launch.title = "mutated";
+      mutable.externalFacts.orderedItemIds.length = 0;
+      assert.strictEqual((yield* pending).kind, "reserved");
+      yield* PubSub.take(subscription);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+      const read = yield* sql.withTransaction(
+        store.readNativeReservationInTransaction({ intentId: input.intentId }),
+      );
+      assert.strictEqual(read.material.launch.title, input.launch.title);
+      if (read.material.version !== 2) throw new Error("expected authority material");
+      assert.deepStrictEqual(
+        read.material.authority.observedScopes,
+        input.authority.observedScopes,
+      );
+      yield* sql`DROP TRIGGER workflow_native_reservation_material_update_guard`;
+      yield* sql`UPDATE workflow_native_reservation_material SET material_hash = ${hash}`;
+      assert.strictEqual(
+        (yield* Effect.flip(store.readThreadCustody({ threadId: input.threadId }))).reason,
+        "integrity",
+      );
+    }).pipe(Effect.provide(layer)),
 );
