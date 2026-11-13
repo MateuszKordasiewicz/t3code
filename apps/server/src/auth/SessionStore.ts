@@ -1,5 +1,6 @@
 import {
   AuthSessionId,
+  EnvironmentId,
   AuthStandardClientScopes,
   AuthEnvironmentScopes,
   type AuthClientMetadata,
@@ -7,7 +8,7 @@ import {
   type AuthEnvironmentScope,
   AuthWebSocketTicketUse,
   RuntimeMode,
-  type ServerAuthSessionMethod,
+  ServerAuthSessionMethod,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
@@ -62,7 +63,22 @@ export interface VerifiedSession {
   readonly peerLink?: true;
 }
 
+export const AuthSessionExecutionConstraints = Schema.Struct({
+  version: Schema.Literal(1),
+  environmentId: EnvironmentId,
+  sessionId: AuthSessionId,
+  subject: Schema.NonEmptyString,
+  method: ServerAuthSessionMethod,
+  observedScopes: AuthEnvironmentScopes,
+  expiresAt: Schema.String,
+  runtimeModeCeiling: Schema.NullOr(RuntimeMode),
+  peerLink: Schema.Boolean,
+  proofKeyThumbprint: Schema.NullOr(Schema.NonEmptyString),
+});
+export type AuthSessionExecutionConstraints = typeof AuthSessionExecutionConstraints.Type;
+
 export interface VerifiedWebSocketTicket extends VerifiedSession {
+  readonly executionConstraints?: AuthSessionExecutionConstraints;
   readonly audience?: AuthWebSocketTicketUse;
 }
 
@@ -389,6 +405,7 @@ export class SessionStore extends Context.Service<
     readonly issueWebSocketToken: (
       sessionId: AuthSessionId,
       input?: {
+        readonly executionConstraints?: AuthSessionExecutionConstraints;
         readonly ttl?: Duration.Duration;
         readonly audience?: AuthWebSocketTicketUse;
         readonly proofKeyThumbprint?: string;
@@ -450,6 +467,7 @@ const WebSocketClaims = Schema.Struct({
   sid: AuthSessionId,
   aud: Schema.optionalKey(AuthWebSocketTicketUse),
   jkt: Schema.optionalKey(Schema.String),
+  xar: Schema.optionalKey(AuthSessionExecutionConstraints),
   iat: Schema.Number,
   exp: Schema.Number,
 });
@@ -862,6 +880,7 @@ const make = Effect.gen(function* () {
       sid: sessionId,
       ...(input?.audience ? { aud: input.audience } : {}),
       ...(input?.proofKeyThumbprint ? { jkt: input.proofKeyThumbprint } : {}),
+      ...(input?.executionConstraints ? { xar: input.executionConstraints } : {}),
       iat: issuedAt.epochMilliseconds,
       exp: expiresAt.epochMilliseconds,
     };
@@ -953,6 +972,7 @@ const make = Effect.gen(function* () {
       expiresAt: row.value.expiresAt,
       subject: row.value.subject,
       scopes: row.value.scopes,
+      ...(claims.xar ? { executionConstraints: claims.xar } : {}),
       ...(claims.aud ? { audience: claims.aud } : {}),
       ...(claims.jkt ? { proofKeyThumbprint: claims.jkt } : {}),
     } satisfies VerifiedWebSocketTicket;

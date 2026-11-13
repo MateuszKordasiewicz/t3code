@@ -6,6 +6,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import * as ServerConfig from "../config.ts";
 import { makeDpopKey } from "./dpop.testkit.ts";
@@ -671,6 +672,12 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodePlatformCrypto.layer))(
           } as never;
           const verified = yield* serverAuth.authenticateWebSocketUpgrade(request, "rpc");
           expect(verified.sessionId).toBe(bearer.sessionId);
+          expect(verified.executionAuthority?.sessionId).toBe(bearer.sessionId);
+          expect(verified.executionAuthority?.subject).toBe(bearer.subject);
+          expect(verified.executionAuthority?.provenance).toBe("verified-session");
+          expect(Object.isFrozen(verified.executionAuthority)).toBe(true);
+          expect(Object.isFrozen(verified.executionAuthority?.observedScopes)).toBe(true);
+          expect(JSON.stringify(verified.executionAuthority)).not.toContain(bearer.token);
           expect((yield* serverAuth.authenticateHttpRequest(request)).sessionId).toBe(
             bearer.sessionId,
           );
@@ -713,6 +720,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodePlatformCrypto.layer))(
           key.sign({ method: "GET", url: socketUrl, token: Redacted.value(rpc.ticket), iat }),
         );
         expect(signed.sessionId).toBe(session.sessionId);
+        expect(signed.executionAuthority).toBeUndefined();
 
         const wrongKey = yield* Effect.flip(
           upgrade(
@@ -732,17 +740,17 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodePlatformCrypto.layer))(
         expect(onMedia._tag).toBe("ServerAuthInvalidCredentialError");
 
         const media = yield* serverAuth.issueWebSocketTicket(session, { use: "media" });
-        expect((yield* upgrade(Redacted.value(media.ticket), "media")).sessionId).toBe(
-          session.sessionId,
-        );
+        const mediaSession = yield* upgrade(Redacted.value(media.ticket), "media");
+        expect(mediaSession.sessionId).toBe(session.sessionId);
+        expect(mediaSession.executionAuthority).toBeUndefined();
         const mediaOnRpc = yield* Effect.flip(upgrade(Redacted.value(media.ticket), "rpc"));
         expect(mediaOnRpc._tag).toBe("ServerAuthInvalidCredentialError");
 
         // Clients that predate ticket binding still connect with the unbound ticket they mint.
         const legacy = yield* serverAuth.issueWebSocketTicket(session);
-        expect((yield* upgrade(Redacted.value(legacy.ticket), "rpc")).sessionId).toBe(
-          session.sessionId,
-        );
+        const legacySession = yield* upgrade(Redacted.value(legacy.ticket), "rpc");
+        expect(legacySession.sessionId).toBe(session.sessionId);
+        expect(legacySession.executionAuthority).toBeUndefined();
       }).pipe(
         Effect.provide(layerEnvironmentAuth({ desktopBootstrapToken: "desktop-bootstrap-token" })),
       ),
@@ -823,6 +831,71 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodePlatformCrypto.layer))(
       }).pipe(
         Effect.provide(layerEnvironmentAuth({ desktopBootstrapToken: "desktop-bootstrap-token" })),
       ),
+    );
+
+    it.effect("retains verified execution constraints through a new RPC ticket", () =>
+      Effect.gen(function* () {
+        const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+        const sessions = yield* SessionStore.SessionStore;
+        const sql = yield* SqlClient.SqlClient;
+        const issued = yield* sessions.issue({
+          subject: "narrowed-rpc-client",
+          method: "bearer-access-token",
+          scopes: ["orchestration:read"],
+          runtimeModeCeiling: "approval-required",
+          peerLink: true,
+        });
+        const authenticated = yield* serverAuth.authenticateHttpRequest(
+          makeBearerRequest(issued.token),
+        );
+        expect(authenticated.executionAuthority?.runtimeModeCeiling).toBe("approval-required");
+        expect(authenticated.executionAuthority?.peerLink).toBe(true);
+        const upgrade = (ticket: string) =>
+          serverAuth.authenticateWebSocketUpgrade(
+            { url: `/ws?wsTicket=${ticket}`, cookies: {}, headers: {} } as Parameters<
+              EnvironmentAuth.EnvironmentAuth["Service"]["authenticateWebSocketUpgrade"]
+            >[0],
+            "rpc",
+          );
+        const tickets = [];
+        for (const principal of [
+          authenticated,
+          { ...authenticated, scopes: new Set(authenticated.scopes) },
+        ]) {
+          tickets.push(yield* serverAuth.issueWebSocketTicket(principal, { use: "rpc" }));
+        }
+        if (authenticated.executionAuthority === undefined)
+          throw new Error("expected captured reference");
+        const mutable = {
+          ...authenticated.executionAuthority,
+          observedScopes: [...authenticated.executionAuthority.observedScopes],
+        };
+        const queuedTicket = serverAuth.issueWebSocketTicket(
+          { ...authenticated, executionAuthority: mutable },
+          { use: "rpc" },
+        );
+        mutable.observedScopes.push("orchestration:operate");
+        tickets.push(yield* queuedTicket);
+        yield* sql`UPDATE auth_sessions SET scopes = ${JSON.stringify(AuthStandardClientScopes)}, expires_at = '2099-01-01T00:00:00.000Z' WHERE session_id = ${issued.sessionId}`;
+        for (const ticket of tickets) {
+          const upgraded = yield* upgrade(Redacted.value(ticket.ticket));
+          expect(upgraded.executionAuthority?.runtimeModeCeiling).toBe("approval-required");
+          expect(upgraded.executionAuthority?.peerLink).toBe(true);
+          expect(upgraded.executionAuthority?.observedScopes).toEqual(["orchestration:read"]);
+          expect(upgraded.executionAuthority?.expiresAt).toBe(
+            authenticated.executionAuthority?.expiresAt,
+          );
+          expect(upgraded.executionAuthority?.proofKeyThumbprint).toBe(
+            authenticated.executionAuthority?.proofKeyThumbprint,
+          );
+        }
+        const malformed = {
+          ...authenticated,
+          executionAuthority: { ...authenticated.executionAuthority, subject: "different-subject" },
+        };
+        const ticket = yield* serverAuth.issueWebSocketTicket(malformed, { use: "rpc" });
+        expect((yield* upgrade(Redacted.value(ticket.ticket))).executionAuthority).toBeUndefined();
+      }).pipe(Effect.provide(layerEnvironmentAuth())),
     );
   },
 );

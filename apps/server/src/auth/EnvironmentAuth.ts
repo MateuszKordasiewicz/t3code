@@ -25,6 +25,11 @@ import {
 } from "@t3tools/contracts";
 import { isLocalLoopbackHost } from "@t3tools/shared/hostClassification";
 import { encodeOAuthScope } from "@t3tools/shared/oauthScope";
+import {
+  captureLocalRpcExecutionAuthority,
+  type LocalRpcExecutionAuthority,
+} from "../workflowRuns/WorkflowExecutionAuthority.ts";
+
 import * as Context from "effect/Context";
 import * as Digest from "effect/crypto/Digest";
 import * as DateTime from "effect/DateTime";
@@ -87,6 +92,7 @@ export interface McpClientSession {
 }
 
 export interface AuthenticatedSession {
+  readonly executionAuthority?: LocalRpcExecutionAuthority;
   readonly sessionId: AuthSessionId;
   readonly subject: string;
   readonly method: ServerAuthSessionMethod;
@@ -539,7 +545,10 @@ export class EnvironmentAuth extends Context.Service<
       use: AuthWebSocketTicketUse,
     ) => Effect.Effect<AuthenticatedSession, ServerAuthCredentialError | ServerAuthInternalError>;
     readonly issueWebSocketTicket: (
-      session: Pick<AuthenticatedSession, "sessionId" | "proofKeyThumbprint">,
+      session: Pick<AuthenticatedSession, "sessionId"> &
+        Partial<Omit<AuthenticatedSession, "sessionId" | "scopes">> & {
+          readonly scopes?: Iterable<AuthEnvironmentScope>;
+        },
       input?: { readonly use?: AuthWebSocketTicketUse },
     ) => Effect.Effect<AuthWebSocketTicketResult, ServerAuthInternalError>;
     readonly issueStartupPairingUrl: (
@@ -721,6 +730,10 @@ export const make = Effect.gen(function* () {
   const secretStore = yield* ServerSecretStore.ServerSecretStore;
   const digest = yield* Digest.Digest;
   const descriptor = yield* policy.getDescriptor();
+  const servingIdentity = yield* Effect.serviceOption(ServerEnvironment.ServerEnvironmentIdentity);
+  const servingId = Option.isSome(servingIdentity)
+    ? yield* servingIdentity.value.getEnvironmentId
+    : undefined;
   const config = yield* ServerConfig.ServerConfig;
   const managedPolicy = yield* ManagedPolicy.ManagedPolicy;
   const devAuth = resolveReusableDevAuth(config);
@@ -743,14 +756,21 @@ export const make = Effect.gen(function* () {
       ),
       mapSessionVerificationErrors,
       Effect.flatMap(rejectMcpClientAudience),
-      Effect.map((session) => ({
-        sessionId: session.sessionId,
-        subject: session.subject,
-        method: session.method,
-        scopes: session.scopes,
-        ...(session.proofKeyThumbprint ? { proofKeyThumbprint: session.proofKeyThumbprint } : {}),
-        ...(session.expiresAt ? { expiresAt: session.expiresAt } : {}),
-      })),
+      Effect.map((session) => {
+        const executionAuthority =
+          servingId === undefined
+            ? undefined
+            : captureLocalRpcExecutionAuthority(session, servingId, "verified-session");
+        return {
+          ...(executionAuthority === undefined ? {} : { executionAuthority }),
+          sessionId: session.sessionId,
+          subject: session.subject,
+          method: session.method,
+          scopes: session.scopes,
+          ...(session.proofKeyThumbprint ? { proofKeyThumbprint: session.proofKeyThumbprint } : {}),
+          ...(session.expiresAt ? { expiresAt: session.expiresAt } : {}),
+        };
+      }),
     );
 
   const resolveRequestCredential = (request: HttpServerRequest.HttpServerRequest) => {
@@ -1231,12 +1251,46 @@ export const make = Effect.gen(function* () {
   // Only the RPC socket's ticket is bound to the client's proof key. The media
   // routes reuse one ticket across <img>, EventSource and several sockets, and
   // each of those would need its own single-use proof.
+  // @effect-diagnostics-next-line effectFnOpportunity:off -- capture authenticated constraints before returning the signing Effect.
   const issueWebSocketTicket: EnvironmentAuth["Service"]["issueWebSocketTicket"] = (
     session,
     input,
-  ) =>
-    sessions
+  ) => {
+    const reference = session.executionAuthority;
+    const observed = reference === undefined ? undefined : new Set(reference.observedScopes);
+    const scopes = session.scopes === undefined ? undefined : Array.from(session.scopes);
+    const complete =
+      reference !== undefined &&
+      servingId !== undefined &&
+      input?.use === "rpc" &&
+      reference.environmentId === servingId &&
+      reference.sessionId === session.sessionId &&
+      reference.subject === session.subject &&
+      reference.method === session.method &&
+      reference.proofKeyThumbprint === (session.proofKeyThumbprint ?? null) &&
+      session.expiresAt !== undefined &&
+      reference.expiresAt === DateTime.formatIso(session.expiresAt) &&
+      scopes !== undefined &&
+      observed !== undefined &&
+      observed.size === new Set(scopes).size &&
+      scopes.every((scope) => observed.has(scope));
+    const constraints = complete
+      ? {
+          version: reference.version,
+          environmentId: reference.environmentId,
+          sessionId: reference.sessionId,
+          subject: reference.subject,
+          method: reference.method,
+          observedScopes: [...reference.observedScopes],
+          expiresAt: reference.expiresAt,
+          runtimeModeCeiling: reference.runtimeModeCeiling,
+          peerLink: reference.peerLink,
+          proofKeyThumbprint: reference.proofKeyThumbprint,
+        }
+      : undefined;
+    return sessions
       .issueWebSocketToken(session.sessionId, {
+        ...(constraints === undefined ? {} : { executionConstraints: constraints }),
         ...(input?.use ? { audience: input.use } : {}),
         ...(input?.use === "rpc" && session.proofKeyThumbprint
           ? { proofKeyThumbprint: session.proofKeyThumbprint }
@@ -1253,6 +1307,7 @@ export const make = Effect.gen(function* () {
         ),
         Effect.withSpan("EnvironmentAuth.issueWebSocketTicket"),
       );
+  };
 
   const authenticateHttpRequest: EnvironmentAuth["Service"]["authenticateHttpRequest"] = (
     request,
@@ -1297,7 +1352,37 @@ export const make = Effect.gen(function* () {
               Effect.provideService(Digest.Digest, digest),
             );
           }
+          const constraints = session.executionConstraints;
+          const expiry =
+            constraints === undefined ? Option.none() : DateTime.make(constraints.expiresAt);
+          const complete =
+            use === "rpc" &&
+            session.audience === "rpc" &&
+            servingId !== undefined &&
+            constraints !== undefined &&
+            constraints.environmentId === servingId &&
+            constraints.sessionId === session.sessionId &&
+            constraints.subject === session.subject &&
+            constraints.method === session.method &&
+            constraints.proofKeyThumbprint === (session.proofKeyThumbprint ?? null) &&
+            Option.isSome(expiry);
+          const executionAuthority = complete
+            ? captureLocalRpcExecutionAuthority(
+                {
+                  ...session,
+                  scopes: constraints.observedScopes,
+                  expiresAt: expiry.value,
+                  ...(constraints.runtimeModeCeiling === null
+                    ? {}
+                    : { runtimeModeCeiling: constraints.runtimeModeCeiling }),
+                  ...(constraints.peerLink ? { peerLink: true as const } : {}),
+                },
+                servingId,
+                "rpc-ticket",
+              )
+            : undefined;
           return {
+            ...(executionAuthority === undefined ? {} : { executionAuthority }),
             sessionId: session.sessionId,
             subject: session.subject,
             method: session.method,
