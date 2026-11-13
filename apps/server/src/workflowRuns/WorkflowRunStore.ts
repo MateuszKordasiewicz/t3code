@@ -10,6 +10,7 @@ import {
   decodeWorkflowRoleResultV1,
   decodeWorkflowRunV1,
   WorkflowOperationV1,
+  OrchestrationV2ProviderThreadJson,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Digest from "effect/crypto/Digest";
@@ -84,6 +85,9 @@ const attemptFacts = <
 };
 const encode = (value: unknown) => JSON.stringify(value);
 const parse = (value: string): unknown => JSON.parse(value);
+const decodeRecoveryProviderThread = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(OrchestrationV2ProviderThreadJson),
+);
 
 export class WorkflowRunStoreError extends Schema.TaggedError<WorkflowRunStoreError>()(
   "WorkflowRunStoreError",
@@ -2245,18 +2249,75 @@ const make = Effect.fn("WorkflowRunStore.make")(function* (
         sessionIds.add(row.provider_session_id);
       }
       for (const id of sessionIds) {
+        const peers = yield* sql<{
+          thread_id: string;
+        }>`SELECT thread_id FROM orchestration_v2_projection_provider_session_bindings WHERE provider_session_id = ${id}`;
         const sessions = yield* sql<{
           thread_id: string | null;
         }>`SELECT thread_id FROM orchestration_v2_projection_provider_sessions WHERE provider_session_id = ${id}`;
+        if (sessions.length === 0) {
+          if (peers.length) return yield* integrity();
+          const references = yield* sql<{
+            provider_thread_id: string;
+            thread_id: string | null;
+            owner_node_id: string | null;
+            provider_session_id: string;
+            status: string;
+            driver: string | null;
+            provider_instance_id: string | null;
+            payload_json: string;
+          }>`SELECT provider_thread_id, thread_id, owner_node_id, provider_session_id, status, driver, provider_instance_id, payload_json FROM orchestration_v2_projection_provider_threads WHERE provider_session_id = ${id}`;
+          if (!references.length) return yield* integrity();
+          for (const row of references) {
+            const reference = yield* decodeRecoveryProviderThread(row.payload_json).pipe(
+              Effect.mapError(integrity),
+            );
+            if (
+              reference.id !== row.provider_thread_id ||
+              reference.appThreadId !== row.thread_id ||
+              reference.ownerNodeId !== row.owner_node_id ||
+              reference.providerSessionId !== id ||
+              row.provider_session_id !== id ||
+              reference.status !== row.status ||
+              reference.driver !== row.driver ||
+              reference.providerInstanceId !== row.provider_instance_id ||
+              reference.status !== "not_loaded" ||
+              reference.nativeThreadRef !== null ||
+              reference.nativeConversationHeadRef !== null ||
+              (reference.pendingBackgroundTasks?.length ?? 0) !== 0
+            )
+              return yield* integrity();
+            let attributed = false;
+            if (reference.appThreadId !== null) {
+              threads.add(reference.appThreadId);
+              attributed = true;
+            }
+            if (reference.ownerNodeId !== null) {
+              const nodes = yield* sql<{
+                thread_id: string;
+              }>`SELECT thread_id FROM orchestration_v2_projection_nodes WHERE node_id = ${reference.ownerNodeId}`;
+              if (nodes.length !== 1 || !validId(nodes[0]?.thread_id)) return yield* integrity();
+              threads.add(nodes[0].thread_id);
+              attributed = true;
+            }
+            const subagents = yield* sql<{
+              thread_id: string;
+            }>`SELECT thread_id FROM orchestration_v2_projection_subagents WHERE provider_thread_id = ${reference.id}`;
+            for (const subagent of subagents) {
+              if (!validId(subagent.thread_id)) return yield* integrity();
+              threads.add(subagent.thread_id);
+              attributed = true;
+            }
+            if (!attributed) return yield* integrity();
+          }
+          continue;
+        }
         if (sessions.length !== 1 || !sessions[0]) return yield* integrity();
         const threadId = sessions[0].thread_id;
         if (threadId !== null) {
           if (!validId(threadId)) return yield* integrity();
           threads.add(threadId);
         }
-        const peers = yield* sql<{
-          thread_id: string;
-        }>`SELECT thread_id FROM orchestration_v2_projection_provider_session_bindings WHERE provider_session_id = ${id}`;
         for (const peer of peers) {
           if (!validId(peer.thread_id)) return yield* integrity();
           threads.add(peer.thread_id);

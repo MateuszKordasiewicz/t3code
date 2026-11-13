@@ -3626,6 +3626,95 @@ it.effect("recovery custody reads all selected associations without changing sta
   }).pipe(Effect.provide(layer)),
 );
 
+it.effect("recovery custody validates allocated sessions and follows every allocation owner", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const store = yield* Store.WorkflowRunStore;
+    const sql = yield* SqlClient.SqlClient;
+    const read = sql.withTransaction(
+      store.readRecoveryCustodyInTransaction({
+        threadId: "ordinary",
+        providerSessionIds: ["allocated"],
+      }),
+    );
+    const allocation = {
+      id: "allocated-thread",
+      driver: "codex",
+      providerInstanceId: "provider",
+      providerSessionId: "allocated",
+      appThreadId: "ordinary",
+      ownerNodeId: null,
+      nativeThreadRef: null,
+      nativeConversationHeadRef: null,
+      status: "not_loaded",
+      firstRunOrdinal: null,
+      lastRunOrdinal: null,
+      handoffIds: [],
+      forkedFrom: null,
+      pendingBackgroundTasks: [],
+      createdAt: "2026-11-01T00:00:00Z",
+      updatedAt: "2026-11-01T00:00:00Z",
+    };
+    yield* sql`INSERT INTO orchestration_v2_projection_provider_threads (provider_thread_id, thread_id, owner_node_id, provider, driver, provider_instance_id, provider_session_id, status, updated_at, payload_json) VALUES ('allocated-thread', 'ordinary', NULL, 'provider', 'codex', 'provider', 'allocated', 'not_loaded', '2026-11-01T00:00:00Z', ${json(allocation)})`;
+    assert.deepStrictEqual(yield* read, { kind: "ordinary" });
+    const input = reservation(
+      operationFor("allocated-owned", "allocated-owned"),
+      "allocated-owned",
+    );
+    yield* store.reserveWorkflowNativeIntent(input);
+    const owned = { ...allocation, appThreadId: input.threadId };
+    yield* sql`INSERT INTO orchestration_v2_projection_provider_threads (provider_thread_id, thread_id, owner_node_id, provider, driver, provider_instance_id, provider_session_id, status, updated_at, payload_json) VALUES ('owned-allocation', ${input.threadId}, NULL, 'provider', 'codex', 'provider', 'allocated', 'not_loaded', '2026-11-01T00:00:00Z', ${json({ ...owned, id: "owned-allocation" })})`;
+    const before = yield* rawReservationState;
+    const referencesBefore = yield* sql`SELECT * FROM orchestration_v2_projection_provider_threads`;
+    assert.deepStrictEqual(yield* read, { kind: "owned" });
+    assert.deepStrictEqual(yield* rawReservationState, before);
+    assert.deepStrictEqual(
+      yield* sql`SELECT * FROM orchestration_v2_projection_provider_threads`,
+      referencesBefore,
+    );
+    yield* sql`UPDATE orchestration_v2_projection_provider_threads SET status = 'active', payload_json = ${json({ ...owned, id: "owned-allocation", status: "active" })} WHERE provider_thread_id = 'owned-allocation'`;
+    assert.strictEqual((yield* Effect.flip(read)).reason, "integrity");
+    yield* sql`DELETE FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id = 'owned-allocation'`;
+    yield* sql`INSERT INTO orchestration_v2_projection_nodes (node_id, thread_id, root_node_id, kind, status, payload_json) VALUES ('owner-node', ${input.threadId}, 'owner-node', 'agent', 'running', '{}')`;
+    yield* sql`UPDATE orchestration_v2_projection_provider_threads SET thread_id = NULL, owner_node_id = 'owner-node', payload_json = ${json({ ...allocation, appThreadId: null, ownerNodeId: "owner-node" })}`;
+    assert.deepStrictEqual(yield* read, { kind: "owned" });
+    yield* sql`DELETE FROM orchestration_v2_projection_nodes`;
+    assert.strictEqual((yield* Effect.flip(read)).reason, "integrity");
+    yield* sql`UPDATE orchestration_v2_projection_provider_threads SET owner_node_id = NULL, payload_json = ${json({ ...allocation, appThreadId: null })}`;
+    assert.strictEqual((yield* Effect.flip(read)).reason, "integrity");
+    yield* sql`INSERT INTO orchestration_v2_projection_subagents (subagent_id, thread_id, parent_node_id, provider, provider_thread_id, origin, status, updated_at, payload_json) VALUES ('subagent', ${input.threadId}, 'parent', 'provider', 'allocated-thread', 'native', 'running', '2026-11-01T00:00:00Z', '{}')`;
+    assert.deepStrictEqual(yield* read, { kind: "owned" });
+    yield* sql`DELETE FROM orchestration_v2_projection_subagents`;
+    yield* sql`UPDATE orchestration_v2_projection_provider_threads SET thread_id = 'ordinary', payload_json = ${json(allocation)}`;
+    for (const invalid of [
+      { ...allocation, status: "active" },
+      {
+        ...allocation,
+        nativeThreadRef: { driver: "codex", nativeId: "existing", strength: "strong" },
+      },
+      {
+        ...allocation,
+        nativeConversationHeadRef: { driver: "codex", nativeId: "head", strength: "strong" },
+      },
+      { ...allocation, pendingBackgroundTasks: [{ kind: "command", taskId: "background" }] },
+      { ...allocation, id: "mismatch" },
+      { ...allocation, appThreadId: "mismatch" },
+      { ...allocation, providerSessionId: "mismatch" },
+      { ...allocation, driver: "claude" },
+      { ...allocation, providerInstanceId: "mismatch" },
+      {},
+    ]) {
+      yield* sql`UPDATE orchestration_v2_projection_provider_threads SET status = ${"status" in invalid ? invalid.status : "not_loaded"}, payload_json = ${json(invalid)}`;
+      assert.strictEqual((yield* Effect.flip(read)).reason, "integrity");
+    }
+    yield* sql`UPDATE orchestration_v2_projection_provider_threads SET status = 'not_loaded', payload_json = ${json(allocation)}`;
+    yield* sql`INSERT INTO orchestration_v2_projection_provider_session_bindings VALUES ('allocated', 'unrelated')`;
+    assert.strictEqual((yield* Effect.flip(read)).reason, "integrity");
+    yield* sql`DELETE FROM orchestration_v2_projection_provider_session_bindings`;
+    assert.deepStrictEqual(yield* read, { kind: "ordinary" });
+  }).pipe(Effect.provide(layer)),
+);
+
 it.effect(
   "recovery custody requires its captured transaction and fails closed on invalid associations",
   () =>
