@@ -23,6 +23,9 @@ import { assert, it } from "@effect/vitest";
 import * as CodexError from "./errors.ts";
 import * as CodexProtocol from "./protocol.ts";
 import { makeInMemoryStdio } from "./_internal/stdio.ts";
+const isControlledFrameFailure = Schema.is(CodexError.CodexAppServerFrameSubmissionError);
+const isCodexRequestFailure = Schema.is(CodexError.CodexAppServerRequestError);
+const isCodexTransportFailure = Schema.is(CodexError.CodexAppServerTransportError);
 const encodeUnknownJsonString = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 const encoder = new TextEncoder();
@@ -1395,5 +1398,759 @@ it.effect(
       if (Exit.isFailure(exit)) assert.isTrue(Cause.hasInterrupts(exit.cause));
       assert.strictEqual((yield* Queue.take(io.outcomes)).outcome, "submitted");
       assert.strictEqual(yield* Queue.size(io.outcomes), 0);
+    }),
+);
+
+it.effect("controlled protocol owns request payload and local selection before evaluation", () =>
+  Effect.gen(function* () {
+    const io = yield* makeInMemoryStdio();
+    const frames = yield* Queue.unbounded<CodexProtocol.CodexAppServerControlledFrame>();
+    const outcomes = yield* Queue.unbounded<CodexProtocol.CodexAppServerFrameOutcome>();
+    const transport = yield* CodexProtocol.makeControlledCodexAppServerProtocol({
+      stdio: io.stdio,
+      wrapper: (frame, submit) => Queue.offer(frames, frame).pipe(Effect.andThen(submit())),
+      onOutcome: (outcome) => Queue.offer(outcomes, outcome).pipe(Effect.asVoid),
+    });
+    const payload = { text: "owned" };
+    const request = transport.request("turn/start", payload, "owned-selection");
+    payload.text = "mutated";
+    const fiber = yield* request.pipe(Effect.forkScoped);
+    const written = yield* Queue.take(io.output);
+    assert.strictEqual(written, '{"id":1,"method":"turn/start","params":{"text":"owned"}}\n');
+    const frame = yield* Queue.take(frames);
+    assert.strictEqual(frame.selection, "owned-selection");
+    assert.strictEqual(frame.method, "turn/start");
+    assert.strictEqual(frame.requestId, 1);
+    assert.strictEqual((yield* Queue.take(outcomes)).outcome, "submitted");
+    yield* Queue.offer(io.input, encodeJsonl({ id: 1, result: { accepted: true } }));
+    assert.deepStrictEqual(yield* Fiber.join(fiber), { accepted: true });
+  }),
+);
+
+it.effect("controlled protocol holds an early response until wrapper and hook settle", () =>
+  Effect.gen(function* () {
+    const io = yield* makeInMemoryStdio();
+    const commit = yield* Deferred.make<void>();
+    const hookEntered = yield* Deferred.make<void>();
+    const publish = yield* Deferred.make<void>();
+    const completed = yield* Deferred.make<void>();
+    const responseObserved = yield* Deferred.make<void>();
+    const transport = yield* CodexProtocol.makeControlledCodexAppServerProtocol({
+      stdio: io.stdio,
+      onNotification: (notification) =>
+        notification.method === "fixture/response-routed"
+          ? Deferred.succeed(responseObserved, undefined).pipe(Effect.asVoid)
+          : Effect.void,
+      wrapper: (_frame, submit) =>
+        Effect.gen(function* () {
+          const receipt = yield* submit();
+          yield* Deferred.await(commit);
+          return receipt;
+        }),
+      onOutcome: () =>
+        Deferred.succeed(hookEntered, undefined).pipe(Effect.andThen(Deferred.await(publish))),
+    });
+    const fiber = yield* transport.request("turn/start", {}, "selected").pipe(
+      Effect.tap(() => Deferred.succeed(completed, undefined)),
+      Effect.forkScoped,
+    );
+    yield* Queue.take(io.output);
+    yield* Queue.offer(
+      io.input,
+      encoder.encode(
+        encodeUnknownJsonString({ id: 1, result: { accepted: true } }) +
+          "\n" +
+          encodeUnknownJsonString({ method: "fixture/response-routed" }) +
+          "\n",
+      ),
+    );
+    yield* Deferred.await(responseObserved);
+    assert.isFalse(yield* Deferred.isDone(completed));
+    yield* Deferred.succeed(commit, undefined);
+    yield* Deferred.await(hookEntered);
+    assert.isFalse(yield* Deferred.isDone(completed));
+    yield* Deferred.succeed(publish, undefined);
+    assert.deepStrictEqual(yield* Fiber.join(fiber), { accepted: true });
+  }),
+);
+
+type ControlledPeerOverrides = Partial<
+  CodexProtocol.CodexAppServerControlledProtocolOptions<CodexError.CodexAppServerFrameSubmissionError>
+>;
+const makeControlledPeer = Effect.fn("test.makeControlledPeer")(function* (
+  overrides: ControlledPeerOverrides = {},
+) {
+  const io = yield* makeInMemoryStdio();
+  const frames = yield* Queue.unbounded<CodexProtocol.CodexAppServerControlledFrame>();
+  const outcomes = yield* Queue.unbounded<CodexProtocol.CodexAppServerFrameOutcome>();
+  const { wrapper, onOutcome, ...other } = overrides;
+  const transport = yield* CodexProtocol.makeControlledCodexAppServerProtocol({
+    stdio: io.stdio,
+    ...other,
+    wrapper: (frame, submit) =>
+      Queue.offer(frames, frame).pipe(
+        Effect.andThen(Effect.suspend(() => (wrapper ? wrapper(frame, submit) : submit()))),
+      ),
+    onOutcome: (outcome) =>
+      Queue.offer(outcomes, outcome).pipe(
+        Effect.andThen(Effect.suspend(() => (onOutcome ? onOutcome(outcome) : Effect.void))),
+        Effect.asVoid,
+      ),
+  });
+  return { ...io, transport, frames, outcomes };
+});
+
+it.effect("controlled protocol serializes all output methods on one FIFO", () =>
+  Effect.gen(function* () {
+    const peer = yield* makeControlledPeer();
+    const request = yield* peer.transport
+      .request("first", {}, "request-selection")
+      .pipe(Effect.forkScoped({ startImmediately: true }));
+    const notification = yield* peer.transport
+      .notify("second", {}, "notify-selection")
+      .pipe(Effect.forkScoped({ startImmediately: true }));
+    const response = yield* peer.transport
+      .respond("server-ok", { ok: true }, "response-selection")
+      .pipe(Effect.forkScoped({ startImmediately: true }));
+    const failure = yield* peer.transport
+      .respondError(
+        "server-error",
+        CodexError.CodexAppServerRequestError.internalError(),
+        "error-selection",
+      )
+      .pipe(Effect.forkScoped({ startImmediately: true }));
+    const written = yield* Queue.takeN(peer.output, 4);
+    assert.deepStrictEqual(
+      written.map((text) => JSON.parse(text).method ?? JSON.parse(text).id),
+      ["first", "second", "server-ok", "server-error"],
+    );
+    const frames = yield* Queue.takeN(peer.frames, 4);
+    assert.deepStrictEqual(
+      frames.map((frame) => frame.selection),
+      ["request-selection", "notify-selection", "response-selection", "error-selection"],
+    );
+    assert.isTrue(written.every((text) => !text.includes("selection")));
+    yield* Fiber.join(notification);
+    yield* Fiber.join(response);
+    yield* Fiber.join(failure);
+    yield* Queue.offer(peer.input, encodeJsonl({ id: 1, result: "finished" }));
+    assert.strictEqual(yield* Fiber.join(request), "finished");
+  }),
+);
+
+it.effect.each([false, true])(
+  "controlled protocol publishes early protocol error only after hook with error=%s",
+  (errorReply) =>
+    Effect.gen(function* () {
+      const hook = yield* Deferred.make<void>();
+      const received = yield* Deferred.make<void>();
+      const completed = yield* Deferred.make<void>();
+      const peer = yield* makeControlledPeer({
+        onOutcome: () => Deferred.await(hook),
+        onNotification: () => Deferred.succeed(received, undefined).pipe(Effect.asVoid),
+      });
+      const fiber = yield* Effect.result(peer.transport.request("early", {}, "selected")).pipe(
+        Effect.tap(() => Deferred.succeed(completed, undefined)),
+        Effect.forkScoped,
+      );
+      yield* Queue.take(peer.output);
+      const reply = errorReply
+        ? { id: 1, error: { code: -32001, message: "peer error" } }
+        : { id: 1, result: "reply" };
+      yield* Queue.offer(
+        peer.input,
+        encoder.encode(
+          encodeUnknownJsonString(reply) +
+            "\n" +
+            encodeUnknownJsonString({ method: "fixture/routed" }) +
+            "\n",
+        ),
+      );
+      yield* Deferred.await(received);
+      try {
+        assert.isFalse(yield* Deferred.isDone(completed));
+      } finally {
+        yield* Deferred.succeed(hook, undefined);
+      }
+      const result = yield* Fiber.join(fiber);
+      assert.strictEqual(result._tag, errorReply ? "Failure" : "Success");
+      if (errorReply && result._tag === "Failure")
+        assert.isTrue(isCodexRequestFailure(result.failure));
+      if (!errorReply && result._tag === "Success") assert.strictEqual(result.success, "reply");
+    }),
+);
+
+it.effect(
+  "controlled protocol unknown blocks later output and preserves earlier replies and late input",
+  () =>
+    Effect.gen(function* () {
+      const failSecond = yield* Deferred.make<void>();
+      const late = yield* Deferred.make<void>();
+      let terminated = 0;
+      const peer = yield* makeControlledPeer({
+        wrapper: (frame, submit) =>
+          Effect.gen(function* () {
+            const receipt = yield* submit();
+            if (frame.method === "second") {
+              yield* Deferred.await(failSecond);
+              return yield* new CodexError.CodexAppServerFrameSubmissionError({
+                outcome: "unknown",
+                reason: "wrapper",
+              });
+            }
+            return receipt;
+          }),
+        onNotification: () => Deferred.succeed(late, undefined).pipe(Effect.asVoid),
+        onTermination: () =>
+          Effect.sync(() => {
+            terminated++;
+          }),
+      });
+      const first = yield* peer.transport
+        .request("first")
+        .pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Queue.take(peer.output);
+      yield* Queue.take(peer.outcomes);
+      const second = yield* Effect.result(peer.transport.request("second")).pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      yield* Queue.take(peer.output);
+      const third = yield* Effect.result(peer.transport.notify("third")).pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      yield* Deferred.succeed(failSecond, undefined);
+      const failed = yield* Fiber.join(second);
+      assert.strictEqual(failed._tag, "Failure");
+      if (failed._tag === "Failure") assert.isTrue(isControlledFrameFailure(failed.failure));
+      if (failed._tag === "Failure" && isControlledFrameFailure(failed.failure))
+        assert.strictEqual(failed.failure.outcome, "unknown");
+      const refused = yield* Fiber.join(third);
+      assert.strictEqual(refused._tag, "Failure");
+      if (refused._tag === "Failure") assert.isTrue(isControlledFrameFailure(refused.failure));
+      if (refused._tag === "Failure" && isControlledFrameFailure(refused.failure))
+        assert.strictEqual(refused.failure.outcome, "not_submitted");
+      for (const write of [
+        peer.transport.request("never"),
+        peer.transport.notify("never"),
+        peer.transport.respond("server", {}),
+        peer.transport.respondError(
+          "server",
+          CodexError.CodexAppServerRequestError.internalError(),
+        ),
+      ]) {
+        const result = yield* Effect.result(write);
+        assert.strictEqual(result._tag, "Failure");
+        if (result._tag === "Failure") assert.isTrue(isControlledFrameFailure(result.failure));
+        if (result._tag === "Failure" && isControlledFrameFailure(result.failure))
+          assert.strictEqual(result.failure.reason, "output_blocked");
+      }
+      assert.strictEqual(yield* Queue.size(peer.output), 0);
+      yield* Queue.offer(
+        peer.input,
+        encoder.encode(
+          encodeUnknownJsonString({ id: 1, result: "late-reply" }) +
+            "\n" +
+            encodeUnknownJsonString({ method: "late-notification" }) +
+            "\n",
+        ),
+      );
+      assert.strictEqual(yield* Fiber.join(first), "late-reply");
+      yield* Deferred.await(late);
+      assert.strictEqual(terminated, 0);
+    }),
+);
+
+it.effect("controlled protocol queued cancellation never writes and retains owned cleanup", () =>
+  Effect.gen(function* () {
+    const hold = yield* Deferred.make<void>();
+    const peer = yield* makeControlledPeer({
+      wrapper: (frame, submit) =>
+        frame.method === "held" ? Deferred.await(hold).pipe(Effect.andThen(submit())) : submit(),
+    });
+    const first = yield* peer.transport
+      .notify("held")
+      .pipe(Effect.forkScoped({ startImmediately: true }));
+    yield* Queue.take(peer.frames);
+    const queued = yield* peer.transport
+      .request("cancelled")
+      .pipe(Effect.forkScoped({ startImmediately: true }));
+    yield* Fiber.interrupt(queued);
+    assert.strictEqual(yield* Queue.size(peer.outcomes), 0);
+    assert.strictEqual(yield* Queue.size(peer.output), 0);
+    yield* Deferred.succeed(hold, undefined);
+    yield* Fiber.join(first);
+    const outcomes = yield* Queue.takeN(peer.outcomes, 2);
+    assert.deepStrictEqual(
+      outcomes.map((outcome) => outcome.outcome),
+      ["submitted", "not_submitted"],
+    );
+    assert.strictEqual(yield* Queue.take(peer.output), '{"method":"held"}\n');
+    assert.strictEqual(yield* Queue.size(peer.output), 0);
+    yield* peer.transport.notify("capacity-reused");
+    assert.strictEqual(yield* Queue.take(peer.output), '{"method":"capacity-reused"}\n');
+  }),
+);
+
+it.effect.each([false, true])(
+  "controlled protocol active cancellation preserves uncertainty after attempted=%s",
+  (attempted) =>
+    Effect.gen(function* () {
+      const hold = yield* Deferred.make<void>();
+      const entered = yield* Deferred.make<void>();
+      const peer = yield* makeControlledPeer({
+        wrapper: (_frame, submit) =>
+          Effect.gen(function* () {
+            if (!attempted) {
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(hold);
+            }
+            const receipt = yield* submit();
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(hold);
+            return receipt;
+          }),
+      });
+      const fiber = yield* peer.transport.request("cancel-active").pipe(Effect.forkScoped);
+      yield* Deferred.await(entered);
+      yield* Fiber.interrupt(fiber);
+      const exit = yield* Fiber.await(fiber);
+      assert.isTrue(Exit.isFailure(exit));
+      if (Exit.isFailure(exit)) assert.isTrue(Cause.hasInterrupts(exit.cause));
+      assert.strictEqual(
+        (yield* Queue.take(peer.outcomes)).outcome,
+        attempted ? "unknown" : "not_submitted",
+      );
+      assert.strictEqual(yield* Queue.size(peer.output), attempted ? 1 : 0);
+    }),
+);
+
+it.effect("controlled protocol sequential owner close settles active and queued callers", () =>
+  Effect.gen(function* () {
+    const scope = yield* Effect.acquireRelease(Scope.make("sequential"), (scope) =>
+      Scope.close(scope, Exit.void),
+    );
+    const hold = yield* Deferred.make<void>();
+    let wrapperReleased = false;
+    const peer = yield* makeControlledPeer({
+      wrapper: (_frame, submit) =>
+        Deferred.await(hold).pipe(
+          Effect.andThen(submit()),
+          Effect.ensuring(
+            Effect.sync(() => {
+              wrapperReleased = true;
+            }),
+          ),
+        ),
+      onOutcome: () =>
+        Effect.sync(() => {
+          assert.isTrue(wrapperReleased);
+        }),
+    }).pipe(Scope.provide(scope));
+    const active = yield* peer.transport
+      .request("active")
+      .pipe(Effect.forkIn(scope, { startImmediately: true }));
+    yield* Queue.take(peer.frames);
+    const queued = yield* peer.transport
+      .request("queued")
+      .pipe(Effect.forkIn(scope, { startImmediately: true }));
+    yield* Scope.close(scope, Exit.void);
+    const outcomes = yield* Queue.takeN(peer.outcomes, 2);
+    assert.isTrue(outcomes.every((outcome) => outcome.outcome === "not_submitted"));
+    assert.strictEqual(yield* Queue.size(peer.output), 0);
+    assert.isTrue(Exit.isFailure(yield* Fiber.await(active)));
+    assert.isTrue(Exit.isFailure(yield* Fiber.await(queued)));
+  }),
+);
+
+it.effect.each(["wrapper", "hook"] as const)(
+  "controlled protocol retains canceled reservations until dequeue with %s held",
+  (stage) =>
+    Effect.gen(function* () {
+      const hold = yield* Deferred.make<void>();
+      const hookEntered = yield* Deferred.make<void>();
+      const peer = yield* makeControlledPeer({
+        wrapper: (frame, submit) =>
+          frame.method === "held" && stage === "wrapper"
+            ? Deferred.await(hold).pipe(Effect.andThen(submit()))
+            : submit(),
+        onOutcome: (outcome) =>
+          outcome.frame.method === "held" && stage === "hook"
+            ? Deferred.succeed(hookEntered, undefined).pipe(Effect.andThen(Deferred.await(hold)))
+            : Effect.void,
+      });
+      const active = yield* peer.transport
+        .notify("held")
+        .pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Queue.take(peer.frames);
+      if (stage === "hook") yield* Deferred.await(hookEntered);
+      const queued = [];
+      for (let index = 0; index < 63; index++)
+        queued.push(
+          yield* peer.transport
+            .notify("queued")
+            .pipe(Effect.forkScoped({ startImmediately: true })),
+        );
+      const full = yield* Effect.result(peer.transport.notify("too-many"));
+      assert.strictEqual(full._tag, "Failure");
+      if (full._tag === "Failure") assert.isTrue(isControlledFrameFailure(full.failure));
+      if (full._tag === "Failure" && isControlledFrameFailure(full.failure))
+        assert.strictEqual(full.failure.reason, "queue_limit");
+      yield* Fiber.interruptAll(queued);
+      const stillFull = yield* Effect.result(peer.transport.notify("still-full"));
+      assert.strictEqual(stillFull._tag, "Failure");
+      assert.strictEqual(yield* Queue.size(peer.outcomes), stage === "hook" ? 1 : 0);
+      yield* Deferred.succeed(hold, undefined);
+      yield* Fiber.join(active);
+      const settled = yield* Queue.takeN(peer.outcomes, 64);
+      assert.strictEqual(
+        settled.filter((outcome) => outcome.outcome === "not_submitted").length,
+        63,
+      );
+      yield* peer.transport.notify("reused");
+      assert.deepStrictEqual(yield* Queue.takeN(peer.output, 2), [
+        '{"method":"held"}\n',
+        '{"method":"reused"}\n',
+      ]);
+    }),
+);
+
+it.effect("controlled protocol caps encoded bytes independently of frame count", () =>
+  Effect.gen(function* () {
+    const hold = yield* Deferred.make<void>();
+    const peer = yield* makeControlledPeer({
+      wrapper: (_frame, submit) => Deferred.await(hold).pipe(Effect.andThen(submit())),
+    });
+    const header = '{"method":"large","params":""}\n';
+    const payload = "x".repeat(1048576 - Buffer.byteLength(header));
+    const calls = [];
+    for (let index = 0; index < 16; index++)
+      calls.push(
+        yield* peer.transport
+          .notify("large", payload)
+          .pipe(Effect.forkScoped({ startImmediately: true })),
+      );
+    const rejected = yield* Effect.result(peer.transport.notify("large", payload));
+    assert.strictEqual(rejected._tag, "Failure");
+    if (rejected._tag === "Failure") assert.isTrue(isControlledFrameFailure(rejected.failure));
+    if (rejected._tag === "Failure" && isControlledFrameFailure(rejected.failure))
+      assert.strictEqual(rejected.failure.reason, "queue_limit");
+    yield* Deferred.succeed(hold, undefined);
+    yield* Fiber.joinAll(calls);
+    assert.strictEqual((yield* Queue.takeN(peer.output, 16)).length, 16);
+  }),
+);
+
+it.effect.each(["wrapper", "hook"] as const)(
+  "controlled protocol refuses same-owner reentrancy from %s",
+  (location) =>
+    Effect.gen(function* () {
+      let transport: CodexProtocol.CodexAppServerControlledProtocol | undefined;
+      const rejected = yield* Queue.unbounded<string>();
+      const recurse = Effect.fn("test.reenterControlledProtocol")(function* () {
+        if (!transport) return yield* Effect.die("transport not initialized");
+        const result = yield* Effect.result(transport.notify("recursive"));
+        assert.strictEqual(result._tag, "Failure");
+        if (result._tag === "Failure") assert.isTrue(isControlledFrameFailure(result.failure));
+        if (result._tag === "Failure" && isControlledFrameFailure(result.failure))
+          yield* Queue.offer(rejected, result.failure.reason);
+      });
+      const peer = yield* makeControlledPeer({
+        wrapper: (_frame, submit) =>
+          location === "wrapper" ? recurse().pipe(Effect.andThen(submit())) : submit(),
+        onOutcome: () => (location === "hook" ? recurse() : Effect.void),
+      });
+      transport = peer.transport;
+      yield* transport.notify("only-frame");
+      assert.strictEqual(yield* Queue.take(rejected), "reentrant");
+      assert.deepStrictEqual(yield* Queue.take(peer.output), '{"method":"only-frame"}\n');
+      assert.strictEqual(yield* Queue.size(peer.output), 0);
+    }),
+);
+
+it.effect(
+  "controlled protocol classifier defect still joins active execution and hook before close",
+  () =>
+    Effect.gen(function* () {
+      const scope = yield* Effect.acquireRelease(Scope.make("sequential"), (scope) =>
+        Scope.close(scope, Exit.void),
+      );
+      const wrapperEntered = yield* Deferred.make<void>();
+      const releaseWrapper = yield* Deferred.make<void>();
+      const hookEntered = yield* Deferred.make<void>();
+      const releaseHook = yield* Deferred.make<void>();
+      const closed = yield* Deferred.make<void>();
+      const terminations = yield* Queue.unbounded<CodexError.CodexAppServerError>();
+      const sentinel = new Error("fixture classifier failed");
+      const peer = yield* makeControlledPeer({
+        terminationError: Effect.die(sentinel),
+        wrapper: (_frame, submit) =>
+          Effect.gen(function* () {
+            const receipt = yield* submit();
+            yield* Deferred.succeed(wrapperEntered, undefined);
+            yield* Deferred.await(releaseWrapper);
+            return receipt;
+          }),
+        onOutcome: () =>
+          Deferred.succeed(hookEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseHook)),
+          ),
+        onTermination: (error) => Queue.offer(terminations, error).pipe(Effect.asVoid),
+      }).pipe(Scope.provide(scope));
+      const request = yield* peer.transport.request("held").pipe(Effect.forkScoped);
+      yield* Deferred.await(wrapperEntered);
+      yield* Queue.end(peer.input);
+      const closing = yield* Effect.exit(Scope.close(scope, Exit.void)).pipe(
+        Effect.tap(() => Deferred.succeed(closed, undefined)),
+        Effect.forkScoped,
+      );
+      const first = yield* Effect.raceFirst(
+        Deferred.await(hookEntered).pipe(Effect.as("hook")),
+        Deferred.await(closed).pipe(Effect.as("closed")),
+      );
+      try {
+        assert.strictEqual(first, "hook");
+        assert.isFalse(yield* Deferred.isDone(closed));
+      } finally {
+        yield* Deferred.succeed(releaseWrapper, undefined);
+        yield* Deferred.succeed(releaseHook, undefined);
+        yield* Fiber.interrupt(request);
+      }
+      assert.isTrue(Exit.isSuccess(yield* Fiber.join(closing)));
+      const error = yield* Queue.take(terminations);
+      assert.isTrue(isCodexTransportFailure(error));
+      if (isCodexTransportFailure(error)) {
+        assert.strictEqual(error.operation, "read-process-exit-status");
+        assert.isTrue(Cause.isCause(error.cause));
+        if (Cause.isCause(error.cause)) {
+          const defect = Cause.findDefect(error.cause);
+          assert.strictEqual(defect._tag, "Success");
+          if (defect._tag === "Success") assert.strictEqual(defect.success, sentinel);
+        }
+      }
+    }),
+);
+
+it.effect.each(["commit", "hook"] as const)(
+  "controlled protocol local %s failure wins over an early successful reply",
+  (stage) =>
+    Effect.gen(function* () {
+      const scope = yield* Effect.acquireRelease(Scope.make("sequential"), (scope) =>
+        Scope.close(scope, Exit.void),
+      );
+      const release = yield* Deferred.make<void>();
+      const received = yield* Deferred.make<void>();
+      const peer = yield* makeControlledPeer({
+        wrapper: (_frame, submit) =>
+          Effect.gen(function* () {
+            const receipt = yield* submit();
+            yield* Deferred.await(release);
+            if (stage === "commit")
+              return yield* new CodexError.CodexAppServerFrameSubmissionError({
+                outcome: "unknown",
+                reason: "wrapper",
+              });
+            return receipt;
+          }),
+        onOutcome: () => (stage === "hook" ? Effect.die("fixture hook failure") : Effect.void),
+        onNotification: () => Deferred.succeed(received, undefined).pipe(Effect.asVoid),
+      }).pipe(Scope.provide(scope));
+      const request = yield* Effect.result(peer.transport.request("early")).pipe(Effect.forkScoped);
+      yield* Queue.take(peer.output);
+      yield* Queue.offer(
+        peer.input,
+        encoder.encode(
+          encodeUnknownJsonString({ id: 1, result: "must-not-publish" }) +
+            "\n" +
+            encodeUnknownJsonString({ method: "routed" }) +
+            "\n",
+        ),
+      );
+      yield* Deferred.await(received);
+      yield* Deferred.succeed(release, undefined);
+      const result = yield* Fiber.join(request);
+      assert.strictEqual(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.isTrue(isControlledFrameFailure(result.failure));
+        if (isControlledFrameFailure(result.failure)) {
+          assert.strictEqual(result.failure.outcome, stage === "commit" ? "unknown" : "submitted");
+          assert.strictEqual(
+            result.failure.reason,
+            stage === "commit" ? "wrapper" : "outcome_hook",
+          );
+        }
+      }
+      const closed = yield* Effect.exit(Scope.close(scope, Exit.void));
+      assert.strictEqual(closed._tag, stage === "hook" ? "Failure" : "Success");
+    }),
+);
+
+it.effect("controlled protocol preserves first reply across duplicate input and hook barrier", () =>
+  Effect.gen(function* () {
+    const release = yield* Deferred.make<void>();
+    const received = yield* Deferred.make<void>();
+    const peer = yield* makeControlledPeer({
+      onOutcome: () => Deferred.await(release),
+      onNotification: () => Deferred.succeed(received, undefined).pipe(Effect.asVoid),
+    });
+    const request = yield* peer.transport.request("duplicate").pipe(Effect.forkScoped);
+    yield* Queue.take(peer.output);
+    yield* Queue.offer(
+      peer.input,
+      encoder.encode(
+        encodeUnknownJsonString({ id: 1, result: "first" }) +
+          "\n" +
+          encodeUnknownJsonString({ id: 1, error: { code: -32603, message: "duplicate error" } }) +
+          "\n" +
+          encodeUnknownJsonString({ method: "routed" }) +
+          "\n",
+      ),
+    );
+    yield* Deferred.await(received);
+    yield* Deferred.succeed(release, undefined);
+    assert.strictEqual(yield* Fiber.join(request), "first");
+    yield* Queue.offer(peer.input, encodeJsonl({ id: 1, result: "third" }));
+  }),
+);
+
+it.effect("controlled protocol expected prewrite denial permits the next frame", () =>
+  Effect.gen(function* () {
+    const peer = yield* makeControlledPeer({
+      wrapper: (frame, submit) =>
+        frame.method === "deny"
+          ? Effect.fail(
+              new CodexError.CodexAppServerFrameSubmissionError({
+                outcome: "not_submitted",
+                reason: "wrapper",
+              }),
+            )
+          : submit(),
+    });
+    const denied = yield* Effect.result(peer.transport.notify("deny"));
+    assert.strictEqual(denied._tag, "Failure");
+    assert.strictEqual((yield* Queue.take(peer.outcomes)).outcome, "not_submitted");
+    yield* peer.transport.notify("allowed");
+    assert.strictEqual((yield* Queue.take(peer.outcomes)).outcome, "submitted");
+    assert.deepStrictEqual(yield* Queue.take(peer.output), '{"method":"allowed"}\n');
+    assert.strictEqual(yield* Queue.size(peer.output), 0);
+  }),
+);
+
+it.effect("controlled protocol response-wait cancellation does not rewrite submitted outcome", () =>
+  Effect.gen(function* () {
+    const received = yield* Deferred.make<void>();
+    const peer = yield* makeControlledPeer({
+      onNotification: () => Deferred.succeed(received, undefined).pipe(Effect.asVoid),
+    });
+    const request = yield* peer.transport.request("sent").pipe(Effect.forkScoped);
+    yield* Queue.take(peer.output);
+    const outcome = yield* Queue.take(peer.outcomes);
+    assert.strictEqual(outcome.outcome, "submitted");
+    yield* Fiber.interrupt(request);
+    yield* Queue.offer(
+      peer.input,
+      encoder.encode(
+        encodeUnknownJsonString({ id: 1, result: "late" }) +
+          "\n" +
+          encodeUnknownJsonString({ method: "after-late" }) +
+          "\n",
+      ),
+    );
+    yield* Deferred.await(received);
+    assert.strictEqual(yield* Queue.size(peer.outcomes), 0);
+    yield* peer.transport.notify("still-usable");
+    assert.strictEqual(yield* Queue.take(peer.output), '{"method":"still-usable"}\n');
+  }),
+);
+
+it.effect("controlled protocol actual non-ending Writable enforces serial drain", () =>
+  Effect.gen(function* () {
+    const io = yield* makeControlledFrameWritable(true);
+    const outcomes = yield* Queue.unbounded<CodexProtocol.CodexAppServerFrameOutcome>();
+    const transport = yield* CodexProtocol.makeControlledCodexAppServerProtocol({
+      stdio: io.stdio,
+      wrapper: (_frame, submit) => submit(),
+      onOutcome: (outcome) => Queue.offer(outcomes, outcome).pipe(Effect.asVoid),
+    });
+    const first = yield* transport
+      .notify("first")
+      .pipe(Effect.forkScoped({ startImmediately: true }));
+    assert.strictEqual(yield* Queue.take(io.writes), '{"method":"first"}\n');
+    const second = yield* transport
+      .notify("second")
+      .pipe(Effect.forkScoped({ startImmediately: true }));
+    assert.strictEqual(yield* Queue.size(io.writes), 0);
+    assert.strictEqual(yield* Queue.size(outcomes), 0);
+    const releaseFirst = yield* Queue.take(io.callbacks);
+    yield* Effect.sync(releaseFirst);
+    yield* Fiber.join(first);
+    assert.strictEqual(yield* Queue.take(io.writes), '{"method":"second"}\n');
+    const releaseSecond = yield* Queue.take(io.callbacks);
+    yield* Effect.sync(releaseSecond);
+    yield* Fiber.join(second);
+    assert.strictEqual((yield* Queue.takeN(outcomes, 2)).length, 2);
+    assert.isFalse(io.writable.writableEnded);
+    assert.isFalse(io.writable.destroyed);
+  }),
+);
+
+it.effect.each(["eof", "malformed"] as const)(
+  "controlled protocol %s termination joins queued work without self-join",
+  (kind) =>
+    Effect.gen(function* () {
+      const hold = yield* Deferred.make<void>();
+      const stopped = yield* Deferred.make<CodexError.CodexAppServerError>();
+      const peer = yield* makeControlledPeer({
+        wrapper: (_frame, submit) => Deferred.await(hold).pipe(Effect.andThen(submit())),
+        onTermination: (error) => Deferred.succeed(stopped, error).pipe(Effect.asVoid),
+      });
+      const active = yield* Effect.result(peer.transport.request("active")).pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      yield* Queue.take(peer.frames);
+      const queued = yield* Effect.result(peer.transport.notify("queued")).pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      if (kind === "eof") yield* Queue.end(peer.input);
+      else yield* Queue.offer(peer.input, encoder.encode("{bad}\n"));
+      const error = yield* Deferred.await(stopped);
+      assert.strictEqual(
+        error._tag,
+        kind === "eof" ? "CodexAppServerInputStreamEndedError" : "CodexAppServerProtocolParseError",
+      );
+      assert.strictEqual((yield* Fiber.join(active))._tag, "Failure");
+      assert.strictEqual((yield* Fiber.join(queued))._tag, "Failure");
+      assert.isTrue(
+        (yield* Queue.takeN(peer.outcomes, 2)).every(
+          (outcome) => outcome.outcome === "not_submitted",
+        ),
+      );
+      assert.strictEqual(yield* Queue.size(peer.output), 0);
+    }),
+);
+
+it.effect.each(["selection", "oversize"] as const)(
+  "controlled protocol rejects %s before admission without a hook",
+  (kind) =>
+    Effect.gen(function* () {
+      const peer = yield* makeControlledPeer();
+      const result = yield* Effect.result(
+        peer.transport.notify(
+          "invalid",
+          kind === "oversize" ? "x".repeat(1048576) : {},
+          kind === "selection" ? " " : undefined,
+        ),
+      );
+      assert.strictEqual(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.isTrue(isControlledFrameFailure(result.failure));
+        if (isControlledFrameFailure(result.failure))
+          assert.strictEqual(
+            result.failure.reason,
+            kind === "oversize" ? "frame_limit" : "invalid_frame",
+          );
+      }
+      assert.strictEqual(yield* Queue.size(peer.frames), 0);
+      assert.strictEqual(yield* Queue.size(peer.outcomes), 0);
+      assert.strictEqual(yield* Queue.size(peer.output), 0);
     }),
 );

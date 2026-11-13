@@ -374,6 +374,9 @@ export class CodexAppServerFrameSubmissionError extends Schema.TaggedError<Codex
     outcome: Schema.Literals(["not_submitted", "unknown", "submitted"]),
     reason: Schema.Literals([
       "invalid_frame",
+      "queue_limit",
+      "output_blocked",
+      "reentrant",
       "frame_limit",
       "invalid_timeout",
       "continuation",
