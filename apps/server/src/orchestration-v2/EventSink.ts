@@ -793,7 +793,8 @@ const makeSink = Effect.fn("orchestrationV2.EventSink.make")(function* (
           if (
             input.events.length === 0 ||
             input.events.some((event) => event.threadId !== input.threadId) ||
-            new Set(input.effects.map((effect) => effect.id)).size !== input.effects.length
+            new Set(input.effects.map((effect) => effect.id)).size !== input.effects.length ||
+            (nativeAuthority !== undefined && input.effects.length > 0)
           )
             return yield* new NativeProof.NativeCommandProofError({ reason: "invalid" });
           for (const effect of input.effects) {

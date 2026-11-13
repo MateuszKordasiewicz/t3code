@@ -2481,6 +2481,7 @@ const controlledNativeFixture = Effect.fn("test.controlledNativeFixture")(functi
   reuse = false,
   claim = true,
   materialVersion: 1 | 2 = 2,
+  generateTitle = false,
 ) {
   assert.isFunction(EventSink.makeCapturedAuthorizedNativeEventInfrastructure);
   yield* TestClock.setTime(DateTime.makeUnsafe(facts.now).epochMilliseconds);
@@ -2530,7 +2531,11 @@ const controlledNativeFixture = Effect.fn("test.controlledNativeFixture")(functi
           ...basicInput(),
           materialVersion: 2 as const,
           authority: reference,
-          launch: { ...basicInput().launch, reuseExistingThread: reuse },
+          launch: {
+            ...basicInput().launch,
+            reuseExistingThread: reuse,
+            ...(generateTitle ? { generateTitle: true } : {}),
+          },
         }
       : (() => {
           const value = planningReservation(admissionInput(binding, "controlled"));
@@ -2538,7 +2543,11 @@ const controlledNativeFixture = Effect.fn("test.controlledNativeFixture")(functi
             ...value,
             materialVersion: 2 as const,
             authority: reference,
-            launch: { ...value.launch, reuseExistingThread: reuse },
+            launch: {
+              ...value.launch,
+              reuseExistingThread: reuse,
+              ...(generateTitle ? { generateTitle: true } : {}),
+            },
           };
         })();
   const input =
@@ -2859,20 +2868,28 @@ it.effect(
         ),
         { kind: "current" },
       );
-      const plan = {
-        ...(yield* nativeDecision(fixture.derived, "claim")),
+      const plan = yield* nativeDecision(fixture.derived, "claim");
+      const publication = yield* observeAuthorizedSink(sink);
+      const wake = yield* outbox.awaitAvailable.pipe(Effect.forkScoped({ startImmediately: true }));
+      const before = yield* nativeCounts;
+      const unselectedCleanup = {
+        ...plan,
         effects: [
           {
-            id: "authorized-pending-effect",
-            commandId: fixture.derived.claimCommand.commandId,
+            id: "native-unselected-cleanup",
+            commandId: plan.command.commandId,
             threadId: fixture.derived.claimCommand.threadId,
             request: { type: "terminal.cleanup" as const },
           },
         ],
       };
-      const publication = yield* observeAuthorizedSink(sink);
-      const wake = yield* outbox.awaitAvailable.pipe(Effect.forkScoped({ startImmediately: true }));
-      const before = yield* nativeCounts;
+      assert.instanceOf(
+        yield* Effect.flip(sink.commitNativeCommand!(unselectedCleanup)),
+        EventSink.EventSinkWriteError,
+      );
+      assert.deepStrictEqual(yield* nativeCounts, before);
+      assert.isUndefined(publication.pollUnsafe());
+      assert.isUndefined(wake.pollUnsafe());
       yield* fixture.sql`CREATE TRIGGER reject_authorized_proof BEFORE INSERT ON workflow_native_command_proofs BEGIN SELECT RAISE(ABORT,'injected authorized proof failure'); END`;
       assert.instanceOf(
         yield* Effect.flip(sink.commitNativeCommand!(plan)),
@@ -2888,7 +2905,29 @@ it.effect(
         (yield* Fiber.join(publication))[0]?.sequence,
         committed.receipt.resultSequence,
       );
+      assert.isUndefined(wake.pollUnsafe());
+      const ordinaryCommandId = CommandId.make("authorized-ordinary-cleanup");
+      const cleanup = yield* sink.commitCommand({
+        commandId: ordinaryCommandId,
+        threadId: fixture.derived.claimCommand.threadId,
+        commandType: "thread.metadata.update",
+        acceptedAt: yield* DateTime.now,
+        events: [],
+        effects: [
+          {
+            id: "authorized-pending-effect",
+            commandId: ordinaryCommandId,
+            threadId: fixture.derived.claimCommand.threadId,
+            request: { type: "terminal.cleanup" },
+          },
+        ],
+      });
+      assert.isTrue(cleanup.committed);
       yield* Fiber.join(wake);
+      assert.strictEqual(
+        Option.getOrThrow(yield* outbox.get("authorized-pending-effect")).request.type,
+        "terminal.cleanup",
+      );
       const proof = (yield* fixture.sql<{
         proof_json: string;
       }>`SELECT proof_json FROM workflow_native_command_proofs`)[0]!;
@@ -3340,6 +3379,54 @@ it.effect(
         assert.strictEqual(error.reason, "invalid");
       }
       assert.strictEqual(getters, 0);
+      assert.deepStrictEqual(yield* producerDatabaseSnapshot(fixture.sql), before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect(
+  "authoritative native metadata refuses title-model work at the atomic commit boundary",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture("workflow", false, true, 2, true);
+      yield* fixture.orchestrator.dispatch(fixture.derived.claimCommand, {
+        intentId: fixture.input.intentId,
+        phase: "claim",
+      });
+      const before = yield* producerDatabaseSnapshot(fixture.sql);
+      const sink = Context.get(fixture.runtime, EventSink.EventSinkV2);
+      const sequence = (yield* fixture.sql<{
+        sequence: number;
+      }>`SELECT MAX(sequence) AS sequence FROM orchestration_events`)[0]!.sequence;
+      const publication = yield* observeAuthorizedSink(sink, sequence);
+      const result = yield* Effect.result(
+        fixture.orchestrator.dispatch(fixture.derived.messageCommand, {
+          intentId: fixture.input.intentId,
+          phase: "message",
+        }),
+      );
+      assert.deepStrictEqual(yield* fixture.sql`SELECT * FROM orchestration_v2_effect_outbox`, []);
+      assert.strictEqual(result._tag, "Failure");
+      assert.deepStrictEqual(yield* producerDatabaseSnapshot(fixture.sql), before);
+      assert.isUndefined(publication.pollUnsafe());
+    }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "native launch producer refuses requested %s title generation before claiming",
+  (kind) =>
+    Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture(kind, false, false, 2, true);
+      const producer = yield* nativeLaunchProducer(fixture);
+      const before = yield* producerDatabaseSnapshot(fixture.sql);
+      const subscription = yield* fixture.store.subscribeChanges;
+      const result = yield* Effect.result(producer.claimReservedIntent(producerSelection(fixture)));
+      assert.deepStrictEqual(yield* fixture.sql`SELECT * FROM orchestration_v2_effect_outbox`, []);
+      assert.strictEqual(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        assert.strictEqual(result.failure.stage, "intent");
+        assert.strictEqual(result.failure.reason, "unavailable");
+      }
       assert.deepStrictEqual(yield* producerDatabaseSnapshot(fixture.sql), before);
       assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
     }).pipe(Effect.provide(testLayer())),

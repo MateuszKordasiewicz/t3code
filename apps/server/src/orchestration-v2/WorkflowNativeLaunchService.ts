@@ -98,6 +98,8 @@ const makeOwned = Effect.fn("WorkflowNativeLaunchService.make")(function* (
       });
     if (selected.held || selected.material.version !== 2)
       return yield* new WorkflowNativeLaunchError({ stage: "intent", reason: "denied" });
+    if (derived.messageCommand.titleSeed !== undefined)
+      return yield* new WorkflowNativeLaunchError({ stage: "intent", reason: "unavailable" });
     const history = yield* atStage(
       "boundary",
       replay({ command: derived.claimCommand, hint: { intentId: input.intentId, phase: "claim" } }),
