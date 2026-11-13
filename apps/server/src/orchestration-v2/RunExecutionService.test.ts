@@ -27,6 +27,8 @@ import {
   ServerSettingsError,
   ThreadId,
   TurnItemId,
+  WorkflowOperationV1,
+  WorkflowRunV1,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -40,13 +42,22 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { CodexAppServerRequestError } from "effect-codex-app-server/errors";
 import { SqlError, classifySqliteError } from "effect/sql/SqlError";
 
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import { WorkflowCanonicalHash } from "../workflowRuns/WorkflowCanonicalHash.ts";
+import * as CommandReceiptStore from "./CommandReceiptStore.ts";
+import * as EffectOutbox from "./EffectOutbox.ts";
+import * as EventStore from "./EventStore.ts";
+import * as ProjectStore from "./ProjectStore.ts";
 import { toPersistenceSqlError } from "../persistence/Errors.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as WorkflowRunStore from "../workflowRuns/WorkflowRunStore.ts";
 import * as CheckpointService from "./CheckpointService.ts";
 import type { PendingOrchestrationEffectV2 } from "./EffectOutbox.ts";
 import * as EventSink from "./EventSink.ts";
@@ -64,6 +75,7 @@ import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 
 const mockEventSink = (implementation: Partial<EventSink.EventSinkV2["Service"]>) =>
   Layer.mock(EventSink.EventSinkV2)({
+    withProviderBatch: (effect) => effect,
     consumeProviderEvents: (source, process, after) =>
       source.pipe(
         Stream.mapEffect((event) => process(event).pipe(Effect.andThen(after))),
@@ -84,6 +96,68 @@ const layerTurnItemPositionsTest = Layer.mock(TurnItemPositionStore.TurnItemPosi
   allocate: () => Effect.succeed(1),
 });
 
+const layerOrdinaryCustody = Layer.mock(WorkflowRunStore.WorkflowRunStore)({
+  readRecoveryCustodyInTransaction: (input) =>
+    [input.threadId, ...(input.providerThreadIds ?? []), ...input.providerSessionIds].every(
+      (id) => typeof id === "string" && id.length > 0,
+    )
+      ? Effect.succeed({ kind: "ordinary" })
+      : Effect.die(new Error("Invalid custody fixture identities")),
+});
+
+const ordinaryExecutionInput = (
+  input: RunExecutionService.RunExecutionServiceV2StartRootRunInput,
+): RunExecutionService.RunExecutionServiceV2StartRootRunInput => ({
+  ...input,
+  session: {
+    ...input.session,
+    providerSessionId: input.session.providerSessionId ?? input.providerSessionId,
+  },
+  run: {
+    ...input.run,
+    providerThreadId:
+      input.run.providerThreadId === undefined
+        ? input.providerThread.id
+        : input.run.providerThreadId,
+  },
+  rootNode: {
+    ...input.rootNode,
+    threadId: input.rootNode.threadId ?? input.appThread.id,
+    providerThreadId:
+      input.rootNode.providerThreadId === undefined
+        ? input.providerThread.id
+        : input.rootNode.providerThreadId,
+  },
+  checkpointScope: {
+    ...input.checkpointScope,
+    threadId: input.checkpointScope.threadId ?? input.appThread.id,
+    providerThreadId:
+      input.checkpointScope.providerThreadId === undefined
+        ? input.providerThread.id
+        : input.checkpointScope.providerThreadId,
+  },
+  providerThread: {
+    ...input.providerThread,
+    appThreadId:
+      input.providerThread.appThreadId === undefined
+        ? input.appThread.id
+        : input.providerThread.appThreadId,
+    providerSessionId:
+      input.providerThread.providerSessionId === undefined
+        ? input.providerSessionId
+        : input.providerThread.providerSessionId,
+  },
+  attempt: {
+    ...input.attempt,
+    providerThreadId: input.attempt.providerThreadId ?? input.providerThread.id,
+  },
+});
+
+const ordinaryExecutionService = (service: RunExecutionService.RunExecutionServiceV2Shape) => ({
+  startRootRun: (input: RunExecutionService.RunExecutionServiceV2StartRootRunInput) =>
+    service.startRootRun(ordinaryExecutionInput(input)),
+});
+
 const layerRunExecutionTest = RunExecutionService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
@@ -92,6 +166,7 @@ const layerRunExecutionTest = RunExecutionService.layer.pipe(
       Layer.mock(CheckpointService.CheckpointServiceV2)({ captureBaseline: () => Effect.void }),
       layerTurnItemPositionsTest,
       mockEventSink({}),
+      layerOrdinaryCustody,
       IdAllocator.layer,
       Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
         ingestNormalized: () => Effect.succeed([]),
@@ -771,9 +846,398 @@ it("does not carry interrupted or still-running child ownership into later attem
   assert.isFalse(RunExecutionService.routeProviderEvent(lateChildNode, identity, state)[0]);
 });
 
+const decodeStartCustodyRun = Schema.decodeEffect(WorkflowRunV1);
+const decodeStartCustodyOperation = Schema.decodeEffect(WorkflowOperationV1);
+const seedStartCustody = (threadId: string, malformed: boolean) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const hash = "a".repeat(64);
+    const run = yield* decodeStartCustodyRun({
+      schemaVersion: 1,
+      id: "custody-run",
+      spec: {
+        ref: { kind: "configuration", id: "spec", sha256: hash },
+        plan: {
+          planId: "custody-plan",
+          revisionId: "revision",
+          revisionSchemaVersion: 1,
+          revisionHash: hash,
+          sourcePacketHash: hash,
+        },
+      },
+      mode: "ordinary",
+      origin: { kind: "human", id: "human" },
+      status: "active",
+      controlGeneration: 0,
+      recordVersion: 0,
+      allowance: {
+        maxAttempts: 2,
+        maxRepairRounds: 1,
+        maxActiveWriters: 1,
+        attemptsConsumed: 0,
+        repairRoundsConsumed: 0,
+        deadline: "2026-12-01T00:00:00Z",
+      },
+      amendmentSequence: 0,
+      createdAt: "2026-11-01T00:00:00Z",
+      access: { origins: [] },
+    });
+    const base = yield* decodeStartCustodyOperation({
+      schemaVersion: 1,
+      id: "custody-operation",
+      owner: { kind: "workflow_run", workflowRunId: run.id },
+      kind: "stage_launch",
+      parameters: {
+        kind: "stage_launch",
+        stage: "implementation",
+        context: {
+          specHash: hash,
+          policyHash: hash,
+          itemId: "item",
+          attemptId: "attempt",
+          candidateHash: hash,
+          configurationHash: hash,
+        },
+        provider: { providerInstanceId: "provider", model: "model" },
+        nativeThreadId: threadId,
+        nativeRunId: "native-run",
+      },
+      fingerprint: hash,
+      origin: run.origin,
+      destination: { environmentId: "environment", projectId: "project-native-account-command" },
+      controlGeneration: 0,
+      status: "pending",
+      access: { origins: [] },
+    });
+    const operation = { ...base, fingerprint: WorkflowCanonicalHash.operation(base) };
+    yield* sql`INSERT INTO workflow_plan_identities VALUES ('custody-plan')`;
+    yield* sql`INSERT INTO workflow_revision_identities VALUES ('custody-plan', 'revision', ${hash}, ${hash})`;
+    yield* sql`INSERT INTO workflow_runs VALUES ('custody-run', 'custody-plan', 'revision', ${hash}, ${hash}, ${hash}, 'active', 0, 0, ${JSON.stringify(run)})`;
+    const record = malformed
+      ? JSON.stringify({ parameters: { nativeThreadId: threadId } })
+      : JSON.stringify(operation);
+    yield* sql`INSERT INTO workflow_operations (id, workflow_run_id, kind, fingerprint, status, generation, record_json) VALUES ('custody-operation', 'custody-run', 'stage_launch', ${operation.fingerprint}, 'pending', 0, ${record})`;
+  });
+
+const custodyDatabase = SqlitePersistence.layerMemory;
+const custodyStore = WorkflowRunStore.layer.pipe(Layer.provide(custodyDatabase));
+const custodySink = EventSink.layerFromStores.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      custodyDatabase,
+      Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({}),
+      Layer.mock(EffectOutbox.EffectOutboxV2)({}),
+      Layer.mock(EventStore.EventStoreV2)({}),
+      Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
+      Layer.mock(ProjectStore.ProjectStoreV2)({}),
+      Layer.mock(TurnItemPositionStore.TurnItemPositionStoreV2)({}),
+    ),
+  ),
+);
+const custodyIntegration = Layer.mergeAll(custodyDatabase, custodyStore, custodySink);
+
+it.effect.each([
+  "owned",
+  "shared",
+  "related-provider",
+  "malformed",
+  "owned-and-invalid",
+  "read-error",
+] as const)("denies direct execution for %s custody in the actual provider batch", (evidence) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* WorkflowRunStore.WorkflowRunStore;
+    const sink = yield* EventSink.EventSinkV2;
+    const threadId = ThreadId.make("thread:direct-sql");
+    const peer = ThreadId.make("thread:direct-owned-peer");
+    const providerThreadId = ProviderThreadId.make("provider-thread:direct-sql");
+    const relatedProviderThreadId = ProviderThreadId.make("provider-thread:related-owned");
+    const providerSessionId = ProviderSessionId.make("session:direct-sql");
+    const providerInstanceId = ProviderInstanceId.make("codex");
+    const attemptId = RunAttemptId.make("attempt:direct-sql");
+    const runId = RunId.make("run:direct-sql");
+    const providerThread = (id: ProviderThreadId, appThreadId: ThreadId) => ({
+      id,
+      driver,
+      providerInstanceId,
+      providerSessionId,
+      appThreadId,
+      ownerNodeId: null,
+      nativeThreadRef: null,
+      nativeConversationHeadRef: null,
+      status: "not_loaded",
+      firstRunOrdinal: 1,
+      lastRunOrdinal: 1,
+      handoffIds: [],
+      forkedFrom: null,
+      pendingBackgroundTasks: [],
+      createdAt: "2026-11-01T00:00:00Z",
+      updatedAt: "2026-11-01T00:00:00Z",
+    });
+    const primary = providerThread(providerThreadId, threadId);
+    yield* sql`INSERT INTO orchestration_v2_projection_provider_threads (provider_thread_id, thread_id, owner_node_id, provider, driver, provider_instance_id, provider_session_id, status, updated_at, payload_json) VALUES (${providerThreadId}, ${threadId}, NULL, 'codex', 'codex', ${providerInstanceId}, ${providerSessionId}, 'not_loaded', '2026-11-01T00:00:00Z', ${JSON.stringify(primary)})`;
+    if (evidence === "related-provider") {
+      const related = {
+        ...providerThread(relatedProviderThreadId, peer),
+        providerSessionId: ProviderSessionId.make("session:related-owned"),
+      };
+      yield* sql`INSERT INTO orchestration_v2_projection_provider_threads (provider_thread_id, thread_id, owner_node_id, provider, driver, provider_instance_id, provider_session_id, status, updated_at, payload_json) VALUES (${relatedProviderThreadId}, ${peer}, NULL, 'codex', 'codex', ${providerInstanceId}, ${related.providerSessionId}, 'not_loaded', '2026-11-01T00:00:00Z', ${JSON.stringify(related)})`;
+    }
+    if (evidence === "shared") {
+      yield* sql`INSERT INTO orchestration_v2_projection_provider_sessions (provider_session_id, thread_id, provider, status, updated_at, payload_json) VALUES (${providerSessionId}, NULL, 'codex', 'running', '2026-11-01T00:00:00Z', '{}')`;
+      yield* sql`INSERT INTO orchestration_v2_projection_provider_session_bindings VALUES (${providerSessionId}, ${threadId})`;
+      yield* sql`INSERT INTO orchestration_v2_projection_provider_session_bindings VALUES (${providerSessionId}, ${peer})`;
+    }
+    if (evidence !== "read-error")
+      yield* seedStartCustody(
+        evidence === "shared" || evidence === "related-provider" ? peer : threadId,
+        evidence === "malformed",
+      );
+    if (evidence === "read-error") yield* sql`DROP TABLE workflow_native_launch_intents`;
+    const snapshot = Effect.gen(function* () {
+      return {
+        intents:
+          evidence === "read-error" ? [] : yield* sql`SELECT * FROM workflow_native_launch_intents`,
+        operations: yield* sql`SELECT * FROM workflow_operations`,
+        workflows: yield* sql`SELECT * FROM workflow_runs`,
+        workflowAttempts: yield* sql`SELECT * FROM workflow_attempts`,
+        workflowReceipts: yield* sql`SELECT * FROM workflow_command_receipts`,
+        intentReceipts: yield* sql`SELECT * FROM workflow_native_intent_receipts`,
+        nativeRuns: yield* sql`SELECT * FROM orchestration_v2_projection_runs`,
+        nativeAttempts: yield* sql`SELECT * FROM orchestration_v2_projection_run_attempts`,
+        nodes: yield* sql`SELECT * FROM orchestration_v2_projection_nodes`,
+        providerTurns: yield* sql`SELECT * FROM orchestration_v2_projection_provider_turns`,
+        checkpointScopes: yield* sql`SELECT * FROM orchestration_v2_projection_checkpoint_scopes`,
+        checkpoints: yield* sql`SELECT * FROM orchestration_v2_projection_checkpoints`,
+        providerThreads: yield* sql`SELECT * FROM orchestration_v2_projection_provider_threads`,
+        sessions: yield* sql`SELECT * FROM orchestration_v2_projection_provider_sessions`,
+        bindings: yield* sql`SELECT * FROM orchestration_v2_projection_provider_session_bindings`,
+        events: yield* sql`SELECT * FROM orchestration_events`,
+        receipts: yield* sql`SELECT * FROM orchestration_command_receipts`,
+        outbox: yield* sql`SELECT * FROM orchestration_v2_effect_outbox`,
+      };
+    });
+    const before = yield* snapshot;
+    const effects = yield* Ref.make<ReadonlyArray<string>>([]);
+    const effect = (name: string) => Ref.update(effects, (items) => [...items, name]);
+    const layerTest = RunExecutionService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.succeed(EventSink.EventSinkV2, sink),
+          Layer.succeed(WorkflowRunStore.WorkflowRunStore, store),
+          Layer.mock(CheckpointService.CheckpointServiceV2)({
+            captureBaseline: () => effect("checkpoint"),
+          }),
+          Layer.mock(McpAppModelContext.McpAppModelContext)({
+            forThread: () => effect("mcp").pipe(Effect.as([])),
+          }),
+          Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
+            ingestNormalized: () => effect("ingestion").pipe(Effect.as([])),
+          }),
+          PreviewAgentActivity.layer,
+          layerTurnItemPositionsTest,
+          IdAllocator.layer,
+          ServerSettings.layerTest(),
+        ),
+      ),
+    );
+    const error = yield* Effect.gen(function* () {
+      const service = yield* RunExecutionService.RunExecutionServiceV2;
+      return yield* service.startRootRun({
+        commandId: CommandId.make("command:direct-sql"),
+        appThread: rootAppThread(threadId),
+        providerSessionId,
+        session: {
+          providerSessionId,
+          events: Stream.fromEffect(effect("stream")).pipe(Stream.flatMap(() => Stream.never)),
+          subscribeEvents: effect("subscribe").pipe(
+            Effect.as({ events: Stream.never, close: effect("close") }),
+          ),
+          startTurn: () => effect("start"),
+          compactThread: () => effect("compact"),
+        } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime,
+        run: {
+          id: runId,
+          threadId,
+          providerThreadId,
+          ordinal: 1,
+          providerInstanceId,
+        } as OrchestrationV2Run,
+        rootNode: {
+          id: NodeId.make("node:direct-sql"),
+          threadId,
+          providerThreadId,
+        } as OrchestrationV2ExecutionNode,
+        checkpointScope: {
+          id: CheckpointScopeId.make("scope:direct-sql"),
+          threadId,
+          providerThreadId,
+        } as OrchestrationV2CheckpointScope,
+        providerThread: primary as unknown as OrchestrationV2ProviderThread,
+        attempt: {
+          id: attemptId,
+          providerThreadId,
+          providerTurnId: null,
+        } as OrchestrationV2RunAttempt,
+        attemptId,
+        providerTurnOrdinal: 1,
+        relatedProviderThreadIds: evidence === "related-provider" ? [relatedProviderThreadId] : [],
+        relatedThreadIds: evidence === "owned-and-invalid" ? ["" as ThreadId] : [],
+        message: {
+          messageId: MessageId.make("message:direct-sql"),
+          text: "hello",
+          attachments: [],
+          createdBy: "user",
+          creationSource: "web",
+        },
+        modelSelection: { instanceId: providerInstanceId, model: "test" },
+        runtimePolicy: {
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: process.cwd(),
+        },
+      });
+    }).pipe(Effect.provide(layerTest), Effect.flip);
+    assert.equal(error._tag, "RunExecutionStartError");
+    if (evidence === "malformed" || evidence === "owned-and-invalid" || evidence === "read-error") {
+      assert.equal((error.cause as { _tag: string })._tag, "WorkflowRunStoreError");
+    } else assert.isUndefined(error.cause);
+    assert.deepEqual(yield* Ref.get(effects), []);
+    assert.deepEqual(yield* snapshot, before);
+  }).pipe(Effect.provide(custodyIntegration)),
+);
+
+it.effect("denies direct execution of workflow-owned custody before capturing a baseline", () =>
+  Effect.gen(function* () {
+    const captured = yield* Ref.make(0);
+    const reads = yield* Ref.make<
+      Array<
+        Parameters<
+          WorkflowRunStore.WorkflowRunStore["Service"]["readRecoveryCustodyInTransaction"]
+        >[0]
+      >
+    >([]);
+    const threadId = ThreadId.make("thread:direct-owned");
+    const providerThreadId = ProviderThreadId.make("provider-thread:direct-owned");
+    const providerSessionId = ProviderSessionId.make("session:direct-owned");
+    const attemptId = RunAttemptId.make("attempt:direct-owned");
+    const runId = RunId.make("run:direct-owned");
+    const providerInstanceId = ProviderInstanceId.make("codex");
+    const layerTest = RunExecutionService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          McpAppModelContext.layerEmpty,
+          PreviewAgentActivity.layer,
+          Layer.mock(CheckpointService.CheckpointServiceV2)({
+            captureBaseline: () =>
+              Ref.update(captured, (count) => count + 1).pipe(
+                Effect.andThen(Effect.die("unexpected baseline")),
+              ),
+          }),
+          layerTurnItemPositionsTest,
+          mockEventSink({ withProviderBatch: (effect) => effect }),
+          Layer.mock(WorkflowRunStore.WorkflowRunStore)({
+            readRecoveryCustodyInTransaction: (input) =>
+              Ref.update(reads, (all) => [...all, input]).pipe(Effect.as({ kind: "owned" })),
+          }),
+          IdAllocator.layer,
+          Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
+            ingestNormalized: () => Effect.succeed([]),
+          }),
+          ServerSettings.layerTest(),
+        ),
+      ),
+    );
+    const exit = yield* Effect.gen(function* () {
+      const service = yield* RunExecutionService.RunExecutionServiceV2;
+      return yield* service.startRootRun({
+        commandId: CommandId.make("command:direct-owned"),
+        appThread: rootAppThread(threadId),
+        providerSessionId,
+        session: {
+          providerSessionId: ProviderSessionId.make("session:runtime"),
+          events: Stream.never,
+        } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime,
+        run: {
+          id: runId,
+          threadId: ThreadId.make("thread:run"),
+          providerThreadId: ProviderThreadId.make("provider-thread:run"),
+          ordinal: 1,
+          providerInstanceId,
+        } as OrchestrationV2Run,
+        rootNode: {
+          id: NodeId.make("node:direct-owned"),
+          threadId: ThreadId.make("thread:node"),
+          providerThreadId: ProviderThreadId.make("provider-thread:node"),
+        } as OrchestrationV2ExecutionNode,
+        checkpointScope: {
+          id: CheckpointScopeId.make("scope:direct-owned"),
+          threadId: ThreadId.make("thread:scope"),
+          providerThreadId: ProviderThreadId.make("provider-thread:scope"),
+        } as OrchestrationV2CheckpointScope,
+        providerThread: {
+          id: providerThreadId,
+          appThreadId: ThreadId.make("thread:provider"),
+          providerSessionId: ProviderSessionId.make("session:provider"),
+          driver,
+        } as OrchestrationV2ProviderThread,
+        attempt: {
+          id: attemptId,
+          providerThreadId: ProviderThreadId.make("provider-thread:attempt"),
+          providerTurnId: null,
+        } as OrchestrationV2RunAttempt,
+        attemptId,
+        providerTurnOrdinal: 1,
+        relatedThreadIds: [threadId, ThreadId.make("thread:related")],
+        relatedProviderThreadIds: [
+          providerThreadId,
+          ProviderThreadId.make("provider-thread:related"),
+        ],
+        message: {
+          messageId: MessageId.make("message:direct-owned"),
+          text: "hello",
+          attachments: [],
+          createdBy: "user",
+          creationSource: "web",
+        },
+        modelSelection: { instanceId: providerInstanceId, model: "test" },
+        runtimePolicy: {
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: process.cwd(),
+        },
+      });
+    }).pipe(Effect.provide(layerTest), Effect.exit);
+    assert.deepEqual(yield* Ref.get(reads), [
+      {
+        threadId,
+        providerSessionIds: [providerSessionId, "session:runtime", "session:provider"],
+        providerThreadIds: [
+          providerThreadId,
+          "provider-thread:run",
+          "provider-thread:attempt",
+          "provider-thread:node",
+          "provider-thread:scope",
+          "provider-thread:related",
+        ],
+      },
+      ...["thread:run", "thread:node", "thread:scope", "thread:provider", "thread:related"].map(
+        (id) => ({ threadId: id, providerSessionIds: [], providerThreadIds: [] }),
+      ),
+    ]);
+    assert.equal(yield* Ref.get(captured), 0);
+    assert.isTrue(Exit.isFailure(exit));
+    if (Exit.isFailure(exit))
+      assert.equal(
+        Option.getOrThrow(Cause.findErrorOption(exit.cause))._tag,
+        "RunExecutionStartError",
+      );
+  }),
+);
+
 it.effect("rechecks run ownership immediately before calling the provider", () =>
   Effect.gen(function* () {
-    const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+    const runExecution = ordinaryExecutionService(yield* RunExecutionService.RunExecutionServiceV2);
     const guardCalls = yield* Ref.make(0);
     const providerStarts = yield* Ref.make(0);
     const threadId = ThreadId.make("thread:run-execution-start-guard");
@@ -847,7 +1311,7 @@ it.effect("rechecks run ownership immediately before calling the provider", () =
 
 it.effect("passes the thread's MCP app context to the provider under a safe key", () =>
   Effect.gen(function* () {
-    const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+    const runExecution = ordinaryExecutionService(yield* RunExecutionService.RunExecutionServiceV2);
     const started = yield* Deferred.make<ProviderAdapter.ProviderAdapterV2TurnInput>();
     const threadId = ThreadId.make("thread:run-execution-app-context");
     const providerInstanceId = ProviderInstanceId.make("codex");
@@ -890,7 +1354,11 @@ it.effect("passes the thread's MCP app context to the provider under a safe key"
         creationSource: "web",
       },
       modelSelection: { instanceId: providerInstanceId, model: "gpt-5.4" },
-      runtimePolicy: { runtimeMode: "full-access", interactionMode: "default", cwd: process.cwd() },
+      runtimePolicy: {
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: process.cwd(),
+      },
     });
 
     const input = yield* Deferred.await(started);
@@ -918,6 +1386,7 @@ it.effect("passes the thread's MCP app context to the provider under a safe key"
               captureBaseline: () => Effect.void,
             }),
             layerTurnItemPositionsTest,
+            layerOrdinaryCustody,
             mockEventSink({}),
             IdAllocator.layer,
             Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
@@ -947,6 +1416,7 @@ it.effect("fails the run when its ownership check cannot be read before calling 
           PreviewAgentActivity.layer,
           Layer.mock(CheckpointService.CheckpointServiceV2)({ captureBaseline: () => Effect.void }),
           layerTurnItemPositionsTest,
+          layerOrdinaryCustody,
           mockEventSink({
             writeIfRunCurrent: (input) =>
               Ref.update(writes, (current) => [...current, ...input.events]).pipe(
@@ -963,7 +1433,9 @@ it.effect("fails the run when its ownership check cannot be read before calling 
     );
 
     yield* Effect.gen(function* () {
-      const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+      const runExecution = ordinaryExecutionService(
+        yield* RunExecutionService.RunExecutionServiceV2,
+      );
       yield* runExecution.startRootRun({
         commandId: CommandId.make("command:run-execution-start-guard-read"),
         appThread: rootAppThread(threadId),
@@ -1042,7 +1514,9 @@ it.effect(
   "dispatches only attachment-free compact commands through the native compaction path",
   () =>
     Effect.gen(function* () {
-      const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+      const runExecution = ordinaryExecutionService(
+        yield* RunExecutionService.RunExecutionServiceV2,
+      );
       const calls: Array<string> = [];
       const attachment = ChatFileAttachment.make({
         type: "file",
@@ -1158,6 +1632,7 @@ it.effect("starts the provider when checkpoint baseline capture fails", () =>
               ),
           }),
           layerTurnItemPositionsTest,
+          layerOrdinaryCustody,
           mockEventSink({
             writeWithEffects: (input) =>
               Ref.update(writes, (current) => [
@@ -1175,7 +1650,9 @@ it.effect("starts the provider when checkpoint baseline capture fails", () =>
     );
 
     yield* Effect.gen(function* () {
-      const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+      const runExecution = ordinaryExecutionService(
+        yield* RunExecutionService.RunExecutionServiceV2,
+      );
       yield* runExecution.startRootRun({
         commandId: CommandId.make("command:run-execution-baseline-failure"),
         appThread: rootAppThread(threadId),
@@ -1272,6 +1749,7 @@ it.effect.each(["failure", "interruption", "stale-attempt", "start-guard"] as co
                 scenario === "start-guard" ? Effect.void : Effect.die("not reached"),
             }),
             layerTurnItemPositionsTest,
+            layerOrdinaryCustody,
             mockEventSink({
               writeIfRunCurrent: (input) =>
                 Effect.gen(function* () {
@@ -1314,7 +1792,9 @@ it.effect.each(["failure", "interruption", "stale-attempt", "start-guard"] as co
       );
 
       const result = yield* Effect.gen(function* () {
-        const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+        const runExecution = ordinaryExecutionService(
+          yield* RunExecutionService.RunExecutionServiceV2,
+        );
         yield* runExecution.startRootRun({
           commandId: CommandId.make("command:run-execution-settings-failure"),
           appThread: rootAppThread(threadId),
@@ -1452,6 +1932,7 @@ it.effect("ingests new member threads of an owned child after the root turn term
           PreviewAgentActivity.layer,
           Layer.mock(CheckpointService.CheckpointServiceV2)({ captureBaseline: () => Effect.void }),
           layerTurnItemPositionsTest,
+          layerOrdinaryCustody,
           mockEventSink({
             write: () => Effect.succeed([]),
             writeWithEffects: (input) =>
@@ -1612,7 +2093,9 @@ it.effect("ingests new member threads of an owned child after the root turn term
     ];
 
     yield* Effect.gen(function* () {
-      const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+      const runExecution = ordinaryExecutionService(
+        yield* RunExecutionService.RunExecutionServiceV2,
+      );
       yield* runExecution.startRootRun({
         commandId: CommandId.make("command:run-execution-late-child"),
         appThread: rootAppThread(threadId),
@@ -1712,6 +2195,7 @@ it.effect("ends a nested native subagent and its thread when the root run is int
           PreviewAgentActivity.layer,
           Layer.mock(CheckpointService.CheckpointServiceV2)({ captureBaseline: () => Effect.void }),
           layerTurnItemPositionsTest,
+          layerOrdinaryCustody,
           mockEventSink({
             write: () => Effect.succeed([]),
             writeWithEffects: (input) =>
@@ -1778,7 +2262,9 @@ it.effect("ends a nested native subagent and its thread when the root run is int
     ];
 
     yield* Effect.gen(function* () {
-      const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+      const runExecution = ordinaryExecutionService(
+        yield* RunExecutionService.RunExecutionServiceV2,
+      );
       yield* runExecution.startRootRun({
         commandId: CommandId.make(`command:${key}`),
         appThread: rootAppThread(threadId),
@@ -1793,7 +2279,10 @@ it.effect("ends a nested native subagent and its thread when the root run is int
           id: CheckpointScopeId.make(`checkpoint-scope:${key}`),
         } as OrchestrationV2CheckpointScope,
         providerThread: { id: providerThreadId, driver } as OrchestrationV2ProviderThread,
-        attempt: { id: attemptId, providerTurnId: rootProviderTurnId } as OrchestrationV2RunAttempt,
+        attempt: {
+          id: attemptId,
+          providerTurnId: rootProviderTurnId,
+        } as OrchestrationV2RunAttempt,
         attemptId,
         providerTurnOrdinal: 1,
         message: {
@@ -1809,7 +2298,11 @@ it.effect("ends a nested native subagent and its thread when the root run is int
           interactionMode: "default",
           cwd: process.cwd(),
           approvalPolicy: "never",
-          sandboxPolicy: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false },
+          sandboxPolicy: {
+            type: "readOnly",
+            access: { type: "fullAccess" },
+            networkAccess: false,
+          },
         },
       });
     }).pipe(Effect.provide(layerTest));
@@ -2159,6 +2652,7 @@ it.effect(
               captureBaseline: () => Effect.void,
             }),
             layerTurnItemPositionsTest,
+            layerOrdinaryCustody,
             mockEventSink({
               write: () => Effect.succeed([]),
               writeWithEffects: (input) =>
@@ -2259,7 +2753,9 @@ it.effect(
       };
 
       yield* Effect.gen(function* () {
-        const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+        const runExecution = ordinaryExecutionService(
+          yield* RunExecutionService.RunExecutionServiceV2,
+        );
         yield* runExecution.startRootRun({
           commandId: CommandId.make("command:subagent-interrupt-cascade"),
           appThread: rootAppThread(ids.threadId),
@@ -3245,6 +3741,7 @@ function captureRootRunTermination(input: {
           }),
           Layer.mock(CheckpointService.CheckpointServiceV2)({ captureBaseline: () => Effect.void }),
           layerTurnItemPositionsTest,
+          layerOrdinaryCustody,
           mockEventSink({
             write: (payload) =>
               Effect.gen(function* () {
@@ -3296,7 +3793,9 @@ function captureRootRunTermination(input: {
     );
 
     const previewActivityEnded = yield* Effect.gen(function* () {
-      const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+      const runExecution = ordinaryExecutionService(
+        yield* RunExecutionService.RunExecutionServiceV2,
+      );
       const start = runExecution.startRootRun({
         commandId: CommandId.make(`command:${input.key}`),
         appThread: rootAppThread(ids.threadId),
@@ -3795,6 +4294,7 @@ function runBackgroundItemScenario(
           Layer.succeed(PreviewAgentActivity.PreviewAgentActivity, previewActivity),
           Layer.mock(CheckpointService.CheckpointServiceV2)({ captureBaseline: () => Effect.void }),
           layerTurnItemPositionsTest,
+          layerOrdinaryCustody,
           mockEventSink({
             ...(coordinator === undefined ? {} : { consumeProviderEvents: coordinator.consume }),
             write: () => Effect.succeed([]),
@@ -3845,7 +4345,9 @@ function runBackgroundItemScenario(
     );
 
     yield* Effect.gen(function* () {
-      const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+      const runExecution = ordinaryExecutionService(
+        yield* RunExecutionService.RunExecutionServiceV2,
+      );
       yield* runExecution.startRootRun({
         commandId: CommandId.make(`command:${key}`),
         appThread: rootAppThread(ids.threadId),

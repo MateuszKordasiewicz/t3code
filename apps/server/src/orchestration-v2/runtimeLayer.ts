@@ -161,6 +161,7 @@ const layerRunExecutionServiceProvided = RunExecutionService.layer.pipe(
       PreviewAgentActivity.layer,
       layerCheckpointServiceProvided,
       layerEventSink,
+      WorkflowRunStore.layer,
       IdAllocator.layer,
       layerProviderEventIngestorProvided,
       TurnItemPositionStore.layer,

@@ -1,3 +1,4 @@
+import * as WorkflowRunStore from "../workflowRuns/WorkflowRunStore.ts";
 import { makeAssistantStreamingFilter } from "./assistantStreaming.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
@@ -607,6 +608,7 @@ export const layer: Layer.Layer<
   never,
   | CheckpointService.CheckpointServiceV2
   | EventSink.EventSinkV2
+  | WorkflowRunStore.WorkflowRunStore
   | IdAllocator.IdAllocatorV2
   | ProviderEventIngestor.ProviderEventIngestorV2
   | ServerSettings.ServerSettingsService
@@ -619,6 +621,7 @@ export const layer: Layer.Layer<
     const scope = yield* Effect.scope;
     const checkpointService = yield* CheckpointService.CheckpointServiceV2;
     const eventSink = yield* EventSink.EventSinkV2;
+    const workflowRuns = yield* WorkflowRunStore.WorkflowRunStore;
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
     const providerEventIngestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
     const serverSettings = yield* ServerSettings.ServerSettingsService;
@@ -895,6 +898,69 @@ export const layer: Layer.Layer<
 
     return RunExecutionServiceV2.of({
       startRootRun: Effect.fn("RunExecutionService.startRootRun")(function* (input) {
+        const threadIds = [
+          ...new Set([
+            input.appThread.id,
+            input.run.threadId,
+            input.rootNode.threadId,
+            input.checkpointScope.threadId,
+            ...(input.providerThread.appThreadId === null
+              ? []
+              : [input.providerThread.appThreadId]),
+            ...(input.relatedThreadIds ?? []),
+          ]),
+        ];
+        const providerThreadIds = [
+          ...new Set([
+            input.providerThread.id,
+            ...(input.run.providerThreadId === null ? [] : [input.run.providerThreadId]),
+            input.attempt.providerThreadId,
+            ...(input.rootNode.providerThreadId === null ? [] : [input.rootNode.providerThreadId]),
+            ...(input.checkpointScope.providerThreadId === null
+              ? []
+              : [input.checkpointScope.providerThreadId]),
+            ...(input.relatedProviderThreadIds ?? []),
+          ]),
+        ];
+        const providerSessionIds = [
+          ...new Set([
+            input.providerSessionId,
+            input.session.providerSessionId,
+            ...(input.providerThread.providerSessionId === null
+              ? []
+              : [input.providerThread.providerSessionId]),
+          ]),
+        ];
+        const owned = yield* eventSink
+          .withProviderBatch(
+            Effect.gen(function* () {
+              let owned = false;
+              for (const [index, threadId] of threadIds.entries()) {
+                const custody = yield* workflowRuns.readRecoveryCustodyInTransaction({
+                  threadId,
+                  providerSessionIds: index === 0 ? providerSessionIds : [],
+                  providerThreadIds: index === 0 ? providerThreadIds : [],
+                });
+                if (custody.kind === "owned") owned = true;
+              }
+              return owned;
+            }),
+          )
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new RunExecutionStartError({
+                  commandId: input.commandId,
+                  runId: input.run.id,
+                  cause,
+                }),
+            ),
+          );
+        if (owned)
+          return yield* new RunExecutionStartError({
+            commandId: input.commandId,
+            runId: input.run.id,
+          });
         const rootTurnOrigin: ProviderUsageAnalytics.ProviderTurnOrigin = {
           createdBy: input.message.createdBy,
           creationSource: input.message.creationSource,

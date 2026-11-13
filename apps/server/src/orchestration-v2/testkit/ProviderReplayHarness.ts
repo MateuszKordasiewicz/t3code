@@ -408,6 +408,7 @@ export function layerWithRegistry<Error>(
         PreviewAgentActivity.layer,
         layerCheckpointServiceProvided,
         layerEventSinkProvided,
+        WorkflowRunStore.layer.pipe(Layer.provide(layerDatabase)),
         IdAllocator.layer,
         layerProviderEventIngestorProvided,
         layerServerSettings,
