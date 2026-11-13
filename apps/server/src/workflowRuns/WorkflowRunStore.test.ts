@@ -7,6 +7,8 @@ import * as NodeSqlite from "node:sqlite";
 import { assert, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  EventId,
+  CheckpointScopeId,
   OrchestrationV2Command,
   ProviderInstanceId,
   ProviderDriverKind,
@@ -27,6 +29,8 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
 import * as Path from "effect/Path";
+import * as EventSink from "../orchestration-v2/EventSink.ts";
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
@@ -9116,6 +9120,10 @@ const nativeBindingState = Effect.gen(function* () {
     nativeThreads: yield* sql`SELECT * FROM orchestration_v2_projection_threads`,
     nativeRuns: yield* sql`SELECT * FROM orchestration_v2_projection_runs`,
     nativeMessages: yield* sql`SELECT * FROM orchestration_v2_projection_messages`,
+    nativeAttempts: yield* sql`SELECT * FROM orchestration_v2_projection_run_attempts`,
+    nativeNodes: yield* sql`SELECT * FROM orchestration_v2_projection_nodes`,
+    nativeProviders: yield* sql`SELECT * FROM orchestration_v2_projection_provider_threads`,
+    nativeScopes: yield* sql`SELECT * FROM orchestration_v2_projection_checkpoint_scopes`,
   };
 });
 const decodeBindingCommand = Schema.decodeSync(OrchestrationV2Command);
@@ -11543,5 +11551,541 @@ it.effect(
       assert.isTrue(Exit.isFailure(outcome));
       assert.deepStrictEqual(yield* nativeBindingState, before);
       assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  ["workflow", false],
+  ["planning", false],
+  ["workflow", true],
+  ["planning", true],
+] as const)(
+  "current native execution claim observes genuine $0 lease with rearm=$1 without mutation",
+  ([kind, rearm]) =>
+    Effect.gen(function* () {
+      const fixture = yield* nativeExecutionFixture(kind, rearm);
+      const { store, sql, claimInput, pendingOperation, input } = fixture;
+      assert.strictEqual((yield* store.claim(claimInput)).kind, "claimed");
+      const selection = {
+        operationId: input.operationId,
+        expectedFingerprint: pendingOperation.fingerprint,
+        expectedGeneration: rearm ? 2 : 0,
+        ...fixture.coordinator,
+      };
+      const before = yield* nativeBindingState;
+      const subscription = yield* store.subscribeChanges;
+      const observed = yield* sql.withTransaction(
+        store.verifyClaimedNativeOperationInTransaction(selection),
+      );
+      assert.strictEqual(observed.kind, "current");
+      if (observed.kind !== "current") throw new Error("expected current claimed observation");
+      assert.strictEqual(observed.stage, "preparing");
+      assert.isTrue(Object.isFrozen(observed));
+      assert.strictEqual(String(observed.operationId), String(input.operationId));
+      assert.strictEqual(String(observed.intentId), String(input.intentId));
+      assert.strictEqual(observed.operationFingerprint, pendingOperation.fingerprint);
+      assert.strictEqual(observed.generation, rearm ? 2 : 0);
+      assert.strictEqual(String(observed.threadId), String(input.threadId));
+      assert.strictEqual(observed.nativeThreadId, null);
+      assert.strictEqual(observed.checkpointScopeId, null);
+      assert.deepStrictEqual(
+        yield* sql.withTransaction(store.verifyClaimedNativeOperationInTransaction(selection)),
+        observed,
+      );
+      assert.deepStrictEqual(yield* nativeBindingState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layer)),
+);
+
+const currentNativeExecutionFixture = Effect.fn("test.currentNativeExecutionFixture")(function* (
+  kind: "workflow" | "planning",
+) {
+  const fixture = yield* nativeExecutionFixture(kind);
+  assert.strictEqual((yield* fixture.store.claim(fixture.claimInput)).kind, "claimed");
+  return {
+    ...fixture,
+    operationSelection: {
+      operationId: fixture.input.operationId,
+      expectedFingerprint: fixture.pendingOperation.fingerprint,
+      expectedGeneration: 0,
+      ...fixture.coordinator,
+    },
+  };
+});
+const readCurrentNativeProjection = Effect.fn("test.readCurrentNativeProjection")(function* (
+  fixture: Effect.Success<ReturnType<typeof currentNativeExecutionFixture>>,
+) {
+  const projections = Context.get(
+    yield* Layer.build(
+      Layer.fresh(
+        ProjectionStore.layer.pipe(Layer.provide(Layer.succeed(SqlClient.SqlClient, fixture.sql))),
+      ),
+    ),
+    ProjectionStore.ProjectionStoreV2,
+  );
+  return yield* projections.getRuntimeRecoveryProjection(decodeThreadId(fixture.input.threadId));
+});
+const setCurrentNativeStage = Effect.fn("test.setCurrentNativeStage")(function* (
+  fixture: Effect.Success<ReturnType<typeof currentNativeExecutionFixture>>,
+  stage: "starting" | "running",
+  loaded = false,
+) {
+  const projection = yield* readCurrentNativeProjection(fixture);
+  const selectedRun = projection.runs[0]!;
+  const attempt = projection.attempts[0]!;
+  const node = projection.nodes[0]!;
+  const provider = projection.providerThreads[0]!;
+  const now = yield* DateTime.now;
+  const scopeId = CheckpointScopeId.make("current-native-root-scope");
+  const sink = Context.get(fixture.runtime, EventSink.EventSinkV2);
+  const common = {
+    threadId: selectedRun.threadId,
+    runId: selectedRun.id,
+    nodeId: node.id,
+    providerInstanceId: provider.providerInstanceId,
+    occurredAt: now,
+  };
+  yield* sink.write({
+    events: [
+      {
+        ...common,
+        id: EventId.make("current-scope"),
+        type: "checkpoint-scope.created",
+        payload: {
+          id: scopeId,
+          threadId: selectedRun.threadId,
+          runId: selectedRun.id,
+          nodeId: node.id,
+          parentScopeId: null,
+          providerThreadId: provider.id,
+          kind: "root_run",
+          ordinalWithinParent: 0,
+          advancesAppRunCount: true,
+          cwd: "/work",
+          createdAt: now,
+        },
+      },
+      {
+        ...common,
+        id: EventId.make("current-provider"),
+        type: "provider-thread.updated",
+        payload: {
+          ...provider,
+          status: stage === "running" ? "active" : provider.status,
+          nativeThreadRef: loaded
+            ? { driver: provider.driver, nativeId: "loaded-current-native", strength: "strong" }
+            : provider.nativeThreadRef,
+          updatedAt: now,
+        },
+      },
+      {
+        ...common,
+        id: EventId.make("current-run"),
+        type: "run.updated",
+        payload: { ...selectedRun, status: stage, startedAt: stage === "running" ? now : null },
+      },
+      {
+        ...common,
+        id: EventId.make("current-attempt"),
+        type: "run-attempt.updated",
+        payload: {
+          ...attempt,
+          ...(loaded ? { nativeThreadId: "loaded-current-native" } : {}),
+          status: stage === "running" ? "running" : "pending",
+          startedAt: stage === "running" ? now : null,
+        },
+      },
+      {
+        ...common,
+        id: EventId.make("current-node"),
+        type: "node.updated",
+        payload: {
+          ...node,
+          status: stage === "running" ? "running" : "pending",
+          startedAt: stage === "running" ? now : null,
+          checkpointScopeId: scopeId,
+        },
+      },
+    ],
+  });
+  return { selectedRun, attempt, node, provider, scopeId };
+});
+
+it.effect.each([
+  ["workflow", "starting"],
+  ["workflow", "running"],
+  ["planning", "starting"],
+  ["planning", "running"],
+] as const)("current native execution claim observes source-backed $0/$1 tuple", ([kind, stage]) =>
+  Effect.gen(function* () {
+    const fixture = yield* currentNativeExecutionFixture(kind);
+    const selected = yield* setCurrentNativeStage(fixture, stage);
+    const before = yield* nativeBindingState;
+    const subscription = yield* fixture.store.subscribeChanges;
+    const result = yield* fixture.sql.withTransaction(
+      fixture.store.verifyClaimedNativeOperationInTransaction(fixture.operationSelection),
+    );
+    assert.strictEqual(result.kind, "current");
+    if (result.kind !== "current") throw new Error("expected current native tuple");
+    assert.strictEqual(result.stage, stage);
+    assert.strictEqual(result.runId, selected.selectedRun.id);
+    assert.strictEqual(result.attemptId, selected.attempt.id);
+    assert.strictEqual(result.rootNodeId, selected.node.id);
+    assert.strictEqual(result.providerThreadId, selected.provider.id);
+    assert.strictEqual(result.providerInstanceId, selected.provider.providerInstanceId);
+    assert.strictEqual(result.providerSessionId, selected.provider.providerSessionId);
+    assert.strictEqual(result.driver, selected.provider.driver);
+    assert.strictEqual(result.checkpointScopeId, selected.scopeId);
+    assert.deepStrictEqual(
+      yield* fixture.sql`SELECT * FROM orchestration_v2_projection_provider_sessions`,
+      [],
+    );
+    assert.deepStrictEqual(yield* nativeBindingState, before);
+    assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "current native execution claim denies real interrupted %s run with active owner",
+  (kind) =>
+    Effect.gen(function* () {
+      const fixture = yield* currentNativeExecutionFixture(kind);
+      const projection = yield* readCurrentNativeProjection(fixture);
+      yield* Context.get(fixture.runtime, Orchestrator.OrchestratorV2).dispatch(
+        decodeBindingCommand({
+          type: "run.interrupt",
+          commandId: "current-native-interrupt",
+          threadId: fixture.input.threadId,
+          runId: projection.runs[0]!.id,
+        }),
+      );
+      const owners =
+        kind === "workflow"
+          ? yield* fixture.sql<{ status: string }>`SELECT status FROM workflow_runs`
+          : yield* fixture.sql<{ status: string }>`SELECT status FROM workflow_planning_sessions`;
+      assert.strictEqual(owners[0]!.status, "active");
+      const before = yield* nativeBindingState;
+      const result = yield* fixture.sql.withTransaction(
+        fixture.store.verifyClaimedNativeOperationInTransaction(fixture.operationSelection),
+      );
+      assert.notStrictEqual(result.kind, "current");
+      assert.deepStrictEqual(yield* nativeBindingState, before);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(
+  (["workflow", "planning"] as const).flatMap((kind) =>
+    [
+      "plain",
+      "outside",
+      "labels",
+      "fingerprint",
+      "generation",
+      "missing",
+      "pending",
+      "held",
+      "cancel",
+      "pause",
+      "stop",
+      "scope",
+      "expiry",
+      "revoke",
+      "deadline",
+      "receipt",
+      "proof",
+      "intent-labels",
+      "native-terminal",
+      "mixed",
+      "turn",
+      "root-identity",
+      "provider-identity",
+      "provider-row",
+      "provider-missing",
+      "provider-driver",
+      "provider-native-driver",
+      "provider-owner",
+      "run-row",
+      "provider-ordinal",
+      "provider-archived",
+      "provider-error",
+      "owner-generation",
+      "claim-label",
+      "claim-generation",
+      "provider-closed",
+      "scope-missing",
+      "scope-identity",
+      "scope-row",
+      "scope-kind",
+    ].map((change) => ({ kind, change })),
+  ),
+)("current native execution claim refuses $kind/$change without mutation", ({ kind, change }) =>
+  Effect.gen(function* () {
+    const fixture = yield* currentNativeExecutionFixture(kind);
+    const { sql, store } = fixture;
+    let selected = store;
+    const request = {
+      ...fixture.operationSelection,
+      operationId: String(fixture.operationSelection.operationId),
+    };
+    if (change.startsWith("scope-") || change === "mixed" || change === "turn")
+      yield* setCurrentNativeStage(fixture, "running");
+    if (change === "plain") selected = yield* Store.WorkflowRunStore;
+    else if (change === "labels") request.workerId = "foreign";
+    else if (change === "fingerprint") request.expectedFingerprint = nextHash;
+    else if (change === "generation") request.expectedGeneration = 2;
+    else if (change === "missing") request.operationId = "absent";
+    else if (change === "pending")
+      yield* sql`UPDATE workflow_operations SET status='pending',record_json=json_remove(json_set(record_json,'$.status','pending'),'$.claim')`;
+    else if (change === "held")
+      yield* sql`UPDATE workflow_operations SET held=1,status='pending',record_json=json_remove(json_set(record_json,'$.status','pending'),'$.claim')`;
+    else if (change === "cancel") yield* sql`UPDATE workflow_operations SET cancel_requested=1`;
+    else if (change === "pause" || change === "stop")
+      yield* nativeClaimControl(kind, store, change);
+    else if (change === "scope")
+      yield* sql`UPDATE auth_sessions SET scopes='["orchestration:read"]'`;
+    else if (change === "expiry") yield* sql`UPDATE auth_sessions SET expires_at=${facts.now}`;
+    else if (change === "revoke") yield* fixture.sessions.revoke(fixture.authority.sessionId);
+    else if (change === "deadline")
+      yield* TestClock.setTime(DateTime.makeUnsafe("2026-12-01T00:00:00Z").epochMilliseconds);
+    else if (change === "receipt")
+      yield* sql`UPDATE workflow_command_receipts SET result_json='{}' WHERE operation_id=${request.operationId}`;
+    else if (change === "proof") {
+      yield* sql`DROP TRIGGER workflow_native_command_proofs_update_guard`;
+      yield* sql`UPDATE workflow_native_command_proofs SET proof_hash=${nextHash} WHERE phase='message'`;
+    } else if (change === "intent-labels")
+      yield* sql`UPDATE workflow_native_launch_intents SET worker_id='foreign'`;
+    else if (change === "native-terminal")
+      yield* sql`UPDATE orchestration_v2_projection_runs SET status='interrupted',payload_json=json_set(payload_json,'$.status','interrupted')`;
+    else if (change === "mixed")
+      yield* sql`UPDATE orchestration_v2_projection_run_attempts SET status='pending',payload_json=json_set(payload_json,'$.status','pending','$.startedAt',NULL)`;
+    else if (change === "turn")
+      yield* sql`UPDATE orchestration_v2_projection_run_attempts SET provider_turn_id='already-sent',payload_json=json_set(payload_json,'$.providerTurnId','already-sent')`;
+    else if (change === "root-identity")
+      yield* sql`UPDATE orchestration_v2_projection_nodes SET payload_json=json_set(payload_json,'$.rootNodeId','foreign-root')`;
+    else if (change === "provider-identity")
+      yield* sql`UPDATE orchestration_v2_projection_provider_threads SET thread_id='foreign',payload_json=json_set(payload_json,'$.appThreadId','foreign')`;
+    else if (change === "provider-row")
+      yield* sql`UPDATE orchestration_v2_projection_provider_threads SET provider_session_id='foreign'`;
+    else if (change === "provider-native-driver")
+      yield* sql`UPDATE orchestration_v2_projection_provider_threads SET driver='claude',payload_json=json_set(payload_json,'$.driver','claude','$.nativeThreadRef',json('{"driver":"claude","nativeId":"substituted-native","strength":"strong"}'))`;
+    else if (change === "provider-owner")
+      yield* sql`UPDATE orchestration_v2_projection_provider_threads SET owner_node_id='foreign',payload_json=json_set(payload_json,'$.ownerNodeId','foreign')`;
+    else if (change === "run-row")
+      yield* sql`UPDATE orchestration_v2_projection_runs SET ordinal=2`;
+    else if (change === "provider-ordinal")
+      yield* sql`UPDATE orchestration_v2_projection_provider_threads SET last_run_ordinal=2`;
+    else if (change === "provider-archived" || change === "provider-error") {
+      const status = change === "provider-archived" ? "archived" : "error";
+      yield* sql`UPDATE orchestration_v2_projection_provider_threads SET status=${status},payload_json=json_set(payload_json,'$.status',${status})`;
+    } else if (change === "owner-generation") {
+      if (kind === "workflow")
+        yield* sql`UPDATE workflow_runs SET control_generation=2,record_json=json_set(record_json,'$.controlGeneration',2)`;
+      else
+        yield* sql`UPDATE workflow_planning_sessions SET control_generation=2,record_json=json_set(record_json,'$.controlGeneration',2)`;
+    } else if (change === "claim-label")
+      yield* sql`UPDATE workflow_operations SET record_json=json_set(record_json,'$.claim.workerId','foreign')`;
+    else if (change === "claim-generation")
+      yield* sql`UPDATE workflow_operations SET record_json=json_set(record_json,'$.claim.generation',2)`;
+    else if (change === "provider-driver")
+      yield* sql`UPDATE orchestration_v2_projection_provider_threads SET driver='claude',payload_json=json_set(payload_json,'$.driver','claude')`;
+    else if (change === "provider-closed")
+      yield* sql`UPDATE orchestration_v2_projection_provider_threads SET status='closed',payload_json=json_set(payload_json,'$.status','closed')`;
+    else if (change === "provider-missing")
+      yield* sql`DELETE FROM orchestration_v2_projection_provider_threads`;
+    else if (change === "scope-missing")
+      yield* sql`DELETE FROM orchestration_v2_projection_checkpoint_scopes`;
+    else if (change === "scope-identity")
+      yield* sql`UPDATE orchestration_v2_projection_checkpoint_scopes SET node_id='foreign',payload_json=json_set(payload_json,'$.nodeId','foreign')`;
+    else if (change === "scope-row")
+      yield* sql`UPDATE orchestration_v2_projection_checkpoint_scopes SET run_id='foreign'`;
+    else if (change === "scope-kind")
+      yield* sql`UPDATE orchestration_v2_projection_checkpoint_scopes SET kind='manual',payload_json=json_set(payload_json,'$.kind','manual')`;
+    const before = yield* nativeBindingState;
+    const subscription = yield* store.subscribeChanges;
+    const read = selected.verifyClaimedNativeOperationInTransaction(request);
+    const exit = yield* Effect.exit(change === "outside" ? read : sql.withTransaction(read));
+    assert.isTrue(Exit.isFailure(exit) || exit.value.kind !== "current");
+    assert.deepStrictEqual(yield* nativeBindingState, before);
+    assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("current native execution claim owns flat selectors before delayed evaluation", () =>
+  Effect.gen(function* () {
+    const fixture = yield* currentNativeExecutionFixture("workflow");
+    const mutable = { ...fixture.operationSelection };
+    const read = fixture.store.verifyClaimedNativeOperationInTransaction(mutable);
+    mutable.expectedGeneration = 99;
+    mutable.workerId = "mutated";
+    mutable.expectedFingerprint = nextHash;
+    assert.strictEqual((yield* fixture.sql.withTransaction(read)).kind, "current");
+    const invalid = [
+      { ...fixture.operationSelection, extra: true },
+      { ...fixture.operationSelection, expectedGeneration: -1 },
+      { ...fixture.operationSelection, expectedGeneration: 0.5 },
+      { ...fixture.operationSelection, expectedFingerprint: "bad" },
+      { ...fixture.operationSelection, workerId: " " },
+      Object.defineProperty({ ...fixture.operationSelection }, "workerId", {
+        get() {
+          throw new Error("must not read selector accessor");
+        },
+        enumerable: true,
+      }),
+    ];
+    for (const input of invalid)
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            fixture.sql.withTransaction(
+              fixture.store.verifyClaimedNativeOperationInTransaction(input),
+            ),
+          ),
+        ),
+      );
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "current native execution claim reads writer-local %s revocation and independent commit order",
+  (kind) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const directory = yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "native-current-order-")),
+          ),
+          (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
+        );
+        const filename = NodePath.join(directory, "state.sqlite");
+        yield* Effect.gen(function* () {
+          const fixture = yield* currentNativeExecutionFixture(kind);
+          const { sql, store, operationSelection } = fixture;
+          yield* sql`PRAGMA journal_mode=WAL`;
+          const sqlB = Context.get(
+            yield* Layer.build(Layer.fresh(NodeSqliteClient.layer({ filename }))),
+            SqlClient.SqlClient,
+          );
+          const other = yield* Store.makeCapturedNativeWorkflowRunStore(
+            sqlB,
+            fixture.config,
+            fixture.path,
+            fixture.identity,
+            fixture.policy,
+            fixture.coordinator,
+          );
+          const sqlReader = Context.get(
+            yield* Layer.build(Layer.fresh(NodeSqliteClient.layer({ filename, readonly: true }))),
+            SqlClient.SqlClient,
+          );
+          const reader = yield* Store.makeCapturedNativeWorkflowRunStore(
+            sqlReader,
+            fixture.config,
+            fixture.path,
+            fixture.identity,
+            fixture.policy,
+            fixture.coordinator,
+          );
+          const sessionsB = yield* AuthSessions.make.pipe(
+            Effect.provideService(SqlClient.SqlClient, sqlB),
+          );
+          const before = yield* nativeBindingState;
+          const subscription = yield* store.subscribeChanges;
+          assert.isTrue(
+            Exit.isFailure(
+              yield* Effect.exit(
+                sqlB.withTransaction(
+                  store.verifyClaimedNativeOperationInTransaction(operationSelection),
+                ),
+              ),
+            ),
+          );
+          const local = yield* Effect.exit(
+            sql.withTransaction(
+              Effect.gen(function* () {
+                yield* sql`UPDATE auth_sessions SET scopes='["orchestration:read"]' WHERE session_id=${fixture.authority.sessionId}`;
+                assert.notStrictEqual(
+                  (yield* store.verifyClaimedNativeOperationInTransaction(operationSelection)).kind,
+                  "current",
+                );
+                assert.strictEqual(
+                  (yield* sqlReader.withTransaction(
+                    reader.verifyClaimedNativeOperationInTransaction(operationSelection),
+                  )).kind,
+                  "current",
+                );
+                return yield* Effect.fail("rollback-local-authority-fixture");
+              }),
+            ),
+          );
+          assert.isTrue(Exit.isFailure(local));
+          assert.deepStrictEqual(local, Exit.fail("rollback-local-authority-fixture"));
+          assert.deepStrictEqual(yield* nativeBindingState, before);
+          assert.strictEqual(
+            (yield* sql.withTransaction(
+              store.verifyClaimedNativeOperationInTransaction(operationSelection),
+            )).kind,
+            "current",
+          );
+          yield* sessionsB.revoke({
+            sessionId: fixture.authority.sessionId,
+            revokedAt: yield* DateTime.now,
+          });
+          const revoked = yield* nativeBindingState;
+          assert.notStrictEqual(
+            (yield* sql.withTransaction(
+              store.verifyClaimedNativeOperationInTransaction(operationSelection),
+            )).kind,
+            "current",
+          );
+          assert.notStrictEqual(
+            (yield* sqlB.withTransaction(
+              other.verifyClaimedNativeOperationInTransaction(operationSelection),
+            )).kind,
+            "current",
+          );
+          assert.deepStrictEqual(yield* nativeBindingState, revoked);
+          assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+        }).pipe(
+          Effect.provide(
+            Store.layer.pipe(Layer.provideMerge(NodeSqliteClient.layer({ filename }))),
+          ),
+        );
+      }),
+    ),
+);
+
+it.effect(
+  "current native execution claim maps direct SQL failure to persistence without writes",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* currentNativeExecutionFixture("workflow");
+      const before = yield* nativeBindingState;
+      const subscription = yield* fixture.store.subscribeChanges;
+      yield* fixture.sql`ALTER TABLE workflow_operations RENAME TO current_fixture_hidden_operations`;
+      const result = yield* Effect.result(
+        fixture.sql.withTransaction(
+          fixture.store.verifyClaimedNativeOperationInTransaction(fixture.operationSelection),
+        ),
+      );
+      yield* fixture.sql`ALTER TABLE current_fixture_hidden_operations RENAME TO workflow_operations`;
+      assert.strictEqual(result._tag, "Failure");
+      if (result._tag === "Failure") assert.strictEqual(result.failure.reason, "persistence");
+      assert.deepStrictEqual(yield* nativeBindingState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "current native execution claim returns newly loaded %s native target",
+  (kind) =>
+    Effect.gen(function* () {
+      const fixture = yield* currentNativeExecutionFixture(kind);
+      yield* setCurrentNativeStage(fixture, "running", true);
+      const result = yield* fixture.sql.withTransaction(
+        fixture.store.verifyClaimedNativeOperationInTransaction(fixture.operationSelection),
+      );
+      assert.strictEqual(result.kind, "current");
+      if (result.kind !== "current") throw new Error("expected loaded native observation");
+      assert.strictEqual(result.nativeThreadId, "loaded-current-native");
     }).pipe(Effect.provide(layer)),
 );

@@ -17,6 +17,7 @@ import {
   OrchestrationV2RunJson,
   OrchestrationV2RunAttemptJson,
   OrchestrationV2ExecutionNodeJson,
+  OrchestrationV2CheckpointScopeJson,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Digest from "effect/crypto/Digest";
@@ -112,6 +113,9 @@ const decodeNativeFinalizationAttempt = Schema.decodeEffect(
 );
 const decodeNativeFinalizationNode = Schema.decodeEffect(
   Schema.fromJsonString(OrchestrationV2ExecutionNodeJson),
+);
+const decodeNativeCheckpointScope = Schema.decodeEffect(
+  Schema.fromJsonString(OrchestrationV2CheckpointScopeJson),
 );
 const decodeRecoveryProviderThread = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2ProviderThreadJson),
@@ -4152,9 +4156,10 @@ const makeStore = Effect.fnUntraced(function* (
       expectedOwnerVersion?: number,
       requireNativeThread = false,
       execution?: NativeExecutionJournal,
-      resuming = false,
+      phase: "pending" | "resume" | "claimed" = "pending",
     ) {
-      if (resuming && !execution) return yield* integrity();
+      const resuming = phase === "resume";
+      if (phase !== "pending" && !execution) return yield* integrity();
       if (
         execution &&
         (execution[nativeExecutionJournalBrand] !== true ||
@@ -4171,7 +4176,7 @@ const makeStore = Effect.fnUntraced(function* (
         execution &&
         (execution.held !== (resuming ? 1 : 0) ||
           execution.cancelRequested !== 0 ||
-          execution.operation.status !== "pending")
+          execution.operation.status !== (phase === "claimed" ? "claimed" : "pending"))
       )
         return nativeIntentDenied("state");
       const currentGeneration = execution
@@ -4553,7 +4558,7 @@ const makeStore = Effect.fnUntraced(function* (
     const { notify: _notify, ...result } = outcome;
     return result;
   });
-  const verifyPreparingNativeRun = Effect.fn("WorkflowRunStore.verifyPreparingNativeRun")(
+  const loadNativeRunStartFootprint = Effect.fn("WorkflowRunStore.loadNativeRunStartFootprint")(
     function* (
       nativeRunId: string,
       threadId: string,
@@ -4567,6 +4572,8 @@ const makeStore = Effect.fnUntraced(function* (
       const rows = yield* sql<{
         run_id: string;
         thread_id: string;
+        ordinal: number;
+        requested_at: string;
         provider_instance_id: string;
         provider_thread_id: string | null;
         status: string;
@@ -4593,7 +4600,6 @@ const makeStore = Effect.fnUntraced(function* (
         run.id !== nativeRunId ||
         run.threadId !== threadId ||
         row.status !== run.status ||
-        row.completed_at !== null ||
         row.provider_instance_id !== run.providerInstanceId ||
         row.provider_thread_id !== run.providerThreadId ||
         run.activeAttemptId !== original.activeAttemptId ||
@@ -4602,13 +4608,6 @@ const makeStore = Effect.fnUntraced(function* (
         run.providerInstanceId !== original.providerInstanceId
       )
         return yield* integrity();
-      if (
-        run.status !== "preparing" ||
-        run.startedAt !== null ||
-        run.completedAt !== null ||
-        run.workStartedAt !== undefined
-      )
-        return false;
       const attempts = yield* sql<{
         attempt_id: string;
         thread_id: string;
@@ -4680,23 +4679,216 @@ const makeStore = Effect.fnUntraced(function* (
         !node.countsForRun
       )
         return yield* integrity();
-      return (
-        attempt.status === "pending" &&
-        attempt.providerTurnId === null &&
-        attempt.startedAt === null &&
-        attempt.completedAt === null &&
-        node.status === "pending" &&
-        node.providerTurnId === null &&
-        node.startedAt === null &&
-        node.completedAt === null &&
-        n.started_at === null &&
-        n.completed_at === null &&
-        node.runtimeRequestId === null &&
-        node.checkpointScopeId === null &&
-        node.nativeItemRef === null
-      );
+      return { original, run, attempt, node, runRow: row, attemptRow: a, nodeRow: n };
     },
   );
+  type NativeRunStartFootprint = Effect.Success<ReturnType<typeof loadNativeRunStartFootprint>>;
+  const isPreparingNativeFootprint = ({ run, attempt, node, nodeRow }: NativeRunStartFootprint) => {
+    return (
+      run.status === "preparing" &&
+      run.startedAt === null &&
+      run.completedAt === null &&
+      run.workStartedAt === undefined &&
+      attempt.status === "pending" &&
+      attempt.providerTurnId === null &&
+      attempt.startedAt === null &&
+      attempt.completedAt === null &&
+      node.status === "pending" &&
+      node.providerTurnId === null &&
+      node.startedAt === null &&
+      node.completedAt === null &&
+      nodeRow.started_at === null &&
+      nodeRow.completed_at === null &&
+      node.runtimeRequestId === null &&
+      node.checkpointScopeId === null &&
+      node.nativeItemRef === null
+    );
+  };
+  const verifyPreparingNativeRun = Effect.fn("WorkflowRunStore.verifyPreparingNativeRun")(
+    function* (
+      nativeRunId: string,
+      threadId: string,
+      events: readonly { readonly event_type: string; readonly payload_json: string }[],
+    ) {
+      const footprint = yield* loadNativeRunStartFootprint(nativeRunId, threadId, events);
+      if (footprint.runRow.completed_at !== null) return yield* integrity();
+      return isPreparingNativeFootprint(footprint);
+    },
+  );
+  const readCurrentNativeFootprintInTransaction = Effect.fn(
+    "WorkflowRunStore.readCurrentNativeFootprintInTransaction",
+  )(function* (
+    nativeRunId: string,
+    threadId: string,
+    events: readonly { readonly event_type: string; readonly payload_json: string }[],
+  ) {
+    const footprint = yield* loadNativeRunStartFootprint(nativeRunId, threadId, events);
+    const { original, run, attempt, node, runRow, nodeRow } = footprint;
+    if (
+      runRow.ordinal !== run.ordinal ||
+      runRow.requested_at !== DateTime.formatIso(run.requestedAt) ||
+      run.ordinal !== original.ordinal ||
+      run.modelSelection.instanceId !== run.providerInstanceId ||
+      !(yield* Effect.try({
+        try: () => sameCustodyValue(run.modelSelection, original.modelSelection),
+        catch: integrity,
+      }))
+    )
+      return yield* integrity();
+    if (
+      run.completedAt !== null ||
+      runRow.completed_at !== null ||
+      attempt.completedAt !== null ||
+      node.completedAt !== null ||
+      nodeRow.completed_at !== null ||
+      attempt.providerTurnId !== null ||
+      node.providerTurnId !== null ||
+      node.runtimeRequestId !== null ||
+      node.nativeItemRef !== null ||
+      run.workStartedAt !== undefined
+    )
+      return nativeIntentDenied("state");
+    const stage =
+      run.status === "preparing" && attempt.status === "pending" && node.status === "pending"
+        ? ("preparing" as const)
+        : run.status === "starting" && attempt.status === "pending" && node.status === "pending"
+          ? ("starting" as const)
+          : run.status === "running" && attempt.status === "running" && node.status === "running"
+            ? ("running" as const)
+            : undefined;
+    if (!stage) return nativeIntentDenied("state");
+    if (
+      stage === "preparing"
+        ? !isPreparingNativeFootprint(footprint)
+        : stage === "starting"
+          ? run.startedAt !== null ||
+            attempt.startedAt !== null ||
+            node.startedAt !== null ||
+            nodeRow.started_at !== null ||
+            node.checkpointScopeId === null
+          : run.startedAt === null ||
+            attempt.startedAt === null ||
+            node.startedAt === null ||
+            nodeRow.started_at !== DateTime.formatIso(node.startedAt) ||
+            node.checkpointScopeId === null
+    )
+      return nativeIntentDenied("state");
+    const providers = yield* sql<{
+      provider_thread_id: string;
+      thread_id: string | null;
+      owner_node_id: string | null;
+      driver: string;
+      provider_instance_id: string;
+      provider_session_id: string | null;
+      status: string;
+      first_run_ordinal: number | null;
+      last_run_ordinal: number | null;
+      updated_at: string;
+      payload_json: string;
+    }>`SELECT * FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id=${run.providerThreadId}`;
+    const providerRow = providers[0];
+    if (providers.length !== 1 || !providerRow) return yield* integrity();
+    const provider = yield* decodeRecoveryProviderThread(providerRow.payload_json).pipe(
+      Effect.mapError(integrity),
+    );
+    if (
+      providerRow.provider_thread_id !== provider.id ||
+      provider.id !== run.providerThreadId ||
+      providerRow.thread_id !== provider.appThreadId ||
+      provider.appThreadId !== run.threadId ||
+      providerRow.owner_node_id !== provider.ownerNodeId ||
+      providerRow.driver !== provider.driver ||
+      providerRow.provider_instance_id !== provider.providerInstanceId ||
+      provider.providerInstanceId !== run.providerInstanceId ||
+      providerRow.provider_session_id !== provider.providerSessionId ||
+      providerRow.status !== provider.status ||
+      providerRow.first_run_ordinal !== provider.firstRunOrdinal ||
+      providerRow.last_run_ordinal !== provider.lastRunOrdinal ||
+      providerRow.updated_at !== DateTime.formatIso(provider.updatedAt) ||
+      (provider.nativeThreadRef !== null && provider.nativeThreadRef.driver !== provider.driver)
+    )
+      return yield* integrity();
+    const originalProviders = yield* Effect.forEach(
+      events.filter((event) => event.event_type === "provider-thread.updated"),
+      (event) => decodeRecoveryProviderThread(event.payload_json).pipe(Effect.mapError(integrity)),
+    );
+    const selectedProviders = originalProviders.filter(
+      (value) => value.id === run.providerThreadId,
+    );
+    const originalProvider = selectedProviders[0];
+    if (
+      selectedProviders.length !== 1 ||
+      !originalProvider ||
+      originalProvider.appThreadId !== run.threadId ||
+      originalProvider.providerInstanceId !== run.providerInstanceId ||
+      provider.driver !== originalProvider.driver ||
+      provider.ownerNodeId !== originalProvider.ownerNodeId
+    )
+      return yield* integrity();
+    if (
+      provider.status === "error" ||
+      provider.status === "closed" ||
+      provider.status === "archived" ||
+      (stage === "running" && provider.status !== "active")
+    )
+      return nativeIntentDenied("state");
+    if (node.checkpointScopeId !== null) {
+      const scopes = yield* sql<{
+        scope_id: string;
+        thread_id: string;
+        run_id: string | null;
+        node_id: string;
+        parent_scope_id: string | null;
+        created_at: string;
+        provider_thread_id: string | null;
+        kind: string;
+        ordinal_within_parent: number;
+        advances_app_run_count: number;
+        payload_json: string;
+      }>`SELECT * FROM orchestration_v2_projection_checkpoint_scopes WHERE scope_id=${node.checkpointScopeId}`;
+      const row = scopes[0];
+      if (scopes.length !== 1 || !row) return yield* integrity();
+      const scope = yield* decodeNativeCheckpointScope(row.payload_json).pipe(
+        Effect.mapError(integrity),
+      );
+      if (
+        row.scope_id !== scope.id ||
+        scope.id !== node.checkpointScopeId ||
+        row.thread_id !== scope.threadId ||
+        scope.threadId !== run.threadId ||
+        row.run_id !== scope.runId ||
+        scope.runId !== run.id ||
+        row.node_id !== scope.nodeId ||
+        scope.nodeId !== node.id ||
+        row.provider_thread_id !== scope.providerThreadId ||
+        scope.providerThreadId !== provider.id ||
+        row.kind !== scope.kind ||
+        scope.kind !== "root_run" ||
+        row.parent_scope_id !== scope.parentScopeId ||
+        scope.parentScopeId !== null ||
+        row.created_at !== DateTime.formatIso(scope.createdAt) ||
+        row.ordinal_within_parent !== scope.ordinalWithinParent ||
+        scope.ordinalWithinParent !== 0 ||
+        row.advances_app_run_count !== 1 ||
+        !scope.advancesAppRunCount
+      )
+        return yield* integrity();
+    }
+    return {
+      kind: "current" as const,
+      stage,
+      threadId: run.threadId,
+      runId: run.id,
+      attemptId: attempt.id,
+      rootNodeId: node.id,
+      providerInstanceId: run.providerInstanceId,
+      providerThreadId: provider.id,
+      driver: provider.driver,
+      providerSessionId: provider.providerSessionId,
+      nativeThreadId: provider.nativeThreadRef?.nativeId ?? null,
+      checkpointScopeId: node.checkpointScopeId,
+    };
+  });
   type NativeReservation = Effect.Success<ReturnType<typeof readNativeReservationInTransaction>>;
   const prepareWorkflowNativeFinalization = Effect.fn(
     "WorkflowRunStore.prepareWorkflowNativeFinalization",
@@ -5340,7 +5532,7 @@ const makeStore = Effect.fnUntraced(function* (
         expectedOwnerVersion,
         true,
         journal,
-        true,
+        "resume",
       );
       if (current.kind !== "current") return current;
       if (
@@ -5355,6 +5547,88 @@ const makeStore = Effect.fnUntraced(function* (
     }
     return { kind: "current" as const, operations };
   });
+  type ClaimedNativeOperationSelection = {
+    readonly operationId: string;
+    readonly expectedFingerprint: string;
+    readonly expectedGeneration: number;
+    readonly bootId: string;
+    readonly workerId: string;
+  };
+  const verifyClaimedNativeOperationInTransaction = Effect.fn(
+    "WorkflowRunStore.verifyClaimedNativeOperationInTransaction",
+  )(
+    function* (input: ClaimedNativeOperationSelection) {
+      if (Option.isNone(yield* Effect.serviceOption(sql.transactionService)))
+        return yield* integrity();
+      if (!nativeBinding || !currentAuthority) return nativeIntentDenied("authority");
+      const rows = yield* sql<{
+        record_json: string;
+      }>`SELECT record_json FROM workflow_operations WHERE id=${input.operationId}`;
+      if (rows.length === 0) return nativeIntentDenied("state");
+      if (rows.length !== 1 || !rows[0]) return yield* integrity();
+      const operation = yield* Effect.try({
+        try: () => parse(rows[0]!.record_json),
+        catch: integrity,
+      }).pipe(Effect.flatMap(decodeWorkflowOperationV1), Effect.mapError(integrity));
+      if (operation.id !== input.operationId) return yield* integrity();
+      const links = yield* readNativeExecutionLinksInTransaction(operation);
+      if (!links.length) return nativeIntentDenied("authority");
+      const row = links[0];
+      if (
+        links.length !== 1 ||
+        !row ||
+        row.operation_id !== operation.id ||
+        row.finalized_operation_id !== operation.id
+      )
+        return yield* integrity();
+      const reservation = yield* readNativeReservationInTransaction({ intentId: row.intent_id });
+      if (reservation.material.version !== 2) return nativeIntentDenied("authority");
+      const journal = yield* readNativeExecutionJournalInTransaction(reservation, row);
+      if (
+        journal.operation.fingerprint !== input.expectedFingerprint ||
+        journal.operation.controlGeneration !== input.expectedGeneration
+      )
+        return { kind: "stale" as const };
+      const claim = journal.operation.claim;
+      if (journal.operation.status !== "claimed" || !claim) return nativeIntentDenied("state");
+      if (
+        claim.generation !== input.expectedGeneration ||
+        claim.bootId !== input.bootId ||
+        claim.workerId !== input.workerId ||
+        input.bootId !== nativeBinding.coordinator.bootId ||
+        input.workerId !== nativeBinding.coordinator.workerId ||
+        reservation.bootId !== nativeBinding.coordinator.bootId ||
+        reservation.workerId !== nativeBinding.coordinator.workerId
+      )
+        return { kind: "stale" as const };
+      const current = yield* verifyNativeIntentEligibility(
+        reservation,
+        row,
+        undefined,
+        true,
+        journal,
+        "claimed",
+      );
+      if (current.kind !== "current") return current;
+      const footprint = yield* readCurrentNativeFootprintInTransaction(
+        reservation.nativeRunId!,
+        reservation.threadId,
+        journal.evidence.events,
+      );
+      if (footprint.kind !== "current") return footprint;
+      // Running projections can precede the SDK request; this read cannot prove whether input was sent.
+      return Object.freeze({
+        ...footprint,
+        operationId: operation.id,
+        intentId: reservation.intentId,
+        operationFingerprint: journal.operation.fingerprint,
+        generation: journal.operation.controlGeneration,
+      });
+    },
+    Effect.mapError((error) =>
+      isStoreError(error) ? error : new WorkflowRunStoreError({ reason: "persistence" }),
+    ),
+  );
   const claim = Effect.fn("WorkflowRunStore.claim")(function* (input: {
     readonly operationId: string;
     readonly expectedOwnerVersion: number;
@@ -5827,6 +6101,25 @@ const makeStore = Effect.fnUntraced(function* (
         )
           throw integrity();
         return finalizePlanningNativeIntent(structuredClone(input));
+      } catch {
+        return Effect.fail(integrity());
+      }
+    },
+    verifyClaimedNativeOperationInTransaction: (input: ClaimedNativeOperationSelection) => {
+      try {
+        WorkflowCanonicalHash.assertCanonical(input);
+        if (
+          Object.keys(input).sort().join() !==
+            "bootId,expectedFingerprint,expectedGeneration,operationId,workerId" ||
+          ![input.operationId, input.bootId, input.workerId].every(
+            (value) => typeof value === "string" && value.trim().length > 0,
+          ) ||
+          !/^[0-9a-f]{64}$/.test(input.expectedFingerprint) ||
+          !Number.isSafeInteger(input.expectedGeneration) ||
+          input.expectedGeneration < 0
+        )
+          throw integrity();
+        return verifyClaimedNativeOperationInTransaction({ ...input });
       } catch {
         return Effect.fail(integrity());
       }
