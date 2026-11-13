@@ -34,6 +34,12 @@ import * as Path from "effect/Path";
 import * as FileSystem from "effect/FileSystem";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+import {
+  encodeSubmissionTransportData,
+  encodeScopeBindingData,
+  encodeScopeSettlementData,
+  snapshotSubmissionFrame,
+} from "../orchestration-v2/ProviderSubmissionCodec.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
@@ -12300,4 +12306,749 @@ it.effect.each(["workflow", "planning"] as const)(
       if (result.kind !== "current") throw new Error("expected loaded native observation");
       assert.strictEqual(result.nativeThreadId, "loaded-current-native");
     }).pipe(Effect.provide(layer)),
+);
+
+const physicalTransport = (
+  openingThreadId: string,
+  transportId = "11111111-2222-3333-4444-555555555555",
+  providerSessionId = "physical-session",
+  providerInstanceId = "provider",
+) =>
+  encodeSubmissionTransportData({
+    context: {
+      v: 1,
+      environmentId: "environment",
+      projectId: "opening-project",
+      openingThreadId,
+      driver: "codex",
+      providerInstanceId,
+      providerSessionId,
+      scopeNamespace: "app-t3code-agents-123456abcdef.slice",
+      hostBootId: "aaaaaaaa-1111-2222-3333-444444444444",
+      expectedClaim: null,
+    },
+    transportId,
+    proposedUnit: `t3code-codex-${transportId}.scope`,
+    creationInputHash: hash,
+    createdAt: facts.now,
+  });
+const physicalAdmissionKinds = [
+  "workflow-native",
+  "workflow-legacy",
+  "planning-native",
+  "planning-legacy",
+] as const;
+const preparePhysicalAdmission = Effect.fn("test.preparePhysicalAdmission")(function* (
+  kind: (typeof physicalAdmissionKinds)[number],
+) {
+  const store = yield* Store.WorkflowRunStore;
+  if (kind === "workflow-native" || kind === "workflow-legacy") {
+    yield* setupAdmission;
+    const operation = operationFor("physical-op", "physical-attempt");
+    const invokeOn = (next: Store.WorkflowRunStore["Service"]) =>
+      kind === "workflow-native"
+        ? Effect.result(
+            next.reserveWorkflowNativeIntent(reservation(operation, "physical-attempt")),
+          )
+        : Effect.result(
+            next.commitTransition({
+              runId: run.id,
+              command: admission(operation, "physical-attempt"),
+              externalFacts: admissionFacts,
+              operation,
+              receiptId: "physical-receipt",
+            }),
+          );
+    return { threadId: "thread", invoke: invokeOn(store), invokeOn };
+  }
+  const binding = yield* seedAdmission.pipe(Effect.provide(Digest.layerWebCrypto));
+  yield* begin(store, session);
+  const input = admissionInput(binding, "physical");
+  const invokeOn = (next: Store.WorkflowRunStore["Service"]) =>
+    kind === "planning-native"
+      ? Effect.result(next.reservePlanningNativeIntent(planningReservation(input)))
+      : Effect.result(next.admitPlanningPass(input));
+  return { threadId: input.pass.native!.threadId, invoke: invokeOn(store), invokeOn };
+});
+
+it.effect.each(physicalAdmissionKinds)(
+  "physical submission custody denies fresh %s before charge or publication",
+  (kind) =>
+    Effect.gen(function* () {
+      const prepared = yield* preparePhysicalAdmission(kind);
+      const store = yield* Store.WorkflowRunStore;
+      const sql = yield* SqlClient.SqlClient;
+      const row = physicalTransport(prepared.threadId);
+      yield* sql`INSERT INTO orchestration_v2_submission_transports ${sql.insert(row)}`;
+      const subscription = yield* store.subscribeChanges;
+      const before = yield* rawReservationState;
+      const result = yield* prepared.invoke;
+      if (kind === "workflow-native" || kind === "workflow-legacy") {
+        assert.isTrue(result._tag === "Success");
+        if (result._tag === "Success")
+          assert.deepStrictEqual(result.success, { kind: "rejected", reason: "custody" });
+      } else {
+        assert.isTrue(result._tag === "Failure");
+        if (result._tag === "Failure") assert.strictEqual(result.failure.reason, "custody");
+      }
+      assert.deepStrictEqual(yield* rawReservationState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_events`, []);
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+const bindPhysicalTransport = Effect.fn("test.bindPhysicalTransport")(function* (
+  row: ReturnType<typeof physicalTransport>,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const binding = {
+    unit: row.proposed_unit,
+    invocationId: "b".repeat(32),
+    controlGroup: `/${row.scope_namespace}/${row.proposed_unit}`,
+    pid: 1234,
+    pidStartTicks: "900719925474099312345",
+  };
+  const encoded = encodeScopeBindingData(binding, row);
+  yield* sql`UPDATE orchestration_v2_submission_transports SET binding_json=${encoded.json},binding_hash=${encoded.hash},bound_at=${facts.now} WHERE transport_id=${row.transport_id}`;
+  return binding;
+});
+const settlePhysicalTransport = Effect.fn("test.settlePhysicalTransport")(function* (
+  row: ReturnType<typeof physicalTransport>,
+  binding: Effect.Success<ReturnType<typeof bindPhysicalTransport>>,
+  wrongHash = false,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const encoded = encodeScopeSettlementData({ binding, observation: "removed" }, binding);
+  yield* sql`UPDATE orchestration_v2_submission_transports SET settlement_json=${encoded.json},settlement_hash=${wrongHash ? "d".repeat(64) : encoded.hash},settled_at=${facts.now} WHERE transport_id=${row.transport_id}`;
+});
+const physicalAttempt = (
+  parent: ReturnType<typeof physicalTransport>,
+  threadId: string,
+  providerThreadId = "physical-provider-thread",
+  nativeThreadId = "physical-native",
+  attemptId = "physical-t3-attempt",
+) => {
+  const params = { threadId: nativeThreadId, input: [{ type: "text", text: "Work" }] };
+  const encoded = `${JSON.stringify({ id: 1, method: "turn/start", params })}\n`;
+  return snapshotSubmissionFrame(
+    {
+      transportId: parent.transport_id,
+      environmentId: parent.environment_id,
+      projectId: "later-project",
+      driver: "codex",
+      providerInstanceId: parent.provider_instance_id,
+      providerSessionId: parent.provider_session_id,
+    },
+    {
+      encoded,
+      byteLength: new TextEncoder().encode(encoded).byteLength,
+      method: "turn/start",
+      requestId: 1,
+      selection: JSON.stringify({
+        v: 1,
+        kind: "start",
+        threadId,
+        runId: "physical-t3-run",
+        runOrdinal: 1,
+        attemptId,
+        rootNodeId: "physical-t3-root",
+        providerTurnOrdinal: 1,
+        providerInstanceId: parent.provider_instance_id,
+        providerSessionId: parent.provider_session_id,
+        providerThreadId,
+        nativeThreadId,
+        invocation: 1,
+      }),
+    },
+    facts.now,
+  );
+};
+const physicalProvider = (
+  id: string,
+  appThreadId: string | null,
+  providerSessionId: string | null,
+  nativeId: string | null,
+  instance = "provider",
+  ownerNodeId: string | null = null,
+) => ({
+  id,
+  driver: "codex",
+  providerInstanceId: instance,
+  providerSessionId,
+  appThreadId,
+  ownerNodeId,
+  nativeThreadRef: nativeId === null ? null : { driver: "codex", nativeId, strength: "strong" },
+  nativeConversationHeadRef: null,
+  status: "idle",
+  firstRunOrdinal: null,
+  lastRunOrdinal: null,
+  handoffIds: [],
+  forkedFrom: null,
+  pendingBackgroundTasks: [],
+  createdAt: facts.now,
+  updatedAt: facts.now,
+});
+const seedPhysicalProvider = Effect.fn("test.seedPhysicalProvider")(function* (
+  value: ReturnType<typeof physicalProvider>,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`INSERT INTO orchestration_v2_projection_provider_threads ${sql.insert({ provider_thread_id: value.id, thread_id: value.appThreadId, owner_node_id: value.ownerNodeId, provider: value.providerInstanceId, driver: value.driver, provider_instance_id: value.providerInstanceId, provider_session_id: value.providerSessionId, status: value.status, first_run_ordinal: value.firstRunOrdinal, last_run_ordinal: value.lastRunOrdinal, updated_at: value.updatedAt, payload_json: json(value) })}`;
+});
+const seedPhysicalSession = Effect.fn("test.seedPhysicalSession")(function* (
+  id: string,
+  threadId: string | null = null,
+  instance = "provider",
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const value = {
+    id,
+    driver: "codex",
+    providerInstanceId: instance,
+    status: "ready",
+    cwd: "/workspace",
+    model: "model",
+    capabilities: CodexProviderCapabilitiesV2,
+    createdAt: facts.now,
+    updatedAt: facts.now,
+    lastError: null,
+  };
+  yield* sql`INSERT INTO orchestration_v2_projection_provider_sessions ${sql.insert({ provider_session_id: id, thread_id: threadId, provider: instance, driver: "codex", provider_instance_id: instance, status: value.status, model: value.model, updated_at: value.updatedAt, payload_json: json(value) })}`;
+});
+const seedPhysicalNode = Effect.fn("test.seedPhysicalNode")(function* (
+  id: string,
+  threadId: string,
+  providerThreadId: string | null = null,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const value = {
+    id,
+    threadId,
+    runId: null,
+    parentNodeId: null,
+    rootNodeId: id,
+    kind: "root_turn",
+    status: "completed",
+    countsForRun: true,
+    providerThreadId,
+    providerTurnId: null,
+    nativeItemRef: null,
+    runtimeRequestId: null,
+    checkpointScopeId: null,
+    startedAt: null,
+    completedAt: null,
+  };
+  yield* sql`INSERT INTO orchestration_v2_projection_nodes ${sql.insert({ node_id: id, thread_id: threadId, run_id: null, parent_node_id: null, root_node_id: id, kind: value.kind, status: value.status, provider_thread_id: providerThreadId, provider_turn_id: null, runtime_request_id: null, checkpoint_scope_id: null, started_at: null, completed_at: null, payload_json: json(value) })}`;
+});
+const expectPhysicalRejection = (result: unknown) =>
+  assert.deepStrictEqual(result, { kind: "rejected", reason: "custody" });
+
+it.effect.each([
+  "shared-session",
+  "provider-thread",
+  "native-alias",
+  "owner-node",
+  "subagent",
+  "fixed-point",
+] as const)("physical custody follows %s exposure without a thread-only exemption", (edge) =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const row = physicalTransport("other-opening-thread");
+    yield* sql`INSERT INTO orchestration_v2_submission_transports ${sql.insert(row)}`;
+    if (edge === "shared-session") {
+      yield* seedPhysicalSession("physical-session");
+      yield* sql`INSERT INTO orchestration_v2_projection_provider_session_bindings VALUES ('physical-session','thread')`;
+    } else if (edge === "provider-thread" || edge === "native-alias") {
+      yield* bindPhysicalTransport(row);
+      const child = physicalAttempt(
+        row,
+        "other-attempt-thread",
+        edge === "provider-thread" ? "selected-provider" : "other-provider",
+        "same-native",
+      );
+      yield* sql`INSERT INTO orchestration_v2_submission_attempts ${sql.insert(child)}`;
+      yield* seedPhysicalProvider(
+        physicalProvider(
+          "selected-provider",
+          "thread",
+          null,
+          edge === "native-alias" ? "same-native" : "other-native",
+        ),
+      );
+    } else if (edge === "owner-node") {
+      yield* seedPhysicalSession("physical-session");
+      yield* seedPhysicalNode("physical-owner", "thread");
+      yield* seedPhysicalProvider(
+        physicalProvider(
+          "selected-provider",
+          null,
+          "physical-session",
+          "same-native",
+          "provider",
+          "physical-owner",
+        ),
+      );
+    } else if (edge === "subagent") {
+      const value = {
+        id: "physical-subagent",
+        threadId: row.opening_thread_id,
+        runId: null,
+        parentNodeId: "physical-parent",
+        origin: "provider_native",
+        createdBy: "agent",
+        driver: "codex",
+        providerInstanceId: "provider",
+        providerThreadId: null,
+        childThreadId: "thread",
+        nativeTaskRef: null,
+        prompt: "Work",
+        title: null,
+        model: null,
+        status: "completed",
+        result: null,
+        startedAt: null,
+        completedAt: null,
+        updatedAt: facts.now,
+      };
+      yield* seedPhysicalNode("physical-parent", row.opening_thread_id);
+      yield* sql`INSERT INTO orchestration_v2_projection_subagents ${sql.insert({ subagent_id: value.id, thread_id: value.threadId, run_id: value.runId, parent_node_id: value.parentNodeId, provider: "provider", driver: "codex", provider_instance_id: "provider", provider_thread_id: null, child_thread_id: "thread", origin: value.origin, status: value.status, started_at: null, completed_at: null, updated_at: value.updatedAt, payload_json: json(value) })}`;
+    } else {
+      yield* seedPhysicalSession("initial-session");
+      yield* seedPhysicalSession("physical-session");
+      yield* seedPhysicalProvider(
+        physicalProvider("first-provider", "thread", "initial-session", "first-native"),
+      );
+      yield* seedPhysicalProvider(
+        physicalProvider("second-provider", null, "initial-session", "bridge-native"),
+      );
+      yield* seedPhysicalProvider(
+        physicalProvider(
+          "alias-provider",
+          "other-alias-thread",
+          "physical-session",
+          "bridge-native",
+        ),
+      );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_submission_attempts`, []);
+    }
+    const subscription = yield* store.subscribeChanges;
+    const before = yield* rawReservationState;
+    expectPhysicalRejection(
+      yield* store.reserveWorkflowNativeIntent(
+        reservation(operationFor("edge-op", "edge-attempt"), "edge-attempt"),
+      ),
+    );
+    assert.deepStrictEqual(yield* rawReservationState, before);
+    assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+  }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect.each(["not_submitted", "unknown", "submitted"] as const)(
+  "physical custody retains a bound parent after child %s",
+  (outcome) =>
+    Effect.gen(function* () {
+      yield* setupAdmission;
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      const row = physicalTransport("thread");
+      yield* sql`INSERT INTO orchestration_v2_submission_transports ${sql.insert(row)}`;
+      yield* bindPhysicalTransport(row);
+      yield* sql`INSERT INTO orchestration_v2_submission_attempts ${sql.insert(physicalAttempt(row, "thread"))}`;
+      yield* sql`UPDATE orchestration_v2_submission_attempts SET local_outcome=${outcome},local_reason=${outcome === "submitted" ? "completed" : "wrapper"},local_observed_at=${facts.now}`;
+      const before = yield* rawReservationState;
+      expectPhysicalRejection(
+        yield* store.reserveWorkflowNativeIntent(
+          reservation(operationFor("outcome-op", "outcome-attempt"), "outcome-attempt"),
+        ),
+      );
+      assert.deepStrictEqual(yield* rawReservationState, before);
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect.each(["valid", "settlement-hash", "selection-hash"] as const)(
+  "physical custody validates %s historical release before fresh admission",
+  (variant) =>
+    Effect.gen(function* () {
+      yield* setupAdmission;
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      const row = physicalTransport("thread");
+      yield* sql`INSERT INTO orchestration_v2_submission_transports ${sql.insert(row)}`;
+      const bound = yield* bindPhysicalTransport(row);
+      const child = physicalAttempt(row, "thread");
+      yield* sql`INSERT INTO orchestration_v2_submission_attempts ${sql.insert({ ...child, selection_hash: variant === "selection-hash" ? "d".repeat(64) : child.selection_hash })}`;
+      yield* sql`UPDATE orchestration_v2_submission_attempts SET local_outcome='unknown',local_reason='sink',local_observed_at=${facts.now}`;
+      yield* settlePhysicalTransport(row, bound, variant === "settlement-hash");
+      const before = yield* rawReservationState;
+      const input = reservation(operationFor("settled-op", "settled-attempt"), "settled-attempt");
+      if (variant === "valid")
+        assert.strictEqual((yield* store.reserveWorkflowNativeIntent(input)).kind, "reserved");
+      else {
+        assert.strictEqual(
+          (yield* Effect.flip(store.reserveWorkflowNativeIntent(input))).reason,
+          "integrity",
+        );
+        assert.deepStrictEqual(yield* rawReservationState, before);
+      }
+      assert.strictEqual(
+        (yield* sql<{
+          local_outcome: string;
+        }>`SELECT local_outcome FROM orchestration_v2_submission_attempts`)[0]?.local_outcome,
+        "unknown",
+      );
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect.each(physicalAdmissionKinds)(
+  "physical custody preserves immutable %s replay without recharging",
+  (kind) =>
+    Effect.gen(function* () {
+      const prepared = yield* preparePhysicalAdmission(kind);
+      const store = yield* Store.WorkflowRunStore;
+      const sql = yield* SqlClient.SqlClient;
+      const original = yield* prepared.invoke;
+      if (original._tag !== "Success" || !("receiptId" in original.success))
+        throw new Error("expected initial admission");
+      yield* sql`INSERT INTO orchestration_v2_submission_transports ${sql.insert(physicalTransport(prepared.threadId))}`;
+      const subscription = yield* store.subscribeChanges;
+      const before = yield* rawReservationState;
+      const replay = yield* prepared.invoke;
+      assert.strictEqual(replay._tag, "Success");
+      if (replay._tag === "Success" && "receiptId" in replay.success) {
+        assert.strictEqual(replay.success.kind, "replay");
+        assert.strictEqual(replay.success.receiptId, original.success.receiptId);
+      } else throw new Error("expected immutable replay");
+      assert.deepStrictEqual(yield* rawReservationState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect("physical custody does not equate native IDs across provider instances", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const row = physicalTransport(
+      "foreign-opening",
+      "11111111-2222-3333-4444-555555555555",
+      "foreign-session",
+      "foreign-instance",
+    );
+    yield* sql`INSERT INTO orchestration_v2_submission_transports ${sql.insert(row)}`;
+    yield* bindPhysicalTransport(row);
+    yield* sql`INSERT INTO orchestration_v2_submission_attempts ${sql.insert(physicalAttempt(row, "foreign-thread", "foreign-provider", "same-native"))}`;
+    yield* seedPhysicalProvider(
+      physicalProvider("selected-provider", "thread", null, "same-native"),
+    );
+    yield* seedPhysicalProvider(
+      physicalProvider(
+        "foreign-provider",
+        "foreign-thread",
+        null,
+        "same-native",
+        "foreign-instance",
+      ),
+    );
+    assert.strictEqual(
+      (yield* store.reserveWorkflowNativeIntent(
+        reservation(operationFor("isolation-op", "isolation-attempt"), "isolation-attempt"),
+      )).kind,
+      "reserved",
+    );
+    assert.strictEqual(
+      (yield* sql`SELECT transport_id FROM orchestration_v2_submission_transports WHERE settlement_json IS NULL`)
+        .length,
+      1,
+    );
+  }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect.each([
+  "allocated",
+  "null-native-id",
+  "unrelated-malformed",
+  "known-malformed",
+  "wrong-shadow",
+  "wrong-session-shadow",
+  "wrong-ref-driver",
+] as const)("physical custody handles %s projection evidence without a global scan", (variant) =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const row = physicalTransport("unrelated-opening");
+    yield* sql`INSERT INTO orchestration_v2_submission_transports ${sql.insert(row)}`;
+    const bound = yield* bindPhysicalTransport(row);
+    yield* settlePhysicalTransport(row, bound);
+    const value = physicalProvider(
+      "selected-provider",
+      "thread",
+      variant === "allocated"
+        ? "allocated-session"
+        : variant === "wrong-session-shadow"
+          ? "selected-session"
+          : null,
+      variant === "allocated" || variant === "null-native-id" ? null : "selected-native",
+    );
+    if (variant === "allocated") value.status = "not_loaded";
+    yield* seedPhysicalProvider(value);
+    if (variant === "null-native-id")
+      yield* sql`UPDATE orchestration_v2_projection_provider_threads SET payload_json=${json({ ...value, nativeThreadRef: { driver: "codex", nativeId: null, strength: "none" } })} WHERE provider_thread_id='selected-provider'`;
+    if (variant === "unrelated-malformed") {
+      yield* seedPhysicalProvider(
+        physicalProvider("unrelated-provider", "unrelated-thread", null, null),
+      );
+      yield* sql`UPDATE orchestration_v2_projection_provider_threads SET payload_json='{malformed' WHERE provider_thread_id='unrelated-provider'`;
+    }
+    if (variant === "known-malformed")
+      yield* sql`UPDATE orchestration_v2_projection_provider_threads SET payload_json='{malformed' WHERE provider_thread_id='selected-provider'`;
+    if (variant === "wrong-shadow")
+      yield* sql`UPDATE orchestration_v2_projection_provider_threads SET provider_instance_id='wrong-instance' WHERE provider_thread_id='selected-provider'`;
+    if (variant === "wrong-session-shadow") {
+      yield* seedPhysicalSession("selected-session");
+      yield* sql`UPDATE orchestration_v2_projection_provider_sessions SET model='wrong-model' WHERE provider_session_id='selected-session'`;
+    }
+    if (variant === "wrong-ref-driver")
+      yield* sql`UPDATE orchestration_v2_projection_provider_threads SET payload_json=${json({ ...value, nativeThreadRef: { driver: "claude", nativeId: "selected-native", strength: "strong" } })} WHERE provider_thread_id='selected-provider'`;
+    const input = reservation(operationFor("evidence-op", "evidence-attempt"), "evidence-attempt");
+    const before = yield* rawReservationState;
+    if (
+      variant === "known-malformed" ||
+      variant === "wrong-shadow" ||
+      variant === "wrong-session-shadow" ||
+      variant === "wrong-ref-driver"
+    ) {
+      assert.strictEqual(
+        (yield* Effect.flip(store.reserveWorkflowNativeIntent(input))).reason,
+        "integrity",
+      );
+      assert.deepStrictEqual(yield* rawReservationState, before);
+    } else assert.strictEqual((yield* store.reserveWorkflowNativeIntent(input)).kind, "reserved");
+  }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect("physical custody continues transport history beyond the first128-row page", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    for (let index = 1; index <= 129; index++) {
+      const id = `${index.toString(16).padStart(8, "0")}-2222-3333-4444-555555555555`;
+      const row = physicalTransport("thread", id);
+      yield* sql`INSERT INTO orchestration_v2_submission_transports ${sql.insert(row)}`;
+      if (index < 129) yield* settlePhysicalTransport(row, yield* bindPhysicalTransport(row));
+    }
+    const before = yield* rawReservationState;
+    expectPhysicalRejection(
+      yield* store.reserveWorkflowNativeIntent(
+        reservation(operationFor("paged-op", "paged-attempt"), "paged-attempt"),
+      ),
+    );
+    assert.deepStrictEqual(yield* rawReservationState, before);
+  }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect("physical custody validates released children beyond the first128-row page", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const row = physicalTransport("thread");
+    yield* sql`INSERT INTO orchestration_v2_submission_transports ${sql.insert(row)}`;
+    const bound = yield* bindPhysicalTransport(row);
+    for (let index = 0; index < 129; index++) {
+      const child = physicalAttempt(
+        row,
+        "thread",
+        "old-provider",
+        "old-native",
+        `attempt-${String(index).padStart(3, "0")}`,
+      );
+      yield* sql`INSERT INTO orchestration_v2_submission_attempts ${sql.insert({ ...child, selection_hash: index === 128 ? "d".repeat(64) : child.selection_hash })}`;
+    }
+    yield* settlePhysicalTransport(row, bound);
+    const before = yield* rawReservationState;
+    assert.strictEqual(
+      (yield* Effect.flip(
+        store.reserveWorkflowNativeIntent(
+          reservation(operationFor("paged-op", "paged-attempt"), "paged-attempt"),
+        ),
+      )).reason,
+      "integrity",
+    );
+    assert.deepStrictEqual(yield* rawReservationState, before);
+  }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect("physical custody continues native alias candidates beyond the first128-row page", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const row = physicalTransport("other-opening");
+    yield* sql`INSERT INTO orchestration_v2_submission_transports ${sql.insert(row)}`;
+    yield* seedPhysicalSession("physical-session");
+    yield* seedPhysicalProvider(physicalProvider("root-provider", "thread", null, "shared-native"));
+    for (let index = 0; index < 128; index++)
+      yield* seedPhysicalProvider(
+        physicalProvider(
+          `aa-provider-${String(index).padStart(3, "0")}`,
+          `foreign-thread-${index}`,
+          null,
+          "shared-native",
+          "foreign-instance",
+        ),
+      );
+    yield* seedPhysicalProvider(
+      physicalProvider("zz-held-provider", "other-alias", "physical-session", "shared-native"),
+    );
+    const before = yield* rawReservationState;
+    expectPhysicalRejection(
+      yield* store.reserveWorkflowNativeIntent(
+        reservation(operationFor("paged-op", "paged-attempt"), "paged-attempt"),
+      ),
+    );
+    assert.deepStrictEqual(yield* rawReservationState, before);
+  }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect.each(physicalAdmissionKinds)(
+  "physical custody serializes %s with an actual independent ledger writer and reopen",
+  (kind) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const directory = yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "submission-admission-")),
+          ),
+          (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
+        );
+        const filename = NodePath.join(directory, "state.sqlite");
+        const fileLayer = () =>
+          Layer.merge(Store.layer, EffectOutbox.layer).pipe(
+            Layer.provideMerge(NodeSqliteClient.layer({ filename })),
+          );
+        const prepared = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const value = yield* preparePhysicalAdmission(kind);
+            const sql = yield* SqlClient.SqlClient;
+            yield* sql`PRAGMA busy_timeout=0`;
+            const other = yield* Effect.acquireRelease(
+              Effect.sync(() => new NodeSqlite.DatabaseSync(filename)),
+              (database) => Effect.sync(() => database.close()),
+            );
+            const row = physicalTransport(value.threadId);
+            yield* Effect.sync(() => {
+              other.exec("PRAGMA busy_timeout=0; BEGIN IMMEDIATE");
+              const keys = Object.keys(row);
+              other
+                .prepare(
+                  `INSERT INTO orchestration_v2_submission_transports (${keys.map((key) => `"${key}"`).join(",")}) VALUES (${keys.map(() => "?").join(",")})`,
+                )
+                .run(...Object.values(row));
+            });
+            const before = yield* rawReservationState;
+            const blocked = yield* value.invoke;
+            assert.strictEqual(blocked._tag, "Failure");
+            if (blocked._tag === "Failure")
+              assert.strictEqual(
+                blocked.failure.reason,
+                kind.startsWith("workflow")
+                  ? "persistence"
+                  : kind === "planning-native"
+                    ? "storage"
+                    : "conflict",
+              );
+            assert.deepStrictEqual(yield* rawReservationState, before);
+            yield* Effect.sync(() => other.exec("COMMIT"));
+            const committed = yield* value.invoke;
+            if (kind.startsWith("workflow")) {
+              assert.strictEqual(committed._tag, "Success");
+              if (committed._tag === "Success") expectPhysicalRejection(committed.success);
+            } else {
+              assert.strictEqual(committed._tag, "Failure");
+              if (committed._tag === "Failure")
+                assert.strictEqual(committed.failure.reason, "custody");
+            }
+            assert.deepStrictEqual(yield* rawReservationState, before);
+            return { threadId: value.threadId, invokeOn: value.invokeOn, before };
+          }).pipe(Effect.provide(fileLayer())),
+        );
+        yield* Effect.gen(function* () {
+          const store = yield* Store.WorkflowRunStore;
+          const result = yield* prepared.invokeOn(store);
+          if (kind.startsWith("workflow")) {
+            assert.strictEqual(result._tag, "Success");
+            if (result._tag === "Success") expectPhysicalRejection(result.success);
+          } else {
+            assert.strictEqual(result._tag, "Failure");
+            if (result._tag === "Failure") assert.strictEqual(result.failure.reason, "custody");
+          }
+          assert.deepStrictEqual(yield* rawReservationState, prepared.before);
+        }).pipe(Effect.provide(fileLayer()));
+      }),
+    ),
+);
+
+it.effect.each(physicalAdmissionKinds)(
+  "physical custody maps unavailable lookup storage for %s without writes",
+  (kind) =>
+    Effect.gen(function* () {
+      const prepared = yield* preparePhysicalAdmission(kind);
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* Store.WorkflowRunStore;
+      const subscription = yield* store.subscribeChanges;
+      const before = yield* rawReservationState;
+      yield* sql`DROP TABLE orchestration_v2_submission_transports`;
+      const result = yield* prepared.invoke;
+      assert.strictEqual(result._tag, "Failure");
+      if (result._tag === "Failure")
+        assert.strictEqual(
+          result.failure.reason,
+          kind.startsWith("workflow") ? "persistence" : "storage",
+        );
+      assert.deepStrictEqual(yield* rawReservationState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect("physical custody keeps a remote child identity separate from a local alias", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* Store.WorkflowRunStore;
+    const row = physicalTransport("other-source");
+    yield* sql`INSERT INTO orchestration_v2_submission_transports ${sql.insert(row)}`;
+    yield* seedPhysicalNode("remote-parent", "other-source");
+    const value = {
+      id: "remote-subagent",
+      threadId: "other-source",
+      runId: null,
+      parentNodeId: "remote-parent",
+      origin: "app_owned",
+      createdBy: "agent",
+      driver: "codex",
+      providerInstanceId: "provider",
+      providerThreadId: null,
+      childThreadId: null,
+      remoteChild: { environmentId: "remote-environment", threadId: "thread", label: "remote" },
+      nativeTaskRef: null,
+      prompt: "Work",
+      title: null,
+      model: null,
+      status: "completed",
+      result: null,
+      startedAt: null,
+      completedAt: null,
+      updatedAt: facts.now,
+    };
+    yield* sql`INSERT INTO orchestration_v2_projection_subagents ${sql.insert({ subagent_id: value.id, thread_id: value.threadId, run_id: null, parent_node_id: value.parentNodeId, provider: "provider", driver: "codex", provider_instance_id: "provider", provider_thread_id: null, child_thread_id: null, origin: value.origin, status: value.status, started_at: null, completed_at: null, updated_at: value.updatedAt, payload_json: json(value) })}`;
+    assert.strictEqual(
+      (yield* store.reserveWorkflowNativeIntent(
+        reservation(operationFor("remote-op", "remote-attempt"), "remote-attempt"),
+      )).kind,
+      "reserved",
+    );
+  }).pipe(Effect.provide(layerWithOutbox)),
 );

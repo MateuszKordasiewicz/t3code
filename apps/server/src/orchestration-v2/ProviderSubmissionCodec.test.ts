@@ -8,6 +8,7 @@ import { WorkflowCanonicalHash } from "../workflowRuns/WorkflowCanonicalHash.ts"
 import {
   assertStoredAttemptMatchesFrame,
   decodeSubmissionTransportData,
+  decodeSubmissionAttemptResourceData,
   encodeScopeBindingData,
   encodeScopeSettlementData,
   encodeSubmissionTransportData,
@@ -674,4 +675,45 @@ describe("provider submission data codec", () => {
     invalid(() => snapshotSubmissionFrame(fresh.context, unsafeFrame, createdAt));
     expect(getterCalls).toBe(0);
   });
+});
+
+it("decodes only present attempt resource data and never invents missing frame preimages", () => {
+  const { context, selection, params } = setup();
+  const frame = makeFrame(selection, params);
+  const row = snapshotSubmissionFrame(context, frame, createdAt);
+  expect(decodeSubmissionAttemptResourceData(row)).toEqual(row);
+  expect(Object.isFrozen(decodeSubmissionAttemptResourceData(row))).toBe(true);
+  const absentPreimages = { ...row, input_hash: "b".repeat(64), frame_hash: "c".repeat(64) };
+  expect(decodeSubmissionAttemptResourceData(absentPreimages)).toEqual(absentPreimages);
+  invalid(() => assertStoredAttemptMatchesFrame(absentPreimages, context, frame), "conflict");
+  for (const [key, value] of Object.entries(row)) {
+    if (key === "environment_id" || key === "project_id") {
+      const changed = { ...row, [key]: "different-valid-id" };
+      expect(decodeSubmissionAttemptResourceData(changed)).toEqual(changed);
+      invalid(() => assertStoredAttemptMatchesFrame(changed, context, frame), "conflict");
+      continue;
+    }
+    const replacement =
+      typeof value === "string" ? `${value}-changed` : value === null ? "changed" : value + 1;
+    invalid(() => decodeSubmissionAttemptResourceData({ ...row, [key]: replacement }));
+  }
+  for (const patch of [
+    { request_id_json: "7.0" },
+    { selection_json: JSON.stringify(selection) },
+    { input_hash: "A".repeat(64) },
+    { frame_hash: "x".repeat(64) },
+    { local_outcome: "unknown", local_reason: "completed", local_observed_at: createdAt },
+    { local_outcome: "unknown", local_reason: "sink", local_observed_at: "invalid" },
+    { extra: 1 },
+  ])
+    invalid(() => decodeSubmissionAttemptResourceData({ ...row, ...patch }));
+  invalid(() => decodeSubmissionAttemptResourceData(without(row, "local_outcome")));
+  expect(
+    decodeSubmissionAttemptResourceData({
+      ...row,
+      local_outcome: "not_submitted",
+      local_reason: "wrapper",
+      local_observed_at: createdAt,
+    }),
+  ).toMatchObject({ local_outcome: "not_submitted" });
 });

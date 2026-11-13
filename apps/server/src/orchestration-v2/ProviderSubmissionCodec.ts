@@ -418,30 +418,65 @@ export function snapshotSubmissionFrame(
   return boundary(() => snapshot(own(perTurnContext), own(frame), own(createdAt)));
 }
 
+function attemptResourceData(input: unknown) {
+  const row = exact(input, attemptKeys);
+  requireData(row.format_version === 1 && row.method === "turn/start");
+  const context = turnContext({
+    transportId: row.transport_id,
+    environmentId: row.environment_id,
+    projectId: row.project_id,
+    driver: row.driver,
+    providerInstanceId: row.provider_instance_id,
+    providerSessionId: row.provider_session_id,
+  });
+  const selected = selection(storedJson(row.selection_json));
+  const shadows = {
+    attempt_id: selected.attemptId,
+    thread_id: selected.threadId,
+    run_id: selected.runId,
+    run_ordinal: selected.runOrdinal,
+    root_node_id: selected.rootNodeId,
+    provider_turn_ordinal: selected.providerTurnOrdinal,
+    provider_instance_id: selected.providerInstanceId,
+    provider_session_id: selected.providerSessionId,
+    provider_thread_id: selected.providerThreadId,
+    native_thread_id: selected.nativeThreadId,
+  };
+  for (const [key, value] of Object.entries(shadows)) requireData(row[key] === value);
+  requireData(
+    selected.providerInstanceId === context.providerInstanceId &&
+      selected.providerSessionId === context.providerSessionId,
+  );
+  requireData(row.selection_hash === tagged("provider-submission-selection", selected));
+  digest(row.input_hash);
+  digest(row.frame_hash);
+  requestId(storedJson(row.request_id_json));
+  timestamp(row.created_at);
+  if (evidenceGroup(row, ["local_outcome", "local_reason", "local_observed_at"])) {
+    requireData(
+      row.local_outcome === "submitted" ||
+        row.local_outcome === "not_submitted" ||
+        row.local_outcome === "unknown",
+    );
+    requireData(typeof row.local_reason === "string" && reasons.has(row.local_reason));
+    requireData((row.local_outcome === "submitted") === (row.local_reason === "completed"));
+    timestamp(row.local_observed_at);
+  }
+  return row;
+}
+
+// This validates stored data only; input/frame digest preimages are absent from resource rows.
+export function decodeSubmissionAttemptResourceData(input: unknown) {
+  return boundary(() => attemptResourceData(own(input)));
+}
+
 export function assertStoredAttemptMatchesFrame(
   input: unknown,
   perTurnContext: unknown,
   actualFrame: unknown,
 ): void {
   boundary(() => {
-    const row = exact(own(input), attemptKeys);
-    requireData(row.format_version === 1);
-    const selected = selection(storedJson(row.selection_json));
-    requireData(row.selection_hash === tagged("provider-submission-selection", selected));
-    digest(row.input_hash);
-    digest(row.frame_hash);
-    requestId(storedJson(row.request_id_json));
-    if (evidenceGroup(row, ["local_outcome", "local_reason", "local_observed_at"])) {
-      requireData(
-        row.local_outcome === "submitted" ||
-          row.local_outcome === "not_submitted" ||
-          row.local_outcome === "unknown",
-      );
-      requireData(typeof row.local_reason === "string" && reasons.has(row.local_reason));
-      requireData((row.local_outcome === "submitted") === (row.local_reason === "completed"));
-      timestamp(row.local_observed_at);
-    }
-    // Hash preimages are not stored in 088; full comparison always requires the actual frame.
+    const row = attemptResourceData(own(input));
     const expected = snapshot(own(perTurnContext), own(actualFrame), row.created_at);
     for (const [key, value] of Object.entries(expected)) {
       if (key !== "local_outcome" && key !== "local_reason" && key !== "local_observed_at")

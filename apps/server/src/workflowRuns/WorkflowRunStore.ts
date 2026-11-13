@@ -14,6 +14,8 @@ import {
   WorkflowOperationV1,
   WorkflowRunV1,
   OrchestrationV2ProviderThreadJson,
+  OrchestrationV2ProviderSessionJson,
+  OrchestrationV2SubagentJson,
   OrchestrationV2RunJson,
   OrchestrationV2RunAttemptJson,
   OrchestrationV2ExecutionNodeJson,
@@ -32,6 +34,10 @@ import * as SqlClient from "effect/sql/SqlClient";
 import type * as Path from "effect/Path";
 import type { ServerConfig } from "../config.ts";
 import * as NativeProtocol from "./WorkflowNativeCommandProtocol.ts";
+import {
+  decodeSubmissionTransportData,
+  decodeSubmissionAttemptResourceData,
+} from "../orchestration-v2/ProviderSubmissionCodec.ts";
 import type { PlanningObservation } from "../developmentPlans/PlanningPassObservation.ts";
 import { DevelopmentPlanHash } from "../developmentPlans/DevelopmentPlanHash.ts";
 import { WorkflowCanonicalHash } from "./WorkflowCanonicalHash.ts";
@@ -119,6 +125,13 @@ const decodeNativeCheckpointScope = Schema.decodeEffect(
 );
 const decodeRecoveryProviderThread = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2ProviderThreadJson),
+);
+
+const decodeSubmissionSession = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(OrchestrationV2ProviderSessionJson),
+);
+const decodeSubmissionSubagent = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(OrchestrationV2SubagentJson),
 );
 
 export class WorkflowRunStoreError extends Schema.TaggedError<WorkflowRunStoreError>()(
@@ -265,6 +278,400 @@ const makeStore = Effect.fnUntraced(function* (
       yield* sql`SELECT 1 FROM orchestration_v2_effect_outbox WHERE thread_id = ${threadId} AND status = 'running' AND effect_type IN ('provider-turn.start', 'provider-turn.restart', 'provider-runtime.continue') LIMIT 1`;
     return rows.length > 0;
   });
+  const readSubmissionCustodyInTransaction = Effect.fn(
+    "WorkflowRunStore.readSubmissionCustodyInTransaction",
+  )(
+    function* (environmentId: string, threadId: string) {
+      if (Option.isNone(yield* Effect.serviceOption(sql.transactionService)))
+        return yield* integrity();
+      const validId = (value: unknown): value is string =>
+        typeof value === "string" && value.trim().length > 0 && value.isWellFormed();
+      if (!validId(environmentId) || !validId(threadId)) return yield* integrity();
+      const present =
+        yield* sql`SELECT 1 FROM orchestration_v2_submission_transports WHERE environment_id=${environmentId} LIMIT 1`;
+      if (!present.length) return false;
+      type Row = Readonly<Record<string, unknown>>;
+      type Kind = "thread" | "session" | "provider" | "node" | "subagent";
+      type Native = { driver: string; instance: string; id: string };
+      type Work = { kind: Kind; id: string } | { kind: "native"; native: Native };
+      const work: Work[] = [];
+      const queued = new Set<string>();
+      const parents = new Map<string, Row>();
+      const attempts = new Set<string>();
+      const sessionIdentities = new Map<string, { driver: string; instance: string }>();
+      const queue = (kind: Kind, id: unknown) => {
+        if (!validId(id)) return false;
+        const key = `${kind}\0${id}`;
+        if (!queued.has(key)) {
+          queued.add(key);
+          work.push({ kind, id });
+        }
+        return true;
+      };
+      const queueNullable = (kind: Kind, id: unknown) => id === null || queue(kind, id);
+      const queueSession = (id: unknown, identity?: { driver: string; instance: string }) => {
+        if (!validId(id)) return false;
+        if (identity) {
+          if (!validId(identity.driver) || !validId(identity.instance)) return false;
+          const previous = sessionIdentities.get(id);
+          if (
+            previous &&
+            (previous.driver !== identity.driver || previous.instance !== identity.instance)
+          )
+            return false;
+          sessionIdentities.set(id, identity);
+        }
+        return queue("session", id);
+      };
+      const queueNative = (native: Native) => {
+        if (!validId(native.driver) || !validId(native.instance) || !validId(native.id))
+          return false;
+        const key = `native\0${JSON.stringify([native.driver, native.instance, native.id])}`;
+        if (!queued.has(key)) {
+          queued.add(key);
+          work.push({ kind: "native", native });
+        }
+        return true;
+      };
+      const matches = (row: Row, shadows: Row) =>
+        Object.entries(shadows).every(([key, value]) => row[key] === value);
+      const sameTime = (raw: unknown, value: DateTime.DateTime | null) => {
+        if (raw === null) return value === null;
+        if (typeof raw !== "string" || !isWorkflowTimestamp(raw) || value === null) return false;
+        const parsed = DateTime.make(raw);
+        return (
+          Option.isSome(parsed) &&
+          DateTime.toEpochMillis(parsed.value) === DateTime.toEpochMillis(value)
+        );
+      };
+      // Per-row helpers share the outer reader's span and captured writer connection.
+      const parseAttempt = Effect.fnUntraced(function* (raw: Row, parent: Row) {
+        const row = yield* Effect.try({
+          try: () => decodeSubmissionAttemptResourceData(raw),
+          catch: integrity,
+        });
+        if (
+          !matches(row, {
+            transport_id: parent.transport_id,
+            environment_id: parent.environment_id,
+            driver: parent.driver,
+            provider_instance_id: parent.provider_instance_id,
+            provider_session_id: parent.provider_session_id,
+          })
+        )
+          return yield* integrity();
+        attempts.add(row.attempt_id as string);
+        return row;
+      });
+      // Repeated history matches share one validation pass inside this reader.
+      const inspectParent = Effect.fnUntraced(function* (raw: Row) {
+        const row = yield* Effect.try({
+          try: () => decodeSubmissionTransportData(raw),
+          catch: integrity,
+        });
+        if (row.environment_id !== environmentId) return yield* integrity();
+        const id = row.transport_id as string;
+        if (parents.has(id)) return parents.get(id)!.settlement_json === null;
+        parents.set(id, row);
+        if (row.settlement_json === null) return true;
+        let cursor = "";
+        for (;;) {
+          const children =
+            yield* sql`SELECT * FROM orchestration_v2_submission_attempts WHERE transport_id=${id} AND attempt_id>${cursor} ORDER BY attempt_id LIMIT 128`;
+          for (const child of children) yield* parseAttempt(child, row);
+          if (children.length < 128) break;
+          const last = children.at(-1)!.attempt_id;
+          if (!validId(last) || last === cursor) return yield* integrity();
+          cursor = last;
+        }
+        return false;
+      });
+      // All historical children must agree with their immutable physical parent.
+      const inspectAttempt = Effect.fnUntraced(function* (raw: Row) {
+        if (validId(raw.attempt_id) && attempts.has(raw.attempt_id)) return false;
+        const row = yield* Effect.try({
+          try: () => decodeSubmissionAttemptResourceData(raw),
+          catch: integrity,
+        });
+        const id = row.transport_id as string;
+        let parent = parents.get(id);
+        let held = false;
+        if (!parent) {
+          const found =
+            yield* sql`SELECT * FROM orchestration_v2_submission_transports WHERE transport_id=${id}`;
+          if (found.length !== 1 || !found[0]) return yield* integrity();
+          held = yield* inspectParent(found[0]);
+          parent = parents.get(id)!;
+        } else held = parent.settlement_json === null;
+        yield* parseAttempt(raw, parent);
+        return held;
+      });
+      // Page boundaries bound result arrays without dropping matched released history.
+      const transportHistory = Effect.fnUntraced(function* (
+        field: "opening_thread_id" | "provider_session_id",
+        id: string,
+      ) {
+        let cursor = "";
+        for (;;) {
+          const rows =
+            yield* sql`SELECT * FROM orchestration_v2_submission_transports WHERE environment_id=${environmentId} AND ${sql(field)}=${id} AND transport_id>${cursor} ORDER BY transport_id LIMIT 128`;
+          for (const row of rows) if (yield* inspectParent(row)) return true;
+          if (rows.length < 128) return false;
+          const last = rows.at(-1)!.transport_id;
+          if (!validId(last) || last === cursor) return yield* integrity();
+          cursor = last;
+        }
+      });
+      // The exact native prefix uses089; session history is deliberately parent-first.
+      const attemptHistory = Effect.fnUntraced(function* (
+        target: { field: "thread_id" | "provider_thread_id"; id: string } | Native,
+      ) {
+        let cursor = "";
+        for (;;) {
+          const rows =
+            "field" in target
+              ? yield* sql`SELECT * FROM orchestration_v2_submission_attempts WHERE environment_id=${environmentId} AND ${sql(target.field)}=${target.id} AND attempt_id>${cursor} ORDER BY attempt_id LIMIT 128`
+              : yield* sql`SELECT * FROM orchestration_v2_submission_attempts WHERE environment_id=${environmentId} AND driver=${target.driver} AND provider_instance_id=${target.instance} AND native_thread_id=${target.id} AND attempt_id>${cursor} ORDER BY attempt_id LIMIT 128`;
+          for (const row of rows) if (yield* inspectAttempt(row)) return true;
+          if (rows.length < 128) return false;
+          const last = rows.at(-1)!.attempt_id;
+          if (!validId(last) || last === cursor) return yield* integrity();
+          cursor = last;
+        }
+      });
+      // Projection decoding validates selected rows, not every unrelated legacy record.
+      const providerData = Effect.fnUntraced(function* (row: Row) {
+        const value = yield* decodeRecoveryProviderThread(row.payload_json, {
+          onExcessProperty: "error",
+        }).pipe(Effect.mapError(integrity));
+        if (
+          !matches(row, {
+            provider_thread_id: value.id,
+            thread_id: value.appThreadId,
+            owner_node_id: value.ownerNodeId,
+            provider_session_id: value.providerSessionId,
+            driver: value.driver,
+            provider_instance_id: value.providerInstanceId,
+            status: value.status,
+            first_run_ordinal: value.firstRunOrdinal,
+            last_run_ordinal: value.lastRunOrdinal,
+          }) ||
+          !sameTime(row.updated_at, value.updatedAt)
+        )
+          return yield* integrity();
+        if (
+          !validId(value.id) ||
+          !validId(value.providerInstanceId) ||
+          (value.nativeThreadRef !== null &&
+            (value.nativeThreadRef.driver !== value.driver ||
+              (value.nativeThreadRef.nativeId !== null &&
+                !validId(value.nativeThreadRef.nativeId))))
+        )
+          return yield* integrity();
+        return value;
+      });
+      queue("thread", threadId);
+      for (let index = 0; index < work.length; index++) {
+        const selected = work[index]!;
+        if (selected.kind === "thread") {
+          if (yield* transportHistory("opening_thread_id", selected.id)) return true;
+          if (yield* attemptHistory({ field: "thread_id", id: selected.id })) return true;
+          const sessions =
+            yield* sql`SELECT provider_session_id FROM orchestration_v2_projection_provider_sessions WHERE thread_id=${selected.id} UNION ALL SELECT provider_session_id FROM orchestration_v2_projection_provider_session_bindings WHERE thread_id=${selected.id}`;
+          for (const row of sessions)
+            if (!queueSession(row.provider_session_id)) return yield* integrity();
+          const references =
+            yield* sql`SELECT provider_thread_id FROM orchestration_v2_projection_provider_threads WHERE thread_id=${selected.id} UNION ALL SELECT p.provider_thread_id FROM orchestration_v2_projection_provider_threads p JOIN orchestration_v2_projection_nodes n ON n.node_id=p.owner_node_id WHERE n.thread_id=${selected.id}`;
+          for (const row of references)
+            if (!queue("provider", row.provider_thread_id)) return yield* integrity();
+          const children =
+            yield* sql`SELECT subagent_id FROM orchestration_v2_projection_subagents WHERE thread_id=${selected.id} OR child_thread_id=${selected.id} UNION ALL SELECT s.subagent_id FROM orchestration_v2_projection_subagents s JOIN orchestration_v2_projection_nodes n ON n.node_id=s.parent_node_id WHERE n.thread_id=${selected.id}`;
+          for (const row of children)
+            if (!queue("subagent", row.subagent_id)) return yield* integrity();
+        } else if (selected.kind === "session") {
+          if (yield* transportHistory("provider_session_id", selected.id)) return true;
+          const rows =
+            yield* sql`SELECT * FROM orchestration_v2_projection_provider_sessions WHERE provider_session_id=${selected.id}`;
+          const peers =
+            yield* sql`SELECT thread_id FROM orchestration_v2_projection_provider_session_bindings WHERE provider_session_id=${selected.id}`;
+          const references =
+            yield* sql`SELECT * FROM orchestration_v2_projection_provider_threads WHERE provider_session_id=${selected.id}`;
+          if (!rows.length) {
+            if (peers.length || !references.length) return yield* integrity();
+            for (const row of references) {
+              const value = yield* providerData(row);
+              if (
+                value.status !== "not_loaded" ||
+                value.nativeThreadRef !== null ||
+                value.nativeConversationHeadRef !== null ||
+                (value.pendingBackgroundTasks?.length ?? 0) !== 0 ||
+                !queueSession(selected.id, {
+                  driver: value.driver,
+                  instance: value.providerInstanceId,
+                })
+              )
+                return yield* integrity();
+            }
+          } else {
+            if (rows.length !== 1 || !rows[0]) return yield* integrity();
+            const row = rows[0];
+            const value = yield* decodeSubmissionSession(row.payload_json, {
+              onExcessProperty: "error",
+            }).pipe(Effect.mapError(integrity));
+            if (
+              !matches(row, {
+                provider_session_id: value.id,
+                driver: value.driver,
+                provider_instance_id: value.providerInstanceId,
+                status: value.status,
+                model: value.model,
+              }) ||
+              !sameTime(row.updated_at, value.updatedAt) ||
+              !queueSession(value.id, {
+                driver: value.driver,
+                instance: value.providerInstanceId,
+              }) ||
+              !queueNullable("thread", row.thread_id)
+            )
+              return yield* integrity();
+          }
+          for (const row of peers) if (!queue("thread", row.thread_id)) return yield* integrity();
+          for (const row of references)
+            if (!queue("provider", row.provider_thread_id)) return yield* integrity();
+        } else if (selected.kind === "provider") {
+          if (yield* attemptHistory({ field: "provider_thread_id", id: selected.id })) return true;
+          const rows =
+            yield* sql`SELECT * FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id=${selected.id}`;
+          if (rows.length !== 1 || !rows[0]) return yield* integrity();
+          const value = yield* providerData(rows[0]);
+          if (
+            !queueNullable("thread", value.appThreadId) ||
+            !queueNullable("node", value.ownerNodeId)
+          )
+            return yield* integrity();
+          if (
+            value.providerSessionId !== null &&
+            !queueSession(value.providerSessionId, {
+              driver: value.driver,
+              instance: value.providerInstanceId,
+            })
+          )
+            return yield* integrity();
+          if (
+            value.nativeThreadRef !== null &&
+            value.nativeThreadRef.nativeId !== null &&
+            !queueNative({
+              driver: value.driver,
+              instance: value.providerInstanceId,
+              id: value.nativeThreadRef.nativeId,
+            })
+          )
+            return yield* integrity();
+          const children =
+            yield* sql`SELECT subagent_id FROM orchestration_v2_projection_subagents WHERE provider_thread_id=${selected.id}`;
+          for (const row of children)
+            if (!queue("subagent", row.subagent_id)) return yield* integrity();
+        } else if (selected.kind === "node") {
+          const rows =
+            yield* sql`SELECT * FROM orchestration_v2_projection_nodes WHERE node_id=${selected.id}`;
+          if (rows.length !== 1 || !rows[0]) return yield* integrity();
+          const row = rows[0];
+          if (typeof row.payload_json !== "string") return yield* integrity();
+          const value = yield* decodeNativeFinalizationNode(row.payload_json, {
+            onExcessProperty: "error",
+          }).pipe(Effect.mapError(integrity));
+          if (
+            !matches(row, {
+              node_id: value.id,
+              thread_id: value.threadId,
+              run_id: value.runId,
+              parent_node_id: value.parentNodeId,
+              root_node_id: value.rootNodeId,
+              kind: value.kind,
+              status: value.status,
+              provider_thread_id: value.providerThreadId,
+              provider_turn_id: value.providerTurnId,
+              runtime_request_id: value.runtimeRequestId,
+              checkpoint_scope_id: value.checkpointScopeId,
+            }) ||
+            !sameTime(row.started_at, value.startedAt) ||
+            !sameTime(row.completed_at, value.completedAt) ||
+            !queue("thread", value.threadId) ||
+            !queueNullable("provider", value.providerThreadId) ||
+            !queueNullable("node", value.parentNodeId) ||
+            !queue("node", value.rootNodeId)
+          )
+            return yield* integrity();
+          const references =
+            yield* sql`SELECT provider_thread_id FROM orchestration_v2_projection_provider_threads WHERE owner_node_id=${selected.id}`;
+          for (const row of references)
+            if (!queue("provider", row.provider_thread_id)) return yield* integrity();
+          const children =
+            yield* sql`SELECT subagent_id FROM orchestration_v2_projection_subagents WHERE parent_node_id=${selected.id}`;
+          for (const row of children)
+            if (!queue("subagent", row.subagent_id)) return yield* integrity();
+        } else if (selected.kind === "subagent") {
+          const rows =
+            yield* sql`SELECT * FROM orchestration_v2_projection_subagents WHERE subagent_id=${selected.id}`;
+          if (rows.length !== 1 || !rows[0]) return yield* integrity();
+          const row = rows[0];
+          const value = yield* decodeSubmissionSubagent(row.payload_json, {
+            onExcessProperty: "error",
+          }).pipe(Effect.mapError(integrity));
+          if (
+            !matches(row, {
+              subagent_id: value.id,
+              thread_id: value.threadId,
+              run_id: value.runId,
+              parent_node_id: value.parentNodeId,
+              provider_thread_id: value.providerThreadId,
+              child_thread_id: value.childThreadId,
+              driver: value.driver,
+              provider_instance_id: value.providerInstanceId,
+              origin: value.origin,
+              status: value.status,
+            }) ||
+            !sameTime(row.started_at, value.startedAt) ||
+            !sameTime(row.completed_at, value.completedAt) ||
+            !sameTime(row.updated_at, value.updatedAt) ||
+            !queue("thread", value.threadId) ||
+            !queue("node", value.parentNodeId) ||
+            !queueNullable("provider", value.providerThreadId)
+          )
+            return yield* integrity();
+          if (value.remoteChild === undefined) {
+            if (!queueNullable("thread", value.childThreadId)) return yield* integrity();
+          } else if (value.childThreadId !== null) return yield* integrity();
+        } else if (selected.kind === "native") {
+          if (yield* attemptHistory(selected.native)) return true;
+          let cursor = "";
+          for (;;) {
+            const candidates =
+              yield* sql`SELECT * FROM orchestration_v2_projection_provider_threads WHERE CASE WHEN json_valid(payload_json) THEN json_extract(payload_json,'$.nativeThreadRef.nativeId') END=${selected.native.id} AND provider_thread_id>${cursor} ORDER BY provider_thread_id LIMIT 128`;
+            for (const row of candidates) {
+              const value = yield* providerData(row);
+              if (
+                value.driver === selected.native.driver &&
+                value.providerInstanceId === selected.native.instance &&
+                value.nativeThreadRef?.nativeId === selected.native.id &&
+                !queue("provider", value.id)
+              )
+                return yield* integrity();
+            }
+            if (candidates.length < 128) break;
+            const last = candidates.at(-1)!.provider_thread_id;
+            if (!validId(last) || last === cursor) return yield* integrity();
+            cursor = last;
+          }
+        }
+      }
+      return false;
+    },
+    Effect.mapError((error) =>
+      isStoreError(error) ? error : new WorkflowRunStoreError({ reason: "persistence" }),
+    ),
+  );
+
   const inTransaction = <A, E, R>(work: Effect.Effect<A, E, R>) =>
     sql
       .withTransaction(work)
@@ -980,6 +1387,15 @@ const makeStore = Effect.fnUntraced(function* (
           }
           if (!retained) return yield* planningError("integrity");
           if (yield* runningNativeEffect(input.threadId)) return yield* planningError("custody");
+          const submitted = yield* readSubmissionCustodyInTransaction(
+            input.environmentId,
+            input.threadId,
+          ).pipe(
+            Effect.mapError((error) =>
+              planningError(error.reason === "integrity" ? "integrity" : "storage"),
+            ),
+          );
+          if (submitted) return yield* planningError("custody");
           const custody = yield* readThreadCustodyInTransaction(input.threadId).pipe(
             Effect.mapError((error) =>
               planningError(error.reason === "integrity" ? "integrity" : "storage"),
@@ -1201,6 +1617,15 @@ const makeStore = Effect.fnUntraced(function* (
         if (outstanding.length) return yield* planningError("conflict");
         if (yield* runningNativeEffect(pass.native!.threadId))
           return yield* planningError("custody");
+        const submitted = yield* readSubmissionCustodyInTransaction(
+          operation.destination.environmentId,
+          pass.native!.threadId,
+        ).pipe(
+          Effect.mapError((error) =>
+            planningError(error.reason === "integrity" ? "integrity" : "storage"),
+          ),
+        );
+        if (submitted) return yield* planningError("custody");
         const custody = yield* readThreadCustodyInTransaction(pass.native!.threadId).pipe(
           Effect.mapError((error) =>
             planningError(error.reason === "integrity" ? "integrity" : "storage"),
@@ -3170,6 +3595,8 @@ const makeStore = Effect.fnUntraced(function* (
         const { fingerprint } = retained;
         if (yield* runningNativeEffect(input.threadId))
           return { kind: "rejected" as const, reason: "custody" as const };
+        if (yield* readSubmissionCustodyInTransaction(input.environmentId, input.threadId))
+          return { kind: "rejected" as const, reason: "custody" as const };
         const custody = yield* readThreadCustodyInTransaction(input.threadId);
         if (
           custody.kind === "owned" &&
@@ -4026,6 +4453,10 @@ const makeStore = Effect.fnUntraced(function* (
       ) {
         const threadId = operation.parameters.nativeThreadId;
         if (yield* runningNativeEffect(threadId))
+          return { kind: "rejected" as const, reason: "custody" as const };
+        if (
+          yield* readSubmissionCustodyInTransaction(operation.destination.environmentId, threadId)
+        )
           return { kind: "rejected" as const, reason: "custody" as const };
         const custody = yield* readThreadCustodyInTransaction(threadId);
         if (
