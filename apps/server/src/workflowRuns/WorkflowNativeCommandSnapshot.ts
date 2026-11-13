@@ -1,10 +1,8 @@
 import { OrchestrationV2Command } from "@t3tools/contracts";
 import { stableStringify } from "@t3tools/shared/relaySigning";
-import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import { WorkflowCanonicalHash } from "./WorkflowCanonicalHash.ts";
-import type { WorkflowNativeLaunchDerivation } from "./WorkflowNativeLaunchDerivation.ts";
 
 const commandTag = "t3.workflow-native-command.v1";
 const decodeCommand = Schema.decodeUnknownSync(OrchestrationV2Command);
@@ -14,9 +12,13 @@ type NativeCommand = Extract<
   { type: "thread.create" | "thread.metadata.update" | "message.dispatch" }
 >;
 type Hint = { readonly intentId: string; readonly phase: "claim" | "message" };
-type Derived = Effect.Success<
-  ReturnType<WorkflowNativeLaunchDerivation["Service"]["deriveInTransaction"]>
->;
+type Derived = {
+  readonly reservation: { readonly intentId: string };
+  readonly claimCommand: NativeCommand;
+  readonly messageCommand: NativeCommand;
+  readonly expectedClaimCommandHash: string;
+  readonly expectedMessageCommandHash: string;
+};
 
 export interface OwnedNativeInput {
   readonly command: NativeCommand;
