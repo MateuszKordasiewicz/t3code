@@ -33,6 +33,7 @@ import {
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ConfigProvider from "effect/ConfigProvider";
+import * as Context from "effect/Context";
 import * as Queue from "effect/Queue";
 import * as Arr from "effect/Array";
 import * as Cause from "effect/Cause";
@@ -60,6 +61,8 @@ import { vi } from "vite-plus/test";
 
 import * as ServerConfig from "../config.ts";
 import * as DatabaseStorage from "../persistence/DatabaseStorage.ts";
+import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
+import * as OrchestrationCommandReceipts from "../persistence/OrchestrationCommandReceipts.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as WorkflowRunStore from "../workflowRuns/WorkflowRunStore.ts";
 import { WorkflowCanonicalHash } from "../workflowRuns/WorkflowCanonicalHash.ts";
@@ -1047,6 +1050,97 @@ it.effect.each([false, true])("groups shutdown commits with rollback=%s", (fail)
     Effect.provideService(Statement.SpanPropagationEnabled, true),
   );
 });
+
+it.effect("captures one isolated event infrastructure with shared live notifications", () =>
+  Effect.gen(function* () {
+    const sqlA = Context.get(yield* Layer.build(Layer.fresh(layerDatabase)), SqlClient.SqlClient);
+    const sqlB = Context.get(yield* Layer.build(Layer.fresh(layerDatabase)), SqlClient.SqlClient);
+    const memo = yield* Layer.makeMemoMap;
+    const scope = yield* Effect.scope;
+    const warmLayers = Layer.mergeAll(
+      OrchestrationEventStore.layer,
+      OrchestrationCommandReceipts.layer,
+      EffectOutbox.layer,
+      ProjectionStore.layer,
+      ProjectStore.layer,
+      TurnItemPositionStore.layer,
+    );
+    const warm = yield* Layer.buildWithMemoMap(warmLayers, memo, scope).pipe(
+      Effect.provideService(SqlClient.SqlClient, sqlB),
+    );
+    const captured = yield* EventSink.makeCapturedEventInfrastructure(sqlA).pipe(
+      Effect.provide(warm),
+      Effect.provideService(SqlClient.SqlClient, sqlB),
+      Effect.provideService(Layer.CurrentMemoMap, memo),
+    );
+    const sink = Context.get(captured, EventSink.EventSinkV2);
+    const outbox = Context.get(captured, EffectOutbox.EffectOutboxV2);
+    const appEvents = Context.get(captured, OrchestrationEventStore.OrchestrationEventStore);
+    const receipts = Context.get(captured, CommandReceiptStore.CommandReceiptStoreV2);
+    const projections = Context.get(captured, ProjectionStore.ProjectionStoreV2);
+    const eventStore = Context.get(captured, EventStore.EventStoreV2);
+    assert.strictEqual(Context.get(captured, SqlClient.SqlClient), sqlA);
+    assert.notStrictEqual(outbox, Context.get(warm, EffectOutbox.EffectOutboxV2));
+    assert.notStrictEqual(
+      appEvents,
+      Context.get(warm, OrchestrationEventStore.OrchestrationEventStore),
+    );
+
+    const now = yield* DateTime.now;
+    const threadId = ThreadId.make("thread:captured-infrastructure");
+    const commandId = CommandId.make("command:captured-infrastructure");
+    const thread = makeThread(threadId, now);
+    const replayStarted = yield* Deferred.make<void>();
+    const observeReplay: Statement.Transformer = (statement) => {
+      const [query] = statement.compile();
+      return /FROM orchestration_events/.test(query) && /WHERE sequence >/.test(query)
+        ? Deferred.succeed(replayStarted, undefined).pipe(Effect.as(statement))
+        : Effect.succeed(statement);
+    };
+    const publication = yield* appEvents
+      .streamApplicationEvents({ afterSequence: 0 })
+      .pipe(
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.provideService(Statement.CurrentTransformer, observeReplay),
+        Effect.forkScoped({ startImmediately: true }),
+      );
+    yield* Deferred.await(replayStarted);
+    const wake = yield* outbox.awaitAvailable.pipe(Effect.forkScoped({ startImmediately: true }));
+    const committed = yield* sink.commitCommand({
+      commandId,
+      threadId,
+      commandType: "thread.create",
+      acceptedAt: now,
+      events: [threadCreatedEvent({ id: "event:captured-infrastructure", thread, now })],
+      effects: [
+        {
+          id: "effect:captured-infrastructure",
+          commandId,
+          threadId,
+          request: { type: "terminal.cleanup" },
+        },
+      ],
+    });
+    yield* Fiber.join(wake);
+    const published = Array.from(yield* Fiber.join(publication));
+    assert.isTrue(committed.committed);
+    assert.equal(published[0]?.sequence, committed.storedEvents[0]?.sequence);
+    assert.isTrue(Option.isSome(yield* receipts.getByCommandId(commandId)));
+    assert.equal((yield* projections.getThreadShell(threadId))?.id, threadId);
+    assert.lengthOf(yield* outbox.listByCommandId(commandId), 1);
+    assert.lengthOf(yield* eventStore.readByCommandId({ commandId }).pipe(Stream.runCollect), 1);
+    const countsA =
+      yield* sqlA`SELECT (SELECT COUNT(*) FROM orchestration_events) AS events, (SELECT COUNT(*) FROM orchestration_command_receipts) AS receipts, (SELECT COUNT(*) FROM orchestration_v2_effect_outbox) AS effects`;
+    const countsB =
+      yield* sqlB`SELECT (SELECT COUNT(*) FROM orchestration_events) AS events, (SELECT COUNT(*) FROM orchestration_command_receipts) AS receipts, (SELECT COUNT(*) FROM orchestration_v2_effect_outbox) AS effects`;
+    assert.deepEqual(countsA, [{ events: 1, receipts: 1, effects: 1 }]);
+    assert.deepEqual(countsB, [{ events: 0, receipts: 0, effects: 0 }]);
+    assert.isNull(
+      yield* Context.get(warm, ProjectionStore.ProjectionStoreV2).getThreadShell(threadId),
+    );
+  }).pipe(Effect.scoped),
+);
 
 it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
   it.effect("projects oversized tool bodies once before replay and live RPC retention", () =>

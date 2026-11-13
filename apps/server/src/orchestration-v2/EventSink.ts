@@ -26,7 +26,9 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as SqlError from "effect/sql/SqlError";
 
 import { replayAndBufferProjectedLiveEvents } from "./LiveStreamBudget.ts";
+import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
 import type { UnsequencedProjectEvent } from "../persistence/OrchestrationEventStore.ts";
+import * as OrchestrationCommandReceipts from "../persistence/OrchestrationCommandReceipts.ts";
 import { projectStoredEventForWire } from "./WireProjection.ts";
 import { makeRunOutcomeRecorder, type RunOutcome } from "./RunMetrics.ts";
 
@@ -1135,3 +1137,23 @@ export const layer: Layer.Layer<
     ),
   ),
 );
+
+export const makeCapturedEventInfrastructure = Effect.fn(
+  "orchestrationV2.makeCapturedEventInfrastructure",
+)(function* (sql: SqlClient.SqlClient) {
+  const layerSql = Layer.succeed(SqlClient.SqlClient, sql);
+  const layerRepositories = Layer.mergeAll(
+    OrchestrationEventStore.layer,
+    OrchestrationCommandReceipts.layer,
+  ).pipe(Layer.provideMerge(layerSql));
+  const layerStores = Layer.mergeAll(
+    EventStore.layerFromOrchestrationEventStore,
+    CommandReceiptStore.layerFromApplicationReceipts,
+    ProjectionStore.layer,
+    ProjectStore.layer,
+    EffectOutbox.layer,
+    TurnItemPositionStore.layer,
+  ).pipe(Layer.provideMerge(layerRepositories));
+  const combined = layerFromStores.pipe(Layer.provideMerge(layerStores));
+  return yield* Layer.build(Layer.fresh(combined));
+});
