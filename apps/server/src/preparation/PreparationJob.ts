@@ -7,6 +7,7 @@ import { WorkflowCanonicalHash } from "../workflowRuns/WorkflowCanonicalHash.ts"
 const invalid = () => new Error("Invalid preparation job");
 const inputKeys =
   "entryKey,environmentId,jobId,kind,originatingLaunchJobId,parentSelection,projectId,request,runId,serverBootId,threadId";
+const nativeInputKeys = inputKeys.replace("kind,", "kind,nativeSelection,");
 const selectionKeys = "entryKey,expectedVersion,jobId,requestIdentityHash,serverBootId";
 function json(value: unknown): void {
   WorkflowCanonicalHash.assertCanonical(value);
@@ -29,6 +30,16 @@ function object(value: unknown, keys?: string) {
 function id(value: unknown) {
   if (typeof value !== "string" || !value.trim() || !value.isWellFormed()) throw invalid();
   return value;
+}
+function ownNativeSelection(value: unknown) {
+  const raw = object(value, "driver,nativeId,providerInstanceId");
+  const selected = {
+    driver: id(raw.driver),
+    providerInstanceId: id(raw.providerInstanceId),
+    nativeId: id(raw.nativeId),
+  };
+  if (Object.values(selected).some((value) => value !== value.trim())) throw invalid();
+  return Object.freeze(selected);
 }
 function digest(value: unknown) {
   if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) throw invalid();
@@ -64,7 +75,14 @@ export function ownSelection(value: unknown) {
 }
 export function ownInput(value: unknown) {
   json(value);
-  const raw = object(value, inputKeys);
+  const raw = object(value);
+  const selected = Object.hasOwn(raw, "nativeSelection")
+    ? {
+        nativeSelection:
+          raw.nativeSelection === null ? null : ownNativeSelection(raw.nativeSelection),
+      }
+    : {};
+  object(raw, Object.hasOwn(raw, "nativeSelection") ? nativeInputKeys : inputKeys);
   const kind = raw.kind;
   if (kind !== "launch" && kind !== "setup" && kind !== "title" && kind !== "release")
     throw invalid();
@@ -89,13 +107,16 @@ export function ownInput(value: unknown) {
     parentSelection,
     serverBootId: id(raw.serverBootId),
     request: structuredClone(object(raw.request)),
+    ...selected,
   });
 }
 export function identity(input: ReturnType<typeof ownInput>) {
-  const value = { v: 1, ...input };
+  const version = Object.hasOwn(input, "nativeSelection") ? 2 : 1;
+  const value = { v: version, ...input };
   return {
+    version,
     text: stableStringify(value),
-    hash: WorkflowCanonicalHash.tagged("t3.preparation-job-identity.v1", value),
+    hash: WorkflowCanonicalHash.tagged(`t3.preparation-job-identity.v${version}`, value),
   };
 }
 function parse(text: unknown) {
@@ -123,10 +144,11 @@ export function decodeRow(value: unknown) {
     "code_closed_at,created_at,entry_key,environment_id,format_version,job_id,kind,originating_launch_job_id,process_exposed,project_id,record_version,request_identity_hash,request_identity_json,run_id,server_boot_id,settled_at,settlement_hash,settlement_json,state,thread_id",
   );
   const stored = parse(raw.request_identity_json);
-  if (stored.v !== 1) throw invalid();
+  if (stored.v !== 1 && stored.v !== 2) throw invalid();
   const { v: _v, ...input } = stored;
   const owned = ownInput(input);
   const encoded = identity(owned);
+  if (encoded.version !== stored.v) throw invalid();
   const shadows = {
     format_version: 1,
     job_id: owned.jobId,
@@ -180,6 +202,7 @@ export function decodeRow(value: unknown) {
   )
     throw invalid();
   return freeze({
+    identityVersion: encoded.version,
     input: owned,
     requestIdentityHash: encoded.hash,
     createdAt,
@@ -192,6 +215,7 @@ export function decodeRow(value: unknown) {
   });
 }
 export type Input = ReturnType<typeof ownInput>;
+export type NativeSelection = ReturnType<typeof ownNativeSelection>;
 export type Job = ReturnType<typeof decodeRow>;
 export type Selection = ReturnType<typeof ownSelection>;
 export function selection(job: Job): Selection {

@@ -313,6 +313,7 @@ const make = Effect.gen(function* () {
     threadId: ThreadId,
     runId: RunId | null,
     request: object,
+    nativeSelection: PreparationJob.NativeSelection | null = null,
   ) {
     const result = yield* workflowRuns.beginOrdinaryPreparation({
       jobId: `${phase}:${input.commandId}`,
@@ -324,6 +325,7 @@ const make = Effect.gen(function* () {
       runId,
       originatingLaunchJobId: null,
       parentSelection: null,
+      nativeSelection,
       serverBootId,
       request: ownOrdinaryInput({ phase, processEvidenceMode: "untracked-preparation", request }),
     });
@@ -1048,7 +1050,20 @@ const make = Effect.gen(function* () {
         .pipe(Effect.mapError(mapError(request, "create-thread"))));
     let handedOff = false;
     return yield* Effect.acquireUseRelease(
-      acquirePreparationJob("thread-launch", request, candidateThreadId, null, request).pipe(
+      acquirePreparationJob(
+        "thread-launch",
+        request,
+        candidateThreadId,
+        null,
+        request,
+        request.importedNativeThread === undefined
+          ? null
+          : {
+              driver: request.importedNativeThread.ref.driver,
+              providerInstanceId: request.modelSelection.instanceId,
+              nativeId: request.importedNativeThread.ref.nativeId,
+            },
+      ).pipe(
         Effect.mapError(mapError(request, "update-thread", candidateThreadId)),
         Effect.flatMap((result) =>
           result.kind === "acquired"

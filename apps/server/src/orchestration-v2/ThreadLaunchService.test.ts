@@ -3029,66 +3029,89 @@ it.effect("replays an accepted send after the project disables the instance", ()
   }).pipe(Effect.provide(Layer.mergeAll(harness.layer, layerFiles)));
 });
 
-it.effect("owns a committed preparation job before the earliest Scratch probe", () => {
-  const harness = makeHarness({
-    beforeScratchProbe: Effect.gen(function* () {
-      const sql = yield* SqlClient.SqlClient;
-      const jobs =
-        yield* sql`SELECT * FROM orchestration_v2_preparation_jobs WHERE thread_id='thread:earliest-custody'`;
-      assert.strictEqual(jobs.length, 1);
-      assert.strictEqual(jobs[0]!.state, "active");
-      assert.strictEqual(jobs[0]!.code_closed_at, null);
-      assert.strictEqual(jobs[0]!.process_exposed, 1);
-    }).pipe(Effect.orDie),
-  });
-  return Effect.gen(function* () {
-    const launches = yield* ThreadLaunch.ThreadLaunchService;
-    yield* launches.launch(
-      launchInput({
-        command: "command:earliest-custody",
-        thread: "thread:earliest-custody",
-        message: "prepare",
-        workspace: { type: "worktree", baseRef: "main", branch: "provided-branch" },
-      }),
-    );
-    yield* preparationSettled(ThreadId.make("thread:earliest-custody"));
-  }).pipe(Effect.provide(harness.layer));
-});
+it.effect.each([false, true])(
+  "owns a committed preparation job before the earliest Scratch probe (native=%s)",
+  (native) => {
+    const importedNativeThread = {
+      ref: {
+        driver: ProviderDriverKind.make("codex"),
+        nativeId: "earliest-selected-native",
+        strength: "strong" as const,
+      },
+    };
+    const harness = makeHarness({
+      beforeScratchProbe: Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const jobs =
+          yield* sql`SELECT * FROM orchestration_v2_preparation_jobs WHERE thread_id='thread:earliest-custody'`;
+        assert.strictEqual(jobs.length, 1);
+        assert.strictEqual(jobs[0]!.state, "active");
+        assert.strictEqual(jobs[0]!.code_closed_at, null);
+        assert.strictEqual(jobs[0]!.process_exposed, 1);
+        const identity = JSON.parse(jobs[0]!.request_identity_json as string);
+        assert.strictEqual(identity.v, 2);
+        assert.deepStrictEqual(
+          identity.nativeSelection,
+          native
+            ? {
+                driver: "codex",
+                providerInstanceId: modelSelection.instanceId,
+                nativeId: importedNativeThread.ref.nativeId,
+              }
+            : null,
+        );
+      }).pipe(Effect.orDie),
+    });
+    return Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      yield* launches.launch({
+        ...launchInput({
+          command: "command:earliest-custody",
+          thread: "thread:earliest-custody",
+          message: "prepare",
+          workspace: { type: "worktree", baseRef: "main", branch: "provided-branch" },
+        }),
+        ...(native ? { importedNativeThread } : {}),
+      });
+      yield* preparationSettled(ThreadId.make("thread:earliest-custody"));
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
 
+const admissionInputDuringLaunch = (fixture: Effect.Success<ReturnType<typeof seedCustody>>) => ({
+  runId: fixture.run.id,
+  command: {
+    kind: "admitAttempt" as const,
+    commandId: "admit-during-launch",
+    fingerprint: custodyHash,
+    expectedVersion: 0,
+    expectedGeneration: 0,
+    expectedSpecHash: custodyHash,
+    operationId: fixture.operation.id,
+    operationFingerprint: fixture.operation.fingerprint,
+    attemptId: "attempt",
+    itemId: "item",
+    repair: false,
+  },
+  externalFacts: {
+    now: "2026-11-12T00:00:00Z",
+    authority: true,
+    custody: "none" as const,
+    activeWriterCount: 0,
+    heldOperations: [],
+    capabilitiesCurrent: true,
+    compatibilityCurrent: true,
+    fingerprintCurrent: true,
+    originGrantCurrent: true,
+    orderedItemIds: ["item"],
+  },
+  operation: fixture.operation,
+  receiptId: "admit-during-launch-receipt",
+});
 const admissionDuringLaunch = (
   store: WorkflowRunStore.WorkflowRunStore["Service"],
   fixture: Effect.Success<ReturnType<typeof seedCustody>>,
-) =>
-  store.commitTransition({
-    runId: fixture.run.id,
-    command: {
-      kind: "admitAttempt",
-      commandId: "admit-during-launch",
-      fingerprint: custodyHash,
-      expectedVersion: 0,
-      expectedGeneration: 0,
-      expectedSpecHash: custodyHash,
-      operationId: fixture.operation.id,
-      operationFingerprint: fixture.operation.fingerprint,
-      attemptId: "attempt",
-      itemId: "item",
-      repair: false,
-    },
-    externalFacts: {
-      now: "2026-11-12T00:00:00Z",
-      authority: true,
-      custody: "none",
-      activeWriterCount: 0,
-      heldOperations: [],
-      capabilitiesCurrent: true,
-      compatibilityCurrent: true,
-      fingerprintCurrent: true,
-      originGrantCurrent: true,
-      orderedItemIds: ["item"],
-    },
-    operation: fixture.operation,
-    receiptId: "admit-during-launch-receipt",
-  });
+) => store.commitTransition(admissionInputDuringLaunch(fixture));
 it.effect(
   "launch graph admits the workflow control before ordinary preparation owns the thread",
   () => {
@@ -3578,5 +3601,187 @@ it.effect(
         Effect.withTracer(tracer),
         Effect.withTracerEnabled(true),
       );
+    }),
+);
+
+it.effect("a selected native reference is checked before a new launch thread exists", () => {
+  let probes = 0;
+  const harness = makeHarness({
+    beforeScratchProbe: Effect.sync(() => {
+      probes++;
+    }),
+  });
+  return Effect.gen(function* () {
+    const launches = yield* ThreadLaunch.ThreadLaunchService;
+    const threads = yield* ThreadManagement.ThreadManagementService;
+    const store = yield* WorkflowRunStore.WorkflowRunStore;
+    const sql = yield* SqlClient.SqlClient;
+    const owned = ThreadId.make("thread:precreation-owned");
+    const ref = {
+      driver: ProviderDriverKind.make("codex"),
+      nativeId: "precreation-owned-native",
+      strength: "strong" as const,
+    };
+    yield* threads.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("create:precreation-owned"),
+      threadId: owned,
+      projectId,
+      title: "owned",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+      importedNativeThread: { ref },
+    });
+    assert.deepStrictEqual(
+      yield* sql.withTransaction(
+        store.readRecoveryCustodyInTransaction({ threadId: owned, providerSessionIds: [] }),
+      ),
+      { kind: "ordinary" },
+    );
+    yield* seedCustody(owned);
+    assert.deepStrictEqual(
+      yield* sql.withTransaction(
+        store.readRecoveryCustodyInTransaction({ threadId: owned, providerSessionIds: [] }),
+      ),
+      { kind: "owned" },
+    );
+    const before = yield* nativeSnapshot;
+    const input = {
+      ...launchInput({
+        command: "command:precreation-native",
+        thread: "thread:not-created",
+        workspace: { type: "worktree" as const, baseRef: "main", branch: "provided" },
+      }),
+      importedNativeThread: { ref },
+    };
+    const result = yield* Effect.result(launches.launch(input));
+    assert.strictEqual(result._tag, "Failure");
+    assert.strictEqual(probes, 0);
+    assert.deepStrictEqual(yield* nativeSnapshot, before);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_preparation_jobs`, []);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect.each(["job-first", "association-first"] as const)(
+  "actual launch and a native workflow reservation exclude each other before projections (%s)",
+  (order) =>
+    Effect.gen(function* () {
+      let during: Effect.Effect<void> = Effect.die("probe not initialized");
+      let probes = 0;
+      const harness = makeHarness({
+        beforeScratchProbe: Effect.suspend(() => {
+          probes++;
+          return during;
+        }),
+      });
+      yield* Effect.gen(function* () {
+        const launches = yield* ThreadLaunch.ThreadLaunchService;
+        const store = yield* WorkflowRunStore.WorkflowRunStore;
+        const sql = yield* SqlClient.SqlClient;
+        const fixture = yield* seedCustody("thread:uncreated-workflow", false, false);
+        if (fixture.operation.parameters.kind !== "stage_launch")
+          throw new Error("wrong fixture operation");
+        const base = {
+          ...fixture.operation,
+          parameters: {
+            ...fixture.operation.parameters,
+            provider: {
+              providerInstanceId: modelSelection.instanceId,
+              model: modelSelection.model,
+            },
+          },
+        };
+        const operation = { ...base, fingerprint: WorkflowCanonicalHash.operation(base) };
+        const admission = admissionInputDuringLaunch({ ...fixture, operation });
+        const {
+          fingerprint: _fingerprint,
+          controlGeneration: _generation,
+          status: _status,
+          ...draftOperation
+        } = operation;
+        const { nativeRunId: _run, ...parameters } = base.parameters;
+        const {
+          fingerprint: _command,
+          operationFingerprint: _operation,
+          ...command
+        } = admission.command;
+        const ref = {
+          driver: ProviderDriverKind.make("codex"),
+          nativeId: "actual-precreation-native",
+          strength: "strong" as const,
+        };
+        const reserve = store.reserveWorkflowNativeIntent({
+          intentId: "actual-native-intent",
+          runId: fixture.run.id,
+          operationId: operation.id,
+          attemptId: "attempt",
+          itemId: "item",
+          repair: false,
+          environmentId: "environment",
+          projectId,
+          launchCommandId: "native-claim",
+          threadId: "thread:uncreated-workflow",
+          messageId: "native-message",
+          receiptId: "native-admission",
+          generation: 0,
+          materialVersion: 1,
+          launch: {
+            ...launchInput({
+              command: "native-claim",
+              thread: "thread:uncreated-workflow",
+              message: "native-message",
+            }),
+            initialMessage: {
+              messageId: MessageId.make("native-message"),
+              text: "native-message",
+              attachments: [],
+            },
+            importedNativeThread: { ref },
+          },
+          draft: {
+            version: 1,
+            kind: "stage_launch",
+            operation: { ...draftOperation, parameters },
+            admission: { command },
+          },
+          externalFacts: admission.externalFacts,
+        });
+        const input = {
+          ...launchInput({
+            command: "actual-precreation-launch",
+            thread: "thread:uncreated-ordinary",
+            message: "prepare",
+            workspace: { type: "worktree" as const, baseRef: "main", branch: "provided" },
+          }),
+          importedNativeThread: { ref },
+        };
+        if (order === "association-first") {
+          assert.strictEqual((yield* reserve).kind, "reserved");
+          const before = yield* nativeSnapshot;
+          assert.strictEqual((yield* Effect.result(launches.launch(input)))._tag, "Failure");
+          assert.strictEqual(probes, 0);
+          assert.deepStrictEqual(yield* nativeSnapshot, before);
+          assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_preparation_jobs`, []);
+        } else {
+          during = Effect.gen(function* () {
+            assert.deepStrictEqual(
+              yield* sql`SELECT * FROM orchestration_v2_projection_threads`,
+              [],
+            );
+            const before = yield* sql`SELECT * FROM workflow_runs`;
+            assert.deepStrictEqual(yield* reserve, { kind: "rejected", reason: "custody" });
+            assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_runs`, before);
+            assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_launch_intents`, []);
+          }).pipe(Effect.orDie);
+          const launched = yield* launches.launch(input);
+          yield* preparationSettled(launched.threadId);
+          assert.strictEqual(probes, 1);
+        }
+      }).pipe(Effect.provide(harness.layer));
     }),
 );

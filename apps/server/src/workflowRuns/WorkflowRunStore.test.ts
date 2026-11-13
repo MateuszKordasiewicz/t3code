@@ -31,6 +31,7 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { stableStringify } from "@t3tools/shared/relaySigning";
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
+import * as Tracer from "effect/Tracer";
 import * as Path from "effect/Path";
 import * as FileSystem from "effect/FileSystem";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
@@ -12343,6 +12344,7 @@ const physicalAdmissionKinds = [
 ] as const;
 const preparePhysicalAdmission = Effect.fn("test.preparePhysicalAdmission")(function* (
   kind: (typeof physicalAdmissionKinds)[number],
+  selectNative = false,
 ) {
   const store = yield* Store.WorkflowRunStore;
   if (kind === "workflow-native" || kind === "workflow-legacy") {
@@ -12351,7 +12353,23 @@ const preparePhysicalAdmission = Effect.fn("test.preparePhysicalAdmission")(func
     const invokeOn = (next: Store.WorkflowRunStore["Service"]) =>
       kind === "workflow-native"
         ? Effect.result(
-            next.reserveWorkflowNativeIntent(reservation(operation, "physical-attempt")),
+            next.reserveWorkflowNativeIntent({
+              ...reservation(operation, "physical-attempt"),
+              launch: {
+                ...reservation(operation, "physical-attempt").launch,
+                ...(selectNative
+                  ? {
+                      importedNativeThread: {
+                        ref: {
+                          driver: "codex",
+                          nativeId: "precreation-shared",
+                          strength: "strong" as const,
+                        },
+                      },
+                    }
+                  : {}),
+              },
+            }),
           )
         : Effect.result(
             next.commitTransition({
@@ -12369,7 +12387,25 @@ const preparePhysicalAdmission = Effect.fn("test.preparePhysicalAdmission")(func
   const input = admissionInput(binding, "physical");
   const invokeOn = (next: Store.WorkflowRunStore["Service"]) =>
     kind === "planning-native"
-      ? Effect.result(next.reservePlanningNativeIntent(planningReservation(input)))
+      ? Effect.result(
+          next.reservePlanningNativeIntent({
+            ...planningReservation(input),
+            launch: {
+              ...planningReservation(input).launch,
+              ...(selectNative
+                ? {
+                    importedNativeThread: {
+                      ref: {
+                        driver: "codex",
+                        nativeId: "precreation-shared",
+                        strength: "strong" as const,
+                      },
+                    },
+                  }
+                : {}),
+            },
+          }),
+        )
       : Effect.result(next.admitPlanningPass(input));
   return { threadId: input.pass.native!.threadId, invoke: invokeOn(store), invokeOn };
 });
@@ -13452,12 +13488,13 @@ const preparationInput = (threadId = "thread", id = "preparation-job") => ({
   threadId,
   runId: null,
   originatingLaunchJobId: null,
+  nativeSelection: null,
   parentSelection: null,
   serverBootId: "preparation-boot",
   request: { command: "prepare" },
 });
 const preparationRow = (threadId: string, id = "preparation-job") => {
-  const identity = { v: 1, ...preparationInput(threadId, id) };
+  const identity = { v: 2, ...preparationInput(threadId, id) };
   return {
     format_version: 1,
     job_id: id,
@@ -13470,7 +13507,7 @@ const preparationRow = (threadId: string, id = "preparation-job") => {
     originating_launch_job_id: identity.originatingLaunchJobId,
     server_boot_id: identity.serverBootId,
     request_identity_json: stableStringify(identity),
-    request_identity_hash: WorkflowCanonicalHash.tagged("t3.preparation-job-identity.v1", identity),
+    request_identity_hash: WorkflowCanonicalHash.tagged("t3.preparation-job-identity.v2", identity),
     created_at: DateTime.formatIso(DateTime.makeUnsafe(facts.now)),
   };
 };
@@ -13596,6 +13633,13 @@ it.effect(
       for (const input of [
         getter,
         { ...preparationInput(), extra: true },
+        ...[
+          {},
+          [],
+          { driver: "codex", nativeId: "id" },
+          { driver: "codex", providerInstanceId: "provider", nativeId: " id" },
+          { driver: "codex", providerInstanceId: "provider", nativeId: "id", extra: true },
+        ].map((nativeSelection) => ({ ...preparationInput(), nativeSelection })),
         { ...preparationInput(), request: cycle },
         { ...preparationInput(), request: { bad: undefined } },
         { ...preparationInput(), request: { bad: -0 } },
@@ -13795,44 +13839,110 @@ it.effect("preparation setup validates the exact open parent identity and versio
 
 it.effect.each(
   physicalAdmissionKinds.flatMap((kind) =>
-    ["job-first", "association-first"].map((order) => ({ kind, order })),
+    (kind.endsWith("native") ? [false, true] : [false]).flatMap((native) =>
+      ["job-first", "association-first"].map((order) => ({ kind, order, native })),
+    ),
   ),
-)("preparation and $kind serialize $order across captured clients and reopen", ({ kind, order }) =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const directory = yield* Effect.acquireRelease(
-        Effect.sync(() => NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "preparation-race-"))),
-        (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
-      );
-      const filename = NodePath.join(directory, "state.sqlite");
-      const fileLayer = () =>
-        Layer.merge(Store.layer, EffectOutbox.layer).pipe(
-          Layer.provideMerge(NodeSqliteClient.layer({ filename })),
+)(
+  "preparation and $kind serialize $order across captured clients and reopen (native=$native)",
+  ({ kind, order, native }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const directory = yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "preparation-race-")),
+          ),
+          (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
         );
-      const retained = yield* Effect.scoped(
-        Effect.gen(function* () {
-          const prepared = yield* preparePhysicalAdmission(kind);
-          const store = yield* Store.WorkflowRunStore;
-          const sql = yield* SqlClient.SqlClient;
-          yield* sql`PRAGMA busy_timeout=0`;
-          const input = preparationInput(prepared.threadId);
-          const other = yield* Effect.acquireRelease(
-            Effect.sync(() => new NodeSqlite.DatabaseSync(filename)),
-            (db) => Effect.sync(() => db.close()),
+        const filename = NodePath.join(directory, "state.sqlite");
+        const fileLayer = () =>
+          Layer.merge(Store.layer, EffectOutbox.layer).pipe(
+            Layer.provideMerge(NodeSqliteClient.layer({ filename })),
           );
-          yield* Effect.sync(() => other.exec("PRAGMA busy_timeout=0; BEGIN IMMEDIATE"));
-          const before = yield* rawReservationState;
-          const blocked =
-            order === "job-first"
-              ? yield* Effect.result(store.beginOrdinaryPreparation(input))
-              : yield* prepared.invoke;
-          assert.strictEqual(blocked._tag, "Failure");
-          assert.deepStrictEqual(yield* rawReservationState, before);
-          assert.deepStrictEqual(yield* preparationState, []);
-          yield* Effect.sync(() => other.exec("COMMIT"));
+        const retained = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const prepared = yield* preparePhysicalAdmission(kind, native);
+            const store = yield* Store.WorkflowRunStore;
+            const sql = yield* SqlClient.SqlClient;
+            yield* sql`PRAGMA busy_timeout=0`;
+            const input = {
+              ...preparationInput(native ? "uncreated-ordinary-thread" : prepared.threadId),
+              nativeSelection: native
+                ? {
+                    driver: "codex",
+                    providerInstanceId: "provider",
+                    nativeId: "precreation-shared",
+                  }
+                : null,
+            };
+            if (native) {
+              assert.deepStrictEqual(
+                yield* sql`SELECT * FROM orchestration_v2_projection_provider_threads`,
+                [],
+              );
+              assert.deepStrictEqual(
+                yield* sql`SELECT * FROM orchestration_v2_projection_threads`,
+                [],
+              );
+            }
+            const other = yield* Effect.acquireRelease(
+              Effect.sync(() => new NodeSqlite.DatabaseSync(filename)),
+              (db) => Effect.sync(() => db.close()),
+            );
+            yield* Effect.sync(() => other.exec("PRAGMA busy_timeout=0; BEGIN IMMEDIATE"));
+            const before = yield* rawReservationState;
+            const blocked =
+              order === "job-first"
+                ? yield* Effect.result(store.beginOrdinaryPreparation(input))
+                : yield* prepared.invoke;
+            assert.strictEqual(blocked._tag, "Failure");
+            assert.deepStrictEqual(yield* rawReservationState, before);
+            assert.deepStrictEqual(yield* preparationState, []);
+            yield* Effect.sync(() => other.exec("COMMIT"));
+            if (order === "job-first") {
+              yield* Effect.scoped(acquirePreparation(input).pipe(Effect.provide(fileLayer())));
+              const result = yield* prepared.invoke;
+              if (kind.startsWith("workflow")) {
+                assert.strictEqual(result._tag, "Success");
+                if (result._tag === "Success") expectPhysicalRejection(result.success);
+              } else {
+                assert.strictEqual(result._tag, "Failure");
+                if (result._tag === "Failure") assert.strictEqual(result.failure.reason, "custody");
+              }
+              assert.deepStrictEqual(yield* rawReservationState, before);
+            } else {
+              const result = yield* prepared.invoke;
+              assert.strictEqual(result._tag, "Success");
+              if (result._tag === "Success")
+                assert.strictEqual(
+                  result.success.kind,
+                  kind.endsWith("native")
+                    ? "reserved"
+                    : kind === "planning-legacy"
+                      ? "applied"
+                      : "accepted",
+                );
+              const denied = yield* Effect.scoped(
+                Effect.gen(function* () {
+                  const second = yield* Store.WorkflowRunStore;
+                  return yield* second.beginOrdinaryPreparation(input);
+                }).pipe(Effect.provide(fileLayer())),
+              );
+              assert.deepStrictEqual(denied, { kind: "denied", reason: "custody" });
+              assert.deepStrictEqual(yield* preparationState, []);
+            }
+            return {
+              invokeOn: prepared.invokeOn,
+              input,
+              state: yield* rawReservationState,
+              jobs: yield* preparationState,
+            };
+          }).pipe(Effect.provide(fileLayer())),
+        );
+        yield* Effect.gen(function* () {
+          const store = yield* Store.WorkflowRunStore;
           if (order === "job-first") {
-            yield* Effect.scoped(acquirePreparation(input).pipe(Effect.provide(fileLayer())));
-            const result = yield* prepared.invoke;
+            const result = yield* retained.invokeOn(store);
             if (kind.startsWith("workflow")) {
               assert.strictEqual(result._tag, "Success");
               if (result._tag === "Success") expectPhysicalRejection(result.success);
@@ -13840,61 +13950,20 @@ it.effect.each(
               assert.strictEqual(result._tag, "Failure");
               if (result._tag === "Failure") assert.strictEqual(result.failure.reason, "custody");
             }
-            assert.deepStrictEqual(yield* rawReservationState, before);
-          } else {
-            const result = yield* prepared.invoke;
-            assert.strictEqual(result._tag, "Success");
-            if (result._tag === "Success")
-              assert.strictEqual(
-                result.success.kind,
-                kind.endsWith("native")
-                  ? "reserved"
-                  : kind === "planning-legacy"
-                    ? "applied"
-                    : "accepted",
-              );
-            const denied = yield* Effect.scoped(
-              Effect.gen(function* () {
-                const second = yield* Store.WorkflowRunStore;
-                return yield* second.beginOrdinaryPreparation(input);
-              }).pipe(Effect.provide(fileLayer())),
+            assert.strictEqual(
+              (yield* store.beginOrdinaryPreparation(retained.input)).kind,
+              "existing",
             );
-            assert.deepStrictEqual(denied, { kind: "denied", reason: "custody" });
-            assert.deepStrictEqual(yield* preparationState, []);
-          }
-          return {
-            invokeOn: prepared.invokeOn,
-            input,
-            state: yield* rawReservationState,
-            jobs: yield* preparationState,
-          };
-        }).pipe(Effect.provide(fileLayer())),
-      );
-      yield* Effect.gen(function* () {
-        const store = yield* Store.WorkflowRunStore;
-        if (order === "job-first") {
-          const result = yield* retained.invokeOn(store);
-          if (kind.startsWith("workflow")) {
-            assert.strictEqual(result._tag, "Success");
-            if (result._tag === "Success") expectPhysicalRejection(result.success);
-          } else {
-            assert.strictEqual(result._tag, "Failure");
-            if (result._tag === "Failure") assert.strictEqual(result.failure.reason, "custody");
-          }
-          assert.strictEqual(
-            (yield* store.beginOrdinaryPreparation(retained.input)).kind,
-            "existing",
-          );
-        } else
-          assert.deepStrictEqual(yield* store.beginOrdinaryPreparation(retained.input), {
-            kind: "denied",
-            reason: "custody",
-          });
-        assert.deepStrictEqual(yield* rawReservationState, retained.state);
-        assert.deepStrictEqual(yield* preparationState, retained.jobs);
-      }).pipe(Effect.provide(fileLayer()));
-    }),
-  ),
+          } else
+            assert.deepStrictEqual(yield* store.beginOrdinaryPreparation(retained.input), {
+              kind: "denied",
+              reason: "custody",
+            });
+          assert.deepStrictEqual(yield* rawReservationState, retained.state);
+          assert.deepStrictEqual(yield* preparationState, retained.jobs);
+        }).pipe(Effect.provide(fileLayer()));
+      }),
+    ),
 );
 it.effect.each(physicalAdmissionKinds)(
   "preparation custody retains historical exact %s replay without recharge",
@@ -13938,21 +14007,25 @@ it.effect.each(physicalAdmissionKinds)(
     }).pipe(Effect.provide(layerWithOutbox)),
 );
 
-it.effect(
-  "preparation custody pages settled history and retains an open job after the first page",
-  () =>
+it.effect.each([false, true])(
+  "preparation custody pages settled history and retains an open job after the first page (native=%s)",
+  (native) =>
     Effect.gen(function* () {
-      const prepared = yield* preparePhysicalAdmission("workflow-native");
+      const prepared = yield* preparePhysicalAdmission("workflow-native", native);
       const store = yield* Store.WorkflowRunStore;
       const sql = yield* SqlClient.SqlClient;
+      const input = (id: string) => ({
+        ...preparationInput(native ? "uncreated-preparation" : prepared.threadId, id),
+        nativeSelection: native
+          ? { driver: "codex", providerInstanceId: "provider", nativeId: "precreation-shared" }
+          : null,
+      });
       for (let index = 0; index < 129; index++) {
-        let job = yield* acquirePreparation(
-          preparationInput(prepared.threadId, `page-${index.toString().padStart(3, "0")}`),
-        );
+        let job = yield* acquirePreparation(input(`page-${index.toString().padStart(3, "0")}`));
         job = yield* store.closePreparationCode(preparationSelection(job));
         yield* store.settleCodeOnlyPreparation(preparationSelection(job));
       }
-      let last = yield* acquirePreparation(preparationInput(prepared.threadId, "zz-open"));
+      let last = yield* acquirePreparation(input("zz-open"));
       let result = yield* prepared.invoke;
       assert.strictEqual(result._tag, "Success");
       if (result._tag === "Success") expectPhysicalRejection(result.success);
@@ -14096,5 +14169,383 @@ it.effect(
         ))._tag,
         "Failure",
       );
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect(
+  "legacy preparation identity is exact read-only history and never lifecycle authority",
+  () =>
+    Effect.gen(function* () {
+      const prepared = yield* preparePhysicalAdmission("workflow-native");
+      const store = yield* Store.WorkflowRunStore;
+      const sql = yield* SqlClient.SqlClient;
+      const { nativeSelection: _native, ...legacy } = preparationInput(prepared.threadId);
+      assert.strictEqual(
+        (yield* Effect.result(store.beginOrdinaryPreparation(legacy)))._tag,
+        "Failure",
+      );
+      const identity = { v: 1, ...legacy };
+      const row = {
+        ...preparationRow(prepared.threadId),
+        request_identity_json: stableStringify(identity),
+        request_identity_hash: WorkflowCanonicalHash.tagged(
+          "t3.preparation-job-identity.v1",
+          identity,
+        ),
+      };
+      yield* sql`INSERT INTO orchestration_v2_preparation_jobs ${sql.insert(row)}`;
+      const result = yield* store.beginOrdinaryPreparation(legacy);
+      assert.strictEqual(result.kind, "existing");
+      if (result.kind !== "existing") throw new Error("expected legacy history");
+      assert.strictEqual(result.job.identityVersion, 1);
+      const selected = preparationSelection(result.job);
+      const before = yield* preparationState;
+      for (const mutation of [
+        store.closePreparationCode(selected),
+        store.markPreparationProcessExposed(selected),
+        store.quiescePreparationJob(selected, "unknown"),
+        store.settleCodeOnlyPreparation(selected),
+      ])
+        assert.strictEqual((yield* Effect.result(mutation))._tag, "Failure");
+      assert.strictEqual(
+        (yield* Effect.result(
+          store.beginOrdinaryPreparation({
+            ...preparationInput(prepared.threadId, "child"),
+            kind: "setup",
+            originatingLaunchJobId: legacy.jobId,
+            parentSelection: selected,
+          }),
+        ))._tag,
+        "Failure",
+      );
+      assert.deepStrictEqual(yield* preparationState, before);
+      const settlement = {
+        v: 1,
+        jobId: legacy.jobId,
+        entryKey: legacy.entryKey,
+        priorVersion: 1,
+        kind: "code_only",
+      };
+      const closed = row.created_at;
+      yield* sql`UPDATE orchestration_v2_preparation_jobs SET code_closed_at=${closed},record_version=1 WHERE job_id=${legacy.jobId}`;
+      yield* sql`UPDATE orchestration_v2_preparation_jobs SET state='settled',record_version=2,settlement_json=${stableStringify(settlement)},settlement_hash=${WorkflowCanonicalHash.tagged("t3.preparation-job-settlement.v1", { requestIdentityHash: row.request_identity_hash, codeClosedAt: closed, settlement })},settled_at=${closed} WHERE job_id=${legacy.jobId}`;
+      const settled = yield* preparationState;
+      assert.strictEqual((yield* store.beginOrdinaryPreparation(legacy)).kind, "existing");
+      const denied = yield* prepared.invoke;
+      assert.strictEqual(denied._tag, "Success");
+      if (denied._tag === "Success") expectPhysicalRejection(denied.success);
+      assert.deepStrictEqual(yield* preparationState, settled);
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect(
+  "native preparation snapshots the tuple and requires matching linked setup selections",
+  () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const store = yield* Store.WorkflowRunStore;
+      const nativeSelection = {
+        driver: "codex",
+        providerInstanceId: "provider",
+        nativeId: "native",
+      };
+      const pending = store.beginOrdinaryPreparation({ ...preparationInput(), nativeSelection });
+      nativeSelection.nativeId = "changed";
+      const result = yield* pending;
+      assert.strictEqual(result.kind, "acquired");
+      if (result.kind !== "acquired") throw new Error("expected V2 acquisition");
+      assert.strictEqual(result.job.identityVersion, 2);
+      assert.deepStrictEqual(result.job.input.nativeSelection, {
+        driver: "codex",
+        providerInstanceId: "provider",
+        nativeId: "native",
+      });
+      const child = {
+        ...preparationInput("thread", "child"),
+        kind: "setup" as const,
+        originatingLaunchJobId: result.job.input.jobId,
+        parentSelection: preparationSelection(result.job),
+      };
+      for (const selected of [
+        null,
+        nativeSelection,
+        { driver: "claude", providerInstanceId: "provider", nativeId: "native" },
+        { driver: "codex", providerInstanceId: "foreign", nativeId: "native" },
+      ])
+        assert.strictEqual(
+          (yield* Effect.result(
+            store.beginOrdinaryPreparation({ ...child, nativeSelection: selected }),
+          ))._tag,
+          "Failure",
+        );
+      assert.strictEqual(
+        (yield* store.beginOrdinaryPreparation({
+          ...child,
+          nativeSelection: result.job.input.nativeSelection ?? null,
+        })).kind,
+        "acquired",
+      );
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect.each(["workflow-native", "planning-native"] as const)(
+  "retained %s native material scopes precreation custody and rejects corrupted selected evidence",
+  (kind) =>
+    Effect.gen(function* () {
+      const prepared = yield* preparePhysicalAdmission(kind, true);
+      const store = yield* Store.WorkflowRunStore;
+      const sql = yield* SqlClient.SqlClient;
+      const reserved = yield* prepared.invoke;
+      assert.strictEqual(reserved._tag, "Success");
+      if (reserved._tag === "Success") assert.strictEqual(reserved.success.kind, "reserved");
+      const nativeSelection = {
+        driver: "codex",
+        providerInstanceId: "provider",
+        nativeId: "precreation-shared",
+      };
+      const selected = { ...preparationInput("uncreated-ordinary"), nativeSelection };
+      const before = yield* rawReservationState;
+      const subscription = yield* store.subscribeChanges;
+      assert.deepStrictEqual(yield* store.beginOrdinaryPreparation(selected), {
+        kind: "denied",
+        reason: "custody",
+      });
+      assert.deepStrictEqual(yield* preparationState, []);
+      assert.deepStrictEqual(yield* rawReservationState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+      for (const [index, patch] of [
+        { environmentId: "foreign" },
+        { nativeSelection: { ...nativeSelection, driver: "claude" } },
+        { nativeSelection: { ...nativeSelection, providerInstanceId: "foreign" } },
+        { nativeSelection: { ...nativeSelection, nativeId: "foreign" } },
+      ].entries()) {
+        assert.strictEqual(
+          (yield* store.beginOrdinaryPreparation({
+            ...selected,
+            jobId: `foreign-${index}`,
+            entryKey: `foreign-entry-${index}`,
+            ...patch,
+          })).kind,
+          "acquired",
+        );
+      }
+      yield* sql`DROP TRIGGER workflow_native_reservation_material_update_guard`;
+      yield* sql`UPDATE workflow_native_reservation_material SET material_hash=${"f".repeat(64)}`;
+      const retainedJobs = yield* preparationState;
+      const bad = yield* Effect.result(store.beginOrdinaryPreparation(selected));
+      assert.strictEqual(bad._tag, "Failure");
+      if (bad._tag === "Failure") assert.strictEqual(bad.failure.reason, "integrity");
+      assert.deepStrictEqual(yield* preparationState, retainedJobs);
+      yield* sql`ALTER TABLE workflow_native_reservation_material RENAME TO hidden_native_material`;
+      assert.strictEqual(
+        (yield* Effect.result(store.beginOrdinaryPreparation(selected)))._tag,
+        "Failure",
+      );
+      assert.deepStrictEqual(yield* preparationState, retainedJobs);
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect.each(["workflow-native", "planning-native"] as const)(
+  "indexed preparation native footprint scopes fresh %s and validates selected hash",
+  (kind) =>
+    Effect.gen(function* () {
+      const prepared = yield* preparePhysicalAdmission(kind, true);
+      const sql = yield* SqlClient.SqlClient;
+      const nativeSelection = {
+        driver: "codex",
+        providerInstanceId: "provider",
+        nativeId: "precreation-shared",
+      };
+      for (const [index, patch] of [
+        { environmentId: "foreign" },
+        { nativeSelection: { ...nativeSelection, driver: "claude" } },
+        { nativeSelection: { ...nativeSelection, providerInstanceId: "foreign" } },
+        { nativeSelection: { ...nativeSelection, nativeId: "foreign" } },
+      ].entries())
+        yield* acquirePreparation({
+          ...preparationInput("uncreated-ordinary", `foreign-${index}`),
+          nativeSelection,
+          ...patch,
+        });
+      const identity = { v: 2, ...preparationInput("uncreated-selected"), nativeSelection };
+      yield* sql`INSERT INTO orchestration_v2_preparation_jobs ${sql.insert({ ...preparationRow("uncreated-selected"), request_identity_json: stableStringify(identity), request_identity_hash: "f".repeat(64) })}`;
+      const before = yield* rawReservationState;
+      const jobs = yield* preparationState;
+      const bad = yield* prepared.invoke;
+      assert.strictEqual(bad._tag, "Failure");
+      if (bad._tag === "Failure") assert.strictEqual(bad.failure.reason, "integrity");
+      assert.deepStrictEqual(yield* rawReservationState, before);
+      assert.deepStrictEqual(yield* preparationState, jobs);
+      assert.deepStrictEqual(
+        yield* sql`SELECT * FROM orchestration_v2_projection_provider_threads`,
+        [],
+      );
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect.each(["workflow-native", "planning-native"] as const)(
+  "foreign native preparation footprints do not prevent fresh %s",
+  (kind) =>
+    Effect.gen(function* () {
+      const prepared = yield* preparePhysicalAdmission(kind, true);
+      const nativeSelection = {
+        driver: "codex",
+        providerInstanceId: "provider",
+        nativeId: "precreation-shared",
+      };
+      for (const [index, patch] of [
+        { environmentId: "foreign" },
+        { nativeSelection: { ...nativeSelection, driver: "claude" } },
+        { nativeSelection: { ...nativeSelection, providerInstanceId: "foreign" } },
+        { nativeSelection: { ...nativeSelection, nativeId: "foreign" } },
+      ].entries())
+        yield* acquirePreparation({
+          ...preparationInput("uncreated-ordinary", `foreign-${index}`),
+          nativeSelection,
+          ...patch,
+        });
+      const accepted = yield* prepared.invoke;
+      assert.strictEqual(accepted._tag, "Success");
+      if (accepted._tag === "Success") assert.strictEqual(accepted.success.kind, "reserved");
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "authority-bearing %s material retains native custody before any projection",
+  (kind) =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(DateTime.makeUnsafe(facts.now).epochMilliseconds);
+      const importedNativeThread = {
+        ref: { driver: "codex", nativeId: "authority-native", strength: "strong" as const },
+      };
+      if (kind === "workflow") {
+        const { store, input } = yield* authorizedWorkflow();
+        assert.strictEqual(
+          (yield* store.reserveWorkflowNativeIntent({
+            ...input,
+            launch: { ...input.launch, importedNativeThread },
+          })).kind,
+          "reserved",
+        );
+      } else {
+        const { store, input } = yield* authorizedPlanning();
+        assert.strictEqual(
+          (yield* store.reservePlanningNativeIntent({
+            ...input,
+            launch: { ...input.launch, importedNativeThread },
+          })).kind,
+          "reserved",
+        );
+      }
+      const ordinary = yield* Store.WorkflowRunStore;
+      const sql = yield* SqlClient.SqlClient;
+      const before = yield* nativeBindingState;
+      assert.deepStrictEqual(
+        yield* ordinary.beginOrdinaryPreparation({
+          ...preparationInput("uncreated-ordinary"),
+          nativeSelection: {
+            driver: "codex",
+            providerInstanceId: "provider",
+            nativeId: "authority-native",
+          },
+        }),
+        { kind: "denied", reason: "custody" },
+      );
+      assert.deepStrictEqual(yield* nativeBindingState, before);
+      assert.deepStrictEqual(yield* preparationState, []);
+      assert.deepStrictEqual(
+        yield* sql`SELECT * FROM orchestration_v2_projection_provider_threads`,
+        [],
+      );
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect("native material history validates each reached thread once per custody traversal", () =>
+  Effect.gen(function* () {
+    yield* setupAdmission;
+    const store = yield* Store.WorkflowRunStore;
+    const sql = yield* SqlClient.SqlClient;
+    for (let index = 0; index < 2; index++) {
+      const input = reservation(
+        operationFor(`history-op-${index}`, `history-attempt-${index}`),
+        `history-attempt-${index}`,
+      );
+      const result = yield* store.reserveWorkflowNativeIntent({
+        ...input,
+        launch: {
+          ...input.launch,
+          importedNativeThread: {
+            ref: { driver: "codex", nativeId: "history-native", strength: "strong" },
+          },
+        },
+        draft: {
+          ...input.draft,
+          admission: { command: { ...input.draft.admission.command, expectedVersion: index } },
+        },
+      });
+      assert.strictEqual(result.kind, "reserved");
+      yield* sql`UPDATE workflow_native_launch_intents SET state='cancelled' WHERE intent_id=${input.intentId}`;
+    }
+    let validations = 0;
+    const tracer = Tracer.make({
+      span(options) {
+        const span = new Tracer.NativeSpan(options);
+        if (span.name === "WorkflowRunStore.readThreadCustodyInTransaction") validations++;
+        return span;
+      },
+    });
+    const input = {
+      ...preparationInput("uncreated-ordinary"),
+      nativeSelection: {
+        driver: "codex",
+        providerInstanceId: "provider",
+        nativeId: "history-native",
+      },
+    };
+    assert.deepStrictEqual(
+      yield* store
+        .beginOrdinaryPreparation(input)
+        .pipe(Effect.withTracer(tracer), Effect.withTracerEnabled(true)),
+      { kind: "denied", reason: "custody" },
+    );
+    assert.strictEqual(validations, 2);
+    assert.deepStrictEqual(yield* preparationState, []);
+  }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect.each(physicalAdmissionKinds)(
+  "current native projection connects an uncreated preparation job to fresh %s",
+  (kind) =>
+    Effect.gen(function* () {
+      const prepared = yield* preparePhysicalAdmission(kind);
+      const sql = yield* SqlClient.SqlClient;
+      yield* seedPhysicalSession("candidate-session");
+      yield* seedPhysicalProvider(
+        physicalProvider(
+          "candidate-provider",
+          prepared.threadId,
+          "candidate-session",
+          "precreation-shared",
+        ),
+      );
+      yield* acquirePreparation({
+        ...preparationInput("uncreated-preparation"),
+        nativeSelection: {
+          driver: "codex",
+          providerInstanceId: "provider",
+          nativeId: "precreation-shared",
+        },
+      });
+      const before = yield* rawReservationState;
+      const result = yield* prepared.invoke;
+      if (kind.startsWith("workflow")) {
+        assert.strictEqual(result._tag, "Success");
+        if (result._tag === "Success") expectPhysicalRejection(result.success);
+      } else {
+        assert.strictEqual(result._tag, "Failure");
+        if (result._tag === "Failure") assert.strictEqual(result.failure.reason, "custody");
+      }
+      assert.deepStrictEqual(yield* rawReservationState, before);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_submission_transports`, []);
     }).pipe(Effect.provide(layerWithOutbox)),
 );

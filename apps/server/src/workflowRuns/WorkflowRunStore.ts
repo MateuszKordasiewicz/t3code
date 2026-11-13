@@ -294,6 +294,12 @@ const makeStore = Effect.fnUntraced(function* (
   ) {
     if (input.parentSelection === null) return null;
     const parent = yield* readPreparationJob(input.parentSelection.jobId);
+    if (
+      Object.hasOwn(input, "nativeSelection") &&
+      (parent.identityVersion !== 2 ||
+        stableStringify(input.nativeSelection) !== stableStringify(parent.input.nativeSelection))
+    )
+      return yield* integrity();
     const selected = input.parentSelection;
     if (
       parent.input.kind !== "launch" ||
@@ -324,7 +330,12 @@ const makeStore = Effect.fnUntraced(function* (
           catch: integrity,
         });
         yield* readPreparationParent(job.input);
-        if (job.state !== "settled" || job.processExposed || job.settlement?.kind !== "code_only")
+        if (
+          job.identityVersion !== 2 ||
+          job.state !== "settled" ||
+          job.processExposed ||
+          job.settlement?.kind !== "code_only"
+        )
           held = true;
       }
       if (rows.length < 128) break;
@@ -332,19 +343,67 @@ const makeStore = Effect.fnUntraced(function* (
     }
     return held;
   });
+  const nativeFromLaunch = (launch: Material["launch"]): PreparationJob.NativeSelection | null =>
+    launch.importedNativeThread === undefined
+      ? null
+      : {
+          driver: launch.importedNativeThread.ref.driver,
+          providerInstanceId: launch.modelSelection.instanceId,
+          nativeId: launch.importedNativeThread.ref.nativeId,
+        };
+  const readNativePreparationCustody = Effect.fn("WorkflowRunStore.readNativePreparationCustody")(
+    function* (environmentId: string, native: PreparationJob.NativeSelection) {
+      let cursor = "";
+      let held = false;
+      for (;;) {
+        const rows =
+          yield* sql`SELECT * FROM orchestration_v2_preparation_jobs WHERE environment_id=${environmentId} AND CASE WHEN json_valid(request_identity_json) THEN json_extract(request_identity_json,'$.nativeSelection.driver') END=${native.driver} AND CASE WHEN json_valid(request_identity_json) THEN json_extract(request_identity_json,'$.nativeSelection.providerInstanceId') END=${native.providerInstanceId} AND CASE WHEN json_valid(request_identity_json) THEN json_extract(request_identity_json,'$.nativeSelection.nativeId') END=${native.nativeId} AND job_id>${cursor} ORDER BY job_id LIMIT 128`;
+        for (const row of rows) {
+          const job = yield* Effect.try({
+            try: () => PreparationJob.decodeRow(row),
+            catch: integrity,
+          });
+          if (
+            job.identityVersion !== 2 ||
+            job.input.environmentId !== environmentId ||
+            !sameCustodyValue(job.input.nativeSelection, native)
+          )
+            return yield* integrity();
+          yield* readPreparationParent(job.input);
+          if (job.state !== "settled" || job.processExposed || job.settlement?.kind !== "code_only")
+            held = true;
+        }
+        if (rows.length < 128) break;
+        cursor = rows.at(-1)!.job_id as string;
+      }
+      return held;
+    },
+  );
   // Public readers own the span; both purposes share the captured projection traversal.
   const walkResourceCustodyInTransaction = Effect.fnUntraced(
     function* (
       input:
-        | { purpose: "physical"; environmentId: string; threadId: string }
+        | {
+            purpose: "physical";
+            environmentId: string;
+            threadId: string;
+            expectedOwner: WorkflowOperationV1["owner"];
+            nativeSelection?: PreparationJob.NativeSelection | null;
+          }
         | {
             purpose: "workflow";
+            environmentId?: string;
+            nativeSelection?: PreparationJob.NativeSelection | null;
             threadId: string;
             providerSessionIds: readonly string[];
             providerThreadIds?: readonly string[];
           },
     ) {
-      const environmentId = input.purpose === "physical" ? input.environmentId : "";
+      const validatedThreads = new Map<
+        string,
+        Effect.Success<ReturnType<typeof readThreadCustodyInTransaction>>
+      >();
+      const environmentId = input.environmentId ?? "";
       const threadId = input.threadId;
       if (Option.isNone(yield* Effect.serviceOption(sql.transactionService)))
         return yield* integrity();
@@ -353,9 +412,6 @@ const makeStore = Effect.fnUntraced(function* (
       if (!validId(threadId)) return yield* integrity();
       if (input.purpose === "physical") {
         if (!validId(environmentId)) return yield* integrity();
-        const present =
-          yield* sql`SELECT 1 FROM orchestration_v2_submission_transports WHERE environment_id=${environmentId} UNION ALL SELECT 1 FROM orchestration_v2_preparation_jobs WHERE environment_id=${environmentId} LIMIT 1`;
-        if (!present.length) return false;
       } else if (
         !Array.isArray(input.providerSessionIds) ||
         !input.providerSessionIds.every(validId) ||
@@ -551,6 +607,16 @@ const makeStore = Effect.fnUntraced(function* (
         return value;
       });
       queue("thread", threadId);
+      if (
+        input.nativeSelection &&
+        !queueNative({
+          driver: input.nativeSelection.driver,
+          instance: input.nativeSelection.providerInstanceId,
+          id: input.nativeSelection.nativeId,
+        })
+      )
+        return yield* integrity();
+      if (environmentId !== "" && !validId(environmentId)) return yield* integrity();
       if (input.purpose === "workflow") {
         for (const id of input.providerSessionIds) queueSession(id);
         for (const id of input.providerThreadIds ?? []) queue("provider", id);
@@ -762,8 +828,40 @@ const makeStore = Effect.fnUntraced(function* (
             if (!queueNullable("thread", value.childThreadId)) return yield* integrity();
           } else if (value.childThreadId !== null) return yield* integrity();
         } else if (selected.kind === "native") {
+          const native = {
+            driver: selected.native.driver,
+            providerInstanceId: selected.native.instance,
+            nativeId: selected.native.id,
+          };
           if (input.purpose === "physical") {
+            if (yield* readNativePreparationCustody(environmentId, native)) return true;
             if (yield* attemptHistory(selected.native)) return true;
+          }
+          if (environmentId !== "") {
+            let materialCursor = "";
+            for (;;) {
+              const materials =
+                yield* sql`SELECT m.intent_id FROM workflow_native_reservation_material m JOIN workflow_native_launch_intents i ON i.intent_id=m.intent_id WHERE CASE WHEN json_valid(m.material_json) THEN json_extract(m.material_json,'$.launch.importedNativeThread.ref.driver') END=${native.driver} AND CASE WHEN json_valid(m.material_json) THEN json_extract(m.material_json,'$.launch.modelSelection.instanceId') END=${native.providerInstanceId} AND CASE WHEN json_valid(m.material_json) THEN json_extract(m.material_json,'$.launch.importedNativeThread.ref.nativeId') END=${native.nativeId} AND i.environment_id=${environmentId} AND m.intent_id>${materialCursor} ORDER BY m.intent_id LIMIT 128`;
+              for (const row of materials) {
+                if (!validId(row.intent_id)) return yield* integrity();
+                const retained = yield* readNativeReservationInTransaction(
+                  {
+                    intentId: row.intent_id,
+                  },
+                  validatedThreads,
+                );
+                if (
+                  retained.destination.environmentId !== environmentId ||
+                  !sameCustodyValue(nativeFromLaunch(retained.material.launch), native) ||
+                  !queue("thread", retained.threadId)
+                )
+                  return yield* integrity();
+              }
+              if (materials.length < 128) break;
+              const last = materials.at(-1)!.intent_id;
+              if (!validId(last) || last === materialCursor) return yield* integrity();
+              materialCursor = last;
+            }
           }
           let cursor = "";
           for (;;) {
@@ -786,16 +884,18 @@ const makeStore = Effect.fnUntraced(function* (
           }
         }
       }
-      if (input.purpose === "workflow") {
-        let owned = false;
-        for (const selected of work) {
-          if (selected.kind !== "thread") continue;
-          const custody = yield* readThreadCustodyInTransaction(selected.id);
-          if (custody.kind === "owned") owned = true;
-        }
-        return owned;
+      let owned = false;
+      for (const selected of work) {
+        if (selected.kind !== "thread") continue;
+        const custody =
+          validatedThreads.get(selected.id) ?? (yield* readThreadCustodyInTransaction(selected.id));
+        if (
+          custody.kind === "owned" &&
+          (input.purpose === "workflow" || !sameCustodyValue(custody.owner, input.expectedOwner))
+        )
+          owned = true;
       }
-      return false;
+      return owned;
     },
     Effect.mapError((error) =>
       isStoreError(error) ? error : new WorkflowRunStoreError({ reason: "persistence" }),
@@ -804,8 +904,20 @@ const makeStore = Effect.fnUntraced(function* (
 
   const readSubmissionCustodyInTransaction = Effect.fn(
     "WorkflowRunStore.readSubmissionCustodyInTransaction",
-  )((environmentId: string, threadId: string) =>
-    walkResourceCustodyInTransaction({ purpose: "physical", environmentId, threadId }),
+  )(
+    (
+      environmentId: string,
+      threadId: string,
+      expectedOwner: WorkflowOperationV1["owner"],
+      nativeSelection: PreparationJob.NativeSelection | null = null,
+    ) =>
+      walkResourceCustodyInTransaction({
+        purpose: "physical",
+        environmentId,
+        threadId,
+        expectedOwner,
+        nativeSelection,
+      }),
   );
 
   const inTransaction = <A, E, R>(work: Effect.Effect<A, E, R>) =>
@@ -833,9 +945,12 @@ const makeStore = Effect.fnUntraced(function* (
               return yield* integrity();
             return Object.freeze({ kind: "existing" as const, job: jobs[0]! });
           }
+          if (encoded.version !== 2) return yield* integrity();
           if (
             yield* walkResourceCustodyInTransaction({
               purpose: "workflow",
+              environmentId: input.environmentId,
+              nativeSelection: input.nativeSelection ?? null,
               threadId: input.threadId,
               providerSessionIds: [],
             })
@@ -844,7 +959,8 @@ const makeStore = Effect.fnUntraced(function* (
           const parent = yield* readPreparationParent(input);
           if (
             parent !== null &&
-            (!preparationMatches(parent, input.parentSelection!) ||
+            (parent.identityVersion !== 2 ||
+              !preparationMatches(parent, input.parentSelection!) ||
               parent.state !== "active" ||
               parent.codeClosedAt !== null)
           )
@@ -891,6 +1007,7 @@ const makeStore = Effect.fnUntraced(function* (
           try: () => PreparationJob.decodeRow(rows[0]),
           catch: integrity,
         });
+        if (job.identityVersion !== 2) return yield* integrity();
         if (
           !preparationMatches(job, selected) ||
           job.state === "settled" ||
@@ -1662,6 +1779,8 @@ const makeStore = Effect.fnUntraced(function* (
           const submitted = yield* readSubmissionCustodyInTransaction(
             input.environmentId,
             input.threadId,
+            { kind: "planning_session", planningSessionId: input.sessionId },
+            nativeFromLaunch(retained.launch),
           ).pipe(
             Effect.mapError((error) =>
               planningError(error.reason === "integrity" ? "integrity" : "storage"),
@@ -1892,6 +2011,7 @@ const makeStore = Effect.fnUntraced(function* (
         const submitted = yield* readSubmissionCustodyInTransaction(
           operation.destination.environmentId,
           pass.native!.threadId,
+          operation.owner,
         ).pipe(
           Effect.mapError((error) =>
             planningError(error.reason === "integrity" ? "integrity" : "storage"),
@@ -3459,7 +3579,13 @@ const makeStore = Effect.fnUntraced(function* (
   const readNativeReservationInTransaction = Effect.fn(
     "WorkflowRunStore.readNativeReservationInTransaction",
   )(
-    function* (input: { readonly intentId: string }) {
+    function* (
+      input: { readonly intentId: string },
+      validatedThreads?: Map<
+        string,
+        Effect.Success<ReturnType<typeof readThreadCustodyInTransaction>>
+      >,
+    ) {
       if (typeof input !== "object" || input === null || Object.keys(input).join() !== "intentId")
         return yield* integrity();
       const intentId = input.intentId;
@@ -3470,7 +3596,10 @@ const makeStore = Effect.fnUntraced(function* (
         yield* sql<IntentRow>`SELECT * FROM workflow_native_launch_intents WHERE intent_id = ${intentId}`;
       const row = rows[0];
       if (rows.length !== 1 || !row) return yield* integrity();
-      const custody = yield* readThreadCustodyInTransaction(row.thread_id);
+      const custody =
+        validatedThreads?.get(row.thread_id) ??
+        (yield* readThreadCustodyInTransaction(row.thread_id));
+      validatedThreads?.set(row.thread_id, custody);
       const owner =
         row.workflow_run_id !== null && row.planning_session_id === null
           ? { kind: "workflow_run" as const, workflowRunId: row.workflow_run_id }
@@ -3752,7 +3881,14 @@ const makeStore = Effect.fnUntraced(function* (
         const { fingerprint } = retained;
         if (yield* runningNativeEffect(input.threadId))
           return { kind: "rejected" as const, reason: "custody" as const };
-        if (yield* readSubmissionCustodyInTransaction(input.environmentId, input.threadId))
+        if (
+          yield* readSubmissionCustodyInTransaction(
+            input.environmentId,
+            input.threadId,
+            operation.owner,
+            nativeFromLaunch(retained.material.launch),
+          )
+        )
           return { kind: "rejected" as const, reason: "custody" as const };
         const custody = yield* readThreadCustodyInTransaction(input.threadId);
         if (
@@ -4612,7 +4748,11 @@ const makeStore = Effect.fnUntraced(function* (
         if (yield* runningNativeEffect(threadId))
           return { kind: "rejected" as const, reason: "custody" as const };
         if (
-          yield* readSubmissionCustodyInTransaction(operation.destination.environmentId, threadId)
+          yield* readSubmissionCustodyInTransaction(
+            operation.destination.environmentId,
+            threadId,
+            operation.owner,
+          )
         )
           return { kind: "rejected" as const, reason: "custody" as const };
         const custody = yield* readThreadCustodyInTransaction(threadId);
@@ -6774,7 +6914,9 @@ const makeStore = Effect.fnUntraced(function* (
     settleCodeOnlyPreparation: (selected: PreparationJob.Selection) =>
       ownPreparationMutation(selected, "settle"),
     readThreadCustody,
-    readNativeReservationInTransaction,
+    readNativeReservationInTransaction: (
+      input: Parameters<typeof readNativeReservationInTransaction>[0],
+    ) => readNativeReservationInTransaction(input),
     readRecoveryCustodyInTransaction: (
       input: Parameters<typeof readRecoveryCustodyInTransaction>[0],
     ) => {
