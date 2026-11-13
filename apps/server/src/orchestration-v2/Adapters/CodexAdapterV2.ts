@@ -1576,34 +1576,45 @@ const decodeCodexChildThread = Schema.decodeUnknownEffect(
   }),
 );
 
+export const makeCodexAppServerLaunch = Effect.fn("CodexAdapterV2.makeCodexAppServerLaunch")(
+  function* (input: {
+    readonly command: string;
+    readonly args: ReadonlyArray<string>;
+    readonly cwd?: string | undefined;
+    readonly env?: NodeJS.ProcessEnv | undefined;
+    readonly extendEnv?: boolean | undefined;
+    readonly threadId?: string | undefined;
+  }) {
+    const launch = yield* (yield* AgentScope).wrap({
+      command: input.command,
+      args: input.args,
+      name: "codex",
+      threadId: input.threadId,
+      env: input.env,
+      shared: true,
+    });
+    const spawnCommand = yield* resolveSpawnCommand(launch.command, launch.args, {
+      ...(input.env === undefined ? {} : { env: input.env }),
+      ...(input.extendEnv === undefined ? {} : { extendEnv: input.extendEnv }),
+    });
+    const command = ChildProcess.make(spawnCommand.command, spawnCommand.args, {
+      ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
+      ...(input.env === undefined ? {} : { env: input.env }),
+      ...(input.extendEnv === undefined ? {} : { extendEnv: input.extendEnv }),
+      shell: spawnCommand.shell,
+    });
+    return Object.freeze({
+      command,
+      ...(launch.unit !== undefined ? { unit: launch.unit } : {}),
+      ...(launch.custody !== undefined ? { custody: launch.custody } : {}),
+    });
+  },
+);
+
 export const makeCodexAppServerSpawnCommand = Effect.fn(
   "CodexAdapterV2.makeCodexAppServerSpawnCommand",
-)(function* (input: {
-  readonly command: string;
-  readonly args: ReadonlyArray<string>;
-  readonly cwd?: string | undefined;
-  readonly env?: NodeJS.ProcessEnv | undefined;
-  readonly extendEnv?: boolean | undefined;
-  readonly threadId?: string | undefined;
-}) {
-  const launch = yield* (yield* AgentScope).wrap({
-    command: input.command,
-    args: input.args,
-    name: "codex",
-    threadId: input.threadId,
-    env: input.env,
-    shared: true,
-  });
-  const spawnCommand = yield* resolveSpawnCommand(launch.command, launch.args, {
-    ...(input.env === undefined ? {} : { env: input.env }),
-    ...(input.extendEnv === undefined ? {} : { extendEnv: input.extendEnv }),
-  });
-  return ChildProcess.make(spawnCommand.command, spawnCommand.args, {
-    ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
-    ...(input.env === undefined ? {} : { env: input.env }),
-    ...(input.extendEnv === undefined ? {} : { extendEnv: input.extendEnv }),
-    shell: spawnCommand.shell,
-  });
+)(function* (input: Parameters<typeof makeCodexAppServerLaunch>[0]) {
+  return (yield* makeCodexAppServerLaunch(input)).command;
 });
 
 export function makeCodexAppServerProtocolLogger(input: {

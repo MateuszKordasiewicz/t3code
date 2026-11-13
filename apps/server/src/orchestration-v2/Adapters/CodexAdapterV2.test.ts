@@ -58,6 +58,9 @@ import * as Sink from "effect/Sink";
 import * as Stdio from "effect/Stdio";
 import * as Exit from "effect/Exit";
 import * as Cause from "effect/Cause";
+import * as Scope from "effect/Scope";
+import * as Path from "effect/Path";
+import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as PlatformError from "effect/PlatformError";
 import { TestClock } from "effect/testing";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
@@ -11160,3 +11163,67 @@ describe("codexDynamicToolOutput", () => {
     ]);
   });
 });
+
+it.live(
+  "retains launch custody through an actual owned controlled process without inventing a binding",
+  () =>
+    Effect.gen(function* () {
+      const selected = yield* Queue.unbounded<number>();
+      const custody = Object.freeze({
+        bind: (pid: number) => Queue.offer(selected, pid).pipe(Effect.as(undefined)),
+        stopAndObserve: () => Effect.undefined,
+      });
+      let wrapped = 0;
+      const agentScope = {
+        ...AgentScope.defaultValue(),
+        wrap: Effect.fn("test.wrapProvenanceLaunch")(function* (input) {
+          wrapped++;
+          return {
+            command: input.command,
+            args: input.args,
+            unit: "provenance-fixture.scope",
+            custody,
+          };
+        }),
+      } satisfies typeof AgentScope.Service;
+      const path = yield* Path.Path;
+      const peer = path.join(
+        import.meta.dirname,
+        "../../../../../packages/effect-codex-app-server/test/fixtures/codex-app-server-mock-peer.ts",
+      );
+      const input = { command: process.execPath, args: [peer], threadId: "provenance-thread" };
+      const launch = yield* CodexAdapterV2.makeCodexAppServerLaunch(input).pipe(
+        Effect.provideService(AgentScope, agentScope),
+      );
+      assert.strictEqual(wrapped, 1);
+      assert.strictEqual(launch.unit, "provenance-fixture.scope");
+      assert.strictEqual(launch.custody, custody);
+      assert.isTrue(Object.isFrozen(launch));
+      const command = yield* CodexAdapterV2.makeCodexAppServerSpawnCommand(input).pipe(
+        Effect.provideService(AgentScope, agentScope),
+      );
+      assert.strictEqual(wrapped, 2);
+      assert.deepStrictEqual(command.args, launch.command.args);
+      const owner = yield* Effect.acquireRelease(Scope.make("sequential"), (scope) =>
+        Scope.close(scope, Exit.void),
+      );
+      const client = yield* CodexClient.makeControlledChildProcessClient(launch.command, {
+        wrapper: (_frame, submit) => submit(),
+        onOutcome: () => Effect.void,
+      }).pipe(Scope.provide(owner));
+      assert.isTrue(yield* client.ownedProcess.isRunning);
+      assert.isUndefined(yield* launch.custody!.bind(client.ownedProcess.pid));
+      assert.strictEqual(yield* Queue.take(selected), client.ownedProcess.pid);
+      assert.isTrue(yield* client.ownedProcess.isRunning);
+      const initialized = yield* client.request("initialize", {
+        clientInfo: { name: "provenance", title: "provenance", version: "1" },
+        capabilities: { experimentalApi: true, optOutNotificationMethods: null },
+      });
+      assert.strictEqual(initialized.userAgent, "mock-codex-app-server");
+      yield* client.quiesceOutput;
+      assert.isTrue(yield* client.ownedProcess.isRunning);
+      yield* Scope.close(owner, Exit.void);
+      yield* Effect.result(client.ownedProcess.awaitExit);
+      assert.isFalse(yield* client.ownedProcess.isRunning);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);

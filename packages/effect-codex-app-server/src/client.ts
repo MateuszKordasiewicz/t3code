@@ -361,6 +361,11 @@ export class CodexAppServerControlledClient extends Context.Service<
   CodexAppServerControlledClient,
   Omit<CodexAppServerClient["Service"], "raw" | "request" | "notify"> & {
     readonly quiesceOutput: CodexProtocol.CodexAppServerControlledProtocol["quiesceOutput"];
+    readonly ownedProcess: {
+      readonly pid: ChildProcessSpawner.ChildProcessHandle["pid"];
+      readonly isRunning: ChildProcessSpawner.ChildProcessHandle["isRunning"];
+      readonly awaitExit: ChildProcessSpawner.ChildProcessHandle["exitCode"];
+    };
     readonly raw: Omit<CodexAppServerClientRaw, "request" | "notify" | "respond" | "respondError"> &
       Pick<
         CodexProtocol.CodexAppServerControlledProtocol,
@@ -520,6 +525,11 @@ const makeOwnedControlledClient = Effect.fn(
     return CodexAppServerControlledClient.of({
       ...state.handlers,
       quiesceOutput: transport.quiesceOutput,
+      ownedProcess: Object.freeze({
+        pid: handle.pid,
+        isRunning: handle.isRunning,
+        awaitExit: handle.exitCode,
+      }),
       awaitTermination: Deferred.await(state.termination),
       raw: {
         notifications: transport.incomingNotifications,

@@ -302,6 +302,15 @@ it.live("owns non-ending child stdin through repeated selected typed and raw sub
     const handle = yield* Queue.take(spawned);
     yield* Effect.gen(function* () {
       const client = yield* CodexClient.CodexAppServerControlledClient;
+      assert.isDefined(client.ownedProcess);
+      assert.deepStrictEqual(Object.keys(client.ownedProcess).toSorted(), [
+        "awaitExit",
+        "isRunning",
+        "pid",
+      ]);
+      assert.isTrue(Object.isFrozen(client.ownedProcess));
+      assert.strictEqual(client.ownedProcess.pid, handle.pid);
+      assert.isTrue(yield* client.ownedProcess.isRunning);
       yield* client.handleServerNotification("item/agentMessage/delta", () =>
         Deferred.succeed(notification, undefined).pipe(Effect.asVoid),
       );
@@ -369,6 +378,7 @@ it.live("owns non-ending child stdin through repeated selected typed and raw sub
       yield* client.quiesceOutput;
       yield* client.quiesceOutput;
       assert.isTrue(yield* handle.isRunning);
+      assert.isTrue(yield* client.ownedProcess.isRunning);
       const refused = yield* client.request("account/read", {}).pipe(Effect.flip);
       assert.instanceOf(refused, CodexError.CodexAppServerFrameSubmissionError);
       assert.strictEqual(yield* Queue.size(frames), 0);
@@ -380,6 +390,11 @@ it.live("owns non-ending child stdin through repeated selected typed and raw sub
     if (Result.isFailure(exited)) assert.include(String(exited.failure.cause), "SIGTERM");
     else assert.strictEqual(exited.success, 0);
     assert.isFalse(yield* handle.isRunning);
+    assert.isFalse(yield* service.ownedProcess.isRunning);
+    const observedExit = yield* Effect.result(service.ownedProcess.awaitExit);
+    assert.strictEqual(observedExit._tag, exited._tag);
+    if (Result.isSuccess(observedExit) && Result.isSuccess(exited))
+      assert.strictEqual(observedExit.success, exited.success);
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
