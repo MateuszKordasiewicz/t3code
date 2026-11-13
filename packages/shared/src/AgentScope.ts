@@ -52,9 +52,15 @@ export interface AgentScopeBinding {
   readonly pidStartTicks: string;
 }
 
+export interface AgentScopeSettlement {
+  readonly binding: AgentScopeBinding;
+  readonly observation: "empty" | "removed";
+}
+
 export interface AgentScopeCustody {
   /** Current membership only; the caller must retain and corroborate its owned child handle. */
   readonly bind: (spawnedPid: number) => Effect.Effect<AgentScopeBinding | undefined>;
+  readonly stopAndObserve: () => Effect.Effect<AgentScopeSettlement | undefined>;
 }
 
 export const AgentScope = Context.Reference<AgentScopeShape>("@t3tools/shared/AgentScope", {

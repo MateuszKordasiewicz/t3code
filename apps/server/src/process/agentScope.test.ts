@@ -69,6 +69,9 @@ const withFakeSystemd = <A, E>(
     transformBindingShow,
     beforeProcRead,
     beforeBindingShow,
+    onBlockingStop,
+    transformBlockingStop,
+    beforeCgroupIO,
   }: {
     readonly oomPolicy?: boolean;
     readonly stopFails?: boolean;
@@ -77,6 +80,11 @@ const withFakeSystemd = <A, E>(
     ) => ProcessRunner.ProcessRunOutput;
     readonly beforeProcRead?: (file: string) => Effect.Effect<void, PlatformError.PlatformError>;
     readonly beforeBindingShow?: () => Effect.Effect<void, ProcessRunner.ProcessRunError>;
+    readonly onBlockingStop?: (unit: string) => Effect.Effect<void, ProcessRunner.ProcessRunError>;
+    readonly transformBlockingStop?: (
+      output: ProcessRunner.ProcessRunOutput,
+    ) => ProcessRunner.ProcessRunOutput;
+    readonly beforeCgroupIO?: (file: string) => Effect.Effect<void, PlatformError.PlatformError>;
   } = {},
 ) =>
   Effect.gen(function* () {
@@ -103,6 +111,8 @@ const withFakeSystemd = <A, E>(
       run: ({ args }) =>
         Effect.gen(function* () {
           calls.push(args);
+          if (args[1] === "stop" && !args.includes("--no-block") && onBlockingStop)
+            yield* onBlockingStop(args[2]!);
           if (beforeBindingShow && args.some((arg) => arg.includes("InvocationID")))
             yield* beforeBindingShow();
           return yield* Effect.sync(() => {
@@ -117,13 +127,17 @@ const withFakeSystemd = <A, E>(
                 code: ChildProcessSpawner.ExitCode(5),
               };
             }
+            if (verb === "stop" && !args.includes("--no-block")) {
+              const result = output("");
+              return transformBlockingStop ? transformBlockingStop(result) : result;
+            }
             if (verb === "reset-failed") units.delete(unit);
             if (verb !== "show") return output("");
             const state = units.get(unit);
             if (args.some((arg) => arg.includes("InvocationID"))) {
               const result = output(
                 state === undefined
-                  ? "LoadState=not-found\n"
+                  ? `Id=${unit}\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nInvocationID=\nControlGroup=\n`
                   : `Id=${state.id ?? unit}\nLoadState=loaded\nActiveState=${state.activeState}\nSubState=${state.subState ?? "running"}\nInvocationID=${state.invocationId ?? "11111111111111111111111111111111"}\nControlGroup=${state.controlGroup ?? ""}\n`,
               );
               return transformBindingShow ? transformBindingShow(result) : result;
@@ -144,6 +158,17 @@ const withFakeSystemd = <A, E>(
       Effect.provideService(HostProcess.Environment, { PATH: bin, XDG_RUNTIME_DIR: "/run/user/1" }),
       Effect.provideService(FileSystem.FileSystem, {
         ...fileSystem,
+        stat: (file) =>
+          (file.startsWith("/sys/fs/cgroup/") && beforeCgroupIO
+            ? beforeCgroupIO(file)
+            : Effect.void
+          ).pipe(
+            Effect.andThen(
+              fileSystem.stat(
+                file.replace("/sys/fs/cgroup", cgroupRoot).replace(/^\/proc(?=\/)/, procRoot),
+              ),
+            ),
+          ),
         readFileString: (path, encoding) =>
           path.startsWith("/proc/")
             ? Effect.sync(() => {
@@ -154,7 +179,14 @@ const withFakeSystemd = <A, E>(
                   fileSystem.readFileString(path.replace("/proc", procRoot), encoding),
                 ),
               )
-            : fileSystem.readFileString(path.replace("/sys/fs/cgroup", cgroupRoot), encoding),
+            : (path.startsWith("/sys/fs/cgroup/") && beforeCgroupIO
+                ? beforeCgroupIO(path)
+                : Effect.void
+              ).pipe(
+                Effect.andThen(
+                  fileSystem.readFileString(path.replace("/sys/fs/cgroup", cgroupRoot), encoding),
+                ),
+              ),
         writeFileString: (path, data, options) =>
           fileSystem.writeFileString(path.replace("/sys/fs/cgroup", cgroupRoot), data, options),
       }),
@@ -975,6 +1007,480 @@ it.effect.each(["proc", "show"] as const)(
                   : Cause.fail(showError),
               )
             : Effect.void,
+      },
+    );
+  },
+);
+
+it.effect.each(["empty", "removed", "leader_exited"] as const)(
+  "launch custody observes completed scope retirement as %s",
+  (kind) => {
+    let stopped: (() => void) | undefined;
+    return withFakeSystemd(
+      ({ scope, units, procRoot, cgroupRoot, calls }) =>
+        Effect.gen(function* () {
+          const launch = yield* scope.wrap({
+            command: "agent",
+            args: [],
+            name: "settlement",
+            shared: true,
+          });
+          if (!launch.unit || !launch.custody) return yield* Effect.die("missing launch custody");
+          const custody = launch.custody;
+          const noPinCalls = calls.length;
+          assert.isUndefined(yield* custody.stopAndObserve());
+          assert.strictEqual(calls.length, noPinCalls);
+          const unit = launch.unit;
+          const { controlGroup, directory } = seedScopeBinding({ units, procRoot, unit, pid: 101 });
+          const groupDirectory = NodePath.join(cgroupRoot, controlGroup);
+          NodeFS.mkdirSync(groupDirectory, { recursive: true });
+          NodeFS.writeFileSync(
+            NodePath.join(groupDirectory, "cgroup.events"),
+            "populated 1\nfrozen 0\n",
+          );
+          const binding = yield* custody.bind(101);
+          assert.isDefined(binding);
+          if (kind === "leader_exited") NodeFS.rmSync(directory, { recursive: true });
+          stopped = () => {
+            NodeFS.rmSync(directory, { recursive: true, force: true });
+            if (kind !== "empty") {
+              NodeFS.rmSync(groupDirectory, { recursive: true });
+              units.delete(unit);
+            } else {
+              units.set(unit, { ...units.get(unit)!, activeState: "inactive", subState: "dead" });
+              NodeFS.writeFileSync(
+                NodePath.join(groupDirectory, "cgroup.events"),
+                "populated 0\nfrozen 0\n",
+              );
+            }
+          };
+          const before = calls.length;
+          const settled = yield* custody.stopAndObserve();
+          assert.deepStrictEqual(settled, {
+            binding,
+            observation: kind === "empty" ? "empty" : "removed",
+          });
+          assert.isTrue(Object.isFrozen(settled));
+          const after = calls.length;
+          assert.strictEqual(yield* custody.stopAndObserve(), settled);
+          assert.strictEqual(calls.length, after);
+          assert.deepStrictEqual(
+            calls.slice(before).filter(([, verb]) => verb === "stop"),
+            [["--user", "stop", unit]],
+          );
+        }),
+      { onBlockingStop: () => Effect.sync(() => stopped!()) },
+    );
+  },
+);
+
+it.effect.each(["collected", "replacement"] as const)(
+  "launch custody refuses %s before retirement without stopping",
+  (kind) =>
+    withFakeSystemd(({ scope, units, procRoot, calls }) =>
+      Effect.gen(function* () {
+        const launch = yield* scope.wrap({ command: "agent", args: [], name: "settlement" });
+        if (!launch.unit || !launch.custody) return yield* Effect.die("missing launch custody");
+        const { custody, unit } = launch;
+        seedScopeBinding({ units, procRoot, unit, pid: 101 });
+        assert.isDefined(yield* custody.bind(101));
+        const state = units.get(unit)!;
+        if (kind === "collected") units.delete(unit);
+        else units.set(unit, { ...state, invocationId: "2".repeat(32) });
+        const before = calls.length;
+        assert.isUndefined(yield* custody.stopAndObserve());
+        units.set(unit, state);
+        assert.isUndefined(yield* custody.stopAndObserve());
+        assert.isTrue(calls.slice(before).every(([, verb]) => verb === "show"));
+        assert.strictEqual(calls.length - before, 1);
+      }),
+    ),
+);
+
+it.effect.each([
+  "timedOut",
+  "stdoutTruncated",
+  "stderrTruncated",
+  "stdoutInvalidUtf8",
+  "stderrInvalidUtf8",
+  "nonzero",
+] as const)("launch custody retains unknown after stop result %s", (flag) =>
+  withFakeSystemd(
+    ({ scope, units, procRoot, calls }) =>
+      Effect.gen(function* () {
+        const launch = yield* scope.wrap({ command: "agent", args: [], name: "settlement" });
+        if (!launch.unit || !launch.custody) return yield* Effect.die("missing launch custody");
+        seedScopeBinding({ units, procRoot, unit: launch.unit, pid: 101 });
+        assert.isDefined(yield* launch.custody.bind(101));
+        const before = calls.length;
+        assert.isUndefined(yield* launch.custody.stopAndObserve());
+        assert.isUndefined(yield* launch.custody.stopAndObserve());
+        assert.deepStrictEqual(
+          calls.slice(before).map(([, verb]) => verb),
+          ["show", "stop"],
+        );
+      }),
+    {
+      transformBlockingStop: (result) =>
+        flag === "nonzero"
+          ? { ...result, code: ChildProcessSpawner.ExitCode(5) }
+          : { ...result, [flag]: true },
+    },
+  ),
+);
+
+it.effect.each([
+  "missing_events",
+  "populated",
+  "duplicate_populated",
+  "malformed_events",
+  "group_not_directory",
+  "live_original_pid",
+  "malformed_pid",
+  "zombie_pid",
+  "wrong_unit_invocation",
+  "wrong_unit_group",
+  "active_unit",
+] as const)("launch custody retains unknown after conflicting post-stop evidence %s", (kind) => {
+  let stopped: (() => void) | undefined;
+  return withFakeSystemd(
+    ({ scope, units, procRoot, cgroupRoot, calls }) =>
+      Effect.gen(function* () {
+        const launch = yield* scope.wrap({ command: "agent", args: [], name: "settlement" });
+        if (!launch.unit || !launch.custody) return yield* Effect.die("missing launch custody");
+        const { custody, unit } = launch;
+        const { controlGroup, directory } = seedScopeBinding({ units, procRoot, unit, pid: 101 });
+        const groupDirectory = NodePath.join(cgroupRoot, controlGroup);
+        NodeFS.mkdirSync(groupDirectory, { recursive: true });
+        assert.isDefined(yield* custody.bind(101));
+        stopped = () => {
+          units.set(unit, { ...units.get(unit)!, activeState: "inactive", subState: "dead" });
+          NodeFS.rmSync(directory, { recursive: true });
+          const events = NodePath.join(groupDirectory, "cgroup.events");
+          NodeFS.writeFileSync(events, "populated 0\nfrozen 0\n");
+          switch (kind) {
+            case "missing_events":
+              NodeFS.unlinkSync(events);
+              break;
+            case "populated":
+              NodeFS.writeFileSync(events, "populated 1\nfrozen 0\n");
+              break;
+            case "duplicate_populated":
+              NodeFS.writeFileSync(events, "populated 0\npopulated 0\n");
+              break;
+            case "malformed_events":
+              NodeFS.writeFileSync(events, "populated nope\n");
+              break;
+            case "group_not_directory":
+              NodeFS.rmSync(groupDirectory, { recursive: true });
+              NodeFS.writeFileSync(groupDirectory, "not a cgroup");
+              break;
+            case "live_original_pid":
+              NodeFS.mkdirSync(directory);
+              NodeFS.writeFileSync(NodePath.join(directory, "stat"), fixtureProcStat(101));
+              break;
+            case "malformed_pid":
+              NodeFS.mkdirSync(directory);
+              NodeFS.writeFileSync(NodePath.join(directory, "stat"), "not process stat");
+              break;
+            case "zombie_pid":
+              NodeFS.mkdirSync(directory);
+              NodeFS.writeFileSync(
+                NodePath.join(directory, "stat"),
+                fixtureProcStat(101, "9007199254740993", "Z"),
+              );
+              break;
+            case "wrong_unit_invocation":
+              units.set(unit, { ...units.get(unit)!, invocationId: "2".repeat(32) });
+              break;
+            case "wrong_unit_group":
+              units.set(unit, { ...units.get(unit)!, controlGroup: "/foreign.scope" });
+              break;
+            case "active_unit":
+              units.set(unit, { ...units.get(unit)!, activeState: "active", subState: "running" });
+              break;
+          }
+        };
+        const before = calls.length;
+        assert.isUndefined(yield* custody.stopAndObserve());
+        assert.isUndefined(yield* custody.stopAndObserve());
+        assert.strictEqual(calls.slice(before).filter(([, verb]) => verb === "stop").length, 1);
+      }),
+    { onBlockingStop: () => Effect.sync(() => stopped!()) },
+  );
+});
+
+it.effect(
+  "launch custody accepts a different live birth at a reused pid without targeting it",
+  () => {
+    let stopped: (() => void) | undefined;
+    return withFakeSystemd(
+      ({ scope, units, procRoot, cgroupRoot, calls }) =>
+        Effect.gen(function* () {
+          const launch = yield* scope.wrap({ command: "agent", args: [], name: "settlement" });
+          if (!launch.unit || !launch.custody) return yield* Effect.die("missing launch custody");
+          const { custody, unit } = launch;
+          const { controlGroup, directory } = seedScopeBinding({ units, procRoot, unit, pid: 101 });
+          const groupDirectory = NodePath.join(cgroupRoot, controlGroup);
+          NodeFS.mkdirSync(groupDirectory, { recursive: true });
+          const binding = yield* custody.bind(101);
+          stopped = () => {
+            units.set(unit, {
+              ...units.get(unit)!,
+              activeState: "inactive",
+              subState: "dead",
+              controlGroup: "",
+            });
+            NodeFS.writeFileSync(
+              NodePath.join(groupDirectory, "cgroup.events"),
+              "populated 0\nfrozen 0\n",
+            );
+            NodeFS.writeFileSync(
+              NodePath.join(directory, "stat"),
+              fixtureProcStat(101, "9007199254740994"),
+            );
+          };
+          const before = calls.length;
+          assert.deepStrictEqual(yield* custody.stopAndObserve(), {
+            binding,
+            observation: "empty",
+          });
+          assert.isFalse(calls.slice(before).some(([, verb]) => verb === "kill"));
+        }),
+      { onBlockingStop: () => Effect.sync(() => stopped!()) },
+    );
+  },
+);
+
+it.effect(
+  "launch custody shares an in-progress retirement without giving waiter cancellation ownership",
+  () =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let stopped: (() => void) | undefined;
+      yield* withFakeSystemd(
+        ({ scope, units, procRoot, cgroupRoot, calls }) =>
+          Effect.gen(function* () {
+            const launch = yield* scope.wrap({ command: "agent", args: [], name: "settlement" });
+            if (!launch.unit || !launch.custody) return yield* Effect.die("missing launch custody");
+            const { custody, unit } = launch;
+            const { controlGroup, directory } = seedScopeBinding({
+              units,
+              procRoot,
+              unit,
+              pid: 101,
+            });
+            const groupDirectory = NodePath.join(cgroupRoot, controlGroup);
+            NodeFS.mkdirSync(groupDirectory, { recursive: true });
+            const binding = yield* custody.bind(101);
+            stopped = () => {
+              units.delete(unit);
+              NodeFS.rmSync(groupDirectory, { recursive: true });
+              NodeFS.rmSync(directory, { recursive: true });
+            };
+            const before = calls.length;
+            const owner = yield* custody.stopAndObserve().pipe(Effect.forkScoped);
+            yield* Deferred.await(entered);
+            const waiter = yield* custody
+              .stopAndObserve()
+              .pipe(Effect.forkScoped({ startImmediately: true }));
+            yield* Fiber.interrupt(waiter);
+            const waiting = yield* Fiber.await(waiter);
+            assert.strictEqual(waiting._tag, "Failure");
+            yield* Deferred.succeed(release, undefined);
+            const receipt = yield* Fiber.join(owner);
+            assert.deepStrictEqual(receipt, { binding, observation: "removed" });
+            assert.strictEqual(yield* custody.stopAndObserve(), receipt);
+            assert.strictEqual(calls.slice(before).filter(([, verb]) => verb === "stop").length, 1);
+          }),
+        {
+          onBlockingStop: () =>
+            Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.andThen(Effect.sync(() => stopped!())),
+            ),
+        },
+      );
+    }),
+);
+
+it.effect.each([false, true])(
+  "launch custody owner interruption caches unknown even from masked cleanup=%s",
+  (masked) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      yield* withFakeSystemd(
+        ({ scope, units, procRoot, calls }) =>
+          Effect.gen(function* () {
+            const launch = yield* scope.wrap({ command: "agent", args: [], name: "settlement" });
+            if (!launch.unit || !launch.custody) return yield* Effect.die("missing launch custody");
+            const { custody, unit } = launch;
+            seedScopeBinding({ units, procRoot, unit, pid: 101 });
+            assert.isDefined(yield* custody.bind(101));
+            const before = calls.length;
+            const retiring = custody.stopAndObserve();
+            const owner = yield* (masked ? Effect.uninterruptible(retiring) : retiring).pipe(
+              Effect.forkScoped,
+            );
+            yield* Deferred.await(entered);
+            const waiter = yield* custody
+              .stopAndObserve()
+              .pipe(Effect.forkScoped({ startImmediately: true }));
+            yield* Fiber.interrupt(owner);
+            const interrupted = yield* Fiber.await(owner);
+            assert.strictEqual(interrupted._tag, "Failure");
+            if (interrupted._tag === "Failure")
+              assert.isTrue(Cause.hasInterrupts(interrupted.cause));
+            assert.isUndefined(yield* Fiber.join(waiter));
+            assert.isUndefined(yield* custody.stopAndObserve());
+            assert.strictEqual(calls.slice(before).filter(([, verb]) => verb === "stop").length, 1);
+          }),
+        {
+          onBlockingStop: () =>
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+        },
+      );
+    }),
+);
+
+it.effect("launch custody owner defect remains a defect while repeats retain unknown", () => {
+  const sentinel = new Error("fixture stop defect");
+  return withFakeSystemd(
+    ({ scope, units, procRoot, calls }) =>
+      Effect.gen(function* () {
+        const launch = yield* scope.wrap({ command: "agent", args: [], name: "settlement" });
+        if (!launch.unit || !launch.custody) return yield* Effect.die("missing launch custody");
+        seedScopeBinding({ units, procRoot, unit: launch.unit, pid: 101 });
+        assert.isDefined(yield* launch.custody.bind(101));
+        const before = calls.length;
+        const failed = yield* Effect.exit(launch.custody.stopAndObserve());
+        assert.strictEqual(failed._tag, "Failure");
+        if (failed._tag === "Failure") {
+          const defect = Cause.findDefect(failed.cause);
+          assert.strictEqual(defect._tag, "Success");
+          if (defect._tag === "Success") assert.strictEqual(defect.success, sentinel);
+        }
+        assert.isUndefined(yield* launch.custody.stopAndObserve());
+        assert.strictEqual(calls.slice(before).filter(([, verb]) => verb === "stop").length, 1);
+      }),
+    { onBlockingStop: () => Effect.die(sentinel) },
+  );
+});
+
+it.effect.each([
+  "empty_to_removed",
+  "removed_to_empty",
+  "pid_reappears",
+  "collected_to_loaded",
+] as const)("launch custody verifies post-stop transition %s", (kind) => {
+  let stopped: (() => void) | undefined;
+  let change: (() => void) | undefined;
+  let afterStop = false;
+  let pidReads = 0;
+  return withFakeSystemd(
+    ({ scope, units, procRoot, cgroupRoot }) =>
+      Effect.gen(function* () {
+        const launch = yield* scope.wrap({ command: "agent", args: [], name: "settlement" });
+        if (!launch.unit || !launch.custody) return yield* Effect.die("missing launch custody");
+        const { custody, unit } = launch;
+        const { controlGroup, directory } = seedScopeBinding({ units, procRoot, unit, pid: 101 });
+        const groupDirectory = NodePath.join(cgroupRoot, controlGroup);
+        NodeFS.mkdirSync(groupDirectory, { recursive: true });
+        const binding = yield* custody.bind(101);
+        const retired = { ...units.get(unit)!, activeState: "inactive", subState: "dead" };
+        stopped = () => {
+          afterStop = true;
+          NodeFS.rmSync(directory, { recursive: true });
+          if (kind === "removed_to_empty" || kind === "collected_to_loaded") {
+            NodeFS.rmSync(groupDirectory, { recursive: true });
+            units.delete(unit);
+          } else {
+            units.set(unit, retired);
+            NodeFS.writeFileSync(
+              NodePath.join(groupDirectory, "cgroup.events"),
+              "populated 0\nfrozen 0\n",
+            );
+          }
+        };
+        change = () => {
+          switch (kind) {
+            case "empty_to_removed":
+              NodeFS.rmSync(groupDirectory, { recursive: true });
+              units.delete(unit);
+              break;
+            case "removed_to_empty":
+              NodeFS.mkdirSync(groupDirectory, { recursive: true });
+              NodeFS.writeFileSync(
+                NodePath.join(groupDirectory, "cgroup.events"),
+                "populated 0\nfrozen 0\n",
+              );
+              break;
+            case "pid_reappears":
+              NodeFS.mkdirSync(directory);
+              NodeFS.writeFileSync(NodePath.join(directory, "stat"), fixtureProcStat(101));
+              break;
+            case "collected_to_loaded":
+              units.set(unit, retired);
+              break;
+          }
+        };
+        const result = yield* custody.stopAndObserve();
+        if (kind === "empty_to_removed")
+          assert.deepStrictEqual(result, { binding, observation: "removed" });
+        else assert.isUndefined(result);
+      }),
+    {
+      onBlockingStop: () => Effect.sync(() => stopped!()),
+      beforeProcRead: (file) =>
+        Effect.sync(() => {
+          if (afterStop && file.endsWith("/stat") && ++pidReads === 2) change!();
+        }),
+    },
+  );
+});
+
+it.effect.each(["directory", "events"] as const)(
+  "launch custody treats unreadable original cgroup %s as unknown",
+  (seam) => {
+    let stopped: (() => void) | undefined;
+    let afterStop = false;
+    return withFakeSystemd(
+      ({ scope, units, procRoot, cgroupRoot }) =>
+        Effect.gen(function* () {
+          const launch = yield* scope.wrap({ command: "agent", args: [], name: "settlement" });
+          if (!launch.unit || !launch.custody) return yield* Effect.die("missing launch custody");
+          const { custody, unit } = launch;
+          const { controlGroup, directory } = seedScopeBinding({ units, procRoot, unit, pid: 101 });
+          const groupDirectory = NodePath.join(cgroupRoot, controlGroup);
+          NodeFS.mkdirSync(groupDirectory, { recursive: true });
+          assert.isDefined(yield* custody.bind(101));
+          stopped = () => {
+            afterStop = true;
+            units.set(unit, { ...units.get(unit)!, activeState: "inactive", subState: "dead" });
+            NodeFS.rmSync(directory, { recursive: true });
+            NodeFS.writeFileSync(
+              NodePath.join(groupDirectory, "cgroup.events"),
+              "populated 0\nfrozen 0\n",
+            );
+          };
+          assert.isUndefined(yield* custody.stopAndObserve());
+        }),
+      {
+        onBlockingStop: () => Effect.sync(() => stopped!()),
+        beforeCgroupIO: (file) =>
+          Effect.suspend(() =>
+            afterStop && file.endsWith("/cgroup.events") === (seam === "events")
+              ? Effect.fail(
+                  PlatformError.systemError({
+                    _tag: "PermissionDenied",
+                    module: "FileSystem",
+                    method: "read",
+                    pathOrDescriptor: file,
+                  }),
+                )
+              : Effect.void,
+          ),
       },
     );
   },
