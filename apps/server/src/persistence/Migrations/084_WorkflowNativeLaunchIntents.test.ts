@@ -565,7 +565,9 @@ it.effect("upgrades 086 with empty immutable command proofs and preserves histor
         material =
           yield* sql`SELECT * FROM workflow_native_reservation_material ORDER BY intent_id`;
         receipts = yield* sql`SELECT * FROM orchestration_command_receipts ORDER BY command_id`;
-        assert.deepStrictEqual(yield* runMigrations(), [[87, "WorkflowNativeCommandProofs"]]);
+        assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 87 }), [
+          [87, "WorkflowNativeCommandProofs"],
+        ]);
         assert.deepStrictEqual(yield* sql`SELECT * FROM workflow_native_command_proofs`, []);
         assert.deepStrictEqual(yield* snapshot, preserved);
         assert.deepStrictEqual(
@@ -576,7 +578,7 @@ it.effect("upgrades 086 with empty immutable command proofs and preserves histor
           yield* sql`SELECT * FROM orchestration_command_receipts ORDER BY command_id`,
           receipts,
         );
-        assert.deepStrictEqual(yield* runMigrations(), []);
+        assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 87 }), []);
 
         const invalid: Array<
           [string | null, string | null, string | null, string | null, string | null]
@@ -641,7 +643,7 @@ it.effect("upgrades 086 with empty immutable command proofs and preserves histor
             material,
           );
         }
-        assert.deepStrictEqual(yield* runMigrations(), []);
+        assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 87 }), []);
         assert.deepStrictEqual(
           yield* sql`SELECT * FROM workflow_native_command_proofs ORDER BY command_id`,
           proofs,
@@ -653,7 +655,7 @@ it.effect("upgrades 086 with empty immutable command proofs and preserves histor
         yield* sql`PRAGMA recursive_triggers = OFF`;
         assert.deepStrictEqual(yield* sql`PRAGMA foreign_keys`, [{ foreign_keys: 1 }]);
         assert.deepStrictEqual(yield* sql`PRAGMA recursive_triggers`, [{ recursive_triggers: 0 }]);
-        assert.deepStrictEqual(yield* runMigrations(), []);
+        assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 87 }), []);
         assert.isTrue(
           Exit.isFailure(
             yield* Effect.exit(
