@@ -6,11 +6,14 @@ import {
   AgentScope,
   agentScopeCommand,
   type AgentScopeShape,
+  type AgentScopeBinding,
+  type AgentScopeCustody,
   type AgentSystemdScope,
 } from "@t3tools/shared/AgentScope";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { resolveCommandPath } from "@t3tools/shared/shell";
 import * as Effect from "effect/Effect";
+import * as Cause from "effect/Cause";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
@@ -86,6 +89,95 @@ function parseKeyValues(text: string): Map<string, string> {
 function parseCgroupCounter(text: string, key: string): number | undefined {
   const match = new RegExp(`^${key} (\\d+)$`, "m").exec(text);
   return match === null ? undefined : Number(match[1]);
+}
+
+const recoverBindingRead = Effect.fn("AgentScope.recoverBindingRead")(function* <E>(
+  cause: Cause.Cause<E>,
+) {
+  const exceptional = Cause.fromReasons<never>(
+    cause.reasons.filter((reason) => reason._tag !== "Fail"),
+  );
+  if (exceptional.reasons.length > 0) return yield* Effect.failCause(exceptional);
+  return undefined;
+});
+
+const BINDING_SCOPE_PROPERTIES = [
+  "Id",
+  "LoadState",
+  "ActiveState",
+  "SubState",
+  "InvocationID",
+  "ControlGroup",
+];
+
+const isCgroupPath = (value: string) =>
+  value.startsWith("/") &&
+  value.length > 1 &&
+  !value.endsWith("/") &&
+  !/[\x00-\x1f\x7f]/.test(value) &&
+  value
+    .slice(1)
+    .split("/")
+    .every((part) => part !== "" && part !== "." && part !== "..");
+
+function parseBindingScope(text: string, unit: string) {
+  const values = new Map<string, string>();
+  for (const line of text.split("\n")) {
+    if (line === "") continue;
+    const index = line.indexOf("=");
+    const key = line.slice(0, index);
+    if (index < 1 || !BINDING_SCOPE_PROPERTIES.includes(key) || values.has(key)) return undefined;
+    values.set(key, line.slice(index + 1));
+  }
+  const invocationId = values.get("InvocationID");
+  const controlGroup = values.get("ControlGroup");
+  if (
+    values.size !== BINDING_SCOPE_PROPERTIES.length ||
+    values.get("Id") !== unit ||
+    values.get("LoadState") !== "loaded" ||
+    values.get("ActiveState") !== "active" ||
+    values.get("SubState") !== "running" ||
+    invocationId === undefined ||
+    !/^[0-9a-f]{32}$/.test(invocationId) ||
+    /^0+$/.test(invocationId) ||
+    controlGroup === undefined ||
+    !isCgroupPath(controlGroup) ||
+    !controlGroup.endsWith(`/${unit}`)
+  )
+    return undefined;
+  return { invocationId, controlGroup };
+}
+
+function parseProcessStart(text: string, pid: number) {
+  const end = text.lastIndexOf(")");
+  if (!text.startsWith(`${pid} (`) || end < `${pid} (`.length || text[end + 1] !== " ")
+    return undefined;
+  const fields = text
+    .slice(end + 2)
+    .trimEnd()
+    .split(" ");
+  if (
+    fields.length < 20 ||
+    !/^[RSDTtKWPI]$/.test(fields[0]!) ||
+    !fields.slice(1, 20).every((field) => /^-?\d+$/.test(field)) ||
+    !/^(0|[1-9]\d*)$/.test(fields[19]!)
+  )
+    return undefined;
+  return fields[19];
+}
+
+function parseUnifiedCgroup(text: string) {
+  let unified: string | undefined;
+  for (const line of text.split("\n")) {
+    if (line === "") continue;
+    const match = /^(0|[1-9]\d*):([^:]*):(\/.*)$/.exec(line);
+    if (!match) return undefined;
+    if (match[1] === "0") {
+      if (match[2] !== "" || unified !== undefined || !isCgroupPath(match[3]!)) return undefined;
+      unified = match[3];
+    } else if (match[2] === "") return undefined;
+  }
+  return unified;
 }
 
 // systemd's default 90 s stop timeout would outlast our leftover-agent wait.
@@ -214,6 +306,84 @@ export const make = Effect.gen(function* () {
       };
     }),
   );
+
+  const readBindingScope = Effect.fn("AgentScope.readBindingScope")(function* (
+    systemctl: string,
+    unit: string,
+  ) {
+    const shown = yield* runner
+      .run({
+        command: systemctl,
+        args: ["--user", "show", unit, `--property=${BINDING_SCOPE_PROPERTIES.join(",")}`],
+        timeout: "5 seconds",
+        maxOutputBytes: 16_384,
+        outputMode: "error",
+        timeoutBehavior: "error",
+      })
+      .pipe(Effect.catchCause(recoverBindingRead));
+    if (shown === undefined) return undefined;
+    const result = shown;
+    if (
+      result.code !== 0 ||
+      result.timedOut !== false ||
+      result.stdoutTruncated !== false ||
+      result.stderrTruncated !== false ||
+      result.stdoutInvalidUtf8 !== false ||
+      result.stderrInvalidUtf8 !== false
+    )
+      return undefined;
+    return parseBindingScope(result.stdout, unit);
+  });
+  const readBindingProc = Effect.fn("AgentScope.readBindingProc")(function* (file: string) {
+    const read = yield* fileSystem.readFileString(file).pipe(Effect.catchCause(recoverBindingRead));
+    return read;
+  });
+  const makeCustody = (systemctl: string, unit: string): AgentScopeCustody => {
+    let pinned: AgentScopeBinding | undefined;
+    return Object.freeze({
+      bind: Effect.fn("AgentScope.bind")(function* (pid: number) {
+        if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+        const firstUnit = yield* readBindingScope(systemctl, unit);
+        if (!firstUnit) return undefined;
+        const firstStat = yield* readBindingProc(`/proc/${pid}/stat`);
+        const firstStart = firstStat === undefined ? undefined : parseProcessStart(firstStat, pid);
+        if (firstStart === undefined) return undefined;
+        const firstMembership = yield* readBindingProc(`/proc/${pid}/cgroup`);
+        const firstGroup =
+          firstMembership === undefined ? undefined : parseUnifiedCgroup(firstMembership);
+        if (
+          firstGroup === undefined ||
+          (firstGroup !== firstUnit.controlGroup &&
+            !firstGroup.startsWith(firstUnit.controlGroup + "/"))
+        )
+          return undefined;
+        const lastMembership = yield* readBindingProc(`/proc/${pid}/cgroup`);
+        const lastGroup =
+          lastMembership === undefined ? undefined : parseUnifiedCgroup(lastMembership);
+        if (lastGroup !== firstGroup) return undefined;
+        const lastStat = yield* readBindingProc(`/proc/${pid}/stat`);
+        const lastStart = lastStat === undefined ? undefined : parseProcessStart(lastStat, pid);
+        if (lastStart !== firstStart) return undefined;
+        const lastUnit = yield* readBindingScope(systemctl, unit);
+        if (
+          !lastUnit ||
+          lastUnit.invocationId !== firstUnit.invocationId ||
+          lastUnit.controlGroup !== firstUnit.controlGroup
+        )
+          return undefined;
+        const candidate = Object.freeze({ unit, ...firstUnit, pid, pidStartTicks: firstStart });
+        return yield* Effect.sync(() => {
+          if (!pinned) pinned = candidate;
+          return pinned.pid === candidate.pid &&
+            pinned.pidStartTicks === candidate.pidStartTicks &&
+            pinned.invocationId === candidate.invocationId &&
+            pinned.controlGroup === candidate.controlGroup
+            ? pinned
+            : undefined;
+        });
+      }),
+    });
+  };
 
   // `shared` scopes serve other threads too: tracked only for OOM diagnosis on old systemd.
   const scopeByThread = new Map<string, { unit: string; oomKilled: boolean; shared: boolean }>();
@@ -396,7 +566,7 @@ export const make = Effect.gen(function* () {
       if (resolved === null) return { command, args };
       const scope = yield* systemd;
       if (scope === undefined) return agentScopeCommand({ command: resolved, args });
-      const unit = `t3code-${name}-${NodeCrypto.randomUUID().slice(0, 8)}.scope`;
+      const unit = `t3code-${name}-${NodeCrypto.randomUUID()}.scope`;
       // A continuing shared scope cannot attribute a tool's OOM to one thread.
       // Clear the launch thread's previous scope instead.
       const continuing = shared === true && scope.supportsOomPolicy;
@@ -418,7 +588,11 @@ export const make = Effect.gen(function* () {
           ...(owned ? [] : ["--collect"]),
         ],
       };
-      return { ...agentScopeCommand({ command: resolved, args, scope: systemdScope }), unit };
+      return {
+        ...agentScopeCommand({ command: resolved, args, scope: systemdScope }),
+        unit,
+        custody: makeCustody(scope.systemctl, unit),
+      };
     }),
     oomKilled,
     stop,

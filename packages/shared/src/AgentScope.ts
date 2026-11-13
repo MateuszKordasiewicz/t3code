@@ -41,6 +41,20 @@ export interface AgentScopeCommand {
   readonly args: ReadonlyArray<string>;
   /** The systemd scope the command runs in, for `stop`. */
   readonly unit?: string | undefined;
+  readonly custody?: AgentScopeCustody;
+}
+
+export interface AgentScopeBinding {
+  readonly unit: string;
+  readonly invocationId: string;
+  readonly controlGroup: string;
+  readonly pid: number;
+  readonly pidStartTicks: string;
+}
+
+export interface AgentScopeCustody {
+  /** Current membership only; the caller must retain and corroborate its owned child handle. */
+  readonly bind: (spawnedPid: number) => Effect.Effect<AgentScopeBinding | undefined>;
 }
 
 export const AgentScope = Context.Reference<AgentScopeShape>("@t3tools/shared/AgentScope", {
