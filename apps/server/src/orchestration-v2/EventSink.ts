@@ -1452,10 +1452,20 @@ const makeAuthorizedNativeInfrastructure = Effect.fn(
   path: Path.Path,
   authority: NativeWorkflowAuthority,
 ) {
-  const store = yield* WorkflowRunStore.makeCapturedAuthorizedWorkflowRunStore(
+  const store = yield* WorkflowRunStore.makeCapturedNativeWorkflowRunStore(
     sql,
+    config,
+    path,
     authority.identity,
     authority.policy,
+    authority.coordinator,
+  ).pipe(
+    Effect.mapError(
+      (error) =>
+        new NativeProof.NativeCommandProofError({
+          reason: error.reason === "persistence" ? "persistence" : "invalid",
+        }),
+    ),
   );
   const verifier = yield* NativeProof.makeNativeCommandProofVerifier(sql, config, path);
   const nativeLayer = Layer.effect(

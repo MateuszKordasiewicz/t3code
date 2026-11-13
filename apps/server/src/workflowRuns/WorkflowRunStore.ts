@@ -21,9 +21,13 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Result from "effect/Result";
 import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import type * as Path from "effect/Path";
+import type { ServerConfig } from "../config.ts";
+import * as NativeProtocol from "./WorkflowNativeCommandProtocol.ts";
 import type { PlanningObservation } from "../developmentPlans/PlanningPassObservation.ts";
 import { DevelopmentPlanHash } from "../developmentPlans/DevelopmentPlanHash.ts";
 import { WorkflowCanonicalHash } from "./WorkflowCanonicalHash.ts";
@@ -184,10 +188,16 @@ type Material = Effect.Success<ReturnType<typeof decodeNativeReservationMaterial
 type CurrentAuthority = Effect.Success<
   ReturnType<typeof ExecutionAuthority.makeCapturedWorkflowExecutionAuthority>
 >;
+type NativeCoordinator = { readonly bootId: string; readonly workerId: string };
+type NativeBindingRuntime = {
+  readonly protocol: Effect.Success<ReturnType<typeof NativeProtocol.makeNativeCommandProtocol>>;
+  readonly coordinator: NativeCoordinator;
+};
 // Public constructors own the construction span; this helper is shared by their two capability sets.
 const makeStore = Effect.fnUntraced(function* (
   beforePublish: Effect.Effect<void> = Effect.void,
   currentAuthority?: CurrentAuthority,
+  nativeBinding?: NativeBindingRuntime,
 ) {
   const changes = yield* Effect.acquireRelease(PubSub.sliding<void>(1), PubSub.shutdown);
   const notify = beforePublish.pipe(
@@ -199,6 +209,7 @@ const makeStore = Effect.fnUntraced(function* (
     material: Material,
     operation: WorkflowOperationV1,
     owner: Pick<WorkflowRunV1 | S, "origin" | "access">,
+    requireNativeThread = false,
   ) {
     if (material.version !== 2) return true;
     if (
@@ -211,7 +222,7 @@ const makeStore = Effect.fnUntraced(function* (
     const destination = {
       environmentId: EnvironmentId.make(operation.destination.environmentId),
       projectId: ProjectId.make(operation.destination.projectId),
-      ...(material.launch.reuseExistingThread === true
+      ...(requireNativeThread || material.launch.reuseExistingThread === true
         ? { threadId: material.launch.threadId }
         : {}),
     };
@@ -4072,6 +4083,7 @@ const makeStore = Effect.fnUntraced(function* (
       reservation: Effect.Success<ReturnType<typeof readNativeReservationInTransaction>>,
       row: IntentRow,
       expectedOwnerVersion?: number,
+      requireNativeThread = false,
     ) {
       if (reservation.material.version !== 2 || !currentAuthority)
         return nativeIntentDenied("authority");
@@ -4219,7 +4231,14 @@ const makeStore = Effect.fnUntraced(function* (
         );
       }
       if (yield* runningNativeEffect(row.thread_id)) return nativeIntentDenied("custody");
-      if (!(yield* checkWorkflowAuthority(reservation.material, operation, owner)))
+      if (
+        !(yield* checkWorkflowAuthority(
+          reservation.material,
+          operation,
+          owner,
+          requireNativeThread,
+        ))
+      )
         return nativeIntentDenied("authority");
       return { kind: "current" as const };
     },
@@ -4312,6 +4331,134 @@ const makeStore = Effect.fnUntraced(function* (
       yield* sql<IntentRow>`SELECT * FROM workflow_native_launch_intents WHERE intent_id = ${input.intentId}`;
     if (rows.length !== 1 || !rows[0]) return yield* integrity();
     return yield* verifyNativeIntentEligibility(reservation, rows[0]);
+  });
+  type NativeBindingInput = {
+    readonly intentId: string;
+    readonly expectedFingerprint: string;
+    readonly expectedGeneration: number;
+  };
+  const nativeProtocolError = (error: NativeProtocol.NativeCommandProofError) =>
+    new WorkflowRunStoreError({
+      reason:
+        error.reason === "persistence"
+          ? "persistence"
+          : error.reason === "conflict"
+            ? "stale"
+            : "integrity",
+    });
+  const bindNativeIntent = Effect.fn("WorkflowRunStore.bindNativeIntent")(function* (
+    input: NativeBindingInput,
+  ) {
+    if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+      return yield* integrity();
+    if (!nativeBinding) return { kind: "denied" as const, reason: "unavailable" as const };
+    const outcome = yield* inTransaction(
+      Effect.gen(function* () {
+        const reservation = yield* readNativeReservationInTransaction({ intentId: input.intentId });
+        if (
+          reservation.fingerprint !== input.expectedFingerprint ||
+          reservation.generation !== input.expectedGeneration
+        )
+          return { kind: "stale" as const, notify: false };
+        if (reservation.material.version !== 2)
+          return { kind: "denied" as const, reason: "authority" as const, notify: false };
+        if (
+          (reservation.state !== "dispatching" && reservation.state !== "unknown") ||
+          reservation.held ||
+          reservation.finalizedOperationId !== null
+        )
+          return { kind: "denied" as const, reason: "state" as const, notify: false };
+        if (
+          reservation.bootId !== nativeBinding.coordinator.bootId ||
+          reservation.workerId !== nativeBinding.coordinator.workerId
+        )
+          return { kind: "stale" as const, notify: false };
+        const rows =
+          yield* sql<IntentRow>`SELECT * FROM workflow_native_launch_intents WHERE intent_id = ${input.intentId}`;
+        const row = rows[0];
+        if (rows.length !== 1 || !row) return yield* integrity();
+        const retainUnknown = Effect.gen(function* () {
+          if (reservation.nativeRunId !== null) return yield* integrity();
+          if (reservation.state === "unknown")
+            return {
+              kind: "reconciliation_required" as const,
+              state: "unknown" as const,
+              notify: false,
+            };
+          const changed =
+            yield* sql`UPDATE workflow_native_launch_intents SET state = 'unknown' WHERE intent_id = ${row.intent_id} AND fingerprint = ${input.expectedFingerprint} AND generation = ${input.expectedGeneration} AND state = 'dispatching' AND held = 0 AND boot_id = ${nativeBinding.coordinator.bootId} AND worker_id = ${nativeBinding.coordinator.workerId} AND native_run_id IS NULL AND finalized_operation_id IS NULL RETURNING intent_id`;
+          if (changed.length !== 1) return yield* stale();
+          const retained = yield* readNativeReservationInTransaction({ intentId: row.intent_id });
+          if (
+            retained.state !== "unknown" ||
+            retained.nativeRunId !== null ||
+            retained.bootId !== reservation.bootId ||
+            retained.workerId !== reservation.workerId ||
+            retained.generation !== reservation.generation ||
+            retained.fingerprint !== reservation.fingerprint
+          )
+            return yield* integrity();
+          return {
+            kind: "reconciliation_required" as const,
+            state: "unknown" as const,
+            notify: true,
+          };
+        });
+        const derived = yield* nativeBinding.protocol
+          .deriveInTransaction(reservation)
+          .pipe(Effect.mapError(nativeProtocolError));
+        const claim = yield* nativeBinding.protocol
+          .readStoredInTransaction(reservation, derived.claimCommand, {
+            intentId: row.intent_id,
+            phase: "claim",
+          })
+          .pipe(Effect.mapError(nativeProtocolError));
+        if (claim.kind === "absent") return yield* retainUnknown;
+        const evidence = yield* nativeBinding.protocol
+          .readStoredInTransaction(reservation, derived.messageCommand, {
+            intentId: row.intent_id,
+            phase: "message",
+          })
+          .pipe(Effect.mapError(nativeProtocolError));
+        if (evidence.kind === "absent") return yield* retainUnknown;
+        if (
+          !("actualT3RunId" in evidence) ||
+          typeof evidence.actualT3RunId !== "string" ||
+          !evidence.actualT3RunId
+        )
+          return yield* integrity();
+        const nativeRunId = evidence.actualT3RunId;
+        if (reservation.nativeRunId !== null) {
+          if (reservation.nativeRunId !== nativeRunId) return yield* integrity();
+          return { kind: "replay" as const, nativeRunId, state: reservation.state, notify: false };
+        }
+        const eligible =
+          reservation.state === "dispatching"
+            ? yield* verifyNativeIntentEligibility(reservation, row, undefined, true)
+            : undefined;
+        const state =
+          reservation.state === "unknown" || eligible?.kind !== "current"
+            ? ("unknown" as const)
+            : ("dispatching" as const);
+        const changed =
+          yield* sql`UPDATE workflow_native_launch_intents SET native_run_id = ${nativeRunId}, state = ${state} WHERE intent_id = ${row.intent_id} AND fingerprint = ${input.expectedFingerprint} AND generation = ${input.expectedGeneration} AND state = ${reservation.state} AND held = 0 AND boot_id = ${nativeBinding.coordinator.bootId} AND worker_id = ${nativeBinding.coordinator.workerId} AND native_run_id IS NULL AND finalized_operation_id IS NULL RETURNING intent_id`;
+        if (changed.length !== 1) return yield* stale();
+        const bound = yield* readNativeReservationInTransaction({ intentId: row.intent_id });
+        if (
+          bound.nativeRunId !== nativeRunId ||
+          bound.state !== state ||
+          bound.bootId !== reservation.bootId ||
+          bound.workerId !== reservation.workerId ||
+          bound.generation !== reservation.generation ||
+          bound.fingerprint !== reservation.fingerprint
+        )
+          return yield* integrity();
+        return { kind: "bound" as const, nativeRunId, state, notify: true };
+      }),
+    );
+    if (outcome.notify) yield* notify;
+    const { notify: _notify, ...result } = outcome;
+    return result;
   });
   const claim = Effect.fn("WorkflowRunStore.claim")(function* (input: {
     readonly operationId: string;
@@ -4672,6 +4819,23 @@ const makeStore = Effect.fnUntraced(function* (
         return Effect.fail(planningError("invalid"));
       }
     },
+    bindNativeIntent: (input: NativeBindingInput) => {
+      try {
+        WorkflowCanonicalHash.assertCanonical(input);
+        if (
+          Object.keys(input).sort().join() !== "expectedFingerprint,expectedGeneration,intentId" ||
+          typeof input.intentId !== "string" ||
+          !input.intentId.trim() ||
+          !/^[0-9a-f]{64}$/.test(input.expectedFingerprint) ||
+          !Number.isSafeInteger(input.expectedGeneration) ||
+          input.expectedGeneration < 0
+        )
+          throw integrity();
+        return bindNativeIntent(structuredClone(input));
+      } catch {
+        return Effect.fail(integrity());
+      }
+    },
     verifyClaimedNativeIntentInTransaction: (input: ClaimedNativeIntentSelection) => {
       try {
         WorkflowCanonicalHash.assertCanonical(input);
@@ -4740,6 +4904,55 @@ export const makeCapturedAuthorizedWorkflowRunStore = Effect.fn(
     Effect.provideService(SqlClient.SqlClient, sql),
   );
 });
+
+const makeNativeStore = Effect.fn("WorkflowRunStore.makeCapturedNative")(function* (
+  sql: SqlClient.SqlClient,
+  config: ServerConfig["Service"],
+  path: Path.Path,
+  identity: ServerEnvironmentIdentity["Service"],
+  policy: ManagedPolicy["Service"],
+  coordinator: NativeCoordinator,
+) {
+  const authority = yield* ExecutionAuthority.makeCapturedWorkflowExecutionAuthority(
+    sql,
+    identity,
+    policy,
+  );
+  const protocol = yield* NativeProtocol.makeNativeCommandProtocol(sql, config, path);
+  return yield* makeStore(Effect.void, authority, { protocol, coordinator }).pipe(
+    Effect.provideService(SqlClient.SqlClient, sql),
+  );
+});
+
+export function makeCapturedNativeWorkflowRunStore(
+  sql: SqlClient.SqlClient,
+  config: ServerConfig["Service"],
+  path: Path.Path,
+  identity: ServerEnvironmentIdentity["Service"],
+  policy: ManagedPolicy["Service"],
+  coordinator: NativeCoordinator,
+) {
+  const owned = Result.try({
+    try: () => {
+      WorkflowCanonicalHash.assertCanonical(coordinator);
+      const ownedCoordinator = Object.freeze({ ...coordinator });
+      if (
+        Object.keys(ownedCoordinator).sort().join() !== "bootId,workerId" ||
+        ![ownedCoordinator.bootId, ownedCoordinator.workerId].every(
+          (id) => typeof id === "string" && id.trim().length > 0,
+        )
+      )
+        throw integrity();
+      return { config: { ...config, baseDir: config.baseDir }, coordinator: ownedCoordinator };
+    },
+    catch: integrity,
+  });
+  return Effect.fromResult(owned).pipe(
+    Effect.flatMap((input) =>
+      makeNativeStore(sql, input.config, path, identity, policy, input.coordinator),
+    ),
+  );
+}
 
 export class WorkflowRunStore extends Context.Service<
   WorkflowRunStore,
