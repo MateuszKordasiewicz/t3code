@@ -14,6 +14,11 @@ import * as SqlClient from "effect/sql/SqlClient";
 import { ServerConfig } from "../config.ts";
 import { runMigrations } from "../persistence/Migrations.ts";
 import * as Derivation from "./WorkflowNativeLaunchDerivation.ts";
+import {
+  assertMatchesDerived,
+  NativeCommandSnapshotError,
+  snapshotNativeInput,
+} from "./WorkflowNativeCommandSnapshot.ts";
 import * as Store from "./WorkflowRunStore.ts";
 import { WorkflowCanonicalHash } from "./WorkflowCanonicalHash.ts";
 import { WorkflowRunPolicy } from "./WorkflowRunPolicy.ts";
@@ -234,6 +239,10 @@ it.effect(
       const launch = {
         ...input.launch,
         generateTitle: true,
+        modelSelection: {
+          ...input.launch.modelSelection,
+          options: [{ id: "effort", value: "high" }],
+        },
         initialMessage: {
           ...input.launch.initialMessage,
           context: {
@@ -290,6 +299,196 @@ it.effect(
         first.expectedMessageCommandHash,
         WorkflowCanonicalHash.tagged("t3.workflow-native-command.v1", first.messageCommand),
       );
+      if (first.claimCommand.type !== "thread.create") throw new Error("expected create");
+      const claimHint = { intentId: input.intentId, phase: "claim" as const };
+      const messageHint = { intentId: input.intentId, phase: "message" as const };
+      const claim = snapshotNativeInput(first.claimCommand, claimHint);
+      const message = snapshotNativeInput(first.messageCommand, messageHint);
+      assertMatchesDerived(claim, first);
+      assertMatchesDerived(message, first);
+      const reason = (expected: "invalid" | "conflict") => new RegExp(`snapshot ${expected}`);
+      assert.throws(
+        () =>
+          assertMatchesDerived(
+            snapshotNativeInput(first.claimCommand, { ...claimHint, intentId: "other" }),
+            first,
+          ),
+        NativeCommandSnapshotError,
+        reason("conflict"),
+      );
+      assert.throws(
+        () =>
+          assertMatchesDerived(
+            snapshotNativeInput({ ...first.claimCommand, commandId: "other" }, claimHint),
+            first,
+          ),
+        NativeCommandSnapshotError,
+        reason("conflict"),
+      );
+      assert.throws(
+        () =>
+          assertMatchesDerived(
+            snapshotNativeInput({ ...first.messageCommand, threadId: "other" }, messageHint),
+            first,
+          ),
+        NativeCommandSnapshotError,
+        reason("conflict"),
+      );
+      assert.throws(
+        () => snapshotNativeInput(first.messageCommand, claimHint),
+        NativeCommandSnapshotError,
+        reason("invalid"),
+      );
+      assert.throws(
+        () => snapshotNativeInput(first.claimCommand, messageHint),
+        NativeCommandSnapshotError,
+        reason("invalid"),
+      );
+      assert.throws(
+        () =>
+          snapshotNativeInput(
+            { type: "thread.delete", commandId: "x", threadId: "thread" },
+            claimHint,
+          ),
+        NativeCommandSnapshotError,
+        reason("invalid"),
+      );
+      assert.throws(
+        () => snapshotNativeInput(first.claimCommand, { ...claimHint, extra: true }),
+        NativeCommandSnapshotError,
+        reason("invalid"),
+      );
+      assert.throws(
+        () => snapshotNativeInput(first.claimCommand, { ...claimHint, intentId: " " }),
+        NativeCommandSnapshotError,
+        reason("invalid"),
+      );
+      const badCommands = [
+        { ...first.claimCommand, extra: true },
+        {
+          ...first.claimCommand,
+          modelSelection: { ...first.claimCommand.modelSelection, options: { effort: "high" } },
+        },
+        { ...first.claimCommand, title: undefined },
+        { ...first.claimCommand, title: NaN },
+        {
+          ...first.claimCommand,
+          modelSelection: { ...first.claimCommand.modelSelection, provider: "legacy" },
+        },
+        {
+          ...first.messageCommand,
+          context: {
+            version: 1,
+            records: [{ version: 1, contextId: "broken", kind: "terminal", label: "Broken" }],
+          },
+        },
+        {
+          ...first.messageCommand,
+          context: {
+            version: 1,
+            records: [
+              {
+                version: 1,
+                contextId: "opaque",
+                kind: "future-kind",
+                label: "Future",
+                payload: { bad: undefined },
+              },
+            ],
+          },
+        },
+      ];
+      for (const bad of badCommands) {
+        assert.throws(
+          () => snapshotNativeInput(bad, bad.type === "message.dispatch" ? messageHint : claimHint),
+          NativeCommandSnapshotError,
+          reason("invalid"),
+        );
+      }
+      let getterCalls = 0;
+      const getterCommand = {
+        ...first.claimCommand,
+        get title() {
+          getterCalls++;
+          return "Work";
+        },
+      };
+      assert.throws(
+        () => snapshotNativeInput(getterCommand, claimHint),
+        NativeCommandSnapshotError,
+        reason("invalid"),
+      );
+      assert.throws(
+        () =>
+          snapshotNativeInput(first.claimCommand, {
+            ...claimHint,
+            get extra() {
+              getterCalls++;
+              return true;
+            },
+          }),
+        NativeCommandSnapshotError,
+        reason("invalid"),
+      );
+      assert.strictEqual(getterCalls, 0);
+      const changedExpected = structuredClone(first);
+      (
+        changedExpected.messageCommand.context!.records[0] as { payload: { nested: string[] } }
+      ).payload.nested[0] = "changed";
+      assert.throws(
+        () => assertMatchesDerived(message, changedExpected),
+        NativeCommandSnapshotError,
+        reason("conflict"),
+      );
+      const otherMessage = structuredClone(first.messageCommand);
+      (otherMessage.modelSelection!.options![0] as { value: string }).value = "low";
+      assert.throws(
+        () => assertMatchesDerived(snapshotNativeInput(otherMessage, messageHint), first),
+        NativeCommandSnapshotError,
+        reason("conflict"),
+      );
+      const postComparison = structuredClone(first);
+      assertMatchesDerived(message, postComparison);
+      (
+        postComparison.messageCommand.context!.records[0] as { payload: { nested: string[] } }
+      ).payload.nested[0] = "later";
+      assert.throws(
+        () => assertMatchesDerived(message, postComparison),
+        NativeCommandSnapshotError,
+        reason("conflict"),
+      );
+      const changedHash = { ...first, expectedMessageCommandHash: "0".repeat(64) };
+      assert.throws(
+        () => assertMatchesDerived(message, changedHash),
+        NativeCommandSnapshotError,
+        reason("conflict"),
+      );
+      const callerCommand = structuredClone(first.messageCommand);
+      const callerHint = { ...messageHint };
+      const owned = snapshotNativeInput(callerCommand, callerHint);
+      const originalBytes = owned.canonicalCommand;
+      const originalHash = owned.commandHash;
+      (callerCommand.context!.records[0] as { payload: { nested: string[] } }).payload.nested[0] =
+        "changed";
+      (callerCommand.modelSelection!.options![0] as { value: string }).value = "low";
+      callerHint.intentId = "other";
+      assertMatchesDerived(owned, first);
+      assert.strictEqual(owned.canonicalCommand, originalBytes);
+      assert.strictEqual(owned.commandHash, originalHash);
+      assert.strictEqual(Object.isFrozen(callerCommand), false);
+      assert.strictEqual(Object.isFrozen(callerHint), false);
+      const ownedMessage = owned.command;
+      if (ownedMessage.type !== "message.dispatch") throw new Error("expected message");
+      const nested = (ownedMessage.context!.records[0] as { payload: { nested: string[] } }).payload
+        .nested;
+      assert.isTrue(Object.isFrozen(nested));
+      assert.throws(() => {
+        nested[0] = "changed";
+      });
+      assert.strictEqual(nested[0], "original");
+      (changedExpected.messageCommand.modelSelection!.options![0] as { value: string }).value =
+        "low";
+      assertMatchesDerived(owned, first);
       const records = first.reservation.material.launch.initialMessage.context!.records;
       (records[0] as { payload: { nested: string[] } }).payload.nested[0] = "mutated";
       assert.deepStrictEqual<unknown>(
@@ -461,6 +660,34 @@ it.effect.each([
       claimKind: "metadata-update",
     });
     assert.strictEqual(result.claimCommand.type, "thread.metadata.update");
+    const claim = snapshotNativeInput(result.claimCommand, {
+      intentId: input.intentId,
+      phase: "claim",
+    });
+    assertMatchesDerived(claim, result);
+    const expectedClaim = result.claimCommand;
+    if (expectedClaim.type !== "thread.metadata.update") throw new Error("expected reuse");
+    assert.throws(
+      () =>
+        assertMatchesDerived(
+          { ...claim, command: { ...expectedClaim, expectedEmpty: false } },
+          result,
+        ),
+      NativeCommandSnapshotError,
+      /snapshot conflict/,
+    );
+    const create = {
+      ...result,
+      claimCommand: {
+        ...result.claimCommand,
+        type: "thread.create" as const,
+      } as typeof result.claimCommand,
+    };
+    assert.throws(
+      () => assertMatchesDerived(claim, create),
+      NativeCommandSnapshotError,
+      /snapshot conflict/,
+    );
     assert.deepStrictEqual(result.messageCommand.dispatchMode, {
       type: "defer_start",
       workspaceStrategy: strategy,
