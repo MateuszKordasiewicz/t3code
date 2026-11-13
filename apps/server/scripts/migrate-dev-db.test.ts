@@ -433,6 +433,8 @@ const operationalWorkflowTables = [
   "workflow_planning_settlements",
   "orchestration_v2_submission_transports",
   "orchestration_v2_submission_attempts",
+  "orchestration_v2_preparation_jobs",
+  "test_preparation_job_child",
 ] as const;
 const planContentTables = [
   "workflow_plan_identities",
@@ -493,6 +495,20 @@ const seedOperationalWorkflow = Effect.fn("test.seedOperationalWorkflowForDevCop
       yield* sql`UPDATE orchestration_v2_submission_transports SET settlement_json=${JSON.stringify({ binding, observation: "removed" })},settlement_hash=${hash},settled_at=${at} WHERE transport_id=${id}`;
     }
   }
+  for (const [id, kind, parent, state] of [
+    ["prep-active", "launch", null, "active"],
+    ["prep-quiescing", "setup", "prep-active", "quiescing"],
+    ["prep-unknown", "title", null, "unknown"],
+    ["prep-settled", "release", null, "settled"],
+  ] as const) {
+    yield* sql`INSERT INTO orchestration_v2_preparation_jobs(format_version,job_id,entry_key,kind,environment_id,project_id,thread_id,originating_launch_job_id,server_boot_id,request_identity_json,request_identity_hash,created_at) VALUES (1,${id},${id},${kind},'environment-kept','project-kept','stopped-thread',${parent},'seed-server-boot','{}',${hash},${at})`;
+    if (state === "settled")
+      yield* sql`UPDATE orchestration_v2_preparation_jobs SET state='settled',record_version=1,code_closed_at=${at},settlement_json=${JSON.stringify({ v: 1, jobId: id, entryKey: id, priorVersion: 0, kind: "code_only" })},settlement_hash=${hash},settled_at=${at} WHERE job_id=${id}`;
+    else if (state !== "active")
+      yield* sql`UPDATE orchestration_v2_preparation_jobs SET state=${state},record_version=1 WHERE job_id=${id}`;
+  }
+  yield* sql`CREATE TABLE test_preparation_job_child(id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES orchestration_v2_preparation_jobs(job_id))`;
+  yield* sql`INSERT INTO test_preparation_job_child VALUES ('copy-descendant','prep-active')`;
 });
 
 const readWorkflowCopyState = Effect.fn("test.readWorkflowCopyState")(function* () {
@@ -506,7 +522,7 @@ const readWorkflowCopyState = Effect.fn("test.readWorkflowCopyState")(function* 
     (table) => sql`SELECT * FROM ${sql(table)}`,
   );
   const schema =
-    yield* sql`SELECT type,name,sql FROM sqlite_master WHERE name IN ('orchestration_v2_submission_transports','orchestration_v2_submission_attempts') OR name LIKE 'submission_%' OR name LIKE 'orchestration_v2_submission_%_guard' ORDER BY name`;
+    yield* sql`SELECT type,name,sql FROM sqlite_master WHERE tbl_name IN ('orchestration_v2_submission_transports','orchestration_v2_submission_attempts','orchestration_v2_preparation_jobs','test_preparation_job_child') OR name LIKE 'submission_%' OR name LIKE 'orchestration_v2_submission_%_guard' ORDER BY name`;
   const history = yield* sql`SELECT * FROM effect_sql_migrations ORDER BY migration_id`;
   return { operational, content, schema, history };
 });

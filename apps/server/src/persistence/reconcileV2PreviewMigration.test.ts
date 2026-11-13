@@ -69,6 +69,7 @@ describe("V2 preview upgrade", () => {
         [87, "WorkflowNativeCommandProofs"],
         [88, "ProviderSubmissionCustody"],
         [89, "ProviderSubmissionLookup"],
+        [90, "ThreadPreparationJobs"],
       ]);
       assert.deepStrictEqual(yield* runMigrations(), []);
       assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_legacy_imports`, imports);
@@ -181,6 +182,7 @@ describe("V2 preview upgrade", () => {
         [87, "WorkflowNativeCommandProofs"],
         [88, "ProviderSubmissionCustody"],
         [89, "ProviderSubmissionLookup"],
+        [90, "ThreadPreparationJobs"],
       ]);
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
