@@ -17,6 +17,7 @@ import {
   OrchestrationV2ProviderSessionJson,
   OrchestrationV2SubagentJson,
   OrchestrationV2RunJson,
+  OrchestrationV2AppThreadJson,
   OrchestrationV2RunAttemptJson,
   OrchestrationV2ExecutionNodeJson,
   OrchestrationV2CheckpointScopeJson,
@@ -125,6 +126,21 @@ const attemptFacts = <
 const encode = (value: unknown) => JSON.stringify(value);
 const parse = (value: string): unknown => JSON.parse(value);
 const decodePreparationWorkflowOwner = Schema.decodeEffect(WorkflowOperationV1.fields.owner);
+const decodeWorkspaceThread = Schema.decodeEffect(
+  Schema.fromJsonString(OrchestrationV2AppThreadJson),
+);
+const decodeWorkspaceEventMetadata = Schema.decodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      applicationEventVersion: Schema.optional(Schema.Literal(2)),
+      runId: Schema.optional(Schema.NonEmptyString),
+      nodeId: Schema.optional(Schema.NonEmptyString),
+      driver: Schema.optional(Schema.NonEmptyString),
+      providerInstanceId: Schema.optional(Schema.NonEmptyString),
+      rawEventId: Schema.optional(Schema.NonEmptyString),
+    }),
+  ),
+);
 const decodeNativeFinalizationRun = Schema.decodeEffect(
   Schema.fromJsonString(OrchestrationV2RunJson),
 );
@@ -368,10 +384,99 @@ const makeStore = Effect.fnUntraced(function* (
       return yield* integrity();
     return parent;
   });
+  const readWorkspaceResourceProof = Effect.fn("WorkflowRunStore.readWorkspaceResourceProof")(
+    function* (job: PreparationJob.Job, closedAt: string) {
+      const entries: PreparationJob.WorkspaceSettlement["resources"]["entries"][number][] = [];
+      let cursor = "";
+      let host: string | undefined;
+      const priorVersion = job.state === "settled" ? job.recordVersion - 1 : job.recordVersion;
+      for (;;) {
+        const rows =
+          yield* sql`SELECT * FROM orchestration_v2_preparation_process_resources WHERE job_id=${job.input.jobId} AND resource_id>${cursor} ORDER BY resource_id LIMIT 128`;
+        for (const row of rows) {
+          const resource = yield* Effect.try({
+            try: () => PreparationResource.decodeRow(row),
+            catch: integrity,
+          });
+          const context = resource.context;
+          const selected = context.jobSelection;
+          if (
+            job.identityVersion !== 3 ||
+            !job.input.nativeOwner ||
+            resource.state !== "settled" ||
+            !resource.binding ||
+            !resource.settlement ||
+            !resource.settlementHash ||
+            !resource.releaseStartedAt ||
+            !resource.settledAt ||
+            resource.settledAt > closedAt ||
+            resource.createdAt < job.createdAt ||
+            resource.settlement.childExit.signal !== null ||
+            resource.settlement.childExit.exitCode === null ||
+            selected.jobId !== job.input.jobId ||
+            selected.entryKey !== job.input.entryKey ||
+            selected.requestIdentityHash !== job.requestIdentityHash ||
+            selected.serverBootId !== job.input.serverBootId ||
+            selected.expectedVersion < 1 ||
+            selected.expectedVersion > priorVersion ||
+            context.environmentId !== job.input.environmentId ||
+            context.projectId !== job.input.projectId ||
+            context.threadId !== job.input.threadId ||
+            context.runId !== job.input.runId ||
+            !sameCustodyValue(context.executionClaim, job.input.nativeOwner.executionClaim) ||
+            !sameCustodyValue(context.current, job.input.request.current)
+          )
+            return yield* integrity();
+          const identity = stableStringify(context.host);
+          if (host !== undefined && host !== identity) return yield* integrity();
+          host = identity;
+          entries.push({
+            resourceId: resource.resourceId,
+            contextHash: resource.contextHash,
+            recordVersion: resource.recordVersion,
+            settlementHash: resource.settlementHash,
+          });
+          cursor = resource.resourceId;
+        }
+        if (rows.length < 128) break;
+      }
+      if (!entries.length) return yield* integrity();
+      return entries;
+    },
+  );
+  const preparationRetired = Effect.fn("WorkflowRunStore.preparationRetired")(function* (
+    job: PreparationJob.Job,
+  ) {
+    if (job.state !== "settled") return false;
+    if (job.identityVersion === 2)
+      return !job.processExposed && job.settlement?.kind === "code_only";
+    if (
+      job.identityVersion !== 3 ||
+      !job.processExposed ||
+      !job.codeClosedAt ||
+      !job.settlement ||
+      !Object.hasOwn(job.settlement, "resources")
+    )
+      return false;
+    const evidence = yield* Effect.try({
+      try: () =>
+        PreparationJob.ownWorkspaceSettlement(
+          job.settlement,
+          job.input,
+          job.recordVersion - 1,
+          job.codeClosedAt!,
+        ),
+      catch: integrity,
+    });
+    const resources = yield* readWorkspaceResourceProof(job, job.codeClosedAt);
+    if (!sameCustodyValue(resources, evidence.resources.entries)) return yield* integrity();
+    return true;
+  });
   const readPreparationCustody = Effect.fn("WorkflowRunStore.readPreparationCustody")(function* (
     environmentId: string,
     threadId: string,
     actor?: PreparationActor,
+    verified?: Set<string>,
   ) {
     let cursor = "";
     let held = false;
@@ -388,13 +493,9 @@ const makeStore = Effect.fnUntraced(function* (
           yield* validateActorInventory(actor);
           continue;
         }
-        if (
-          job.identityVersion !== 2 ||
-          job.state !== "settled" ||
-          job.processExposed ||
-          job.settlement?.kind !== "code_only"
-        )
-          held = true;
+        if (verified?.has(job.input.jobId) || (yield* preparationRetired(job)))
+          verified?.add(job.input.jobId);
+        else held = true;
       }
       if (rows.length < 128) break;
       cursor = rows.at(-1)!.job_id as string;
@@ -414,6 +515,7 @@ const makeStore = Effect.fnUntraced(function* (
       environmentId: string,
       native: PreparationJob.NativeSelection,
       actor?: PreparationActor,
+      verified?: Set<string>,
     ) {
       let cursor = "";
       let held = false;
@@ -436,13 +538,9 @@ const makeStore = Effect.fnUntraced(function* (
             yield* validateActorInventory(actor);
             continue;
           }
-          if (
-            job.identityVersion !== 2 ||
-            job.state !== "settled" ||
-            job.processExposed ||
-            job.settlement?.kind !== "code_only"
-          )
-            held = true;
+          if (verified?.has(job.input.jobId) || (yield* preparationRetired(job)))
+            verified?.add(job.input.jobId);
+          else held = true;
         }
         if (rows.length < 128) break;
         cursor = rows.at(-1)!.job_id as string;
@@ -475,6 +573,7 @@ const makeStore = Effect.fnUntraced(function* (
         string,
         Effect.Success<ReturnType<typeof readThreadCustodyInTransaction>>
       >();
+      const retiredPreparations = new Set<string>();
       const environmentId = input.environmentId ?? "";
       const threadId = input.threadId;
       if (Option.isNone(yield* Effect.serviceOption(sql.transactionService)))
@@ -697,7 +796,10 @@ const makeStore = Effect.fnUntraced(function* (
         const selected = work[index]!;
         if (selected.kind === "thread") {
           if (input.purpose === "physical") {
-            if (yield* readPreparationCustody(environmentId, selected.id, actor)) return true;
+            if (
+              yield* readPreparationCustody(environmentId, selected.id, actor, retiredPreparations)
+            )
+              return true;
             if (yield* transportHistory("opening_thread_id", selected.id)) return true;
             if (yield* attemptHistory({ field: "thread_id", id: selected.id })) return true;
           }
@@ -906,7 +1008,10 @@ const makeStore = Effect.fnUntraced(function* (
             nativeId: selected.native.id,
           };
           if (input.purpose === "physical") {
-            if (yield* readNativePreparationCustody(environmentId, native, actor)) return true;
+            if (
+              yield* readNativePreparationCustody(environmentId, native, actor, retiredPreparations)
+            )
+              return true;
             if (yield* attemptHistory(selected.native)) return true;
           }
           if (environmentId !== "") {
@@ -6902,6 +7007,144 @@ const makeStore = Effect.fnUntraced(function* (
           : Effect.fail(PreparationOwner.error("input", "invalid"));
       };
       const port: PreparationOwner.CommandPort = {
+        retireWorkspace: Effect.fn("WorkflowRunStore.retireWorkspace")(function* (completion) {
+          const result = yield* writer(
+            "inventory",
+            Effect.gen(function* () {
+              const job = yield* checkJob();
+              if (
+                !flags.intakeSealed ||
+                flags.stopping ||
+                flags.blocked ||
+                runtime.scope.state._tag === "Closed" ||
+                job.state !== "active" ||
+                job.codeClosedAt !== null ||
+                !job.processExposed ||
+                job.recordVersion === Number.MAX_SAFE_INTEGER ||
+                commands.size === 0 ||
+                commands.size !== actor.resources.size ||
+                completion.native.threadId !== job.input.threadId ||
+                completion.native.runId !== job.input.runId
+              )
+                return yield* stale();
+              yield* validateActorInventory(actor);
+              const launch = yield* decodeNativeReservationLaunch(job.input.request.launch).pipe(
+                Effect.mapError(integrity),
+              );
+              if (
+                launch.launchHash !== job.input.request.launchHash ||
+                launch.launch.workspaceStrategy.type !== "worktree" ||
+                launch.launch.workspaceStrategy.branch !== completion.worktree.refName
+              )
+                return yield* integrity();
+              const commandId = `${launch.launch.commandId}:native-workspace`;
+              const receipts = yield* sql<{
+                aggregate_kind: string;
+                aggregate_id: string;
+                accepted_at: string;
+                result_sequence: number;
+                status: string;
+                error: string | null;
+                command_type: string;
+              }>`SELECT aggregate_kind,aggregate_id,accepted_at,result_sequence,status,error,command_type FROM orchestration_command_receipts WHERE command_id=${commandId}`;
+              const receipt = receipts[0];
+              if (
+                receipts.length !== 1 ||
+                !receipt ||
+                receipt.aggregate_kind !== "thread" ||
+                receipt.aggregate_id !== job.input.threadId ||
+                receipt.status !== "accepted" ||
+                receipt.error !== null ||
+                receipt.command_type !== "thread.metadata.update"
+              )
+                return yield* integrity();
+              const events = yield* sql<{
+                sequence: number;
+                event_id: string;
+                aggregate_kind: string;
+                stream_id: string;
+                stream_version: number;
+                event_type: string;
+                occurred_at: string;
+                command_id: string | null;
+                payload_json: string;
+                metadata_json: string;
+                application_event_version: number;
+              }>`SELECT sequence,event_id,aggregate_kind,stream_id,stream_version,event_type,occurred_at,command_id,payload_json,metadata_json,application_event_version FROM orchestration_events WHERE command_id=${commandId} ORDER BY sequence`;
+              const event = events[0];
+              if (
+                events.length !== 1 ||
+                !event ||
+                event.sequence !== receipt.result_sequence ||
+                event.aggregate_kind !== "thread" ||
+                event.stream_id !== job.input.threadId ||
+                event.event_type !== "thread.metadata-updated" ||
+                event.application_event_version !== 2 ||
+                event.command_id !== commandId ||
+                !Number.isSafeInteger(event.stream_version) ||
+                event.stream_version < 0
+              )
+                return yield* integrity();
+              const payload = yield* decodeWorkspaceThread(event.payload_json, {
+                onExcessProperty: "error",
+              }).pipe(Effect.mapError(integrity));
+              const metadata = yield* decodeWorkspaceEventMetadata(event.metadata_json, {
+                onExcessProperty: "error",
+              }).pipe(Effect.mapError(integrity));
+              if (
+                payload.id !== job.input.threadId ||
+                payload.projectId !== job.input.projectId ||
+                payload.branch !== completion.worktree.refName ||
+                payload.worktreePath !== completion.worktree.path ||
+                (metadata.runId !== undefined && metadata.runId !== job.input.runId)
+              )
+                return yield* integrity();
+              const now = DateTime.formatIso(yield* DateTime.now);
+              const resources = yield* readWorkspaceResourceProof(job, now);
+              const encoded = yield* Effect.try({
+                try: () =>
+                  PreparationJob.encodeWorkspaceSettlement(job.input, now, job.recordVersion, {
+                    v: 1,
+                    kind: "owned_resources",
+                    jobId: job.input.jobId,
+                    entryKey: job.input.entryKey,
+                    priorVersion: job.recordVersion,
+                    resources: { v: 1, entries: resources },
+                    workspace: {
+                      v: 1,
+                      profile: "native-local-worktree-v1",
+                      ...completion.worktree,
+                      command: {
+                        commandId,
+                        threadId: job.input.threadId,
+                        commandType: receipt.command_type,
+                        acceptedAt: receipt.accepted_at,
+                        resultSequence: receipt.result_sequence,
+                        status: receipt.status,
+                        error: receipt.error,
+                        eventId: event.event_id,
+                        eventType: event.event_type,
+                        occurredAt: event.occurred_at,
+                      },
+                    },
+                  }),
+                catch: integrity,
+              });
+              const rows =
+                yield* sql`UPDATE orchestration_v2_preparation_jobs SET state='settled',code_closed_at=${now},settlement_json=${encoded.text},settlement_hash=${encoded.hash},settled_at=${now},record_version=${job.recordVersion + 1} WHERE job_id=${job.input.jobId} AND entry_key=${job.input.entryKey} AND request_identity_hash=${job.requestIdentityHash} AND server_boot_id=${job.input.serverBootId} AND record_version=${job.recordVersion} RETURNING *`;
+              if (rows.length !== 1) return yield* stale();
+              return yield* Effect.try({
+                try: () => PreparationJob.decodeRow(rows[0]),
+                catch: integrity,
+              });
+            }).pipe(Effect.mapError((error) => (isStoreError(error) ? error : integrity()))),
+            (job) => {
+              actor.job = job;
+            },
+          );
+          yield* notify;
+          return result;
+        }),
         checkOutsideWriter: outside,
         prepareCommand: Effect.fn("WorkflowRunStore.prepareOwnedCommand")(function* (input, state) {
           yield* writer(

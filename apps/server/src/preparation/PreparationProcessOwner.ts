@@ -8,6 +8,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import type * as PreparationJob from "./PreparationJob.ts";
 import { WorkflowCanonicalHash } from "../workflowRuns/WorkflowCanonicalHash.ts";
 
 export class PreparationProcessOwnerError extends Schema.TaggedError<PreparationProcessOwnerError>()(
@@ -88,7 +89,20 @@ export interface CommandState {
   >;
   sealed: boolean;
 }
+export interface WorkspaceCompletion {
+  readonly kind: "worktree-created";
+  readonly state: "preparing-held";
+  readonly native: { readonly threadId: string; readonly runId: string };
+  readonly worktree: { readonly path: string; readonly refName: string };
+}
+export interface Retirement {
+  readonly kind: "retired";
+  readonly job: PreparationJob.Job;
+}
 export interface CommandPort {
+  readonly retireWorkspace: (
+    completion: WorkspaceCompletion,
+  ) => Effect.Effect<PreparationJob.Job, PreparationProcessOwnerError>;
   readonly checkOutsideWriter: (
     stage: PreparationProcessOwnerError["stage"],
   ) => Effect.Effect<void, PreparationProcessOwnerError>;
@@ -197,6 +211,12 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
     readonly stopped: Deferred.Deferred<void>;
     startup?: Fiber.Fiber<void>;
   };
+  let retirement:
+    | {
+        readonly invocation: Pick<Invocation, "fiber" | "done">;
+        readonly result: Deferred.Deferred<Retirement, PreparationProcessOwnerError>;
+      }
+    | undefined;
   const invocations = new Set<Invocation>();
   const commands = new Set<Slot>();
   let workspaceEntry: Fiber.Fiber<unknown, unknown> | undefined;
@@ -255,6 +275,11 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
       Effect.andThen(
         Effect.uninterruptible(
           Effect.withFiber((fiber) => {
+            if (
+              retirement?.invocation.fiber.id === fiber.id &&
+              !Deferred.isDoneUnsafe(retirement.invocation.done)
+            )
+              return Effect.fail(error("cleanup", "invalid"));
             if (workspaceEntry?.id === fiber.id && workspaceEntry.pollUnsafe() === undefined)
               return Effect.fail(error("cleanup", "invalid"));
             if (
@@ -269,6 +294,8 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
             for (const slot of commands) signalClose(slot);
             if (workspaceEntry && workspaceEntry.pollUnsafe() === undefined)
               workspaceEntry.interruptUnsafe();
+            if (retirement && !Deferred.isDoneUnsafe(retirement.invocation.done))
+              retirement.invocation.fiber.interruptUnsafe();
             if (stopDone) return Deferred.await(stopDone);
             const completion = Deferred.makeUnsafe<Inventory, PreparationProcessOwnerError>();
             stopDone = completion;
@@ -279,6 +306,7 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
                 concurrency: "unbounded",
                 discard: true,
               });
+              if (retirement) yield* Deferred.await(retirement.invocation.done);
               if (workspaceEntry) yield* Fiber.await(workspaceEntry);
               const exits = yield* Effect.forEach(
                 commands,
@@ -478,7 +506,79 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
     },
     Effect.interruptible,
   );
+  const retirementScopeClosed = () =>
+    storeScope.state._tag === "Closed" || ownerScope.state._tag === "Closed";
+  const retireWorkspace = Effect.fn("PreparationProcessOwner.retireWorkspace")(function* () {
+    yield* port.checkOutsideWriter("inventory");
+    return yield* Effect.uninterruptibleMask(() =>
+      Effect.withFiber((fiber) =>
+        Effect.suspend(() => {
+          if (workspaceEntry?.id === fiber.id && workspaceEntry.pollUnsafe() === undefined)
+            return Effect.fail(error("inventory", "invalid"));
+          if (retirement) return Deferred.await(retirement.result).pipe(Effect.interruptible);
+          const current = {
+            invocation: { fiber, done: Deferred.makeUnsafe<void>() },
+            result: Deferred.makeUnsafe<Retirement, PreparationProcessOwnerError>(),
+          };
+          retirement = current;
+          flags.intakeSealed = true;
+          const work = Effect.gen(function* () {
+            if (flags.blocked || flags.stopping || retirementScopeClosed() || !workspaceEntry)
+              return yield* error("inventory", "closed");
+            const exit = yield* Fiber.await(workspaceEntry);
+            if (Exit.isFailure(exit)) return yield* error("inventory", "invalid");
+            yield* Effect.forEach(invocations, (invocation) => Deferred.await(invocation.done), {
+              concurrency: "unbounded",
+              discard: true,
+            });
+            yield* Effect.forEach(commands, (slot) => Deferred.await(slot.done), {
+              concurrency: "unbounded",
+              discard: true,
+            });
+            if (flags.blocked || flags.stopping || retirementScopeClosed())
+              return yield* error("inventory", "closed");
+            const completion = yield* Effect.try({
+              try: (): WorkspaceCompletion => {
+                const value = properties(exit.value);
+                const native = properties(value.native);
+                const worktree = properties(value.worktree);
+                if (
+                  Object.keys(value).sort().join() !== "kind,native,state,worktree" ||
+                  value.kind !== "worktree-created" ||
+                  value.state !== "preparing-held" ||
+                  Object.keys(native).sort().join() !== "runId,threadId" ||
+                  native.threadId !== identity.threadId ||
+                  native.runId !== identity.runId ||
+                  Object.keys(worktree).sort().join() !== "path,refName" ||
+                  !text(worktree.path) ||
+                  !text(worktree.refName)
+                )
+                  throw error("inventory", "invalid");
+                return Object.freeze({
+                  kind: "worktree-created",
+                  state: "preparing-held",
+                  native: Object.freeze({ threadId: identity.threadId, runId: identity.runId }),
+                  worktree: Object.freeze({ path: worktree.path, refName: worktree.refName }),
+                });
+              },
+              catch: () => error("inventory", "invalid"),
+            });
+            const job = yield* port.retireWorkspace(completion);
+            return Object.freeze({ kind: "retired" as const, job });
+          }).pipe((work) => sanitize("inventory", work), Effect.interruptible);
+          return Effect.gen(function* () {
+            const exit = yield* Effect.exit(work);
+            if (Exit.isFailure(exit)) flags.blocked = true;
+            Deferred.doneUnsafe(current.invocation.done, Exit.void);
+            Deferred.doneUnsafe(current.result, exit);
+            return yield* exit;
+          });
+        }),
+      ),
+    );
+  }, Effect.interruptible);
   const owner = Object.freeze({
+    retireWorkspace,
     captureWorkspaceEntry,
     jobId: identity.jobId,
     threadId: identity.threadId,

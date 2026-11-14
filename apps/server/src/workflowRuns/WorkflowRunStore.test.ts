@@ -15956,3 +15956,365 @@ it.effect.each(
       );
     }),
 );
+
+const seedWorkspaceRetirement = Effect.fn("test.seedWorkspaceRetirement")(function* (
+  threadId: string,
+  native: boolean,
+  count = 2,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const at = DateTime.formatIso(DateTime.makeUnsafe(facts.now));
+  const current = {
+    driver: "codex",
+    providerInstanceId: "provider",
+    providerThreadId: "historical-provider",
+    providerSessionId: null,
+    nativeThreadId: null,
+  };
+  const launch = {
+    commandId: "workspace-launch",
+    threadId,
+    projectId: "project",
+    workspaceStrategy: { type: "worktree", baseRef: "main", branch: "feature" },
+    initialMessage: { attachments: [] },
+  };
+  const claim = {
+    operationId: "historical-operation",
+    expectedFingerprint: "a".repeat(64),
+    expectedGeneration: 0,
+    bootId: "preparation-boot",
+    workerId: "worker",
+  };
+  const input = PreparationJob.ownInput({
+    ...preparationInput(threadId),
+    runId: "historical-run",
+    nativeSelection: native
+      ? { driver: "codex", providerInstanceId: "provider", nativeId: "precreation-shared" }
+      : null,
+    nativeOwner: {
+      intentId: "historical-intent",
+      owner: { kind: "workflow_run", workflowRunId: "historical-workflow" },
+      executionClaim: claim,
+    },
+    request: {
+      phase: "native-preparation",
+      current,
+      launch,
+      launchHash: WorkflowCanonicalHash.tagged("t3.workflow-native-reservation-launch.v1", launch),
+    },
+  });
+  const identity = PreparationJob.identity(input);
+  yield* sql`INSERT INTO orchestration_v2_preparation_jobs ${sql.insert({ ...preparationRow(threadId), run_id: input.runId, request_identity_json: identity.text, request_identity_hash: identity.hash })}`;
+  yield* sql`UPDATE orchestration_v2_preparation_jobs SET process_exposed=1,record_version=1 WHERE job_id=${input.jobId}`;
+  const entries: PreparationJob.WorkspaceSettlement["resources"]["entries"][number][] = [];
+  for (let index = 1; index <= count; index++) {
+    const resourceId = `11111111-1111-4111-8111-${String(index).padStart(12, "0")}`;
+    const context = PreparationResource.ownContext({
+      v: 1,
+      profile: "linux-node-no-stdin-v1",
+      jobSelection: {
+        jobId: input.jobId,
+        entryKey: input.entryKey,
+        requestIdentityHash: identity.hash,
+        serverBootId: input.serverBootId,
+        expectedVersion: 1,
+      },
+      environmentId: input.environmentId,
+      projectId: input.projectId,
+      threadId,
+      runId: input.runId,
+      executionClaim: claim,
+      current,
+      host: {
+        hostBootId: "33333333-3333-4333-8333-333333333333",
+        scopeNamespace: "app-t3code-agents-123456789abc.slice",
+      },
+      proposedUnit: `t3code-preparation-${resourceId}.scope`,
+      creationInputHash: "b".repeat(64),
+    });
+    const encoded = PreparationResource.encodeContext(context);
+    const binding = PreparationResource.ownBinding(
+      {
+        unit: context.proposedUnit,
+        invocationId: "1".repeat(32),
+        controlGroup: `/app.slice/${context.host.scopeNamespace}/${context.proposedUnit}`,
+        pid: 123 + index,
+        pidStartTicks: "1234",
+      },
+      context,
+    );
+    const bound = PreparationResource.encodeBinding(resourceId, context, binding);
+    const settled = PreparationResource.encodeSettlement(resourceId, context, binding, 3, {
+      v: 1,
+      resourceId,
+      contextHash: encoded.hash,
+      priorVersion: 3,
+      childExit: { pid: binding.pid, exitCode: index === 1 ? 1 : 0, signal: null },
+      scope: { binding, observation: "removed" },
+    });
+    yield* sql`INSERT INTO orchestration_v2_preparation_process_resources ${sql.insert({
+      format_version: 1,
+      resource_id: resourceId,
+      job_id: input.jobId,
+      job_request_identity_hash: identity.hash,
+      environment_id: input.environmentId,
+      project_id: input.projectId,
+      thread_id: threadId,
+      run_id: input.runId,
+      server_boot_id: input.serverBootId,
+      host_boot_id: context.host.hostBootId,
+      scope_namespace: context.host.scopeNamespace,
+      proposed_unit: context.proposedUnit,
+      creation_input_hash: context.creationInputHash,
+      creation_context_json: encoded.text,
+      creation_context_hash: encoded.hash,
+      created_at: at,
+    })}`;
+    yield* sql`UPDATE orchestration_v2_preparation_process_resources SET creation_started_at=${at},child_pid=${binding.pid},record_version=1 WHERE resource_id=${resourceId}`;
+    yield* sql`UPDATE orchestration_v2_preparation_process_resources SET binding_json=${bound.text},binding_hash=${bound.hash},bound_at=${at},record_version=2 WHERE resource_id=${resourceId}`;
+    yield* sql`UPDATE orchestration_v2_preparation_process_resources SET release_started_at=${at},record_version=3 WHERE resource_id=${resourceId}`;
+    yield* sql`UPDATE orchestration_v2_preparation_process_resources SET state='settled',settlement_json=${settled.text},settlement_hash=${settled.hash},settled_at=${at},record_version=4 WHERE resource_id=${resourceId}`;
+    entries.push({
+      resourceId,
+      contextHash: encoded.hash,
+      recordVersion: 4,
+      settlementHash: settled.hash,
+    });
+  }
+  const evidence = {
+    v: 1,
+    kind: "owned_resources",
+    jobId: input.jobId,
+    entryKey: input.entryKey,
+    priorVersion: 1,
+    resources: { v: 1, entries },
+    workspace: {
+      v: 1,
+      profile: "native-local-worktree-v1",
+      path: "/worktrees/feature",
+      refName: "feature",
+      command: {
+        commandId: "workspace-launch:native-workspace",
+        threadId,
+        commandType: "thread.metadata.update",
+        acceptedAt: at,
+        resultSequence: 1,
+        status: "accepted",
+        error: null,
+        eventId: "historical-event",
+        eventType: "thread.metadata-updated",
+        occurredAt: at,
+      },
+    },
+  };
+  return { sql, input, identity, evidence, at };
+});
+it.effect.each(
+  ([false, true] as const).flatMap((native) =>
+    (
+      [
+        "complete",
+        "legacy",
+        "missing",
+        "foreign-hash",
+        "late-resource",
+        "foreign-claim",
+        "foreign-host",
+        "signal",
+        "unreleased",
+      ] as const
+    ).map((mode) => ({
+      native,
+      mode,
+    })),
+  ),
+)(
+  "workspace retirement validates permanent $mode history through native=$native custody",
+  ({ native, mode }) =>
+    Effect.gen(function* () {
+      const prepared = yield* preparePhysicalAdmission("workflow-native", native);
+      const seeded = yield* seedWorkspaceRetirement(
+        native ? "uncreated-preparation" : prepared.threadId,
+        native,
+        mode === "legacy" ? 2 : 129,
+      );
+      const { sql, input, identity, evidence, at } = seeded;
+      if (["foreign-claim", "foreign-host", "signal", "unreleased"].includes(mode)) {
+        const row =
+          (yield* sql`SELECT * FROM orchestration_v2_preparation_process_resources ORDER BY resource_id DESC LIMIT 1`)[0]!;
+        const original = PreparationResource.decodeRow(row);
+        const context = PreparationResource.ownContext({
+          ...original.context,
+          executionClaim:
+            mode === "foreign-claim"
+              ? { ...original.context.executionClaim!, expectedGeneration: 1 }
+              : original.context.executionClaim,
+          host:
+            mode === "foreign-host"
+              ? { ...original.context.host, hostBootId: "44444444-4444-4444-8444-444444444444" }
+              : original.context.host,
+        });
+        const encoded = PreparationResource.encodeContext(context);
+        const bound = PreparationResource.encodeBinding(
+          original.resourceId,
+          context,
+          original.binding!,
+        );
+        const settled = PreparationResource.encodeSettlement(
+          original.resourceId,
+          context,
+          original.binding!,
+          3,
+          {
+            ...original.settlement!,
+            contextHash: encoded.hash,
+            childExit:
+              mode === "signal"
+                ? { pid: original.binding!.pid, exitCode: null, signal: "SIGTERM" }
+                : original.settlement!.childExit,
+          },
+        );
+        yield* sql`DROP TRIGGER preparation_process_resources_update_guard`;
+        const changed =
+          yield* sql`UPDATE orchestration_v2_preparation_process_resources SET creation_context_json=${encoded.text},creation_context_hash=${encoded.hash},host_boot_id=${context.host.hostBootId},binding_hash=${bound.hash},settlement_json=${settled.text},settlement_hash=${settled.hash},release_started_at=${mode === "unreleased" ? null : original.releaseStartedAt} WHERE resource_id=${original.resourceId} RETURNING *`;
+        assert.strictEqual(PreparationResource.decodeRow(changed[0]).state, "settled");
+        Object.assign(evidence.resources.entries.at(-1)!, {
+          contextHash: encoded.hash,
+          settlementHash: settled.hash,
+        });
+      }
+      let stored: object = evidence;
+      if (mode === "legacy")
+        stored = {
+          v: 1,
+          kind: "owned_resources",
+          jobId: input.jobId,
+          entryKey: input.entryKey,
+          priorVersion: 1,
+        };
+      if (mode === "missing") evidence.resources.entries.pop();
+      if (mode === "foreign-hash")
+        evidence.resources.entries.at(-1)!.settlementHash = "f".repeat(64);
+      yield* sql`UPDATE orchestration_v2_preparation_jobs SET state='settled',code_closed_at=${at},settlement_json=${stableStringify(stored)},settlement_hash=${PreparationJob.settlementHash(identity.hash, at, stored)},settled_at=${at},record_version=2 WHERE job_id=${input.jobId}`;
+      if (mode === "late-resource") {
+        const resource =
+          (yield* sql`SELECT * FROM orchestration_v2_preparation_process_resources ORDER BY resource_id DESC LIMIT 1`)[0]!;
+        yield* sql`DROP TRIGGER preparation_process_resources_update_guard`;
+        yield* sql`UPDATE orchestration_v2_preparation_process_resources SET record_version=${Number(resource.record_version) + 1} WHERE resource_id=${resource.resource_id}`;
+      }
+      const before = yield* rawReservationState;
+      const result = yield* prepared.invoke;
+      if (mode === "complete") {
+        assert.strictEqual(result._tag, "Success");
+        if (result._tag === "Success") assert.strictEqual(result.success.kind, "reserved");
+        assert.strictEqual(
+          (yield* sql`SELECT * FROM orchestration_v2_preparation_process_resources`).length,
+          129,
+        );
+        assert.strictEqual(
+          (yield* Effect.result(
+            sql`UPDATE orchestration_v2_preparation_jobs SET record_version=3 WHERE job_id=${input.jobId}`,
+          ))._tag,
+          "Failure",
+        );
+      } else if (mode === "legacy") {
+        assert.strictEqual(result._tag, "Success");
+        if (result._tag === "Success") expectPhysicalRejection(result.success);
+        assert.deepStrictEqual(yield* rawReservationState, before);
+      } else {
+        assert.strictEqual(result._tag, "Failure");
+        if (result._tag === "Failure") assert.strictEqual(result.failure.reason, "integrity");
+        assert.deepStrictEqual(yield* rawReservationState, before);
+      }
+    }).pipe(Effect.provide(layerWithOutbox)),
+);
+
+it.effect.each([false, true])(
+  "workspace retirement survives independent commit visibility and reopen (native=%s)",
+  (native) =>
+    Effect.gen(function* () {
+      const directory = yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "workspace-retirement-")),
+        ),
+        (value) => Effect.sync(() => NodeFS.rmSync(value, { recursive: true, force: true })),
+      );
+      const filename = NodePath.join(directory, "state.sqlite");
+      const fileLayer = Layer.merge(Store.layer, EffectOutbox.layer).pipe(
+        Layer.provideMerge(NodeSqliteClient.layer({ filename })),
+      );
+      const prepared = yield* Effect.gen(function* () {
+        const selected = yield* preparePhysicalAdmission("workflow-native", native);
+        const seeded = yield* seedWorkspaceRetirement(
+          native ? "uncreated-preparation" : selected.threadId,
+          native,
+          129,
+        );
+        const { sql, input, identity, evidence, at } = seeded;
+        yield* sql`PRAGMA journal_mode=WAL`;
+        using other = new NodeSqlite.DatabaseSync(filename, { readOnly: true });
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`UPDATE orchestration_v2_preparation_jobs SET state='settled',code_closed_at=${at},settlement_json=${stableStringify(evidence)},settlement_hash=${PreparationJob.settlementHash(identity.hash, at, evidence)},settled_at=${at},record_version=2 WHERE job_id=${input.jobId}`;
+            assert.deepStrictEqual(
+              {
+                ...other
+                  .prepare("SELECT state,code_closed_at FROM orchestration_v2_preparation_jobs")
+                  .get(),
+              },
+              { state: "active", code_closed_at: null },
+            );
+          }),
+        );
+        assert.deepStrictEqual(
+          {
+            ...other
+              .prepare("SELECT state,code_closed_at FROM orchestration_v2_preparation_jobs")
+              .get(),
+          },
+          { state: "settled", code_closed_at: at },
+        );
+        const first =
+          (yield* sql`SELECT * FROM orchestration_v2_preparation_process_resources ORDER BY resource_id LIMIT 1`)[0]!;
+        yield* sql`UPDATE projection_projects SET workspace_root='/later' WHERE project_id='project'`;
+        const prior = PreparationResource.decodeRow(first);
+        const lateContext = PreparationResource.encodeContext({
+          ...prior.context,
+          proposedUnit: "t3code-preparation-99999999-9999-4999-8999-999999999999.scope",
+          jobSelection: { ...prior.context.jobSelection, expectedVersion: 2 },
+        });
+        const late = {
+          ...first,
+          resource_id: "99999999-9999-4999-8999-999999999999",
+          proposed_unit: "t3code-preparation-99999999-9999-4999-8999-999999999999.scope",
+          creation_context_json: lateContext.text,
+          creation_context_hash: lateContext.hash,
+          record_version: 0,
+          state: "active",
+          creation_started_at: null,
+          child_pid: null,
+          binding_json: null,
+          binding_hash: null,
+          bound_at: null,
+          release_started_at: null,
+          settlement_json: null,
+          settlement_hash: null,
+          settled_at: null,
+        };
+        PreparationResource.decodeRow(late);
+        assert.strictEqual(
+          (yield* Effect.result(
+            sql`INSERT INTO orchestration_v2_preparation_process_resources ${sql.insert(late)}`,
+          ))._tag,
+          "Failure",
+        );
+        return selected;
+      }).pipe(Effect.provide(Layer.fresh(fileLayer)), Effect.scoped);
+      yield* Effect.gen(function* () {
+        const store = yield* Store.WorkflowRunStore;
+        const result = yield* prepared.invokeOn(store);
+        assert.strictEqual(result._tag, "Success");
+        if (result._tag === "Success") assert.strictEqual(result.success.kind, "reserved");
+      }).pipe(Effect.provide(Layer.fresh(fileLayer)), Effect.scoped);
+    }),
+);

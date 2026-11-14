@@ -7,11 +7,13 @@ import * as Fiber from "effect/Fiber";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as Owner from "./PreparationProcessOwner.ts";
+import type * as Job from "./PreparationJob.ts";
 
 const input = { command: "/usr/bin/git", args: ["status"], cwd: "/workspace" };
 const bytes = (value: string) => new TextEncoder().encode(value);
 const fixture = Effect.fn("test.preparationControllerFixture")(function* (
   options: {
+    readonly retirement?: Effect.Effect<Job.Job, Owner.PreparationProcessOwnerError>;
     readonly beforeCreate?: Effect.Effect<void, Owner.PreparationProcessOwnerError>;
     readonly beforeStartup?: Effect.Effect<void, Owner.PreparationProcessOwnerError>;
     readonly beforeCleanup?: Effect.Effect<void>;
@@ -26,7 +28,7 @@ const fixture = Effect.fn("test.preparationControllerFixture")(function* (
   const createEntered = yield* Deferred.make<void>();
   const startupEntered = yield* Deferred.make<void>();
   const cleanupEntered = yield* Deferred.make<void>();
-  const calls = { prepared: 0, created: 0, started: 0, cleaned: 0, assessed: 0 };
+  const calls = { prepared: 0, created: 0, started: 0, cleaned: 0, assessed: 0, retired: 0 };
   const inputs: Owner.CommandInput[] = [];
   const records = new Map<
     object,
@@ -38,6 +40,11 @@ const fixture = Effect.fn("test.preparationControllerFixture")(function* (
     return value;
   };
   const port: Owner.CommandPort = {
+    retireWorkspace: () =>
+      Effect.suspend(() => {
+        calls.retired++;
+        return options.retirement ?? Effect.fail(Owner.error("inventory", "invalid"));
+      }),
     checkOutsideWriter: (stage) =>
       Effect.gen(function* () {
         if (options.insideWriter?.value) return yield* Owner.error(stage, "invalid");
@@ -398,6 +405,7 @@ it.effect("workspace entry refuses repeated capture and self stop or seal", () =
         test.owner.captureWorkspaceEntry(),
         test.owner.stop(),
         test.owner.seal(),
+        test.owner.retireWorkspace(),
       ]) {
         const result = yield* Effect.result(operation);
         assert.strictEqual(result._tag, "Failure");
@@ -420,5 +428,73 @@ it.effect("a startup defect stays exceptional when output is subscribed after st
     assert.isTrue(test.flags.blocked);
     const exit = yield* Effect.exit(Stream.runCollect(facade.stdout));
     assert.isTrue(Exit.isFailure(exit) && exit.cause.reasons.some(Cause.isDieReason));
+  }).pipe(Effect.scoped),
+);
+
+const completion = Object.freeze({
+  kind: "worktree-created",
+  state: "preparing-held",
+  native: { threadId: "thread", runId: "run" },
+  worktree: { path: "/workspace/feature", refName: "feature" },
+});
+it.effect("retirement caches the original failed writer outcome without retry", () =>
+  Effect.gen(function* () {
+    const test = yield* fixture();
+    const entry = yield* test.owner
+      .captureWorkspaceEntry()
+      .pipe(Effect.as(completion), Effect.scoped, Effect.forkScoped);
+    yield* Fiber.join(entry);
+    const first = yield* Effect.exit(test.owner.retireWorkspace());
+    const second = yield* Effect.exit(test.owner.retireWorkspace());
+    assert.isTrue(Exit.isFailure(first));
+    assert.deepStrictEqual(second, first);
+    assert.strictEqual(test.calls.retired, 1);
+    assert.isTrue(test.flags.blocked);
+  }).pipe(Effect.scoped),
+);
+it.effect("retirement requires the captured entry's successful completion", () =>
+  Effect.gen(function* () {
+    const test = yield* fixture();
+    const entry = yield* test.owner
+      .captureWorkspaceEntry()
+      .pipe(Effect.andThen(Effect.fail("metadata failed")), Effect.scoped, Effect.forkScoped);
+    yield* Fiber.await(entry);
+    assert.strictEqual((yield* Effect.result(test.owner.retireWorkspace()))._tag, "Failure");
+    assert.strictEqual(test.calls.retired, 0);
+    assert.isTrue(test.flags.blocked);
+  }).pipe(Effect.scoped),
+);
+it.effect("stop joins retirement's interrupted writer body before completing cleanup", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const unwinding = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const test = yield* fixture({
+      retirement: Deferred.succeed(entered, undefined).pipe(
+        Effect.andThen(Effect.never),
+        Effect.ensuring(
+          Deferred.succeed(unwinding, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        ),
+      ),
+    });
+    const entry = yield* test.owner
+      .captureWorkspaceEntry()
+      .pipe(Effect.as(completion), Effect.scoped, Effect.forkScoped);
+    yield* Fiber.join(entry);
+    const retiring = yield* test.owner.retireWorkspace().pipe(Effect.forkScoped);
+    yield* Deferred.await(entered);
+    const stopping = yield* test.owner.stop().pipe(Effect.forkScoped);
+    yield* Deferred.await(unwinding);
+    yield* Effect.sync(() => {
+      assert.isUndefined(stopping.pollUnsafe());
+      assert.isUndefined(retiring.pollUnsafe());
+      assert.strictEqual(test.calls.assessed, 0);
+    }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+    const exit = yield* Fiber.await(retiring);
+    assert.isTrue(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause));
+    yield* Fiber.join(stopping);
+    const replay = yield* Effect.exit(test.owner.retireWorkspace());
+    assert.isTrue(Exit.isFailure(replay) && Cause.hasInterrupts(replay.cause));
+    assert.strictEqual(test.calls.retired, 1);
   }).pipe(Effect.scoped),
 );

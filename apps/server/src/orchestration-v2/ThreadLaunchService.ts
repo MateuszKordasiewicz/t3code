@@ -1745,8 +1745,20 @@ const makeNativeWorkspacePreparationOwned = Effect.fn(
                 return yield* Effect.failCause(exit.cause);
               }
               if (!entry.owner) return yield* nativeWorkspaceError("invalid");
+              const retirement = yield* Effect.result(entry.owner.retireWorkspace());
+              const preparation =
+                retirement._tag === "Success"
+                  ? retirement.success
+                  : Object.freeze({ kind: "held" as const, reason: retirement.failure.reason });
               const inventory = yield* entry.owner.seal();
-              return Object.freeze({ ...exit.value, inventory });
+              return Object.freeze({
+                kind: exit.value.kind,
+                runState: "preparing" as const,
+                native: exit.value.native,
+                worktree: exit.value.worktree,
+                preparation,
+                inventory,
+              });
             }),
           ),
           Effect.ensuring(

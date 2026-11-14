@@ -6847,6 +6847,7 @@ const preparationCoreFixture = Effect.fn("test.preparationCoreFixture")(function
     { jobId: "job", threadId: "thread", runId: "run" },
     storeScope,
     {
+      retireWorkspace: () => Effect.fail(PreparationOwner.error("inventory", "invalid")),
       checkOutsideWriter: () => Effect.void,
       prepareCommand: (input, state) =>
         Effect.gen(function* () {

@@ -206,6 +206,149 @@ export function settlementHash(
     settlement,
   });
 }
+function proofId(value: unknown) {
+  const result = id(value);
+  if (result.includes("\0")) throw invalid();
+  return result;
+}
+function resourceId(value: unknown) {
+  const result = proofId(value);
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(result) ||
+    result === "00000000-0000-0000-0000-000000000000"
+  )
+    throw invalid();
+  return result;
+}
+export function ownWorkspaceSettlement(
+  value: unknown,
+  original: ReturnType<typeof ownInput>,
+  priorVersion: number,
+  closedAt: string,
+) {
+  json(value);
+  const input = ownInput(original);
+  const raw = object(value, "entryKey,jobId,kind,priorVersion,resources,v,workspace");
+  const close = timestamp(closedAt);
+  if (
+    identity(input).version !== 3 ||
+    raw.v !== 1 ||
+    raw.kind !== "owned_resources" ||
+    proofId(raw.jobId) !== input.jobId ||
+    proofId(raw.entryKey) !== input.entryKey ||
+    version(raw.priorVersion) !== version(priorVersion) ||
+    priorVersion < 1
+  )
+    throw invalid();
+  const request = object(input.request);
+  const launch = object(request.launch);
+  const strategy = object(launch.workspaceStrategy);
+  const initialMessage = object(launch.initialMessage);
+  if (
+    request.phase !== "native-preparation" ||
+    digest(request.launchHash) !==
+      WorkflowCanonicalHash.tagged("t3.workflow-native-reservation-launch.v1", launch) ||
+    launch.threadId !== input.threadId ||
+    launch.projectId !== input.projectId ||
+    launch.reuseExistingThread === true ||
+    launch.generateTitle === true ||
+    strategy.type !== "worktree" ||
+    strategy.startFromOrigin === true ||
+    !Array.isArray(initialMessage.attachments) ||
+    initialMessage.attachments.length !== 0
+  )
+    throw invalid();
+  const branch = proofId(strategy.branch);
+  const resources = object(raw.resources, "entries,v");
+  if (resources.v !== 1 || !Array.isArray(resources.entries) || resources.entries.length === 0)
+    throw invalid();
+  let last = "";
+  const entries = resources.entries.map((value) => {
+    const entry = object(value, "contextHash,recordVersion,resourceId,settlementHash");
+    const selected = resourceId(entry.resourceId);
+    if (selected <= last || version(entry.recordVersion) < 3) throw invalid();
+    last = selected;
+    return {
+      resourceId: selected,
+      contextHash: digest(entry.contextHash),
+      recordVersion: version(entry.recordVersion),
+      settlementHash: digest(entry.settlementHash),
+    };
+  });
+  const workspace = object(raw.workspace, "command,path,profile,refName,v");
+  const path = proofId(workspace.path);
+  if (
+    workspace.v !== 1 ||
+    workspace.profile !== "native-local-worktree-v1" ||
+    workspace.refName !== branch ||
+    !path.startsWith("/") ||
+    path === "/" ||
+    path.endsWith("/") ||
+    path
+      .slice(1)
+      .split("/")
+      .some((part) => !part || part === "." || part === "..")
+  )
+    throw invalid();
+  const command = object(
+    workspace.command,
+    "acceptedAt,commandId,commandType,error,eventId,eventType,occurredAt,resultSequence,status,threadId",
+  );
+  const acceptedAt = timestamp(command.acceptedAt);
+  const occurredAt = timestamp(command.occurredAt);
+  if (
+    command.commandId !== `${proofId(launch.commandId)}:native-workspace` ||
+    command.threadId !== input.threadId ||
+    command.commandType !== "thread.metadata.update" ||
+    command.status !== "accepted" ||
+    command.error !== null ||
+    command.eventType !== "thread.metadata-updated" ||
+    version(command.resultSequence) < 1 ||
+    acceptedAt > close ||
+    occurredAt > close
+  )
+    throw invalid();
+  return freeze({
+    v: 1 as const,
+    kind: "owned_resources" as const,
+    jobId: input.jobId,
+    entryKey: input.entryKey,
+    priorVersion,
+    resources: { v: 1 as const, entries },
+    workspace: {
+      v: 1 as const,
+      profile: "native-local-worktree-v1" as const,
+      path,
+      refName: branch,
+      command: {
+        commandId: proofId(command.commandId),
+        threadId: input.threadId,
+        commandType: "thread.metadata.update" as const,
+        acceptedAt,
+        resultSequence: version(command.resultSequence),
+        status: "accepted" as const,
+        error: null,
+        eventId: proofId(command.eventId),
+        eventType: "thread.metadata-updated" as const,
+        occurredAt,
+      },
+    },
+  });
+}
+export function encodeWorkspaceSettlement(
+  input: ReturnType<typeof ownInput>,
+  closedAt: string,
+  priorVersion: number,
+  value: unknown,
+) {
+  const owned = ownWorkspaceSettlement(value, input, priorVersion, closedAt);
+  return Object.freeze({
+    settlement: owned,
+    text: stableStringify(owned),
+    hash: settlementHash(identity(ownInput(input)).hash, timestamp(closedAt), owned),
+  });
+}
+export type WorkspaceSettlement = ReturnType<typeof ownWorkspaceSettlement>;
 export function decodeRow(value: unknown) {
   json(value);
   const raw = object(
@@ -249,7 +392,11 @@ export function decodeRow(value: unknown) {
   let settlement = null;
   let settledAt = null;
   if (state === "settled") {
-    const evidence = object(parse(raw.settlement_json), "entryKey,jobId,kind,priorVersion,v");
+    const storedEvidence = parse(raw.settlement_json);
+    const evidence =
+      Object.hasOwn(storedEvidence, "resources") || Object.hasOwn(storedEvidence, "workspace")
+        ? ownWorkspaceSettlement(storedEvidence, owned, recordVersion - 1, codeClosedAt ?? "")
+        : object(storedEvidence, "entryKey,jobId,kind,priorVersion,v");
     if (
       evidence.v !== 1 ||
       evidence.jobId !== owned.jobId ||
@@ -258,6 +405,7 @@ export function decodeRow(value: unknown) {
       (evidence.kind !== "code_only" && evidence.kind !== "owned_resources") ||
       codeClosedAt === null ||
       (evidence.kind === "code_only" && raw.process_exposed !== 0) ||
+      (Object.hasOwn(evidence, "resources") && raw.process_exposed !== 1) ||
       digest(raw.settlement_hash) !== settlementHash(encoded.hash, codeClosedAt, evidence)
     )
       throw invalid();

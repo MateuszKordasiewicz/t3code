@@ -1,3 +1,4 @@
+import { vi } from "vite-plus/test";
 import * as FileSystem from "effect/FileSystem";
 import { ChildProcessSpawner } from "effect/process";
 import { AgentScope, type AgentScopeBinding } from "@t3tools/shared/AgentScope";
@@ -3688,6 +3689,7 @@ const nativeWorkspaceEntry = Effect.fn("test.nativeWorkspaceEntry")(function* (
   fixture: Effect.Success<ReturnType<typeof controlledNativeFixture>>,
   fileSystem?: FileSystem.FileSystem,
   settings: Parameters<typeof Settings.layerTest>[0] = {},
+  orchestrator: typeof fixture.orchestrator = fixture.orchestrator,
 ) {
   const coreConstruction = makeGitVcsDriverCore().pipe(
     Effect.provideService(ServerConfig, fixture.config),
@@ -3703,6 +3705,7 @@ const nativeWorkspaceEntry = Effect.fn("test.nativeWorkspaceEntry")(function* (
   ).pipe(Effect.provide(NodeServices.layer));
   return yield* ThreadLaunch.makeNativeWorkspacePreparation(fixture.authority.coordinator).pipe(
     Effect.provideService(GitVcsDriver.GitVcsDriver, core),
+    Effect.provideService(Orchestrator.OrchestratorV2, orchestrator),
     Effect.provide(fixture.runtime),
     Effect.provideService(SqlClient.SqlClient, fixture.sql),
     Effect.provideService(ServerConfig, fixture.config),
@@ -3728,7 +3731,8 @@ it.effect.each(["workflow", "planning"] as const)(
           Effect.provideService(SpawnExecutableResolution, () => "/foreign/git"),
         );
         assert.strictEqual(result.kind, "worktree-created");
-        assert.strictEqual(result.state, "preparing-held");
+        assert.strictEqual(result.runState, "preparing");
+        assert.strictEqual(result.preparation.kind, "retired");
         assert.strictEqual(result.worktree.refName, "native-feature");
         assert.deepStrictEqual(
           yield* fixture.sql`SELECT json_extract(payload_json,'$.branch') AS branch,json_extract(payload_json,'$.worktreePath') AS path FROM orchestration_v2_projection_threads WHERE thread_id=${result.native.threadId}`,
@@ -3748,8 +3752,31 @@ it.effect.each(["workflow", "planning"] as const)(
         const job = PreparationJob.decodeRow(
           (yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_jobs`)[0],
         );
-        assert.strictEqual(job.state, "active");
-        assert.strictEqual(job.codeClosedAt, null);
+        assert.strictEqual(job.state, "settled");
+        assert.isNotNull(job.codeClosedAt);
+        if (kind === "workflow") {
+          const workspaceEvents =
+            yield* fixture.sql`DELETE FROM orchestration_events WHERE command_id=${`${fixture.input.launchCommandId}:native-workspace`} RETURNING event_id`;
+          assert.strictEqual(workspaceEvents.length, 1);
+          yield* fixture.sql`UPDATE orchestration_v2_projection_threads SET payload_json=json_set(payload_json,'$.branch','later-branch','$.worktreePath','/later') WHERE thread_id=${result.native.threadId}`;
+          yield* fixture.sessions.revoke(fixture.reference.sessionId);
+          const next = reservation(
+            operationFor("post-workspace", "post-workspace-attempt"),
+            "post-workspace-attempt",
+          );
+          assert.strictEqual(
+            (yield* Effect.result(fixture.store.reserveWorkflowNativeIntent(next)))._tag,
+            "Success",
+          );
+          const original = resources[0]!;
+          yield* fixture.sql`DROP TRIGGER preparation_process_resources_update_guard`;
+          yield* fixture.sql`UPDATE orchestration_v2_preparation_process_resources SET settlement_hash=${"f".repeat(64)} WHERE resource_id=${original.resource_id}`;
+          const bad = yield* Effect.result(fixture.store.reserveWorkflowNativeIntent(next));
+          assert.strictEqual(bad._tag, "Failure");
+          if (bad._tag === "Failure") assert.strictEqual(bad.failure.reason, "integrity");
+          yield* fixture.sql`UPDATE orchestration_v2_preparation_process_resources SET settlement_hash=${original.settlement_hash} WHERE resource_id=${original.resource_id}`;
+        }
+
         assert.isTrue(job.processExposed);
         assert.deepStrictEqual(
           yield* fixture.sql`SELECT status FROM orchestration_v2_projection_runs`,
@@ -3960,6 +3987,208 @@ it.effect.each(["caller", "constructor"] as const)(
         );
         assert.strictEqual(job.codeClosedAt, null);
         assert.isTrue(job.processExposed);
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each([
+  "metadata-rejected",
+  "missing-event",
+  "wrong-sequence",
+  "rollback",
+  "lost-return",
+  "revoked-after-work",
+] as const)("native workspace retirement preserves the actual %s boundary", (mode) =>
+  Effect.gen(function* () {
+    const harness = yield* nativeWorkspaceProcesses();
+    yield* Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture("workflow", false, false, 2, false, {
+        type: "worktree",
+        baseRef: "main",
+        branch: "native-feature",
+      });
+      const actual = fixture.orchestrator;
+      const orchestrator: typeof actual = {
+        ...actual,
+        dispatch: (command, hint) => {
+          if (command.type !== "thread.metadata.update") return actual.dispatch(command, hint);
+          return Effect.gen(function* () {
+            const result = yield* actual.dispatch(
+              mode === "metadata-rejected"
+                ? { ...command, expectedBranch: "conflicting-branch" }
+                : command,
+              hint,
+            );
+            yield* Effect.gen(function* () {
+              assert.isAbove(harness.requests.length, 3);
+              const resources =
+                yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_process_resources`;
+              for (const row of resources)
+                assert.strictEqual(PreparationResource.decodeRow(row).state, "settled");
+              const job = PreparationJob.decodeRow(
+                (yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_jobs`)[0],
+              );
+              assert.strictEqual(job.codeClosedAt, null);
+              if (mode === "missing-event")
+                yield* fixture.sql`DELETE FROM orchestration_events WHERE command_id=${command.commandId}`;
+              if (mode === "wrong-sequence")
+                yield* fixture.sql`UPDATE orchestration_command_receipts SET result_sequence=result_sequence+1 WHERE command_id=${command.commandId}`;
+              if (mode === "rollback")
+                yield* fixture.sql`CREATE TRIGGER reject_workspace_retirement BEFORE UPDATE ON orchestration_v2_preparation_jobs WHEN NEW.state='settled' BEGIN SELECT RAISE(ABORT,'fixture retirement rollback'); END`;
+              if (mode === "revoked-after-work")
+                yield* fixture.sessions.revoke(fixture.reference.sessionId);
+            }).pipe(Effect.orDie);
+            return result;
+          });
+        },
+      };
+      const entry = yield* nativeWorkspaceEntry(fixture, undefined, {}, orchestrator);
+      const original = fixture.sql.withTransaction;
+      let lost = 0;
+      using _return = vi
+        .spyOn(fixture.sql, "withTransaction")
+        .mockImplementation(<A, E, R>(work: Effect.Effect<A, E, R>) =>
+          original(work).pipe(
+            Effect.flatMap((value) => {
+              if (
+                mode === "lost-return" &&
+                value &&
+                typeof value === "object" &&
+                "input" in value &&
+                "state" in value &&
+                value.state === "settled"
+              ) {
+                lost++;
+                return Effect.interrupt;
+              }
+              return Effect.succeed(value);
+            }),
+          ),
+        );
+      const exit = yield* Effect.exit(entry.createReservedWorkspace(producerSelection(fixture)));
+      const job = PreparationJob.decodeRow(
+        (yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_jobs`)[0],
+      );
+      for (const row of yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_process_resources`)
+        assert.strictEqual(PreparationResource.decodeRow(row).state, "settled");
+      if (mode === "lost-return") {
+        assert.isTrue(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause));
+        assert.strictEqual(lost, 1);
+        assert.strictEqual(job.state, "settled");
+      } else if (mode === "metadata-rejected") {
+        assert.isTrue(Exit.isFailure(exit));
+        assert.strictEqual(job.state, "active");
+        assert.strictEqual(job.codeClosedAt, null);
+      } else {
+        assert.isTrue(Exit.isSuccess(exit));
+        if (Exit.isSuccess(exit)) {
+          assert.strictEqual(
+            exit.value.inventory.inventory,
+            mode === "revoked-after-work" ? "all-retired" : "held",
+          );
+          assert.strictEqual(
+            exit.value.preparation.kind,
+            mode === "revoked-after-work" ? "retired" : "held",
+          );
+        }
+        assert.strictEqual(job.state, mode === "revoked-after-work" ? "settled" : "active");
+        if (mode !== "revoked-after-work") assert.strictEqual(job.codeClosedAt, null);
+      }
+      assert.strictEqual(
+        (yield* Effect.result(entry.createReservedWorkspace(producerSelection(fixture))))._tag,
+        "Failure",
+      );
+      assert.deepStrictEqual(
+        yield* fixture.sql`SELECT * FROM orchestration_v2_effect_outbox WHERE effect_type IN ('provider-turn.start','provider-turn.restart','provider-runtime.continue')`,
+        [],
+      );
+    }).pipe(Effect.provide(harness.services));
+  }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each([false, true])(
+  "native retirement joins a blocked SQL writer under outer mask=%s",
+  (masked) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      const constructorScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(constructorScope, Exit.void));
+      const entered = yield* Deferred.make<void>();
+      const unwinding = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      yield* Effect.gen(function* () {
+        const fixture = yield* controlledNativeFixture("workflow", false, false, 2, false, {
+          type: "worktree",
+          baseRef: "main",
+          branch: "native-feature",
+        });
+        let armed = false;
+        const actual = fixture.orchestrator;
+        const orchestrator: typeof actual = {
+          ...actual,
+          dispatch: (command, hint) =>
+            actual.dispatch(command, hint).pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  if (command.type === "thread.metadata.update") armed = true;
+                }),
+              ),
+            ),
+        };
+        const entry = yield* nativeWorkspaceEntry(fixture, undefined, {}, orchestrator).pipe(
+          Effect.provideService(Scope.Scope, constructorScope),
+        );
+        const original = fixture.sql.withTransaction;
+        using _writer = vi
+          .spyOn(fixture.sql, "withTransaction")
+          .mockImplementation(<A, E, R>(work: Effect.Effect<A, E, R>) => {
+            if (!armed) return original(work);
+            armed = false;
+            return original(
+              Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Effect.never),
+                Effect.ensuring(
+                  Deferred.succeed(unwinding, undefined).pipe(
+                    Effect.andThen(Deferred.await(release)),
+                  ),
+                ),
+              ),
+            );
+          });
+        const creating = yield* entry
+          .createReservedWorkspace(producerSelection(fixture))
+          .pipe(
+            (work) => (masked ? Effect.uninterruptible(work) : work),
+            Effect.exit,
+            Effect.forkScoped,
+          );
+        yield* Deferred.await(entered);
+        const closing = yield* Scope.close(constructorScope, Exit.void).pipe(Effect.forkScoped);
+        yield* Deferred.await(unwinding);
+        yield* Effect.sync(() => {
+          assert.isUndefined(closing.pollUnsafe());
+          assert.isUndefined(creating.pollUnsafe());
+        }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+        yield* Fiber.join(closing);
+        const outer = yield* Fiber.await(creating);
+        assert.isTrue(
+          Exit.isFailure(outer)
+            ? Cause.hasInterrupts(outer.cause)
+            : Exit.isFailure(outer.value) && Cause.hasInterrupts(outer.value.cause),
+        );
+        const job = PreparationJob.decodeRow(
+          (yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_jobs`)[0],
+        );
+        assert.strictEqual(job.state, "active");
+        assert.strictEqual(job.codeClosedAt, null);
+        assert.strictEqual(
+          yield* fixture.sql.withTransaction(Effect.succeed("writer released")),
+          "writer released",
+        );
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT * FROM orchestration_v2_effect_outbox WHERE effect_type IN ('provider-turn.start','provider-turn.restart','provider-runtime.continue')`,
+          [],
+        );
       }).pipe(Effect.provide(harness.services));
     }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
 );
