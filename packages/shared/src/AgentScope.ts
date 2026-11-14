@@ -61,6 +61,7 @@ export interface AgentScopeCustody {
   /** Current membership only; the caller must retain and corroborate its owned child handle. */
   readonly bind: (spawnedPid: number) => Effect.Effect<AgentScopeBinding | undefined>;
   readonly stopAndObserve: () => Effect.Effect<AgentScopeSettlement | undefined>;
+  readonly observeRetirement?: () => Effect.Effect<AgentScopeSettlement | undefined>;
 }
 
 export const AgentScope = Context.Reference<AgentScopeShape>("@t3tools/shared/AgentScope", {

@@ -1012,67 +1012,92 @@ it.effect.each(["proc", "show"] as const)(
   },
 );
 
-it.effect.each(["empty", "removed", "leader_exited"] as const)(
-  "launch custody observes completed scope retirement as %s",
-  (kind) => {
-    let stopped: (() => void) | undefined;
-    return withFakeSystemd(
-      ({ scope, units, procRoot, cgroupRoot, calls }) =>
-        Effect.gen(function* () {
-          const launch = yield* scope.wrap({
-            command: "agent",
-            args: [],
-            name: "settlement",
-            shared: true,
-          });
-          if (!launch.unit || !launch.custody) return yield* Effect.die("missing launch custody");
-          const custody = launch.custody;
-          const noPinCalls = calls.length;
-          assert.isUndefined(yield* custody.stopAndObserve());
-          assert.strictEqual(calls.length, noPinCalls);
-          const unit = launch.unit;
-          const { controlGroup, directory } = seedScopeBinding({ units, procRoot, unit, pid: 101 });
-          const groupDirectory = NodePath.join(cgroupRoot, controlGroup);
-          NodeFS.mkdirSync(groupDirectory, { recursive: true });
-          NodeFS.writeFileSync(
-            NodePath.join(groupDirectory, "cgroup.events"),
-            "populated 1\nfrozen 0\n",
-          );
-          const binding = yield* custody.bind(101);
-          assert.isDefined(binding);
-          if (kind === "leader_exited") NodeFS.rmSync(directory, { recursive: true });
-          stopped = () => {
-            NodeFS.rmSync(directory, { recursive: true, force: true });
-            if (kind !== "empty") {
-              NodeFS.rmSync(groupDirectory, { recursive: true });
-              units.delete(unit);
-            } else {
-              units.set(unit, { ...units.get(unit)!, activeState: "inactive", subState: "dead" });
-              NodeFS.writeFileSync(
-                NodePath.join(groupDirectory, "cgroup.events"),
-                "populated 0\nfrozen 0\n",
-              );
-            }
-          };
-          const before = calls.length;
-          const settled = yield* custody.stopAndObserve();
-          assert.deepStrictEqual(settled, {
-            binding,
-            observation: kind === "empty" ? "empty" : "removed",
-          });
-          assert.isTrue(Object.isFrozen(settled));
-          const after = calls.length;
-          assert.strictEqual(yield* custody.stopAndObserve(), settled);
+it.effect.each(
+  (["active", "passive"] as const).flatMap((mode) =>
+    (["empty", "removed", "leader_exited"] as const).map((kind) => ({ mode, kind })),
+  ),
+)("launch custody observes completed scope retirement as $kind ($mode)", ({ mode, kind }) => {
+  let stopped: (() => void) | undefined;
+  return withFakeSystemd(
+    ({ scope, units, procRoot, cgroupRoot, calls }) =>
+      Effect.gen(function* () {
+        const launch = yield* scope.wrap({
+          command: "agent",
+          args: [],
+          name: "settlement",
+          shared: true,
+        });
+        if (!launch.unit || !launch.custody) return yield* Effect.die("missing launch custody");
+        const custody = launch.custody;
+        const observe = mode === "active" ? custody.stopAndObserve : custody.observeRetirement;
+        assert.isFunction(observe);
+        if (!observe) return yield* Effect.die("passive retirement capability missing");
+        const noPinCalls = calls.length;
+        assert.isUndefined(yield* observe());
+        assert.strictEqual(calls.length, noPinCalls);
+        const unit = launch.unit;
+        const { controlGroup, directory } = seedScopeBinding({ units, procRoot, unit, pid: 101 });
+        const groupDirectory = NodePath.join(cgroupRoot, controlGroup);
+        NodeFS.mkdirSync(groupDirectory, { recursive: true });
+        NodeFS.writeFileSync(
+          NodePath.join(groupDirectory, "cgroup.events"),
+          "populated 1\nfrozen 0\n",
+        );
+        const binding = yield* custody.bind(101);
+        assert.isDefined(binding);
+        if (kind === "leader_exited") NodeFS.rmSync(directory, { recursive: true });
+        stopped = () => {
+          NodeFS.rmSync(directory, { recursive: true, force: true });
+          if (kind !== "empty") {
+            NodeFS.rmSync(groupDirectory, { recursive: true });
+            units.delete(unit);
+          } else {
+            units.set(unit, { ...units.get(unit)!, activeState: "inactive", subState: "dead" });
+            NodeFS.writeFileSync(
+              NodePath.join(groupDirectory, "cgroup.events"),
+              "populated 0\nfrozen 0\n",
+            );
+          }
+        };
+        if (mode === "passive") {
+          assert.isUndefined(yield* observe());
+          stopped();
+        }
+        const before = calls.length;
+        const settled = yield* observe();
+        assert.deepStrictEqual(settled, {
+          binding,
+          observation: kind === "empty" ? "empty" : "removed",
+        });
+        assert.isTrue(Object.isFrozen(settled));
+        assert.strictEqual(settled?.binding, binding);
+        const after = calls.length;
+        if (mode === "active") {
+          assert.strictEqual(yield* observe(), settled);
           assert.strictEqual(calls.length, after);
           assert.deepStrictEqual(
             calls.slice(before).filter(([, verb]) => verb === "stop"),
             [["--user", "stop", unit]],
           );
-        }),
-      { onBlockingStop: () => Effect.sync(() => stopped!()) },
-    );
-  },
-);
+        } else {
+          const repeated = yield* observe();
+          assert.deepStrictEqual(repeated, settled);
+          assert.notStrictEqual(repeated, settled);
+          assert.isTrue(calls.length > after);
+          units.set(unit, {
+            activeState: "inactive",
+            result: "success",
+            subState: "dead",
+            invocationId: "2".repeat(32),
+            controlGroup,
+          });
+          assert.isUndefined(yield* observe());
+          assert.isTrue(calls.slice(before).every(([, verb]) => verb === "show"));
+        }
+      }),
+    { onBlockingStop: () => Effect.sync(() => stopped!()) },
+  );
+});
 
 it.effect.each(["collected", "replacement"] as const)(
   "launch custody refuses %s before retirement without stopping",
@@ -1368,12 +1393,13 @@ it.effect("launch custody owner defect remains a defect while repeats retain unk
   );
 });
 
-it.effect.each([
-  "empty_to_removed",
-  "removed_to_empty",
-  "pid_reappears",
-  "collected_to_loaded",
-] as const)("launch custody verifies post-stop transition %s", (kind) => {
+it.effect.each(
+  (["active", "passive"] as const).flatMap((mode) =>
+    (["empty_to_removed", "removed_to_empty", "pid_reappears", "collected_to_loaded"] as const).map(
+      (kind) => ({ mode, kind }),
+    ),
+  ),
+)("launch custody verifies retirement transition $kind ($mode)", ({ mode, kind }) => {
   let stopped: (() => void) | undefined;
   let change: (() => void) | undefined;
   let afterStop = false;
@@ -1425,7 +1451,10 @@ it.effect.each([
               break;
           }
         };
-        const result = yield* custody.stopAndObserve();
+        if (mode === "passive") stopped();
+        const result = yield* mode === "active"
+          ? custody.stopAndObserve()
+          : custody.observeRetirement!();
         if (kind === "empty_to_removed")
           assert.deepStrictEqual(result, { binding, observation: "removed" });
         else assert.isUndefined(result);
@@ -1484,4 +1513,157 @@ it.effect.each(["directory", "events"] as const)(
       },
     );
   },
+);
+
+it.effect(
+  "passive retirement can recover after an interrupted active stop without retrying it",
+  () =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      yield* withFakeSystemd(
+        ({ scope, units, procRoot, cgroupRoot, calls }) =>
+          Effect.gen(function* () {
+            const launch = yield* scope.wrap({
+              command: "agent",
+              args: [],
+              name: "passive-recovery",
+            });
+            if (!launch.unit || !launch.custody?.observeRetirement)
+              return yield* Effect.die("missing passive custody");
+            const { custody, unit } = launch;
+            const { directory, controlGroup } = seedScopeBinding({
+              units,
+              procRoot,
+              unit,
+              pid: 101,
+            });
+            const groupDirectory = NodePath.join(cgroupRoot, controlGroup);
+            NodeFS.mkdirSync(groupDirectory, { recursive: true });
+            NodeFS.writeFileSync(
+              NodePath.join(groupDirectory, "cgroup.events"),
+              "populated 1\nfrozen 0\n",
+            );
+            const binding = yield* custody.bind(101);
+            const owner = yield* custody.stopAndObserve().pipe(Effect.forkScoped);
+            yield* Deferred.await(entered);
+            assert.isUndefined(yield* custody.observeRetirement!());
+            yield* Fiber.interrupt(owner);
+            const interrupted = yield* Fiber.await(owner);
+            assert.strictEqual(interrupted._tag, "Failure");
+            if (interrupted._tag === "Failure")
+              assert.isTrue(Cause.hasInterrupts(interrupted.cause));
+            assert.isUndefined(yield* custody.stopAndObserve());
+            NodeFS.rmSync(directory, { recursive: true });
+            NodeFS.writeFileSync(
+              NodePath.join(groupDirectory, "cgroup.events"),
+              "populated 0\nfrozen 0\n",
+            );
+            units.set(unit, { ...units.get(unit)!, activeState: "inactive", subState: "dead" });
+            assert.deepStrictEqual(yield* custody.observeRetirement!(), {
+              binding,
+              observation: "empty",
+            });
+            assert.isUndefined(yield* custody.stopAndObserve());
+            assert.strictEqual(
+              calls.filter((args) => args[1] === "stop" && !args.includes("--no-block")).length,
+              1,
+            );
+          }),
+        {
+          onBlockingStop: () =>
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+        },
+      );
+    }),
+);
+
+it.effect.each([false, true])(
+  "passive observers preserve interruption and defects without sharing state (masked=%s)",
+  (masked) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const sentinel = new Error("passive read defect");
+      let read: "normal" | "block" | "defect" = "normal";
+      let retire: (() => void) | undefined;
+      yield* withFakeSystemd(
+        ({ scope, units, procRoot, cgroupRoot, calls }) =>
+          Effect.gen(function* () {
+            const launch = yield* scope.wrap({
+              command: "agent",
+              args: [],
+              name: "passive-interruption",
+            });
+            if (!launch.unit || !launch.custody?.observeRetirement)
+              return yield* Effect.die("missing passive custody");
+            const { custody, unit } = launch;
+            const { directory, controlGroup } = seedScopeBinding({
+              units,
+              procRoot,
+              unit,
+              pid: 101,
+            });
+            const groupDirectory = NodePath.join(cgroupRoot, controlGroup);
+            NodeFS.mkdirSync(groupDirectory, { recursive: true });
+            const binding = yield* custody.bind(101);
+            retire = () => {
+              NodeFS.rmSync(directory, { recursive: true, force: true });
+              NodeFS.writeFileSync(
+                NodePath.join(groupDirectory, "cgroup.events"),
+                "populated 0\nfrozen 0\n",
+              );
+              units.set(unit, { ...units.get(unit)!, activeState: "inactive", subState: "dead" });
+            };
+            retire();
+            read = "block";
+            const observation = custody.observeRetirement!();
+            const owner = yield* (masked ? Effect.uninterruptible(observation) : observation).pipe(
+              Effect.forkScoped,
+            );
+            yield* Deferred.await(entered);
+            assert.deepStrictEqual(yield* custody.observeRetirement!(), {
+              binding,
+              observation: "empty",
+            });
+            yield* Fiber.interrupt(owner);
+            const interrupted = yield* Fiber.await(owner);
+            assert.strictEqual(interrupted._tag, "Failure");
+            if (interrupted._tag === "Failure")
+              assert.isTrue(Cause.hasInterrupts(interrupted.cause));
+            read = "defect";
+            const failed = yield* Effect.exit(custody.observeRetirement!());
+            assert.strictEqual(failed._tag, "Failure");
+            if (failed._tag === "Failure") {
+              const found = Cause.findDefect(failed.cause);
+              assert.strictEqual(found._tag, "Success");
+              if (found._tag === "Success") assert.strictEqual(found.success, sentinel);
+            }
+            read = "normal";
+            assert.deepStrictEqual(yield* custody.observeRetirement!(), {
+              binding,
+              observation: "empty",
+            });
+            assert.isTrue(calls.every(([, verb]) => verb !== "stop"));
+            seedScopeBinding({ units, procRoot, unit, pid: 101 });
+            NodeFS.writeFileSync(
+              NodePath.join(groupDirectory, "cgroup.events"),
+              "populated 1\nfrozen 0\n",
+            );
+            assert.deepStrictEqual(yield* custody.stopAndObserve(), {
+              binding,
+              observation: "empty",
+            });
+            assert.strictEqual(calls.filter(([, verb]) => verb === "stop").length, 1);
+          }),
+        {
+          beforeBindingShow: () =>
+            Effect.suspend(() => {
+              if (read === "defect") return Effect.die(sentinel);
+              if (read !== "block") return Effect.void;
+              read = "normal";
+              return Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never));
+            }),
+          onBlockingStop: () => Effect.sync(() => retire!()),
+        },
+      );
+    }),
 );

@@ -429,6 +429,23 @@ export const make = Effect.gen(function* () {
     const start = parseProcessStart(stat, binding.pid);
     return start !== undefined && start !== binding.pidStartTicks;
   });
+  const observeRetiredSettlement = Effect.fn("AgentScope.observeRetiredSettlement")(function* (
+    systemctl: string,
+    binding: AgentScopeBinding,
+  ) {
+    const firstValues = yield* readStrictScope(systemctl, binding.unit);
+    const firstUnit = firstValues ? parseRetiredScope(firstValues, binding) : undefined;
+    if (!firstUnit) return undefined;
+    const firstGroup = yield* observeOriginalCgroup(binding);
+    if (!firstGroup || !(yield* originalPidGone(binding)) || !(yield* originalPidGone(binding)))
+      return undefined;
+    const lastGroup = yield* observeOriginalCgroup(binding);
+    if (!lastGroup || (firstGroup === "removed" && lastGroup !== "removed")) return undefined;
+    const lastValues = yield* readStrictScope(systemctl, binding.unit);
+    const lastUnit = lastValues ? parseRetiredScope(lastValues, binding) : undefined;
+    if (!lastUnit || (firstUnit === "collected" && lastUnit !== "collected")) return undefined;
+    return Object.freeze({ binding, observation: lastGroup });
+  });
   const observeSettlement = Effect.fn("AgentScope.observeSettlement")(function* (
     systemctl: string,
     binding: AgentScopeBinding,
@@ -445,18 +462,7 @@ export const make = Effect.gen(function* () {
       undefined
     )
       return undefined;
-    const firstValues = yield* readStrictScope(systemctl, binding.unit);
-    const firstUnit = firstValues ? parseRetiredScope(firstValues, binding) : undefined;
-    if (!firstUnit) return undefined;
-    const firstGroup = yield* observeOriginalCgroup(binding);
-    if (!firstGroup || !(yield* originalPidGone(binding)) || !(yield* originalPidGone(binding)))
-      return undefined;
-    const lastGroup = yield* observeOriginalCgroup(binding);
-    if (!lastGroup || (firstGroup === "removed" && lastGroup !== "removed")) return undefined;
-    const lastValues = yield* readStrictScope(systemctl, binding.unit);
-    const lastUnit = lastValues ? parseRetiredScope(lastValues, binding) : undefined;
-    if (!lastUnit || (firstUnit === "collected" && lastUnit !== "collected")) return undefined;
-    return Object.freeze({ binding, observation: lastGroup });
+    return yield* observeRetiredSettlement(systemctl, binding);
   });
   const makeCustody = Effect.fn("AgentScope.makeCustody")(function* (
     systemctl: string,
@@ -506,6 +512,11 @@ export const make = Effect.gen(function* () {
             ? pinned
             : undefined;
         });
+      }),
+      observeRetirement: Effect.fn("AgentScope.observeRetirement")(function* () {
+        const binding = pinned;
+        if (!binding) return undefined;
+        return yield* observeRetiredSettlement(systemctl, binding).pipe(Effect.interruptible);
       }),
       stopAndObserve: Effect.fn("AgentScope.stopAndObserve")(function* () {
         const binding = pinned;
