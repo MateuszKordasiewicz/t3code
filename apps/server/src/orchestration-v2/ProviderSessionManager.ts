@@ -256,6 +256,18 @@ export interface NativeManagerPreparationRegistration {
   readonly onCleanup: () => void;
 }
 interface NativeManagerReceiver {
+  readonly verifyBinding: (
+    owner: object,
+    sql: SqlClient.SqlClient,
+  ) => Effect.Effect<void, NativeManagerRuntimeError>;
+  readonly verifyConversationCaller: (
+    owner: object,
+    sql: SqlClient.SqlClient,
+  ) => Effect.Effect<void, NativeManagerRuntimeError>;
+  readonly profileInTransaction: (
+    owner: object,
+    sql: SqlClient.SqlClient,
+  ) => Effect.Effect<void, NativeManagerRuntimeError>;
   readonly reservePreparation: (
     registration: NativeManagerPreparationRegistration,
   ) => Effect.Effect<void, NativeManagerRuntimeError>;
@@ -270,6 +282,9 @@ interface NativeManagerReceiver {
   readonly reserve: (
     registration: NativeManagerRegistration,
   ) => Effect.Effect<void, NativeManagerRuntimeError>;
+  readonly conversation: (
+    owner: object,
+  ) => Effect.Effect<WorkflowRunStore.NativeConversationResult, NativeManagerRuntimeError>;
   readonly publish: (
     owner: object,
   ) => Effect.Effect<ProviderAdapter.ProviderAdapterV2SessionRuntime, NativeManagerRuntimeError>;
@@ -325,6 +340,32 @@ export const publishNativeManagerRuntime = Effect.fn("ProviderSessionManager.pub
     return yield* (yield* nativeReceiver(manager)).publish(owner);
   },
 );
+export const assertOriginalNativeManagerBinding = Effect.fn(
+  "ProviderSessionManager.assertOriginalNativeBinding",
+)(function* (manager: object, owner: object, sql: SqlClient.SqlClient) {
+  const receiver = nativeManagerReceivers.get(manager);
+  if (!receiver) return yield* new NativeManagerRuntimeError({ reason: "unregistered" });
+  yield* receiver.verifyBinding(owner, sql);
+});
+export const assertOriginalNativeConversationCaller = Effect.fn(
+  "ProviderSessionManager.assertOriginalNativeConversationCaller",
+)(function* (manager: object, owner: object, sql: SqlClient.SqlClient) {
+  const receiver = nativeManagerReceivers.get(manager);
+  if (!receiver) return yield* new NativeManagerRuntimeError({ reason: "unregistered" });
+  yield* receiver.verifyConversationCaller(owner, sql);
+});
+export const checkNativeConversationProfileInTransaction = Effect.fn(
+  "ProviderSessionManager.checkNativeConversationProfileInTransaction",
+)(function* (manager: object, owner: object, sql: SqlClient.SqlClient) {
+  const receiver = nativeManagerReceivers.get(manager);
+  if (!receiver) return yield* new NativeManagerRuntimeError({ reason: "unregistered" });
+  yield* receiver.profileInTransaction(owner, sql);
+});
+export const openNativeManagerConversation = Effect.fn(
+  "ProviderSessionManager.openNativeConversation",
+)(function* (manager: ProviderSessionManagerV2["Service"], owner: object) {
+  return yield* (yield* nativeReceiver(manager)).conversation(owner);
+});
 export const closeNativeManagerRuntime = Effect.fn("ProviderSessionManager.closeNativeRuntime")(
   function* (manager: ProviderSessionManagerV2["Service"], owner: object) {
     return yield* (yield* nativeReceiver(manager)).release(owner);
@@ -559,6 +600,9 @@ export const layerWithOptions = (
         readonly onHandoff: () => void;
         registration?: NativeManagerRegistration;
         mcp?: NativeMcpState;
+        conversationAttempted?: boolean;
+        conversationFiber?: Fiber.Fiber<unknown, unknown>;
+        conversationWorker?: Fiber.Fiber<unknown, unknown>;
         source?: WorkflowRunStore.NativeManagerOwnerSource;
         readonly sessionId: ProviderSessionId;
         readonly threadId: ThreadId;
@@ -2487,14 +2531,34 @@ export const layerWithOptions = (
             subscribeEvents.pipe(Effect.map((subscription) => subscription.events)),
           ),
           ensureThread: (input) =>
-            observeRuntimeActivity(
-              providerSessionId,
-              ensureThreadAttached({
-                providerSessionId,
-                threadId: input.threadId,
-                providerInstanceId: runtime.instanceId,
-              }),
+            (native
+              ? Effect.gen(function* () {
+                  const fiber = yield* Effect.withFiber(Effect.succeed);
+                  if (
+                    !native.source ||
+                    !native.conversationFiber ||
+                    !native.conversationWorker ||
+                    native.conversationWorker.id !== fiber.id ||
+                    native.conversationWorker.pollUnsafe() !== undefined ||
+                    native.conversationFiber.pollUnsafe() !== undefined
+                  )
+                    return yield* nativeAdmissionError();
+                  yield* native.source
+                    .checkConversationCaller(input)
+                    .pipe(Effect.mapError(() => nativeAdmissionError()));
+                })
+              : Effect.void
             ).pipe(
+              Effect.andThen(
+                observeRuntimeActivity(
+                  providerSessionId,
+                  ensureThreadAttached({
+                    providerSessionId,
+                    threadId: input.threadId,
+                    providerInstanceId: runtime.instanceId,
+                  }),
+                ),
+              ),
               Effect.andThen(loadNatively(runtime.ensureThread(input))),
               Effect.tap(({ loaded: providerThread, linkedEnvironments }) =>
                 markProviderThreadLoaded({
@@ -3022,16 +3086,20 @@ export const layerWithOptions = (
                 const idle = entry?.idleFiber;
                 if (idle && idle.pollUnsafe() === undefined) idle.interruptUnsafe();
                 if (idle) yield* Fiber.await(idle);
-                if (entry) {
-                  yield* failSubscribers(
-                    entry,
-                    input.detail ?? "Native provider session released.",
-                  );
-                  yield* Scope.close(entry.scope, Exit.void);
-                }
+                const subscribers = entry
+                  ? yield* Effect.exit(
+                      failSubscribers(entry, input.detail ?? "Native provider session released."),
+                    )
+                  : Exit.void;
+                const sessionClosed = entry
+                  ? yield* Effect.exit(Scope.close(entry.scope, Exit.void))
+                  : Exit.void;
                 if (record.continuation && record.continuation.pollUnsafe() === undefined)
                   record.continuation.interruptUnsafe();
                 if (record.continuation) yield* Fiber.await(record.continuation);
+                if (record.conversationFiber && record.conversationFiber.pollUnsafe() === undefined)
+                  record.conversationFiber.interruptUnsafe();
+                if (record.conversationFiber) yield* Fiber.await(record.conversationFiber);
                 const original = yield* record.preparation.close();
                 dropNativeMcpReservation(record);
                 if (
@@ -3055,16 +3123,20 @@ export const layerWithOptions = (
                     "native",
                   );
                 }
+                const cleanupFailed =
+                  Exit.isFailure(subscribers) ||
+                  Exit.isFailure(sessionClosed) ||
+                  original.kind === "held";
                 const retired = record.prepared
                   ? yield* eventSink.retireNativeSession!(
                       record.store,
                       record.owner,
-                      original.kind === "held" ? "runtime_error" : input.reason,
-                      original.kind === "held" ? "Native cleanup is unconfirmed." : input.detail,
+                      cleanupFailed ? "runtime_error" : input.reason,
+                      cleanupFailed ? "Native cleanup is unconfirmed." : input.detail,
                     )
                   : "retired";
                 const result: WorkflowRunStore.NativeManagerDisposition =
-                  retired === "held"
+                  retired === "held" || cleanupFailed
                     ? { kind: "held", transportId: source?.transportId ?? original.transportId }
                     : original;
                 for (const callback of record.cleanupCallbacks) callback();
@@ -3240,6 +3312,7 @@ export const layerWithOptions = (
           record.cleanupCallbacks.add(registration.onCleanup);
           nativeRecords.set(registration.owner, record);
           yield* source.checkReservation();
+          yield* source.bindOriginalManager(manager);
           yield* sessionOpen
             .withLock(
               record.sessionId,
@@ -3368,6 +3441,160 @@ export const layerWithOptions = (
         },
         Effect.mapError((cause) => nativeManagerError("state", cause)),
       );
+
+      const openConversation = Effect.fn("ProviderSessionManager.openOriginalNativeConversation")(
+        function* (owner: object) {
+          const record = nativeRecords.get(owner);
+          if (
+            !record?.source ||
+            !record.registration ||
+            !record.entry ||
+            !record.published ||
+            record.closing ||
+            nativeSealed ||
+            record.conversationAttempted ||
+            Ref.getUnsafe(sessions).get(sessionKey(record.sessionId))?.nativeOwner !== owner ||
+            Ref.getUnsafe(sessions).get(sessionKey(record.sessionId))?.runtime !==
+              record.entry.runtime ||
+            Ref.getUnsafe(sessions).get(sessionKey(record.sessionId))?.exposedRuntime !==
+              record.entry.exposedRuntime ||
+            record.registration.mcp !== mcpSessions ||
+            (options.configureMcp !== false && record.mcp?.issued !== true)
+          )
+            return yield* nativeManagerError("state");
+          const source = record.source;
+          const registration = record.registration;
+          const entry = record.entry;
+          yield* source.assertCanStop().pipe(Effect.mapError(() => nativeManagerError("source")));
+          return yield* Effect.uninterruptibleMask((restore) =>
+            Effect.gen(function* () {
+              yield* Effect.sync(() => {
+                const current = Ref.getUnsafe(sessions).get(sessionKey(record.sessionId));
+                if (
+                  nativeSealed ||
+                  layerScope.state._tag === "Closed" ||
+                  record.closing ||
+                  record.conversationAttempted ||
+                  nativeRecords.get(owner) !== record ||
+                  current?.nativeOwner !== owner ||
+                  current.runtime !== entry.runtime ||
+                  current.exposedRuntime !== entry.exposedRuntime
+                )
+                  throw nativeManagerError("state");
+                record.conversationAttempted = true;
+              });
+              const enrolled = yield* Deferred.make<void>();
+              const work = Effect.gen(function* () {
+                yield* Deferred.await(enrolled);
+                record.conversationWorker = yield* Effect.withFiber(Effect.succeed);
+                yield* registration.checkProfile();
+                const input = yield* source.captureConversation(
+                  options.configureMcp === false ? "disabled" : "issued",
+                  record.mcp?.linked,
+                );
+                // Provider failures can echo the credential-bearing native request before outer sanitization.
+                yield* PreparationOwner.sanitize(
+                  "creation",
+                  entry.exposedRuntime.ensureThread(input),
+                ).pipe(Effect.withTracerEnabled(false));
+                yield* registration.checkProfile();
+                return yield* source.completeConversation();
+              }).pipe(
+                (work) => PreparationOwner.withOperation(source.preparationOwner, work, "native"),
+                (work) => PreparationOwner.sanitize("creation", work),
+                Effect.interruptible,
+                Effect.timeout("10 seconds"),
+              );
+              const fiber = yield* work.pipe(Effect.forkIn(layerScope));
+              record.conversationFiber = fiber;
+              yield* Deferred.succeed(enrolled, undefined);
+              const result = yield* restore(Fiber.await(fiber)).pipe(
+                Effect.onInterrupt(() =>
+                  releaseNativeRecord(record, {
+                    providerSessionId: record.sessionId,
+                    reason: "runtime_error",
+                    detail: "Native conversation interrupted.",
+                  }).pipe(Effect.ignore),
+                ),
+              );
+              if (Exit.isFailure(result)) {
+                yield* releaseNativeRecord(record, {
+                  providerSessionId: record.sessionId,
+                  reason: "runtime_error",
+                  detail: "Native conversation failed.",
+                }).pipe(Effect.ignore);
+                return yield* Effect.failCause(result.cause);
+              }
+              return result.value;
+            }),
+          );
+        },
+        Effect.mapError(() => nativeManagerError("state")),
+      );
+
+      const verifyNativeBinding = Effect.fn("ProviderSessionManager.verifyOriginalNativeBinding")(
+        function* (owner: object, sql: SqlClient.SqlClient) {
+          const record = nativeRecords.get(owner);
+          if (
+            !record ||
+            record.owner !== owner ||
+            !record.source ||
+            !record.registration ||
+            record.sql !== sql ||
+            record.source.sql !== sql ||
+            record.registration.sql !== sql ||
+            nativeRecords.get(record.source.preparationOwner) !== record
+          )
+            return yield* nativeManagerError("source");
+        },
+      );
+      const verifyConversationCaller = Effect.fn(
+        "ProviderSessionManager.verifyOriginalConversationCaller",
+      )(function* (owner: object, sql: SqlClient.SqlClient) {
+        yield* verifyNativeBinding(owner, sql);
+        const record = nativeRecords.get(owner)!;
+        const caller = yield* Effect.withFiber(Effect.succeed);
+        const current = Ref.getUnsafe(sessions).get(sessionKey(record.sessionId));
+        if (
+          nativeSealed ||
+          layerScope.state._tag === "Closed" ||
+          !record.published ||
+          record.closing ||
+          record.conversationWorker?.id !== caller.id ||
+          record.conversationWorker.pollUnsafe() !== undefined ||
+          record.conversationFiber?.pollUnsafe() !== undefined ||
+          current?.nativeOwner !== owner ||
+          current.runtime !== record.entry?.runtime ||
+          current.exposedRuntime !== record.entry?.exposedRuntime
+        )
+          return yield* nativeManagerError("state");
+      });
+      const profileInTransaction = Effect.fn(
+        "ProviderSessionManager.observeOriginalProfileInWriter",
+      )(function* (owner: object, sql: SqlClient.SqlClient) {
+        yield* verifyNativeBinding(owner, sql);
+        const record = nativeRecords.get(owner)!;
+        const current = () => {
+          const entry = Ref.getUnsafe(sessions).get(sessionKey(record.sessionId));
+          return (
+            !nativeSealed &&
+            layerScope.state._tag !== "Closed" &&
+            record.published &&
+            !record.closing &&
+            record.conversationWorker?.pollUnsafe() === undefined &&
+            record.conversationWorker !== undefined &&
+            entry?.nativeOwner === owner &&
+            entry.runtime === record.entry?.runtime &&
+            entry.exposedRuntime === record.entry?.exposedRuntime
+          );
+        };
+        if (Option.isNone(yield* Effect.serviceOption(sql.transactionService)) || !current())
+          return yield* nativeManagerError("source");
+        yield* record
+          .registration!.checkProfile()
+          .pipe(Effect.mapError(() => nativeManagerError("profile")));
+        if (!current()) return yield* nativeManagerError("state");
+      });
 
       const guardNativeCallers = Effect.fn("ProviderSessionManager.guardNativeCallers")(function* (
         records: ReadonlyArray<NativeRecord>,
@@ -3939,8 +4166,12 @@ export const layerWithOptions = (
           ),
       } satisfies ProviderSessionManagerV2Shape);
       nativeManagerReceivers.set(manager, {
+        verifyBinding: verifyNativeBinding,
+        verifyConversationCaller,
+        profileInTransaction,
         preflight: nativePreflight,
         checkMcp: checkNativeMcp,
+        conversation: openConversation,
         reservePreparation,
         reserve: reserveNative,
         publish: publishNative,

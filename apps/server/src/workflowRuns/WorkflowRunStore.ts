@@ -1,5 +1,7 @@
 import {
   EnvironmentId,
+  ProviderSessionId,
+  type OrchestrationV2ProviderThread,
   ThreadId,
   ProjectId,
   PlanningSessionV1,
@@ -51,7 +53,10 @@ import { stableStringify } from "@t3tools/shared/relaySigning";
 import type { ServerConfig } from "../config.ts";
 import type { ModelSelection, OrchestrationV2AppThread } from "@t3tools/contracts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as NativeManager from "../orchestration-v2/ProviderSessionManager.ts";
 import type * as CodexClient from "effect-codex-app-server/client";
+import type * as CodexProtocol from "effect-codex-app-server/protocol";
+import { codexThreadRuntimeParams } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import type * as McpRegistry from "../mcp/McpSessionRegistry.ts";
 import * as McpSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import { buildCodexAdapterInitializeParams } from "../provider/CodexProvider.ts";
@@ -63,6 +68,11 @@ import * as PreparationGate from "../preparation/PreparationProcessGate.ts";
 import * as PreparationNode from "../preparation/PreparationNodeChild.ts";
 import {
   decodeSubmissionTransportData,
+  snapshotConversationFrame,
+  decodeConversationReceiptData,
+  assertStoredConversationMatchesFrame,
+  encodeConversationOutcomeData,
+  encodeConversationResponseData,
   decodeSubmissionAttemptResourceData,
   encodeSubmissionTransportData,
   encodeScopeBindingData,
@@ -305,6 +315,7 @@ type NativeTransportActor = {
   readonly scope: Scope.Scope;
   readonly flags: { stopped: boolean; blocked: boolean };
   row?: ReturnType<typeof decodeSubmissionTransportData>;
+  conversation?: { candidate?: ReturnType<typeof snapshotConversationFrame> };
 };
 type NativeBindingRuntime = {
   readonly scope: Scope.Scope;
@@ -355,7 +366,25 @@ export interface NativeManagerPreparationSource {
   readonly awaitConsumption: Effect.Effect<Exit.Exit<void, unknown>>;
   readonly close: () => Effect.Effect<NativeManagerDisposition, NativeManagerSourceError>;
 }
+export type NativeConversationResult = {
+  readonly kind: "conversation-opened";
+  readonly transportId: string;
+  readonly runState: "preparing";
+  readonly receipt: Readonly<Record<string, unknown>>;
+};
 export interface NativeManagerOwnerSource {
+  readonly bindOriginalManager: (manager: object) => Effect.Effect<void, NativeManagerSourceError>;
+  readonly captureConversation: (
+    mode: "issued" | "disabled",
+    linked: boolean | null | undefined,
+  ) => Effect.Effect<ProviderAdapter.ProviderAdapterV2EnsureThreadInput, NativeManagerSourceError>;
+  readonly checkConversationCaller: (
+    input: ProviderAdapter.ProviderAdapterV2EnsureThreadInput,
+  ) => Effect.Effect<void, NativeManagerSourceError>;
+  readonly completeConversation: () => Effect.Effect<
+    NativeConversationResult,
+    NativeManagerSourceError
+  >;
   readonly preparationOwner: PreparationOwner.Owner;
   readonly assertCanStop: () => Effect.Effect<void, NativeManagerSourceError>;
   readonly sql: SqlClient.SqlClient;
@@ -783,6 +812,7 @@ const makeStore = Effect.fnUntraced(function* (
       const queued = new Set<string>();
       const parents = new Map<string, Row>();
       const exemptParents = new Set<string>();
+      const logicalParents = new Set<string>();
       const attempts = new Set<string>();
       const sessionIdentities = new Map<string, { driver: string; instance: string }>();
       const queue = (kind: Kind, id: unknown) => {
@@ -849,6 +879,61 @@ const makeStore = Effect.fnUntraced(function* (
         attempts.add(row.attempt_id as string);
         return row;
       });
+      const inspectParentConversation = Effect.fnUntraced(function* (parent: Row) {
+        const rows =
+          yield* sql`SELECT * FROM orchestration_v2_native_conversations WHERE transport_id=${parent.transport_id}`;
+        if (rows.length === 0) return;
+        if (rows.length !== 1) return yield* integrity();
+        const row = yield* Effect.try({
+          try: () => decodeConversationReceiptData(rows[0]),
+          catch: integrity,
+        });
+        const context = parse(parent.creation_context_json as string) as Record<string, unknown>;
+        const selection = parse(row.selection_json as string) as Record<string, unknown>;
+        if (
+          !matches(row, {
+            transport_id: parent.transport_id,
+            environment_id: parent.environment_id,
+            project_id: parent.project_id,
+            thread_id: parent.opening_thread_id,
+            driver: parent.driver,
+            provider_instance_id: parent.provider_instance_id,
+            provider_session_id: parent.provider_session_id,
+          }) ||
+          !sameCustodyValue(selection.expectedClaim, context.expectedClaim) ||
+          !queue("thread", row.thread_id) ||
+          !queueSession(row.provider_session_id, {
+            driver: row.driver as string,
+            instance: row.provider_instance_id as string,
+          })
+        )
+          return yield* integrity();
+        const own = transport?.row?.transport_id === parent.transport_id;
+        if (own) {
+          const candidate = transport?.conversation?.candidate;
+          if (!candidate) return yield* integrity();
+          for (const [key, value] of Object.entries(candidate)) {
+            if (
+              ![
+                "local_outcome",
+                "local_reason",
+                "local_observed_at",
+                "response_json",
+                "response_hash",
+                "response_observed_at",
+              ].includes(key) &&
+              row[key] !== value
+            )
+              return yield* integrity();
+          }
+        } else if (
+          row.local_outcome === null ||
+          row.local_outcome === "unknown" ||
+          (row.local_outcome === "submitted" && row.response_json === null)
+        ) {
+          logicalParents.add(parent.transport_id as string);
+        }
+      });
       // Repeated history matches share one validation pass inside this reader.
       const inspectParent = Effect.fnUntraced(function* (raw: Row) {
         const row = yield* Effect.try({
@@ -858,7 +943,11 @@ const makeStore = Effect.fnUntraced(function* (
         if (row.environment_id !== environmentId) return yield* integrity();
         const id = row.transport_id as string;
         if (parents.has(id))
-          return !exemptParents.has(id) && parents.get(id)!.settlement_json === null;
+          return (
+            logicalParents.has(id) ||
+            (!exemptParents.has(id) && parents.get(id)!.settlement_json === null)
+          );
+        yield* inspectParentConversation(row);
         if (transport?.row?.transport_id === id) {
           if (
             !nativeTransports.has(transport) ||
@@ -890,7 +979,7 @@ const makeStore = Effect.fnUntraced(function* (
           return false;
         }
         parents.set(id, row);
-        if (row.settlement_json === null) return true;
+        if (row.settlement_json === null || logicalParents.has(id)) return true;
         let cursor = "";
         for (;;) {
           const children =
@@ -919,7 +1008,9 @@ const makeStore = Effect.fnUntraced(function* (
           if (found.length !== 1 || !found[0]) return yield* integrity();
           held = yield* inspectParent(found[0]);
           parent = parents.get(id)!;
-        } else held = !exemptParents.has(id) && parent.settlement_json === null;
+        } else
+          held =
+            logicalParents.has(id) || (!exemptParents.has(id) && parent.settlement_json === null);
         yield* parseAttempt(raw, parent);
         return held;
       });
@@ -1225,6 +1316,25 @@ const makeStore = Effect.fnUntraced(function* (
             if (yield* attemptHistory(selected.native)) return true;
           }
           if (environmentId !== "") {
+            let conversationCursor = "";
+            for (;;) {
+              const receipts =
+                yield* sql`SELECT * FROM orchestration_v2_native_conversations WHERE environment_id=${environmentId} AND driver=${native.driver} AND provider_instance_id=${native.providerInstanceId} AND json_extract(response_json,'$.nativeThreadId')=${native.nativeId} AND transport_id>${conversationCursor} ORDER BY transport_id LIMIT 128`;
+              for (const raw of receipts) {
+                const receipt = yield* Effect.try({
+                  try: () => decodeConversationReceiptData(raw),
+                  catch: integrity,
+                });
+                const rows =
+                  yield* sql`SELECT * FROM orchestration_v2_submission_transports WHERE transport_id=${receipt.transport_id}`;
+                if (rows.length !== 1 || !rows[0]) return yield* integrity();
+                if (yield* inspectParent(rows[0])) return true;
+              }
+              if (receipts.length < 128) break;
+              const last = receipts.at(-1)!.transport_id;
+              if (!validId(last) || last === conversationCursor) return yield* integrity();
+              conversationCursor = last;
+            }
             let materialCursor = "";
             for (;;) {
               const materials =
@@ -7910,6 +8020,32 @@ const makeStore = Effect.fnUntraced(function* (
         let adapterAccepted = false;
         let publication: Fiber.Fiber<unknown, unknown> | undefined;
         let publicationAccepted = false;
+        type Conversation = {
+          readonly fiber: Fiber.Fiber<unknown, unknown>;
+          input?: ProviderAdapter.ProviderAdapterV2EnsureThreadInput;
+          context?: Record<string, unknown>;
+          params?: ReturnType<typeof codexThreadRuntimeParams>;
+          mcp?: Record<string, unknown>;
+          credential?: Record<string, unknown>;
+          frame?: CodexProtocol.CodexAppServerControlledFrame;
+          candidate?: ReturnType<typeof snapshotConversationFrame>;
+          committed: boolean;
+          delivered: boolean;
+          deliveryAttempted?: boolean;
+          selected: boolean;
+          attempted: boolean;
+          accepted: boolean;
+          outcome?: {
+            readonly kind: CodexProtocol.CodexAppServerFrameOutcome["outcome"];
+            readonly reason: CodexProtocol.CodexAppServerFrameOutcome["reason"];
+          };
+          response?: Record<string, unknown>;
+          inputKey?: string;
+          outcomeAt?: string;
+          responseAt?: string;
+        };
+        let conversation: Conversation | undefined;
+        let originalManager: object | undefined;
         let bootstrapPhase: "new" | "initialize" | "confirmed" | "initialized" = "new";
         const initializeParams = buildCodexAdapterInitializeParams();
         const initializeJson = stableStringify(initializeParams);
@@ -7982,6 +8118,7 @@ const makeStore = Effect.fnUntraced(function* (
                 .length
             )
               return yield* integrity();
+            yield* readConversationReceipt();
           }
         });
         const checkCurrent = Effect.fn("WorkflowRunStore.checkTransportCurrent")(function* (
@@ -8084,7 +8221,7 @@ const makeStore = Effect.fnUntraced(function* (
               }),
             catch: integrity,
           });
-          return { thread, modelSelection: run.modelSelection, key };
+          return { thread, modelSelection: run.modelSelection, run, key };
         });
         const captureAdapterConstruction = Effect.fn(
           "WorkflowRunStore.captureNativeAdapterConstruction",
@@ -8224,6 +8361,572 @@ const makeStore = Effect.fnUntraced(function* (
           },
           Effect.interruptible,
         );
+        const bindOriginalManager = Effect.fn("WorkflowRunStore.bindOriginalNativeManager")(
+          function* (manager: object): Effect.fn.Return<void, NativeManagerSourceError> {
+            yield* outside();
+            const fiber = yield* Effect.withFiber(Effect.succeed);
+            if (
+              originalManager ||
+              constructor?.id !== fiber.id ||
+              constructor.pollUnsafe() !== undefined ||
+              flags.stopped ||
+              flags.blocked
+            )
+              return yield* integrity();
+            yield* NativeManager.assertOriginalNativeManagerBinding(manager, facade, sql).pipe(
+              Effect.mapError(integrity),
+            );
+            yield* Effect.sync(() => {
+              if (originalManager || flags.stopped || flags.blocked) throw integrity();
+              originalManager = manager;
+            });
+          },
+        );
+        const checkFinalConversationProfile = Effect.fn(
+          "WorkflowRunStore.checkFinalConversationProfile",
+        )(function* (): Effect.fn.Return<void, NativeManagerSourceError> {
+          if (!originalManager) return yield* integrity();
+          yield* NativeManager.checkNativeConversationProfileInTransaction(
+            originalManager,
+            facade,
+            sql,
+          ).pipe(Effect.mapError(integrity));
+        });
+        const readConversationReceipt = Effect.fn(
+          "WorkflowRunStore.readOriginalConversationReceipt",
+        )(function* () {
+          const rows =
+            yield* sql`SELECT * FROM orchestration_v2_native_conversations WHERE transport_id=${id}`;
+          if (rows.length === 0) return undefined;
+          const state = conversation;
+          if (
+            rows.length !== 1 ||
+            !state?.candidate ||
+            !state.context ||
+            !state.frame ||
+            !state.params ||
+            !state.mcp
+          )
+            return yield* integrity();
+          return yield* Effect.try({
+            try: () => {
+              const row = decodeConversationReceiptData(rows[0]);
+              assertStoredConversationMatchesFrame(
+                row,
+                state.context,
+                state.frame,
+                state.params,
+                state.mcp,
+              );
+              return row;
+            },
+            catch: integrity,
+          });
+        });
+        const activeConversation = Effect.fn("WorkflowRunStore.activeOriginalConversation")(
+          function* (caller: boolean) {
+            yield* outside();
+            const state = conversation;
+            if (
+              !state ||
+              state.fiber.pollUnsafe() !== undefined ||
+              flags.stopped ||
+              flags.blocked ||
+              runtime.scope.state._tag === "Closed" ||
+              physical.state._tag === "Closed"
+            )
+              return yield* integrity();
+            if (caller && state.fiber.id !== (yield* Effect.withFiber(Effect.succeed)).id)
+              return yield* integrity();
+            return state;
+          },
+        );
+        const checkConversationMcp = Effect.fn("WorkflowRunStore.checkOriginalConversationMcp")(
+          function* () {
+            const state = conversation;
+            if (!state?.input || !state.params || !state.mcp) return yield* integrity();
+            const receipt = acquisition.actor.mcpIssuance?.receipt;
+            if (state.mcp.mode === "disabled") {
+              if (receipt) return yield* integrity();
+              return;
+            }
+            if (!receipt || (yield* receipt.sessions.read(state.input.threadId)) !== receipt.config)
+              return yield* stale();
+            const resolved = yield* receipt.registry.resolve(
+              receipt.config.authorizationHeader.replace(/^Bearer\s+/, ""),
+            );
+            if (
+              !resolved ||
+              resolved.environmentId !== runtime.environmentId ||
+              resolved.thread.threadId !== job.input.threadId ||
+              resolved.thread.providerSessionId !== receipt.credentialId ||
+              resolved.thread.providerInstanceId !== current.providerInstanceId ||
+              receipt.config.providerSessionId !== receipt.credentialId ||
+              receipt.config.environmentId !== runtime.environmentId ||
+              receipt.config.threadId !== job.input.threadId ||
+              receipt.config.providerInstanceId !== current.providerInstanceId ||
+              (yield* receipt.sessions.read(state.input.threadId)) !== receipt.config
+            )
+              return yield* stale();
+            const params = codexThreadRuntimeParams({
+              threadId: state.input.threadId,
+              mcpSession: receipt.config,
+              modelSelection: state.input.modelSelection,
+              runtimePolicy: state.input.runtimePolicy,
+            });
+            if (
+              stableStringify(params) !== stableStringify(state.params) ||
+              stableStringify([...resolved.capabilities].sort()) !==
+                stableStringify(state.mcp.capabilities) ||
+              (resolved.thread.subagent === true) !== state.mcp.subagent
+            )
+              return yield* stale();
+          },
+        );
+        const captureConversation = Effect.fn("WorkflowRunStore.captureOriginalConversation")(
+          function* (mode: "issued" | "disabled", linked: boolean | null | undefined) {
+            yield* outside();
+            if (!originalManager) return yield* integrity();
+            yield* NativeManager.assertOriginalNativeConversationCaller(
+              originalManager,
+              facade,
+              sql,
+            ).pipe(Effect.mapError(integrity));
+            return yield* Effect.uninterruptibleMask((resume) =>
+              Effect.gen(function* () {
+                const fiber = yield* Effect.withFiber(Effect.succeed);
+                const state = yield* Effect.sync(() => {
+                  if (
+                    conversation ||
+                    !publicationAccepted ||
+                    publication?.pollUnsafe()?._tag !== "Success" ||
+                    flags.stopped ||
+                    flags.blocked
+                  )
+                    throw integrity();
+                  const state: Conversation = {
+                    fiber,
+                    committed: false,
+                    delivered: false,
+                    selected: false,
+                    attempted: false,
+                    accepted: false,
+                  };
+                  conversation = state;
+                  actor.conversation = state;
+                  return state;
+                });
+                return yield* resume(
+                  body(
+                    writer(
+                      Effect.gen(function* () {
+                        const construction = yield* readConstruction();
+                        const selected = yield* readAdapterInput();
+                        const scope = yield* verifyClaimedNativeOperationInTransaction(claim);
+                        if (
+                          scope.kind !== "current" ||
+                          scope.stage !== "preparing" ||
+                          scope.nativeThreadId !== null ||
+                          scope.runId !== selected.run.id ||
+                          selected.key !== adapterInputKey ||
+                          job.input.nativeSelection != null
+                        )
+                          return yield* stale();
+                        if (
+                          (yield* sql`SELECT 1 FROM orchestration_v2_native_conversations WHERE environment_id=${runtime.environmentId} AND run_id=${scope.runId} LIMIT 1`)
+                            .length ||
+                          (yield* sql`SELECT 1 FROM orchestration_v2_native_conversations WHERE environment_id=${runtime.environmentId} AND provider_thread_id=${current.providerThreadId} LIMIT 1`)
+                            .length ||
+                          (yield* sql`SELECT 1 FROM orchestration_v2_submission_attempts WHERE environment_id=${runtime.environmentId} AND run_id=${scope.runId} LIMIT 1`)
+                            .length
+                        )
+                          return yield* stale();
+                        const owned = structuredClone({
+                          threadId: selected.thread.id,
+                          modelSelection: selected.modelSelection,
+                          runtimePolicy: construction.policy,
+                          providerSessionId: ProviderSessionId.make(current.providerSessionId),
+                          forceNewNativeThread: true,
+                        });
+                        const freeze = (value: unknown): void => {
+                          if (value !== null && typeof value === "object") {
+                            for (const item of Object.values(value)) freeze(item);
+                            Object.freeze(value);
+                          }
+                        };
+                        freeze(owned);
+                        state.input = owned;
+                        state.inputKey = selected.key;
+                        const receipt = acquisition.actor.mcpIssuance?.receipt;
+                        if (mode === "issued") {
+                          if (
+                            !receipt ||
+                            (yield* receipt.sessions.read(owned.threadId)) !== receipt.config
+                          )
+                            return yield* stale();
+                          const resolved = yield* receipt.registry.resolve(
+                            receipt.config.authorizationHeader.replace(/^Bearer\s+/, ""),
+                          );
+                          if (!resolved) return yield* stale();
+                          state.mcp = {
+                            mode: "issued",
+                            credentialId: receipt.credentialId,
+                            capabilities: [...resolved.capabilities].sort(),
+                            browserToolsAvailable: resolved.capabilities.has("preview"),
+                            subagent: resolved.thread.subagent === true,
+                            linked:
+                              linked === undefined
+                                ? "absent"
+                                : linked === null
+                                  ? "unavailable"
+                                  : linked,
+                          };
+                          state.credential = {
+                            mode: "issued",
+                            credentialId: receipt.credentialId,
+                            authorizationHeader: receipt.config.authorizationHeader,
+                          };
+                        } else {
+                          if (receipt) return yield* integrity();
+                          state.mcp = { mode: "disabled" };
+                          state.credential = { mode: "disabled" };
+                        }
+                        state.params = codexThreadRuntimeParams({
+                          threadId: owned.threadId,
+                          mcpSession: receipt?.config,
+                          modelSelection: owned.modelSelection,
+                          runtimePolicy: owned.runtimePolicy,
+                        });
+                        const expectedSelection = {
+                          v: 1,
+                          kind: "fresh-conversation",
+                          transportId: id,
+                          environmentId: runtime.environmentId,
+                          projectId: job.input.projectId,
+                          threadId: job.input.threadId,
+                          runId: scope.runId,
+                          runOrdinal: selected.run.ordinal,
+                          attemptId: scope.attemptId,
+                          rootNodeId: scope.rootNodeId,
+                          intentId: scope.intentId,
+                          driver: "codex",
+                          providerInstanceId: current.providerInstanceId,
+                          providerSessionId: current.providerSessionId,
+                          providerThreadId: current.providerThreadId,
+                          invocation: 1,
+                          expectedClaim: claim,
+                        };
+                        state.context = {
+                          transportId: id,
+                          environmentId: runtime.environmentId,
+                          projectId: job.input.projectId,
+                          driver: "codex",
+                          providerInstanceId: current.providerInstanceId,
+                          providerSessionId: current.providerSessionId,
+                          expectedSelection,
+                        };
+                        yield* checkConversationMcp();
+                        return owned;
+                      }),
+                      () => {},
+                    ),
+                  ),
+                );
+              }),
+            );
+          },
+          Effect.interruptible,
+        );
+        const checkConversationCaller = Effect.fn(
+          "WorkflowRunStore.checkOriginalConversationCaller",
+        )(function* (input: ProviderAdapter.ProviderAdapterV2EnsureThreadInput) {
+          const state = yield* activeConversation(true);
+          if (state.input !== input) return yield* integrity();
+        });
+        const selectConversationFrame = Effect.fn(
+          "WorkflowRunStore.selectOriginalConversationFrame",
+        )(function* (input: ProviderAdapter.ProviderAdapterV2EnsureThreadInput, params: unknown) {
+          const state = yield* activeConversation(true);
+          if (
+            state.selected ||
+            !state.input ||
+            !state.context ||
+            stableStringify(input) !== stableStringify(state.input) ||
+            stableStringify(params) !== stableStringify(state.params)
+          )
+            return yield* integrity();
+          state.selected = true;
+          yield* body(
+            writer(
+              Effect.gen(function* () {
+                const fresh = yield* readAdapterInput();
+                if (fresh.key !== state.inputKey) return yield* stale();
+                yield* checkConversationMcp();
+              }),
+              () => {},
+            ),
+          );
+          return stableStringify(state.context.expectedSelection);
+        }, Effect.interruptible);
+        const ownConversationFrame = (
+          state: Conversation,
+          frame: CodexProtocol.CodexAppServerControlledFrame,
+          at: string,
+        ) => {
+          if (!state.context || !state.params || !state.mcp || !state.selected) throw integrity();
+          if (state.frame) {
+            if (stableStringify(state.frame) !== stableStringify(frame)) throw integrity();
+          } else {
+            state.frame = Object.freeze({ ...frame });
+          }
+          if (!state.candidate) {
+            state.candidate = snapshotConversationFrame(
+              state.context,
+              state.frame,
+              state.params,
+              state.mcp,
+              at,
+            );
+          }
+          return state.candidate!;
+        };
+        const reserveConversationFrame = Effect.fn(
+          "WorkflowRunStore.reserveOriginalConversationFrame",
+        )(function* (frame: CodexProtocol.CodexAppServerControlledFrame) {
+          const state = yield* activeConversation(false);
+          if (state.attempted || state.frame || state.outcome) return yield* integrity();
+          state.attempted = true;
+          const at = DateTime.formatIso(yield* DateTime.now);
+          const candidate = yield* Effect.try({
+            try: () => ownConversationFrame(state, frame, at),
+            catch: integrity,
+          });
+          yield* body(
+            writer(
+              Effect.gen(function* () {
+                const selected = yield* readAdapterInput();
+                if (selected.key !== state.inputKey) return yield* stale();
+                yield* checkConversationMcp();
+                const rows =
+                  yield* sql`INSERT INTO orchestration_v2_native_conversations ${sql.insert(candidate)} RETURNING *`;
+                if (rows.length !== 1) return yield* integrity();
+                return yield* Effect.try({
+                  try: () => decodeConversationReceiptData(rows[0]),
+                  catch: integrity,
+                });
+              }),
+              () => {
+                state.committed = true;
+              },
+            ),
+          );
+        }, Effect.interruptible);
+        const flushConversation = Effect.fn(
+          "WorkflowRunStore.flushOriginalConversationObservations",
+        )(function* () {
+          const state = conversation;
+          if (!state) return undefined;
+          if (!state.candidate) {
+            if (!state.frame || !state.outcome) return undefined;
+            const at = DateTime.formatIso(yield* DateTime.now);
+            yield* Effect.try({
+              try: () => ownConversationFrame(state, state.frame!, at),
+              catch: integrity,
+            });
+          }
+          return yield* writer(
+            Effect.gen(function* () {
+              yield* checkOriginal();
+              let row = yield* readConversationReceipt();
+              if (!row) {
+                if (!state.outcome || state.delivered) return yield* integrity();
+                const rows =
+                  yield* sql`INSERT INTO orchestration_v2_native_conversations ${sql.insert(state.candidate!)} RETURNING *`;
+                if (rows.length !== 1) return yield* integrity();
+                row = yield* Effect.try({
+                  try: () => decodeConversationReceiptData(rows[0]),
+                  catch: integrity,
+                });
+              }
+              if (state.outcome) {
+                state.outcomeAt ??= DateTime.formatIso(yield* DateTime.now);
+                const expected = yield* Effect.try({
+                  try: () => encodeConversationOutcomeData(row, state.outcome, state.outcomeAt),
+                  catch: integrity,
+                });
+                const rows =
+                  yield* sql`UPDATE orchestration_v2_native_conversations SET local_outcome=${expected.local_outcome},local_reason=${expected.local_reason},local_observed_at=${expected.local_observed_at} WHERE transport_id=${id} RETURNING *`;
+                if (rows.length !== 1) return yield* integrity();
+                row = yield* Effect.try({
+                  try: () => decodeConversationReceiptData(rows[0]),
+                  catch: integrity,
+                });
+              }
+              if (state.response) {
+                state.responseAt ??= DateTime.formatIso(yield* DateTime.now);
+                const expected = yield* Effect.try({
+                  try: () =>
+                    encodeConversationResponseData(
+                      row,
+                      state.response,
+                      state.responseAt,
+                      state.credential,
+                    ),
+                  catch: integrity,
+                });
+                const rows =
+                  yield* sql`UPDATE orchestration_v2_native_conversations SET response_json=${expected.response_json},response_hash=${expected.response_hash},response_observed_at=${expected.response_observed_at} WHERE transport_id=${id} RETURNING *`;
+                if (rows.length !== 1) return yield* integrity();
+                row = yield* Effect.try({
+                  try: () => decodeConversationReceiptData(rows[0]),
+                  catch: integrity,
+                });
+              }
+              return row;
+            }),
+            () => {},
+          );
+        }, Effect.interruptible);
+        const persistConversationOutcome = Effect.fn(
+          "WorkflowRunStore.observeOriginalConversationOutcome",
+        )(function* () {
+          yield* outside();
+          const state = conversation;
+          if (!state?.frame || !state.outcome) return yield* integrity();
+          const at = DateTime.formatIso(yield* DateTime.now);
+          yield* Effect.try({
+            try: () => ownConversationFrame(state, state.frame!, at),
+            catch: integrity,
+          });
+          yield* body(flushConversation());
+        }, Effect.interruptible);
+        // @effect-diagnostics-next-line effectFnOpportunity:off -- retain the original SDK observation before returning any interruptible Effect.
+        const observeConversationOutcome = (outcome: CodexProtocol.CodexAppServerFrameOutcome) => {
+          const state = conversation;
+          if (
+            !state?.context ||
+            !state.selected ||
+            outcome.frame.selection !== stableStringify(state.context.expectedSelection) ||
+            outcome.frame.method !== "thread/start"
+          )
+            return Effect.fail(integrity());
+          const frame = Object.freeze({ ...outcome.frame });
+          if (state.frame && stableStringify(state.frame) !== stableStringify(frame))
+            return Effect.fail(integrity());
+          if (
+            (outcome.outcome === "submitted" && !state.delivered) ||
+            (outcome.outcome === "not_submitted" && state.deliveryAttempted)
+          )
+            return Effect.fail(integrity());
+          const observed = Object.freeze({ kind: outcome.outcome, reason: outcome.reason });
+          if (state.outcome && stableStringify(state.outcome) !== stableStringify(observed))
+            return Effect.fail(integrity());
+          state.frame ??= frame;
+          state.outcome ??= observed;
+          return persistConversationOutcome();
+        };
+        const captureConversationResponse = (response: OrchestrationV2ProviderThread) => {
+          const state = conversation;
+          const native = response.nativeThreadRef;
+          if (
+            !state?.input ||
+            Fiber.getCurrent()?.id !== state.fiber.id ||
+            !state.candidate ||
+            !state.delivered ||
+            state.outcome?.kind !== "submitted" ||
+            state.response ||
+            response.driver !== "codex" ||
+            response.providerInstanceId !== current.providerInstanceId ||
+            response.providerSessionId !== current.providerSessionId ||
+            response.appThreadId !== state.input.threadId ||
+            !native ||
+            native.driver !== "codex" ||
+            native.strength !== "strong"
+          )
+            throw PreparationOwner.error("creation", "invalid");
+          const value = Object.freeze({
+            v: 1,
+            nativeThreadId: native.nativeId,
+            returnedProviderThreadId: response.id,
+            driver: "codex",
+            providerInstanceId: current.providerInstanceId,
+            providerSessionId: current.providerSessionId,
+            threadId: job.input.threadId,
+          });
+          state.response = value;
+          try {
+            const submitted = encodeConversationOutcomeData(
+              state.candidate,
+              state.outcome,
+              state.candidate.created_at,
+            );
+            encodeConversationResponseData(
+              submitted,
+              value,
+              state.candidate.created_at,
+              state.credential,
+            );
+          } catch {
+            throw PreparationOwner.error("creation", "invalid");
+          }
+        };
+        const completeConversation = Effect.fn("WorkflowRunStore.completeOriginalConversation")(
+          function* (): Effect.fn.Return<NativeConversationResult, NativeManagerSourceError> {
+            const state = yield* activeConversation(true);
+            if (!state.response || state.outcome?.kind !== "submitted") return yield* integrity();
+            yield* body(flushConversation());
+            const receipt = yield* body(
+              writer(
+                Effect.gen(function* () {
+                  const fresh = yield* readAdapterInput();
+                  if (fresh.key !== state.inputKey) return yield* stale();
+                  yield* checkConversationMcp();
+                  const row = yield* readConversationReceipt();
+                  if (!row || row.local_outcome !== "submitted" || !row.response_json)
+                    return yield* integrity();
+                  yield* Effect.try({
+                    try: () =>
+                      encodeConversationResponseData(
+                        row,
+                        state.response,
+                        state.responseAt,
+                        state.credential,
+                      ),
+                    catch: integrity,
+                  });
+                  return row;
+                }),
+                () => {
+                  state.accepted = true;
+                },
+              ),
+            );
+            return Object.freeze({
+              kind: "conversation-opened",
+              transportId: id,
+              runState: "preparing",
+              receipt,
+            });
+          },
+          Effect.interruptible,
+        );
+        const readOriginalClient = Effect.fn("WorkflowRunStore.readOriginalNativeClient")(
+          function* () {
+            const completed = constructor?.pollUnsafe();
+            if (!completed || Exit.isFailure(completed)) return undefined;
+            const value = completed.value;
+            if (originalIo !== undefined && value === originalIo) return undefined;
+            if (
+              typeof value !== "object" ||
+              value === null ||
+              !("kind" in value) ||
+              value.kind !== "transport-created" ||
+              !("client" in value)
+            )
+              return yield* integrity();
+            return value.client as typeof CodexClient.CodexAppServerControlledClient.Service;
+          },
+        );
         const close = Effect.fn("WorkflowRunStore.closeNativeCodexTransport")(function* () {
           yield* outside();
           yield* assertCanStop();
@@ -8236,6 +8939,8 @@ const makeStore = Effect.fnUntraced(function* (
                   (publication?.id === fiber.id && publication.pollUnsafe() === undefined) ||
                   (adapterConstruction?.id === fiber.id &&
                     adapterConstruction.pollUnsafe() === undefined) ||
+                  (conversation?.fiber.id === fiber.id &&
+                    conversation.fiber.pollUnsafe() === undefined) ||
                   [...bodies].some(
                     (invocation) =>
                       invocation.fiber.id === fiber.id && !Deferred.isDoneUnsafe(invocation.done),
@@ -8258,6 +8963,12 @@ const makeStore = Effect.fnUntraced(function* (
                     publication.interruptUnsafe();
                   if (adapterConstruction && adapterConstruction.pollUnsafe() === undefined)
                     adapterConstruction.interruptUnsafe();
+                  if (conversation && conversation.fiber.pollUnsafe() === undefined)
+                    conversation.fiber.interruptUnsafe();
+                  const protocol = yield* readOriginalClient();
+                  const quiesced = protocol
+                    ? yield* Effect.exit(protocol.quiesceOutput)
+                    : Exit.void;
                   for (const invocation of bodies) invocation.fiber.interruptUnsafe();
                   yield* Effect.forEach(bodies, (invocation) => Deferred.await(invocation.done), {
                     concurrency: "unbounded",
@@ -8271,6 +8982,8 @@ const makeStore = Effect.fnUntraced(function* (
                   const adapted = adapterConstruction
                     ? yield* Fiber.await(adapterConstruction)
                     : undefined;
+                  if (conversation) yield* Fiber.await(conversation.fiber);
+                  const observations = yield* Effect.exit(flushConversation());
                   const closed = yield* Effect.exit(Scope.close(physical, Exit.void));
                   const stopped = pending
                     ? yield* Effect.exit(pending.stopOwnedChild())
@@ -8289,8 +9002,10 @@ const makeStore = Effect.fnUntraced(function* (
                       (!publishedRuntime ||
                         Exit.isFailure(publishedRuntime) ||
                         !publicationAccepted)) ||
-                    Exit.isFailure(closed) ||
-                    Exit.isFailure(stopped) ||
+                    (conversation === undefined &&
+                      (Exit.isFailure(quiesced) ||
+                        Exit.isFailure(closed) ||
+                        Exit.isFailure(stopped))) ||
                     !pending ||
                     !held ||
                     actor.row.binding_json === null
@@ -8338,7 +9053,19 @@ const makeStore = Effect.fnUntraced(function* (
                   if (Exit.isFailure(settled)) return { kind: "held" as const, transportId: id };
                   const published = yield* Effect.exit(notify);
                   return {
-                    kind: Exit.isSuccess(published) ? ("retired" as const) : ("held" as const),
+                    kind:
+                      Exit.isSuccess(published) &&
+                      Exit.isSuccess(quiesced) &&
+                      Exit.isSuccess(closed) &&
+                      Exit.isSuccess(stopped) &&
+                      Exit.isSuccess(observations) &&
+                      (!conversation ||
+                        conversation.outcome?.kind === "not_submitted" ||
+                        (conversation.accepted &&
+                          conversation.outcome?.kind === "submitted" &&
+                          conversation.response !== undefined))
+                        ? ("retired" as const)
+                        : ("held" as const),
                     transportId: id,
                   };
                 }).pipe(
@@ -8366,6 +9093,8 @@ const makeStore = Effect.fnUntraced(function* (
               (publication?.id === fiber.id && publication.pollUnsafe() === undefined) ||
               (adapterConstruction?.id === fiber.id &&
                 adapterConstruction.pollUnsafe() === undefined) ||
+              (conversation?.fiber.id === fiber.id &&
+                conversation.fiber.pollUnsafe() === undefined) ||
               [...bodies].some(
                 (invocation) =>
                   invocation.fiber.id === fiber.id && !Deferred.isDoneUnsafe(invocation.done),
@@ -8498,8 +9227,10 @@ const makeStore = Effect.fnUntraced(function* (
                 body(
                   Effect.gen(function* () {
                     if (
-                      !bootstrap ||
-                      bootstrap.pollUnsafe() !== undefined ||
+                      (!(bootstrap && bootstrap.pollUnsafe() === undefined) &&
+                        !(
+                          conversation?.selected && conversation.fiber.pollUnsafe() === undefined
+                        )) ||
                       flags.stopped ||
                       flags.blocked
                     )
@@ -8539,6 +9270,62 @@ const makeStore = Effect.fnUntraced(function* (
                       catch: integrity,
                     });
                     const method = frame.method;
+                    if (method === "thread/start") {
+                      const state = conversation;
+                      if (
+                        !state?.frame ||
+                        !state.candidate ||
+                        !state.context ||
+                        !state.params ||
+                        !state.mcp ||
+                        !state.committed ||
+                        state.deliveryAttempted ||
+                        state.outcome ||
+                        state.fiber.pollUnsafe() !== undefined ||
+                        state.frame.encoded !== new TextDecoder().decode(bytes)
+                      )
+                        return yield* integrity();
+                      yield* writer(
+                        Effect.gen(function* () {
+                          const fresh = yield* readAdapterInput();
+                          if (
+                            fresh.key !== state.inputKey ||
+                            flags.stopped ||
+                            state.fiber.pollUnsafe() !== undefined
+                          )
+                            return yield* stale();
+                          yield* checkConversationMcp();
+                          const retained = yield* readConversationReceipt();
+                          if (
+                            !retained ||
+                            retained.local_outcome !== null ||
+                            retained.response_json !== null ||
+                            state.deliveryAttempted
+                          )
+                            return yield* integrity();
+                          yield* Effect.try({
+                            try: () =>
+                              assertStoredConversationMatchesFrame(
+                                retained,
+                                state.context,
+                                state.frame,
+                                state.params,
+                                state.mcp,
+                              ),
+                            catch: integrity,
+                          });
+                          yield* checkFinalConversationProfile();
+                          yield* checkConversationMcp();
+                          yield* checkCurrent(true);
+                          state.deliveryAttempted = true;
+                          yield* Stream.run(Stream.make(bytes), payload.stdin);
+                        }),
+                        () => {
+                          state.delivered = true;
+                        },
+                      );
+                      return [undefined] as const;
+                    }
                     const isInitialize =
                       method === "initialize" &&
                       Object.keys(frame).sort().join() === "id,method,params" &&
@@ -8593,6 +9380,10 @@ const makeStore = Effect.fnUntraced(function* (
           open,
           captureAdapterConstruction,
           confirmAdapterConstruction,
+          selectConversationFrame,
+          reserveConversationFrame,
+          observeConversationOutcome,
+          captureConversationResponse,
           captureBootstrap: Effect.fn("WorkflowRunStore.captureNativeCodexBootstrap")(function* () {
             yield* outside();
             const fiber = yield* Effect.withFiber(Effect.succeed);
@@ -8644,6 +9435,10 @@ const makeStore = Effect.fnUntraced(function* (
         });
         const managerSource: NativeManagerOwnerSource = Object.freeze({
           preparationOwner: acquisition.actor.owner,
+          bindOriginalManager,
+          captureConversation,
+          checkConversationCaller,
+          completeConversation,
           assertCanStop,
           sql,
           transportId: id,
@@ -8672,21 +9467,7 @@ const makeStore = Effect.fnUntraced(function* (
                 return yield* integrity();
             },
           ),
-          readClient: Effect.fn("WorkflowRunStore.readOriginalNativeClient")(function* () {
-            const completed = constructor?.pollUnsafe();
-            if (!completed || Exit.isFailure(completed)) return undefined;
-            const value = completed.value;
-            if (originalIo !== undefined && value === originalIo) return undefined;
-            if (
-              typeof value !== "object" ||
-              value === null ||
-              !("kind" in value) ||
-              value.kind !== "transport-created" ||
-              !("client" in value)
-            )
-              return yield* integrity();
-            return value.client as typeof CodexClient.CodexAppServerControlledClient.Service;
-          }),
+          readClient: readOriginalClient,
           readRetirement: Effect.fn("WorkflowRunStore.readOriginalNativeRetirement")(function* () {
             if (!closeDone || !Deferred.isDoneUnsafe(closeDone)) return yield* integrity();
             const disposition = yield* Deferred.await(closeDone);

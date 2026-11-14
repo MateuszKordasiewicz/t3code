@@ -267,6 +267,11 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
             const { config, env, executable, args } = profile;
             const checkProfile = Effect.fn("WorkflowNativeCodexTransport.checkExistingProfile")(
               function* () {
+                if (entry.construction) {
+                  const currentPolicy = yield* policy.resolve(entry.construction.input);
+                  if (stableStringify(currentPolicy) !== stableStringify(entry.construction.policy))
+                    return yield* failure("profile");
+                }
                 const fresh = yield* readProfile(ProjectId.make(job.input.projectId), instanceId);
                 if (fresh.instance !== profile.instance || fresh.key !== profile.key)
                   return yield* failure("profile");
@@ -322,6 +327,7 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
                 yield* checkProfile();
                 const io = yield* owner.open();
                 let bootstrapSelection: string | undefined;
+                let conversationSelection: string | undefined;
                 let bootstrapMethod: "initialize" | "initialized" | undefined;
                 let bootstrapAttempted = false;
                 let adapterAttempted = false;
@@ -342,19 +348,45 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
                   },
                   {
                     wrapper: (frame, submit) =>
-                      bootstrapSelection !== undefined &&
-                      frame.selection === bootstrapSelection &&
-                      frame.method === bootstrapMethod
-                        ? submit()
-                        : Effect.fail(
-                            new CodexErrors.CodexAppServerFrameSubmissionError({
-                              outcome: "not_submitted",
-                              reason: "wrapper",
-                            }),
-                          ),
-                    onOutcome: (outcome) => (observer ? observer(outcome) : Effect.void),
+                      frame.method === "thread/start" &&
+                      conversationSelection !== undefined &&
+                      frame.selection === conversationSelection
+                        ? Effect.gen(function* () {
+                            yield* checkProfile();
+                            yield* owner.reserveConversationFrame(frame);
+                            yield* checkProfile();
+                          }).pipe(
+                            Effect.mapError(
+                              () =>
+                                new CodexErrors.CodexAppServerFrameSubmissionError({
+                                  outcome: "not_submitted",
+                                  reason: "wrapper",
+                                }),
+                            ),
+                            Effect.andThen(submit),
+                          )
+                        : bootstrapSelection !== undefined &&
+                            frame.selection === bootstrapSelection &&
+                            frame.method === bootstrapMethod
+                          ? submit()
+                          : Effect.fail(
+                              new CodexErrors.CodexAppServerFrameSubmissionError({
+                                outcome: "not_submitted",
+                                reason: "wrapper",
+                              }),
+                            ),
+                    onOutcome: (outcome) =>
+                      (outcome.frame.method === "thread/start" &&
+                      conversationSelection !== undefined &&
+                      outcome.frame.selection === conversationSelection
+                        ? owner.observeConversationOutcome(outcome).pipe(Effect.orDie)
+                        : Effect.void
+                      ).pipe(Effect.andThen(() => (observer ? observer(outcome) : Effect.void))),
                   },
-                ).pipe(Effect.provideService(Scope.Scope, owner.scope));
+                ).pipe(
+                  Effect.withTracerEnabled(false),
+                  Effect.provideService(Scope.Scope, owner.scope),
+                );
                 const terminated = yield* client.awaitTermination.pipe(
                   Effect.exit,
                   Effect.forkIn(owner.scope),
@@ -370,6 +402,27 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
                         Effect.map(ChildProcessSpawner.ExitCode),
                         Effect.mapError(() => unavailable("exit")),
                       ),
+                    }),
+                  }),
+                );
+                const refusePublicOutput = () =>
+                  Effect.fail(
+                    new CodexErrors.CodexAppServerFrameSubmissionError({
+                      outcome: "not_submitted",
+                      reason: "wrapper",
+                    }),
+                  );
+                const exposed = Object.freeze(
+                  CodexClient.CodexAppServerControlledClient.of({
+                    ...retained,
+                    request: refusePublicOutput,
+                    notify: refusePublicOutput,
+                    raw: Object.freeze({
+                      ...retained.raw,
+                      request: refusePublicOutput,
+                      notify: refusePublicOutput,
+                      respond: refusePublicOutput,
+                      respondError: refusePublicOutput,
                     }),
                   }),
                 );
@@ -507,7 +560,48 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
                                 yield* owner.confirmAdapterConstruction();
                                 yield* checkProfile();
                                 observer = actual.onOutcome;
-                                return { client: retained, initializeResponse: response };
+                                return {
+                                  client: retained,
+                                  initializeResponse: response,
+                                  captureFreshConversationResponse:
+                                    owner.captureConversationResponse,
+                                  selectFreshConversation: Effect.fn(
+                                    "WorkflowNativeCodexTransport.selectFreshConversation",
+                                  )(
+                                    function* (
+                                      input: ProviderAdapter.ProviderAdapterV2EnsureThreadInput,
+                                      params: ReturnType<
+                                        typeof CodexAdapter.codexThreadRuntimeParams
+                                      >,
+                                    ) {
+                                      yield* checkProfile();
+                                      const selected = yield* Effect.uninterruptibleMask(
+                                        (restore) =>
+                                          restore(
+                                            owner.selectConversationFrame(input, params),
+                                          ).pipe(
+                                            Effect.tap((value) =>
+                                              Effect.sync(() => {
+                                                conversationSelection = value;
+                                              }),
+                                            ),
+                                          ),
+                                      );
+                                      yield* checkProfile();
+                                      return selected;
+                                    },
+                                    (work, input) =>
+                                      work.pipe(
+                                        Effect.mapError(
+                                          () =>
+                                            new ProviderAdapter.ProviderAdapterEnsureThreadError({
+                                              driver: ProviderDriverKind.make("codex"),
+                                              threadId: input.threadId,
+                                            }),
+                                        ),
+                                      ),
+                                  ),
+                                };
                               },
                               (work, actual) =>
                                 work.pipe(
@@ -619,7 +713,7 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
                   preparation: retiredPreparation,
                   transportId: owner.transportId,
                   bootstrap,
-                  client: retained,
+                  client: exposed,
                   createAdapterRuntime,
                   publishRuntime: Effect.fn("WorkflowNativeCodexTransport.publishRuntime")(
                     function* () {
@@ -634,6 +728,17 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
                         runtime,
                         runState: "preparing" as const,
                       });
+                    },
+                    Effect.mapError(() => failure("failed")),
+                    Effect.interruptible,
+                  ),
+                  openConversation: Effect.fn("WorkflowNativeCodexTransport.openConversation")(
+                    function* () {
+                      if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+                        return yield* failure("boundary");
+                      if (closed || serviceScope.state._tag === "Closed" || !entry.runtime)
+                        return yield* failure("closed");
+                      return yield* Manager.openNativeManagerConversation(manager, owner);
                     },
                     Effect.mapError(() => failure("failed")),
                     Effect.interruptible,

@@ -1,3 +1,9 @@
+import * as Tracer from "effect/Tracer";
+import * as Logger from "effect/Logger";
+import * as References from "effect/References";
+import * as CodexErrors from "effect-codex-app-server/errors";
+import { stableStringify } from "@t3tools/shared/relaySigning";
+import * as CodexClient from "effect-codex-app-server/client";
 import { vi } from "vite-plus/test";
 import * as FileSystem from "effect/FileSystem";
 import { ChildProcessSpawner } from "effect/process";
@@ -108,6 +114,10 @@ import {
   snapshotNativeInput,
 } from "./WorkflowNativeCommandSnapshot.ts";
 import {
+  snapshotConversationFrame,
+  encodeConversationOutcomeData,
+  encodeConversationResponseData,
+  encodeScopeSettlementData,
   snapshotSubmissionFrame,
   encodeSubmissionTransportData,
   encodeScopeBindingData,
@@ -3699,6 +3709,9 @@ const nativeWorkspaceProcesses = Effect.fn("test.nativeWorkspaceProcesses")(func
     payloads: string[];
     payloadWritten: Queue.Queue<string>;
     initializeReply: "valid" | "missing" | "invalid" | "already" | "wrong-id";
+    conversationReply: "valid" | "missing" | "error";
+    conversationErrorMessage?: string;
+    nativeConversationId: string;
   };
   const children = new Map<string, Child>();
   const bytes = (text: string) => new TextEncoder().encode(text);
@@ -3728,6 +3741,8 @@ const nativeWorkspaceProcesses = Effect.fn("test.nativeWorkspaceProcesses")(func
           payloads: [],
           payloadWritten: yield* Queue.unbounded<string>(),
           initializeReply: "valid",
+          conversationReply: "valid",
+          nativeConversationId: "original-native-conversation",
           nonce: input.args[3]!,
         };
         children.set(child.nonce, child);
@@ -3824,6 +3839,53 @@ const nativeWorkspaceProcesses = Effect.fn("test.nativeWorkspaceProcesses")(func
                                         platformFamily: "unix",
                                         platformOs: "linux",
                                       },
+                              };
+                        Queue.offerUnsafe(child.output, bytes(JSON.stringify(response) + "\n"));
+                      }
+                      if (
+                        message.method === "thread/start" &&
+                        child.conversationReply !== "missing"
+                      ) {
+                        const params = message.params as Record<string, unknown>;
+                        const response =
+                          child.conversationReply === "error"
+                            ? {
+                                id: message.id,
+                                error: {
+                                  code: -32603,
+                                  message:
+                                    child.conversationErrorMessage ?? "fixture conversation failed",
+                                },
+                              }
+                            : {
+                                id: message.id,
+                                result: {
+                                  model: params.model,
+                                  modelProvider: "openai",
+                                  cwd: params.cwd,
+                                  approvalPolicy: "on-request",
+                                  approvalsReviewer: "user",
+                                  sandbox: {
+                                    type: "workspaceWrite",
+                                    writableRoots: [],
+                                    networkAccess: false,
+                                  },
+                                  thread: {
+                                    id: child.nativeConversationId,
+                                    sessionId: child.nativeConversationId,
+                                    projectId: null,
+                                    preview: "",
+                                    ephemeral: false,
+                                    modelProvider: "openai",
+                                    createdAt: 1782622440,
+                                    updatedAt: 1782622440,
+                                    status: { type: "idle" },
+                                    cwd: params.cwd,
+                                    cliVersion: "fixture",
+                                    source: "vscode",
+                                    turns: [],
+                                  },
+                                },
                               };
                         Queue.offerUnsafe(child.output, bytes(JSON.stringify(response) + "\n"));
                       }
@@ -5507,7 +5569,7 @@ it.effect.each(["workflow", "planning"] as const)(
         assert.strictEqual(initialized.response.userAgent, "fixture-codex/1");
         assert.strictEqual(child.payloads.length, 2);
         const [initialize, notification] = child.payloads.map((text) => JSON.parse(text));
-        assert.strictEqual(initialize.id, 2);
+        assert.strictEqual(initialize.id, 1);
         assert.strictEqual(initialize.method, "initialize");
         assert.deepStrictEqual(initialize.params.capabilities, {
           experimentalApi: true,
@@ -8802,6 +8864,7 @@ const configuredNativeManager = Effect.fn("test.configuredNativeManager")(functi
   mcp: typeof McpProviderSessions.McpProviderSessions.Service,
   registry: McpRegistry.McpSessionRegistryShape,
   tracker?: typeof AgentScope.Service,
+  configureMcp = true,
 ) {
   const initial = Context.get(
     yield* Layer.build(Layer.fresh(Settings.layerTest())),
@@ -8837,8 +8900,10 @@ const configuredNativeManager = Effect.fn("test.configuredNativeManager")(functi
   const manager = Context.get(
     yield* Layer.build(
       Layer.fresh(
-        ProviderSessionManager.layer.pipe(Layer.provide(dependencies), (layer) =>
-          tracker ? layer.pipe(Layer.provide(Layer.succeed(AgentScope, tracker))) : layer,
+        ProviderSessionManager.layerWithOptions({ configureMcp }).pipe(
+          Layer.provide(dependencies),
+          (layer) =>
+            tracker ? layer.pipe(Layer.provide(Layer.succeed(AgentScope, tracker))) : layer,
         ),
       ),
     ),
@@ -8931,6 +8996,7 @@ const configuredNativeEntry = Effect.fn("test.configuredNativeEntry")(function* 
   kind: "workflow" | "planning" = "workflow",
   registryOptions: McpRegistry.McpSessionRegistryOptions = {},
   factoryScope?: Scope.Scope,
+  configureMcp = true,
 ) {
   const fixture = yield* controlledNativeFixture(kind, false, false, 2, false, {
     type: "worktree",
@@ -8942,7 +9008,13 @@ const configuredNativeEntry = Effect.fn("test.configuredNativeEntry")(function* 
     yield* Layer.build(Layer.fresh(McpProviderSessions.layer)),
     McpProviderSessions.McpProviderSessions,
   );
-  const { manager, state, settings } = yield* configuredNativeManager(fixture, mcp, registry);
+  const { manager, state, settings } = yield* configuredNativeManager(
+    fixture,
+    mcp,
+    registry,
+    undefined,
+    configureMcp,
+  );
   const selected = {
     ...fixture,
     runtime: Context.add(fixture.runtime, ProviderSessionManager.ProviderSessionManagerV2, manager),
@@ -9485,4 +9557,1200 @@ it.effect.each(
       assert.strictEqual(child.payloads.length, phase === "bootstrap" ? 0 : 2);
     }).pipe(Effect.provide(harness.services));
   }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "native original %s conversation uses the same published Adapter and retains its actual result",
+  (kind) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        const { fixture, service, mcp, manager, request } = yield* configuredNativeEntry(kind);
+        const transport = yield* service.createReservedTransport(producerSelection(fixture));
+        yield* transport.bootstrap();
+        yield* transport.createAdapterRuntime();
+        const published = yield* transport.publishRuntime();
+        const counts = yield* nativeCounts;
+        const open = transport.openConversation;
+        const result = yield* open();
+        assert.strictEqual(result.kind, "conversation-opened");
+        assert.strictEqual(result.runState, "preparing");
+        assert.deepStrictEqual(yield* nativeCounts, counts);
+        const receipts = yield* fixture.sql`SELECT * FROM orchestration_v2_native_conversations`;
+        assert.strictEqual(receipts.length, 1);
+        const receipt = receipts[0]!;
+        assert.strictEqual(receipt.local_outcome, "submitted");
+        assert.strictEqual(receipt.local_reason, "completed");
+        const response = JSON.parse(String(receipt.response_json)) as Record<string, unknown>;
+        assert.strictEqual(response.nativeThreadId, "original-native-conversation");
+        assert.notStrictEqual(response.returnedProviderThreadId, receipt.provider_thread_id);
+        const config = yield* mcp.read(request.threadId);
+        if (!config) throw new Error("original MCP credential missing after conversation");
+        assert.isFalse(JSON.stringify(receipts).includes(config.authorizationHeader));
+        assert.isFalse(
+          JSON.stringify(receipts).includes(config.authorizationHeader.slice("Bearer ".length)),
+        );
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        const child = harness.children.get(image.args[3]!)!;
+        assert.strictEqual(child.payloads.length, 3);
+        assert.strictEqual(
+          (JSON.parse(child.payloads[2]!) as Record<string, unknown>).method,
+          "thread/start",
+        );
+        assert.strictEqual(
+          harness.requests.filter((image) => image.args[4] === "/fixture-bin/codex").length,
+          1,
+        );
+        assert.isTrue(yield* manager.isLive(published.runtime.providerSessionId));
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(open())));
+        assert.strictEqual(child.payloads.length, 3);
+        assert.strictEqual((yield* transport.close()).kind, "retired");
+        assert.isFalse(child.running);
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect(
+  "native conversation retains the SDK outcome before evaluating its interrupted observer",
+  () =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const unwinding = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let observing: Fiber.Fiber<unknown, unknown> | undefined;
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        const { fixture, service } = yield* configuredNativeEntry();
+
+        const original = CodexClient.makeControlledProcessProtocolClient;
+        using _client = vi
+          .spyOn(CodexClient, "makeControlledProcessProtocolClient")
+          .mockImplementation(
+            <E>(
+              handle: Parameters<typeof CodexClient.makeControlledProcessProtocolClient>[0],
+              options: CodexClient.CodexAppServerControlledClientOptions<E>,
+            ) =>
+              original(handle, {
+                ...options,
+                onOutcome: (outcome) => {
+                  const work = options.onOutcome(outcome);
+                  if (outcome.frame.method !== "thread/start") return work;
+                  return Effect.gen(function* () {
+                    observing = yield* Effect.withFiber(Effect.succeed);
+                    return yield* Deferred.succeed(entered, undefined).pipe(
+                      Effect.andThen(Effect.never),
+                      Effect.ensuring(
+                        Deferred.succeed(unwinding, undefined).pipe(
+                          Effect.andThen(Deferred.await(release)),
+                        ),
+                      ),
+                      Effect.andThen(work),
+                    );
+                  }).pipe(Effect.interruptible);
+                },
+              }),
+          );
+
+        const transport = yield* service.createReservedTransport(producerSelection(fixture));
+
+        yield* transport.bootstrap();
+
+        yield* transport.createAdapterRuntime();
+        yield* transport.publishRuntime();
+
+        const opening = yield* transport.openConversation().pipe(Effect.exit, Effect.forkScoped);
+        yield* Effect.raceFirst(
+          Deferred.await(entered),
+          Fiber.join(opening).pipe(
+            Effect.andThen(Effect.die("original opening completed before outcome callback")),
+          ),
+        );
+
+        if (!observing) throw new Error("original outcome observer fiber missing");
+        const stopping = yield* Fiber.interrupt(observing).pipe(
+          Effect.forkScoped({ startImmediately: true }),
+        );
+        yield* Deferred.await(unwinding);
+
+        yield* Effect.sync(() => assert.isUndefined(stopping.pollUnsafe())).pipe(
+          Effect.ensuring(Deferred.succeed(release, undefined)),
+        );
+        yield* Fiber.join(stopping);
+
+        assert.isTrue(Exit.isFailure(yield* Fiber.join(opening)));
+
+        const rows = yield* fixture.sql`SELECT * FROM orchestration_v2_native_conversations`;
+        assert.strictEqual(rows.length, 1);
+        assert.strictEqual(rows[0]!.local_outcome, "submitted");
+        assert.strictEqual(rows[0]!.response_json, null);
+        const parents =
+          yield* fixture.sql`SELECT settlement_json FROM orchestration_v2_submission_transports`;
+        assert.notStrictEqual(parents[0]!.settlement_json, null);
+        assert.strictEqual((yield* transport.close()).kind, "held");
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        assert.isFalse(harness.children.get(image.args[3]!)!.running);
+      }).pipe(
+        Effect.provide(harness.services),
+        Effect.ensuring(Deferred.succeed(release, undefined)),
+      );
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect(
+  "native conversation atomically retains one Manager invocation after concurrent guards",
+  () =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        const { fixture, service, manager } = yield* configuredNativeEntry();
+        const transport = yield* service.createReservedTransport(producerSelection(fixture));
+        yield* transport.bootstrap();
+        yield* transport.createAdapterRuntime();
+        const published = yield* transport.publishRuntime();
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const original = PreparationOwner.assertNativeCanStop;
+        let calls = 0;
+        using _guard = vi
+          .spyOn(PreparationOwner, "assertNativeCanStop")
+          .mockImplementation((owner) =>
+            Effect.gen(function* () {
+              if (++calls <= 2) {
+                if (calls === 2) yield* Deferred.succeed(entered, undefined);
+                yield* Deferred.await(release);
+              }
+              return yield* original(owner);
+            }),
+          );
+        const first = yield* transport.openConversation().pipe(Effect.exit, Effect.forkScoped);
+        const second = yield* transport.openConversation().pipe(Effect.exit, Effect.forkScoped);
+        yield* Deferred.await(entered);
+        yield* Deferred.succeed(release, undefined);
+        const outcomes = yield* Effect.all([Fiber.join(first), Fiber.join(second)]);
+        assert.strictEqual(outcomes.filter(Exit.isSuccess).length, 1);
+        assert.strictEqual(outcomes.filter(Exit.isFailure).length, 1);
+        assert.isTrue(yield* manager.isLive(published.runtime.providerSessionId));
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        assert.strictEqual(harness.children.get(image.args[3]!)!.payloads.length, 3);
+        assert.strictEqual((yield* transport.close()).kind, "retired");
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect("native conversation refuses provider-row reuse across completed historical runs", () =>
+  Effect.gen(function* () {
+    const harness = yield* nativeWorkspaceProcesses();
+    yield* Effect.gen(function* () {
+      const { fixture, service } = yield* configuredNativeEntry();
+      const transport = yield* service.createReservedTransport(producerSelection(fixture));
+      yield* transport.bootstrap();
+      yield* transport.createAdapterRuntime();
+      yield* transport.publishRuntime();
+      const original =
+        (yield* fixture.sql`SELECT * FROM orchestration_v2_submission_transports`)[0]!;
+      const current = transport.preparation.job.input.request.current as Record<string, string>;
+      const context = JSON.parse(String(original.creation_context_json)) as Record<string, unknown>;
+      const transportId = "99999999-9999-4999-8999-999999999999";
+      const at = String(original.created_at);
+      const parent = encodeSubmissionTransportData({
+        context,
+        transportId,
+        proposedUnit: `t3code-codex-${transportId}.scope`,
+        creationInputHash: hash,
+        createdAt: at,
+      });
+      const binding = {
+        unit: parent.proposed_unit,
+        invocationId: "b".repeat(32),
+        controlGroup: `/fixture/${parent.scope_namespace}/${parent.proposed_unit}`,
+        pid: 999,
+        pidStartTicks: "9999",
+      };
+      yield* fixture.sql`INSERT INTO orchestration_v2_submission_transports ${fixture.sql.insert(parent)}`;
+      const bound = encodeScopeBindingData(binding, parent);
+      yield* fixture.sql`UPDATE orchestration_v2_submission_transports SET binding_json=${bound.json},binding_hash=${bound.hash},bound_at=${at} WHERE transport_id=${transportId}`;
+      const selected = {
+        v: 1,
+        kind: "fresh-conversation",
+        transportId,
+        environmentId: parent.environment_id,
+        projectId: parent.project_id,
+        threadId: parent.opening_thread_id,
+        runId: "historical-run",
+        runOrdinal: 1,
+        attemptId: "historical-attempt",
+        rootNodeId: "historical-root",
+        intentId: "historical-intent",
+        driver: "codex",
+        providerInstanceId: parent.provider_instance_id,
+        providerSessionId: parent.provider_session_id,
+        providerThreadId: current.providerThreadId,
+        invocation: 1,
+        expectedClaim: context.expectedClaim,
+      };
+      const params = {
+        config: {
+          "tools.update_plan.enabled": true,
+          mcp_optional_startup_grace_ms: 10000,
+          "features.concurrent_reasoning_summaries": true,
+          "shell_environment_policy.set.T3CODE_THREAD_ID": selected.threadId,
+        },
+      };
+      const encoded = JSON.stringify({ id: 3, method: "thread/start", params }) + "\n";
+      const row = snapshotConversationFrame(
+        {
+          transportId,
+          environmentId: selected.environmentId,
+          projectId: selected.projectId,
+          driver: "codex",
+          providerInstanceId: selected.providerInstanceId,
+          providerSessionId: selected.providerSessionId,
+          expectedSelection: selected,
+        },
+        {
+          encoded,
+          byteLength: new TextEncoder().encode(encoded).byteLength,
+          method: "thread/start",
+          requestId: 3,
+          selection: stableStringify(selected),
+        },
+        params,
+        { mode: "disabled" },
+        at,
+      );
+      yield* fixture.sql`INSERT INTO orchestration_v2_native_conversations ${fixture.sql.insert(row)}`;
+      const outcome = encodeConversationOutcomeData(
+        row,
+        { kind: "submitted", reason: "completed" },
+        at,
+      );
+      yield* fixture.sql`UPDATE orchestration_v2_native_conversations SET local_outcome=${outcome.local_outcome},local_reason=${outcome.local_reason},local_observed_at=${outcome.local_observed_at} WHERE transport_id=${transportId}`;
+      const response = encodeConversationResponseData(
+        outcome,
+        {
+          v: 1,
+          nativeThreadId: "historical-native",
+          returnedProviderThreadId: "historical-derived",
+          driver: "codex",
+          providerInstanceId: selected.providerInstanceId,
+          providerSessionId: selected.providerSessionId,
+          threadId: selected.threadId,
+        },
+        at,
+        { mode: "disabled" },
+      );
+      yield* fixture.sql`UPDATE orchestration_v2_native_conversations SET response_json=${response.response_json},response_hash=${response.response_hash},response_observed_at=${response.response_observed_at} WHERE transport_id=${transportId}`;
+      const settlement = encodeScopeSettlementData({ binding, observation: "empty" }, binding);
+      yield* fixture.sql`UPDATE orchestration_v2_submission_transports SET settlement_json=${settlement.json},settlement_hash=${settlement.hash},settled_at=${at} WHERE transport_id=${transportId}`;
+      const before = yield* fixture.sql`SELECT * FROM orchestration_v2_native_conversations`;
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(transport.openConversation())));
+      const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+      assert.strictEqual(harness.children.get(image.args[3]!)!.payloads.length, 2);
+      assert.deepStrictEqual(
+        yield* fixture.sql`SELECT * FROM orchestration_v2_native_conversations`,
+        before,
+      );
+      yield* transport.close();
+    }).pipe(Effect.provide(harness.services));
+  }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect("native conversation observes changed policy inside the delivery writer", () =>
+  Effect.gen(function* () {
+    const harness = yield* nativeWorkspaceProcesses();
+    yield* Effect.gen(function* () {
+      const { fixture, service, state } = yield* configuredNativeEntry();
+      const transport = yield* service.createReservedTransport(producerSelection(fixture));
+      yield* transport.bootstrap();
+      yield* transport.createAdapterRuntime();
+      yield* transport.publishRuntime();
+      const original = fixture.sql.withTransaction;
+      let armed = false;
+      let changed = false;
+      using _writer = vi
+        .spyOn(fixture.sql, "withTransaction")
+        .mockImplementation(<A, E, R>(work: Effect.Effect<A, E, R>) =>
+          original(
+            Effect.suspend(() => {
+              if (armed) {
+                armed = false;
+                changed = true;
+                state.settings = { ...state.settings, enableAgentBrowserAccess: false };
+              }
+              return work;
+            }),
+          ).pipe(
+            Effect.tap((value) =>
+              Effect.sync(() => {
+                if (
+                  value &&
+                  typeof value === "object" &&
+                  "method" in value &&
+                  value.method === "thread/start" &&
+                  "local_outcome" in value &&
+                  value.local_outcome === null
+                )
+                  armed = true;
+              }),
+            ),
+          ),
+        );
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(transport.openConversation())));
+      assert.isTrue(changed);
+      const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+      assert.strictEqual(harness.children.get(image.args[3]!)!.payloads.length, 2);
+      const rows = yield* fixture.sql`SELECT * FROM orchestration_v2_native_conversations`;
+      assert.strictEqual(rows.length, 1);
+      assert.strictEqual(rows[0]!.local_outcome, "unknown");
+      assert.strictEqual(rows[0]!.response_json, null);
+      yield* transport.close();
+      assert.isFalse(harness.children.get(image.args[3]!)!.running);
+    }).pipe(Effect.provide(harness.services));
+  }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect("native conversation keeps public client output from consuming the Adapter slot", () =>
+  Effect.gen(function* () {
+    const harness = yield* nativeWorkspaceProcesses();
+    yield* Effect.gen(function* () {
+      const { fixture, service } = yield* configuredNativeEntry();
+      const transport = yield* service.createReservedTransport(producerSelection(fixture));
+      yield* transport.bootstrap();
+      yield* transport.createAdapterRuntime();
+      yield* transport.publishRuntime();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let checks = 0;
+      service.facts.afterPolicy = Effect.gen(function* () {
+        if (++checks === 3) {
+          yield* Deferred.succeed(entered, undefined);
+          yield* Deferred.await(release);
+        }
+      });
+      const opening = yield* transport.openConversation().pipe(Effect.exit, Effect.forkScoped);
+      yield* Effect.raceFirst(
+        Deferred.await(entered),
+        Fiber.join(opening).pipe(
+          Effect.andThen(Effect.die("original Adapter did not reach selected policy gate")),
+        ),
+      );
+      const scope = yield* fixture.sql.withTransaction(
+        fixture.store.verifyClaimedNativeOperationInTransaction(transport.executionClaim),
+      );
+      if (scope.kind !== "current") throw new Error("selected current scope missing");
+      const parent = (yield* fixture.sql`SELECT * FROM orchestration_v2_submission_transports`)[0]!;
+      const runRow =
+        (yield* fixture.sql`SELECT payload_json FROM orchestration_v2_projection_runs WHERE run_id=${scope.runId}`)[0]!;
+      const run = JSON.parse(String(runRow.payload_json)) as Record<string, unknown>;
+      const current = transport.preparation.job.input.request.current as Record<string, string>;
+      const selection = stableStringify({
+        v: 1,
+        kind: "fresh-conversation",
+        transportId: transport.transportId,
+        environmentId: parent.environment_id,
+        projectId: parent.project_id,
+        threadId: parent.opening_thread_id,
+        runId: scope.runId,
+        runOrdinal: run.ordinal,
+        attemptId: scope.attemptId,
+        rootNodeId: scope.rootNodeId,
+        intentId: scope.intentId,
+        driver: "codex",
+        providerInstanceId: current.providerInstanceId,
+        providerSessionId: current.providerSessionId,
+        providerThreadId: current.providerThreadId,
+        invocation: 1,
+        expectedClaim: transport.executionClaim,
+      });
+      for (const work of [
+        transport.client.raw.notify("thread/start", {}, selection),
+        transport.client.raw.request("thread/start", {}, selection),
+        transport.client.request("thread/start", {}, selection),
+        transport.client.notify("initialized", undefined, selection),
+        transport.client.raw.respond(3, {}, selection),
+        transport.client.raw.respondError(
+          3,
+          new CodexErrors.CodexAppServerRequestError({ code: -32000, errorMessage: "fixture" }),
+          selection,
+        ),
+      ])
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(work)));
+      yield* Deferred.succeed(release, undefined);
+      assert.isTrue(Exit.isSuccess(yield* Fiber.join(opening)));
+      const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+      assert.strictEqual(harness.children.get(image.args[3]!)!.payloads.length, 3);
+      assert.strictEqual((yield* transport.close()).kind, "retired");
+    }).pipe(Effect.provide(harness.services));
+  }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(
+  (["wrapper", "outcome"] as const).flatMap((stage) =>
+    ([false, true] as const).flatMap((masked) =>
+      (["caller", "factory", "store", "manager"] as const).map((boundary) => ({
+        stage,
+        masked,
+        boundary,
+      })),
+    ),
+  ),
+)(
+  "native conversation joins $stage cancellation through $boundary with mask=$masked",
+  ({ stage, masked, boundary }) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      const storeScope = yield* Scope.make();
+      const factoryScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(storeScope, Exit.void));
+      yield* Effect.addFinalizer(() => Scope.close(factoryScope, Exit.void));
+      yield* Effect.gen(function* () {
+        const { fixture, service, manager } = yield* configuredNativeEntry(
+          "workflow",
+          {},
+          factoryScope,
+        ).pipe(Effect.provideService(Scope.Scope, storeScope));
+        const entered = yield* Deferred.make<void>();
+        const unwinding = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const blocked = Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Effect.never),
+          Effect.ensuring(
+            Deferred.succeed(unwinding, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          ),
+          Effect.interruptible,
+        );
+        const original = CodexClient.makeControlledProcessProtocolClient;
+        const clientSpy = vi
+          .spyOn(CodexClient, "makeControlledProcessProtocolClient")
+          .mockImplementation(
+            <E>(
+              handle: Parameters<typeof CodexClient.makeControlledProcessProtocolClient>[0],
+              options: CodexClient.CodexAppServerControlledClientOptions<E>,
+            ) =>
+              original(handle, {
+                ...options,
+                wrapper: (frame, submit) =>
+                  stage === "wrapper" && frame.method === "thread/start"
+                    ? blocked.pipe(Effect.andThen(options.wrapper(frame, submit)))
+                    : options.wrapper(frame, submit),
+                onOutcome: (outcome) => {
+                  const work = options.onOutcome(outcome);
+                  return stage === "outcome" && outcome.frame.method === "thread/start"
+                    ? blocked.pipe(Effect.andThen(work))
+                    : work;
+                },
+              }),
+          );
+        yield* Effect.addFinalizer(() => Effect.sync(() => clientSpy.mockRestore()));
+        const transport = yield* service.createReservedTransport(producerSelection(fixture));
+        yield* transport.bootstrap();
+        yield* transport.createAdapterRuntime();
+        const published = yield* transport.publishRuntime();
+        const opening = yield* transport
+          .openConversation()
+          .pipe(
+            (work) => (masked ? Effect.uninterruptible(work) : work),
+            Effect.exit,
+            Effect.forkScoped,
+          );
+        yield* Effect.raceFirst(
+          Deferred.await(entered),
+          Fiber.join(opening).pipe(
+            Effect.andThen(Effect.die("original conversation did not reach cancellation gate")),
+          ),
+        );
+        const stopping = yield* (
+          boundary === "caller"
+            ? Fiber.interrupt(opening)
+            : boundary === "factory"
+              ? Scope.close(factoryScope, Exit.void)
+              : boundary === "store"
+                ? Scope.close(storeScope, Exit.void)
+                : manager.shutdown
+        ).pipe(Effect.forkScoped({ startImmediately: true }));
+        yield* Deferred.await(unwinding);
+        yield* Effect.sync(() => assert.isUndefined(stopping.pollUnsafe())).pipe(
+          Effect.ensuring(Deferred.succeed(release, undefined)),
+        );
+        yield* Fiber.join(stopping);
+        const opened = yield* Fiber.await(opening);
+        assert.isTrue(Exit.isFailure(opened) || Exit.isFailure(opened.value));
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        const child = harness.children.get(image.args[3]!)!;
+        assert.strictEqual(child.payloads.length, stage === "wrapper" ? 2 : 3);
+        assert.isFalse(child.running);
+        const rows = yield* fixture.sql`SELECT * FROM orchestration_v2_native_conversations`;
+        assert.strictEqual(rows.length, 1);
+        assert.strictEqual(
+          rows[0]!.local_outcome,
+          stage === "wrapper" ? "not_submitted" : "submitted",
+        );
+        assert.strictEqual(rows[0]!.response_json, null);
+        const parents =
+          yield* fixture.sql`SELECT settlement_json FROM orchestration_v2_submission_transports`;
+        assert.notStrictEqual(parents[0]!.settlement_json, null);
+        assert.isFalse(yield* manager.isLive(published.runtime.providerSessionId));
+        assert.strictEqual(
+          (yield* transport.close()).kind,
+          stage === "wrapper" ? "retired" : "held",
+        );
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(["disabled", "borrowed"] as const)(
+  "native conversation handles %s MCP without taking borrowed authority",
+  (mode) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        const { fixture, service, registry, mcp, request } = yield* configuredNativeEntry(
+          "workflow",
+          {},
+          undefined,
+          mode !== "disabled",
+        );
+        if (mode === "borrowed") yield* mcp.set((yield* registry.issue(request)).config);
+        const transport = yield* service.createReservedTransport(producerSelection(fixture));
+        yield* transport.bootstrap();
+        yield* transport.createAdapterRuntime();
+        yield* transport.publishRuntime();
+        const result = yield* Effect.exit(transport.openConversation());
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        const child = harness.children.get(image.args[3]!)!;
+        const rows = yield* fixture.sql`SELECT * FROM orchestration_v2_native_conversations`;
+        if (mode === "disabled") {
+          assert.isTrue(Exit.isSuccess(result));
+          assert.strictEqual(child.payloads.length, 3);
+          assert.strictEqual(rows.length, 1);
+          const input = JSON.parse(String(rows[0]!.input_json)) as { mcp: { mode: string } };
+          assert.strictEqual(input.mcp.mode, "disabled");
+          assert.isUndefined(yield* mcp.read(request.threadId));
+        } else {
+          assert.isTrue(Exit.isFailure(result));
+          assert.strictEqual(child.payloads.length, 2);
+          assert.deepStrictEqual(rows, []);
+        }
+        assert.strictEqual((yield* transport.close()).kind, "retired");
+        assert.isFalse(child.running);
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(["reservation", "delivery", "outcome", "response", "acceptance"] as const)(
+  "native conversation retains original evidence after %s writer return loss",
+  (phase) =>
+    Effect.gen(function* () {
+      let delivered = false;
+      const harness = yield* nativeWorkspaceProcesses(
+        Effect.void,
+        Effect.void,
+        () => {},
+        (_image, text) => {
+          if ((JSON.parse(text) as Record<string, unknown>).method === "thread/start")
+            delivered = true;
+        },
+      );
+      yield* Effect.gen(function* () {
+        const { fixture, service } = yield* configuredNativeEntry();
+        const transport = yield* service.createReservedTransport(producerSelection(fixture));
+        yield* transport.bootstrap();
+        yield* transport.createAdapterRuntime();
+        yield* transport.publishRuntime();
+        const counts = yield* nativeCounts;
+        const original = fixture.sql.withTransaction;
+        let lost = false;
+        let responseReturns = 0;
+        const writerSpy = vi
+          .spyOn(fixture.sql, "withTransaction")
+          .mockImplementation(<A, E, R>(work: Effect.Effect<A, E, R>) =>
+            original(work).pipe(
+              Effect.flatMap((value) => {
+                const row =
+                  value !== null &&
+                  typeof value === "object" &&
+                  "method" in value &&
+                  value.method === "thread/start" &&
+                  "local_outcome" in value &&
+                  "response_json" in value
+                    ? value
+                    : undefined;
+                if (row?.response_json !== null && row?.response_json !== undefined)
+                  responseReturns++;
+                const selected =
+                  phase === "reservation"
+                    ? row?.local_outcome === null
+                    : phase === "delivery"
+                      ? delivered
+                      : phase === "outcome"
+                        ? row?.local_outcome === "submitted" && row.response_json === null
+                        : phase === "response"
+                          ? responseReturns === 1
+                          : responseReturns === 2;
+                if (lost || !selected) return Effect.succeed(value);
+                lost = true;
+                return Effect.fail(PreparationOwner.error("creation", "invalid"));
+              }),
+            ),
+          );
+        yield* Effect.addFinalizer(() => Effect.sync(() => writerSpy.mockRestore()));
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(transport.openConversation())));
+        assert.isTrue(lost);
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(transport.openConversation())));
+        const rows = yield* fixture.sql`SELECT * FROM orchestration_v2_native_conversations`;
+        assert.strictEqual(rows.length, 1);
+        assert.strictEqual(
+          rows[0]!.local_outcome,
+          phase === "reservation"
+            ? "not_submitted"
+            : phase === "delivery"
+              ? "unknown"
+              : "submitted",
+        );
+        assert.strictEqual(
+          rows[0]!.response_json === null,
+          phase !== "response" && phase !== "acceptance",
+        );
+        const parents =
+          yield* fixture.sql`SELECT settlement_json FROM orchestration_v2_submission_transports`;
+        assert.notStrictEqual(parents[0]!.settlement_json, null);
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        const child = harness.children.get(image.args[3]!)!;
+        assert.strictEqual(child.payloads.length, phase === "reservation" ? 2 : 3);
+        assert.isFalse(child.running);
+        const after = yield* nativeCounts;
+        const { events: _beforeEvents, ...beforeCounts } = counts[0]!;
+        const { events: _afterEvents, ...afterCounts } = after[0]!;
+        assert.deepStrictEqual(afterCounts, beforeCounts);
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT status FROM orchestration_v2_projection_runs`,
+          [{ status: "preparing" }],
+        );
+        assert.strictEqual(
+          (yield* transport.close()).kind,
+          phase === "reservation" ? "retired" : "held",
+        );
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect(
+  "native conversation cannot accept a sibling supplied response through retained Source services",
+  () =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        const { fixture, service } = yield* configuredNativeEntry();
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined));
+        const original = CodexClient.makeControlledProcessProtocolClient;
+        const clientSpy = vi
+          .spyOn(CodexClient, "makeControlledProcessProtocolClient")
+          .mockImplementation(
+            <E>(
+              handle: Parameters<typeof CodexClient.makeControlledProcessProtocolClient>[0],
+              options: CodexClient.CodexAppServerControlledClientOptions<E>,
+            ) =>
+              original(handle, {
+                ...options,
+                onOutcome: (outcome) =>
+                  options
+                    .onOutcome(outcome)
+                    .pipe(
+                      Effect.andThen(
+                        outcome.frame.method === "thread/start"
+                          ? Deferred.succeed(entered, undefined).pipe(
+                              Effect.andThen(Deferred.await(release)),
+                            )
+                          : Effect.void,
+                      ),
+                    ),
+              }),
+          );
+        yield* Effect.addFinalizer(() => Effect.sync(() => clientSpy.mockRestore()));
+        const transport = yield* service.createReservedTransport(producerSelection(fixture));
+        yield* transport.bootstrap();
+        yield* transport.createAdapterRuntime();
+        yield* transport.publishRuntime();
+        const opening = yield* transport.openConversation().pipe(Effect.exit, Effect.forkScoped);
+        yield* Effect.raceFirst(
+          Deferred.await(entered),
+          Fiber.join(opening).pipe(Effect.andThen(Effect.die("actual SDK outcome gate missing"))),
+        );
+        const workspaceOwner = yield* Store.readNativeManagerWorkspaceOwner(
+          fixture.store,
+          transport.preparation.job,
+          fixture.sql,
+        );
+        const preparation = yield* Store.readNativeManagerPreparationOwner(
+          fixture.store,
+          workspaceOwner,
+          fixture.sql,
+        );
+        const source = yield* preparation.readNative();
+        if (!source) throw new Error("retained Source missing");
+        const capture: unknown = Reflect.get(source, "captureConversationResponse");
+        const current = source.current;
+        yield* Effect.exit(
+          Effect.try({
+            try: () => {
+              if (typeof capture === "function")
+                capture({
+                  driver: "codex",
+                  providerInstanceId: current.providerInstanceId,
+                  providerSessionId: current.providerSessionId,
+                  appThreadId: source.threadId,
+                  id: "sibling-forged-derived",
+                  nativeThreadRef: {
+                    driver: "codex",
+                    strength: "strong",
+                    nativeId: "sibling-forged-native",
+                  },
+                });
+            },
+            catch: () => PreparationOwner.error("creation", "invalid"),
+          }),
+        );
+        const client = yield* source.readClient();
+        if (!client) throw new Error("retained lifecycle client missing");
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(client.raw.request("thread/start", {}))));
+        yield* Deferred.succeed(release, undefined);
+        assert.isTrue(Exit.isSuccess(yield* Fiber.join(opening)));
+        const rows = yield* fixture.sql`SELECT * FROM orchestration_v2_native_conversations`;
+        const response = JSON.parse(String(rows[0]!.response_json)) as Record<string, unknown>;
+        assert.strictEqual(response.nativeThreadId, "original-native-conversation");
+        assert.isFalse(JSON.stringify(rows).includes("sibling-forged"));
+        assert.strictEqual((yield* transport.close()).kind, "retired");
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(["map", "settings", "provider"] as const)(
+  "native conversation rechecks %s after final policy observation",
+  (drift) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        const { fixture, service, registry, mcp, request, state } = yield* configuredNativeEntry();
+        const replacement = yield* registry.issue(request);
+        const transport = yield* service.createReservedTransport(producerSelection(fixture));
+        yield* transport.bootstrap();
+        yield* transport.createAdapterRuntime();
+        yield* transport.publishRuntime();
+        let checks = 0;
+        service.facts.afterPolicy = Effect.gen(function* () {
+          if (++checks !== 6) return;
+          if (drift === "map") yield* mcp.set(replacement.config);
+          else if (drift === "settings")
+            state.settings = { ...state.settings, enableAgentBrowserAccess: false };
+          else {
+            if (!service.facts.instance) throw new Error("original provider missing");
+            service.facts.instance = { ...service.facts.instance };
+          }
+        });
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(transport.openConversation())));
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        assert.strictEqual(harness.children.get(image.args[3]!)!.payloads.length, 2);
+        if (drift === "map")
+          assert.strictEqual(yield* mcp.read(request.threadId), replacement.config);
+        assert.isDefined(
+          yield* registry.resolve(replacement.config.authorizationHeader.slice("Bearer ".length)),
+        );
+        yield* transport.close();
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect("native conversation capture cannot be preempted through the original Source view", () =>
+  Effect.gen(function* () {
+    const harness = yield* nativeWorkspaceProcesses();
+    yield* Effect.gen(function* () {
+      const { fixture, service, state } = yield* configuredNativeEntry();
+      const transport = yield* service.createReservedTransport(producerSelection(fixture));
+      yield* transport.bootstrap();
+      yield* transport.createAdapterRuntime();
+      yield* transport.publishRuntime();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined));
+      let checks = 0;
+      service.facts.afterPolicy = Effect.gen(function* () {
+        if (++checks === 1) {
+          yield* Deferred.succeed(entered, undefined);
+          yield* Deferred.await(release);
+        }
+      });
+      const opening = yield* transport.openConversation().pipe(Effect.exit, Effect.forkScoped);
+      yield* Effect.raceFirst(
+        Deferred.await(entered),
+        Fiber.join(opening).pipe(
+          Effect.andThen(Effect.die("original Manager profile gate missing")),
+        ),
+      );
+      const workspaceOwner = yield* Store.readNativeManagerWorkspaceOwner(
+        fixture.store,
+        transport.preparation.job,
+        fixture.sql,
+      );
+      const preparation = yield* Store.readNativeManagerPreparationOwner(
+        fixture.store,
+        workspaceOwner,
+        fixture.sql,
+      );
+      const source = yield* preparation.readNative();
+      if (!source) throw new Error("retained Source missing");
+      const attacking = yield* source
+        .captureConversation("issued", state.settings.linkedEnvironmentsEnabled)
+        .pipe(Effect.exit, Effect.forkScoped);
+      const attempted = yield* Fiber.join(attacking);
+      yield* Effect.sync(() => assert.isTrue(Exit.isFailure(attempted))).pipe(
+        Effect.ensuring(Deferred.succeed(release, undefined)),
+      );
+      assert.isTrue(Exit.isSuccess(yield* Fiber.join(opening)));
+      const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+      assert.strictEqual(harness.children.get(image.args[3]!)!.payloads.length, 3);
+      assert.strictEqual((yield* transport.close()).kind, "retired");
+    }).pipe(Effect.provide(harness.services));
+  }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect("native conversation checks expiry after awaited final profile work", () =>
+  Effect.gen(function* () {
+    const harness = yield* nativeWorkspaceProcesses();
+    yield* Effect.gen(function* () {
+      const { fixture, service } = yield* configuredNativeEntry();
+      const transport = yield* service.createReservedTransport(producerSelection(fixture));
+      yield* transport.bootstrap();
+      yield* transport.createAdapterRuntime();
+      yield* transport.publishRuntime();
+      const now = yield* DateTime.now;
+      const expires = DateTime.formatIso(DateTime.makeUnsafe(now.epochMilliseconds + 100));
+      yield* fixture.sql`UPDATE auth_sessions SET expires_at=${expires} WHERE session_id=${fixture.reference.sessionId}`;
+      let checks = 0;
+      service.facts.afterPolicy = Effect.gen(function* () {
+        if (++checks === 6) yield* TestClock.adjust("200 millis");
+      });
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(transport.openConversation())));
+      const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+      assert.strictEqual(harness.children.get(image.args[3]!)!.payloads.length, 2);
+      yield* transport.close();
+      assert.isFalse(harness.children.get(image.args[3]!)!.running);
+    }).pipe(Effect.provide(harness.services));
+  }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(
+  (["workflow", "planning"] as const).flatMap((kind) =>
+    (["revoke", "delivery"] as const).map((first) => ({ kind, first })),
+  ),
+)("native conversation serializes $kind grant writers with $first first", ({ kind, first }) =>
+  Effect.gen(function* () {
+    const directory = yield* Effect.acquireRelease(
+      Effect.sync(() =>
+        NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "native-conversation-grant-")),
+      ),
+      (value) => Effect.sync(() => NodeFS.rmSync(value, { recursive: true, force: true })),
+    );
+    const filename = NodePath.join(directory, "state.sqlite");
+    yield* Effect.gen(function* () {
+      using competing = new NodeSqlite.DatabaseSync(filename);
+      let probes = 0;
+      const harness = yield* nativeWorkspaceProcesses(
+        Effect.void,
+        Effect.void,
+        () => {},
+        (_image, text) => {
+          if ((JSON.parse(text) as Record<string, unknown>).method !== "thread/start") return;
+          probes++;
+          assert.throws(() => competing.exec("BEGIN IMMEDIATE"), /locked/);
+        },
+      );
+      yield* Effect.gen(function* () {
+        const { fixture, service } = yield* configuredNativeEntry(kind);
+        yield* fixture.sql`PRAGMA journal_mode=WAL`;
+        const sqlB = Context.get(
+          yield* Layer.build(Layer.fresh(NodeSqliteClient.layer({ filename }))),
+          SqlClient.SqlClient,
+        );
+        const sessionsB = yield* AuthSessions.make.pipe(
+          Effect.provideService(SqlClient.SqlClient, sqlB),
+        );
+        const revoke = sessionsB.revoke({
+          sessionId: fixture.reference.sessionId,
+          revokedAt: yield* DateTime.now,
+        });
+        const transport = yield* service.createReservedTransport(producerSelection(fixture));
+        yield* transport.bootstrap();
+        yield* transport.createAdapterRuntime();
+        yield* transport.publishRuntime();
+        const original = fixture.sql.withTransaction;
+        let revoked = false;
+        const writerSpy = vi
+          .spyOn(fixture.sql, "withTransaction")
+          .mockImplementation(<A, E, R>(work: Effect.Effect<A, E, R>) =>
+            original(work).pipe(
+              Effect.tap((value) =>
+                Effect.gen(function* () {
+                  if (
+                    first !== "revoke" ||
+                    revoked ||
+                    !value ||
+                    typeof value !== "object" ||
+                    !("method" in value) ||
+                    value.method !== "thread/start" ||
+                    !("local_outcome" in value) ||
+                    value.local_outcome !== null
+                  )
+                    return;
+                  revoked = true;
+                  assert.isTrue(yield* revoke);
+                }),
+              ),
+            ),
+          );
+        yield* Effect.addFinalizer(() => Effect.sync(() => writerSpy.mockRestore()));
+        const result = yield* Effect.exit(transport.openConversation());
+        assert.strictEqual(Exit.isSuccess(result), first === "delivery");
+        if (first === "delivery") assert.isTrue(yield* revoke);
+        else assert.isTrue(revoked);
+        assert.strictEqual(probes, first === "delivery" ? 1 : 0);
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        const child = harness.children.get(image.args[3]!)!;
+        assert.strictEqual(child.payloads.length, first === "delivery" ? 3 : 2);
+        assert.strictEqual(
+          (yield* transport.close()).kind,
+          first === "delivery" ? "retired" : "held",
+        );
+        assert.isFalse(child.running);
+        const parents =
+          yield* sqlB`SELECT settlement_json FROM orchestration_v2_submission_transports`;
+        assert.notStrictEqual(parents[0]!.settlement_json, null);
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(filename), Digest.layerWebCrypto)));
+  }),
+);
+
+it.effect.each(["provider-error", "native-id"] as const)(
+  "native conversation keeps original credentials out of %s traces and durable evidence",
+  (surface) => {
+    const traces: string[] = [];
+    const logs: string[] = [];
+    const tracer = Tracer.make({
+      span(options) {
+        const span = new Tracer.NativeSpan(options);
+        const end = span.end.bind(span);
+        span.end = (time, exit) => {
+          end(time, exit);
+          traces.push(JSON.stringify([...span.attributes]));
+          if (Exit.isFailure(exit)) traces.push(Cause.pretty(exit.cause));
+        };
+        return span;
+      },
+    });
+    const logger = Logger.make<unknown, void>((options) => {
+      logs.push(JSON.stringify(options.message));
+      logs.push(JSON.stringify(options.fiber.getRef(References.CurrentLogAnnotations)));
+    });
+    return Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        const { fixture, service, mcp, request } = yield* configuredNativeEntry();
+        const transport = yield* service.createReservedTransport(producerSelection(fixture));
+        yield* transport.bootstrap();
+        yield* transport.createAdapterRuntime();
+        yield* transport.publishRuntime();
+        const config = yield* mcp.read(request.threadId);
+        if (!config) throw new Error("original MCP config missing");
+        const header = config.authorizationHeader;
+        const token = header.slice("Bearer ".length);
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        const child = harness.children.get(image.args[3]!)!;
+        if (surface === "provider-error") {
+          child.conversationReply = "error";
+          child.conversationErrorMessage = `provider echoed ${header}`;
+        } else child.nativeConversationId = token;
+        const result = yield* Effect.exit(transport.openConversation());
+        assert.isTrue(Exit.isFailure(result));
+        yield* transport.close();
+        const rows = yield* fixture.sql`SELECT * FROM orchestration_v2_native_conversations`;
+        assert.strictEqual(rows.length, 1);
+        assert.strictEqual(rows[0]!.local_outcome, "submitted");
+        assert.strictEqual(rows[0]!.response_json, null);
+        const persisted: unknown[] = [];
+        const tables = yield* fixture.sql<{
+          name: string;
+        }>`SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'`;
+        for (const table of tables)
+          persisted.push(yield* fixture.sql`SELECT * FROM ${fixture.sql(table.name)}`);
+        const output =
+          JSON.stringify({ logs, traces, persisted }) +
+          (Exit.isFailure(result) ? Cause.pretty(result.cause) : "");
+        assert.isFalse(output.includes(header));
+        assert.isFalse(output.includes(token));
+        assert.isFalse(child.running);
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          testLayer(),
+          Digest.layerWebCrypto,
+          Logger.layer([logger], { mergeWithExisting: false }),
+        ),
+      ),
+      Effect.withTracer(tracer),
+      Effect.withTracerEnabled(true),
+    );
+  },
+);
+
+it.effect.each([false, true] as const)(
+  "native conversation custody validates completed native-only history after reopen with corruption=%s",
+  (corrupt) =>
+    Effect.gen(function* () {
+      const directory = yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "native-conversation-history-")),
+        ),
+        (value) => Effect.sync(() => NodeFS.rmSync(value, { recursive: true, force: true })),
+      );
+      const filename = NodePath.join(directory, "state.sqlite");
+      yield* Effect.gen(function* () {
+        const harness = yield* nativeWorkspaceProcesses();
+        yield* Effect.gen(function* () {
+          const { fixture, service } = yield* configuredNativeEntry();
+          const transport = yield* service.createReservedTransport(producerSelection(fixture));
+          yield* transport.bootstrap();
+          yield* transport.createAdapterRuntime();
+          yield* transport.publishRuntime();
+          yield* transport.openConversation();
+          assert.strictEqual((yield* transport.close()).kind, "retired");
+          if (corrupt) {
+            yield* fixture.sql`DROP TRIGGER native_conversations_update_guard`;
+            yield* fixture.sql`UPDATE orchestration_v2_native_conversations SET response_hash=${"f".repeat(64)}`;
+          }
+          const sqlB = Context.get(
+            yield* Layer.build(Layer.fresh(NodeSqliteClient.layer({ filename }))),
+            SqlClient.SqlClient,
+          );
+          const reopened = Context.get(
+            yield* Layer.build(
+              Layer.fresh(
+                Store.layer.pipe(Layer.provide(Layer.succeed(SqlClient.SqlClient, sqlB))),
+              ),
+            ),
+            Store.WorkflowRunStore,
+          );
+          const before = yield* sqlB`SELECT * FROM orchestration_v2_preparation_jobs`;
+          const result = yield* Effect.exit(
+            reopened.beginOrdinaryPreparation({
+              jobId: "native-history-probe",
+              entryKey: "native-history-entry",
+              kind: "launch",
+              environmentId: "environment",
+              projectId: "project",
+              threadId: "uncreated-native-probe",
+              runId: null,
+              originatingLaunchJobId: null,
+              nativeSelection: {
+                driver: "codex",
+                providerInstanceId: "provider",
+                nativeId: "original-native-conversation",
+              },
+              parentSelection: null,
+              serverBootId: "probe-boot",
+              request: { command: "prepare" },
+            }),
+          );
+          if (corrupt) assert.isTrue(Exit.isFailure(result));
+          else {
+            assert.isTrue(Exit.isSuccess(result));
+            if (Exit.isSuccess(result))
+              assert.deepStrictEqual(result.value, { kind: "denied", reason: "custody" });
+          }
+          assert.deepStrictEqual(
+            yield* sqlB`SELECT * FROM orchestration_v2_preparation_jobs`,
+            before,
+          );
+        }).pipe(Effect.provide(harness.services));
+      }).pipe(Effect.provide(Layer.mergeAll(testLayer(filename), Digest.layerWebCrypto)));
+    }),
+);
+
+it.effect(
+  "native conversation keeps unsolicited notifications and auto replies outside launch authority",
+  () =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        const { fixture, service } = yield* configuredNativeEntry();
+        const denied = yield* Deferred.make<void>();
+        const notified = yield* Deferred.make<void>();
+        const original = CodexClient.makeControlledProcessProtocolClient;
+        const clientSpy = vi
+          .spyOn(CodexClient, "makeControlledProcessProtocolClient")
+          .mockImplementation((handle, options) =>
+            original(handle, {
+              ...options,
+              onOutcome: (outcome) =>
+                options
+                  .onOutcome(outcome)
+                  .pipe(
+                    Effect.tap(() =>
+                      outcome.frame.method === null
+                        ? Deferred.succeed(denied, undefined)
+                        : Effect.void,
+                    ),
+                  ),
+            }),
+          );
+        yield* Effect.addFinalizer(() => Effect.sync(() => clientSpy.mockRestore()));
+        const transport = yield* service.createReservedTransport(producerSelection(fixture));
+        yield* transport.bootstrap();
+        yield* transport.createAdapterRuntime();
+        yield* transport.publishRuntime();
+        yield* transport.openConversation();
+        const before = yield* nativeCounts;
+        yield* transport.client.handleServerNotification("thread/started", () =>
+          Deferred.succeed(notified, undefined).pipe(Effect.asVoid),
+        );
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        const child = harness.children.get(image.args[3]!)!;
+        const wire = (value: unknown) => new TextEncoder().encode(JSON.stringify(value) + "\n");
+        yield* Queue.offer(
+          child.output,
+          wire({
+            method: "thread/started",
+            params: {
+              thread: {
+                id: "unqualified-native",
+                sessionId: "unqualified-native",
+                projectId: null,
+                preview: "",
+                ephemeral: false,
+                modelProvider: "openai",
+                createdAt: 1782622440,
+                updatedAt: 1782622440,
+                status: { type: "idle" },
+                cwd: "/fixture/workspace",
+                cliVersion: "fixture",
+                source: "vscode",
+                turns: [],
+              },
+            },
+          }),
+        );
+        yield* Deferred.await(notified);
+        yield* Queue.offer(
+          child.output,
+          wire({ id: "unsupported-server-request", method: "fixture/unsupported", params: {} }),
+        );
+        yield* Deferred.await(denied);
+        assert.strictEqual(child.payloads.length, 3);
+        assert.deepStrictEqual(yield* nativeCounts, before);
+        const rows = yield* fixture.sql`SELECT * FROM orchestration_v2_native_conversations`;
+        assert.strictEqual(rows.length, 1);
+        assert.strictEqual((yield* transport.close()).kind, "retired");
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
 );

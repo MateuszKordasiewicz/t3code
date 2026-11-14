@@ -1483,6 +1483,11 @@ export interface CodexAppServerClientFactoryShape {
     {
       readonly client: CodexClient.CodexAppServerControlledClient["Service"];
       readonly initializeResponse: CodexSchema.V1InitializeResponse;
+      readonly captureFreshConversationResponse?: (response: OrchestrationV2ProviderThread) => void;
+      readonly selectFreshConversation?: (
+        input: ProviderAdapter.ProviderAdapterV2EnsureThreadInput,
+        params: ReturnType<typeof codexThreadRuntimeParams>,
+      ) => Effect.Effect<string, ProviderAdapter.ProviderAdapterEnsureThreadError>;
     },
     ProviderAdapter.ProviderAdapterOpenSessionError,
     Scope.Scope
@@ -1510,7 +1515,7 @@ const CODEX_T3_MCP_TOOL_TIMEOUT_SEC = 65 * 60;
 const CODEX_T3_DIRECT_MCP_SERVER = "t3-code-direct";
 const CODEX_DIRECT_ONLY_T3_TOOL = "t3_thread_wait";
 
-function codexThreadRuntimeParams(input: {
+export function codexThreadRuntimeParams(input: {
   readonly threadId: ThreadId | null;
   readonly mcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
   readonly modelSelection?: { readonly model: string };
@@ -8015,39 +8020,64 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
             return false;
           }),
-          ensureThread: (threadInput) =>
-            ensureInitialized.pipe(
-              Effect.andThen(mcpSessions.read(threadInput.threadId)),
+          ensureThread: (threadInput) => {
+            const owned = adopted?.selectFreshConversation
+              ? Object.freeze({
+                  ...threadInput,
+                  modelSelection: structuredClone(threadInput.modelSelection),
+                  runtimePolicy: structuredClone(threadInput.runtimePolicy),
+                })
+              : threadInput;
+            const request = ensureInitialized.pipe(
+              Effect.andThen(mcpSessions.read(owned.threadId)),
               Effect.flatMap((mcpSession) =>
-                client.request(
-                  "thread/start",
-                  codexThreadRuntimeParams({
-                    threadId: threadInput.threadId,
+                Effect.gen(function* () {
+                  const params = codexThreadRuntimeParams({
+                    threadId: owned.threadId,
                     mcpSession,
-                    modelSelection: threadInput.modelSelection,
-                    runtimePolicy: threadInput.runtimePolicy,
-                  }),
-                ),
-              ),
-              Effect.map((response): OrchestrationV2ProviderThread =>
-                providerThreadFromCodexThread({
-                  appThreadId: threadInput.threadId,
-                  idAllocator,
-                  ownerNodeId: null,
-                  providerSessionId: input.providerSessionId,
-                  providerInstanceId: adapterOptions.instanceId,
-                  thread: response.thread,
+                    modelSelection: owned.modelSelection,
+                    runtimePolicy: owned.runtimePolicy,
+                  });
+                  const selection = adopted?.selectFreshConversation
+                    ? yield* adopted.selectFreshConversation(owned, params)
+                    : undefined;
+                  return yield* client.request("thread/start", params, selection);
                 }),
               ),
+            );
+            const mapResponse = (response: CodexSchema.V2ThreadStartResponse) =>
+              providerThreadFromCodexThread({
+                appThreadId: owned.threadId,
+                idAllocator,
+                ownerNodeId: null,
+                providerSessionId: input.providerSessionId,
+                providerInstanceId: adapterOptions.instanceId,
+                thread: response.thread,
+              });
+            const capture = adopted?.captureFreshConversationResponse;
+            return (
+              capture
+                ? Effect.uninterruptibleMask((restore) =>
+                    restore(request).pipe(
+                      Effect.map((response) => {
+                        const mapped = mapResponse(response);
+                        capture(mapped);
+                        return mapped;
+                      }),
+                    ),
+                  )
+                : request.pipe(Effect.map(mapResponse))
+            ).pipe(
               Effect.mapError(
                 (cause) =>
                   new ProviderAdapter.ProviderAdapterEnsureThreadError({
                     driver: CODEX_PROVIDER,
-                    threadId: threadInput.threadId,
+                    threadId: owned.threadId,
                     cause,
                   }),
               ),
-            ),
+            );
+          },
           resumeThread: Effect.fn("CodexAdapterV2.resumeThread")(
             function* (threadInput) {
               const nativeThreadId = yield* getNativeThreadId(threadInput.providerThread);
