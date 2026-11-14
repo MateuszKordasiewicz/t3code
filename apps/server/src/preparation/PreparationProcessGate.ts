@@ -10,7 +10,7 @@ import * as Path from "effect/Path";
 import * as Pull from "effect/Pull";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
-import { ChildProcess, ChildProcessSpawner } from "effect/process";
+import * as NodeChild from "./PreparationNodeChild.ts";
 
 import { WorkflowCanonicalHash } from "../workflowRuns/WorkflowCanonicalHash.ts";
 
@@ -147,8 +147,7 @@ const prepareOwned = Effect.fn("PreparationProcessGate.prepare")(
     const hostCwd = yield* HostProcess.WorkingDirectory;
     const hostEnvironment = yield* HostProcess.Environment;
     const scope = yield* AgentScope;
-    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-    const spawn = spawner.spawn;
+    const creator = yield* NodeChild.PreparationNodeChild;
     const owned = yield* Effect.try({
       try: () => {
         // oxlint-disable-next-line t3code/no-global-process-runtime -- The image describes the actual Node spawner, not an overridable platform reference.
@@ -210,21 +209,16 @@ const prepareOwned = Effect.fn("PreparationProcessGate.prepare")(
       },
       catch: () => failure("prepare", "invalid"),
     });
-    const command = ChildProcess.make(executable, finalArgs, {
+    const image = Object.freeze({
+      executable,
+      args: finalArgs,
       cwd: owned.cwd,
-      env: owned.env,
-      extendEnv: false,
-      shell: false,
-      detached: true,
-      windowsHide: false,
-      stdin: { stream: "pipe", endOnDone: false },
-      stdout: "pipe",
-      stderr: "pipe",
-      killSignal: "SIGTERM",
-      forceKillAfter: "1 second",
+      environment: owned.env,
     });
-    const creationInputHash = WorkflowCanonicalHash.tagged("t3.preparation-creation-input.v1", {
-      v: 1,
+    const preparedChild = yield* creator.prepare(image);
+    const creationInputHash = WorkflowCanonicalHash.tagged("t3.preparation-creation-input.v2", {
+      v: 2,
+      creator: "synchronous-node-v1",
       platform: "linux",
       runtime: { kind: "node", version: process.versions.node },
       executable,
@@ -232,24 +226,15 @@ const prepareOwned = Effect.fn("PreparationProcessGate.prepare")(
       args: finalArgs,
       cwd: owned.cwd,
       environment: Object.entries(owned.env).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
-      spawn: {
-        shell: false,
-        extendEnv: false,
-        detached: true,
-        windowsHide: false,
-        stdin: { stream: "pipe", endOnDone: false, encoding: "utf-8" },
-        stdout: "pipe",
-        stderr: "pipe",
-        additionalFds: [],
-        killSignal: "SIGTERM",
-        forceKillAfterMs: 1000,
+      spawn: { shell: false, detached: true, windowsHide: false, stdio: ["pipe", "pipe", "pipe"] },
+      input: { sinkEndOnDone: false, encoding: "utf-8", payloadStdin: "/dev/null", nonce },
+      cleanup: {
+        originalHandleOnly: true,
+        termWaitMs: 1000,
+        killWaitMs: 1000,
+        outsideWriter: true,
       },
-      profile: { stdin: "absent", payloadStdin: "/dev/null", nonce },
     });
-    Object.freeze(command.options.stdin);
-    Object.freeze(command.options);
-    Object.freeze(command.args);
-    Object.freeze(command);
     let spawned = false;
     return Object.freeze({
       creationInputHash,
@@ -257,17 +242,20 @@ const prepareOwned = Effect.fn("PreparationProcessGate.prepare")(
       spawnHeld: Effect.fn("PreparationProcessGate.spawnHeld")(function* () {
         if (spawned) return yield* failure("spawn", "used");
         spawned = true;
-        const child = yield* sanitize("spawn", spawn(command));
-        const pull = yield* Stream.toPull(child.stdout);
+        const child = yield* sanitize("spawn", preparedChild.createLocal());
+        const initializeOutput = Stream.toPull(child.stdout);
+        let pull: Effect.Success<typeof initializeOutput> | undefined;
         let pending: ReadonlyArray<Uint8Array> = [];
         let head = 0;
         const readLine = Effect.fn("PreparationProcessGate.readHeader")(function* (
           stage: "ready" | "exec",
         ) {
+          const activePull = pull;
+          if (!activePull) return yield* failure(stage, "protocol");
           const bytes: number[] = [];
           for (;;) {
             if (head >= pending.length) {
-              pending = yield* pull.pipe(
+              pending = yield* activePull.pipe(
                 Pull.catchDone(() => Effect.fail(failure(stage, "protocol"))),
                 Effect.mapError(() => failure(stage, "protocol")),
               );
@@ -308,6 +296,8 @@ const prepareOwned = Effect.fn("PreparationProcessGate.prepare")(
           const binding = yield* sanitize(
             "ready",
             Effect.gen(function* () {
+              yield* child.awaitSpawn;
+              pull = yield* initializeOutput;
               const line = yield* readLine("ready");
               if (
                 line !== "READY:" + nonce + ":" + String(child.pid) ||
@@ -386,7 +376,9 @@ const prepareOwned = Effect.fn("PreparationProcessGate.prepare")(
                       head = 0;
                       return Effect.succeed(chunks);
                     }
-                    return pull.pipe(
+                    const activePull = pull;
+                    if (!activePull) return Effect.fail(failure("output", "protocol"));
+                    return activePull.pipe(
                       Effect.mapError((error) =>
                         Cause.isDone(error) ? error : failure("output", "unknown"),
                       ),
@@ -402,6 +394,7 @@ const prepareOwned = Effect.fn("PreparationProcessGate.prepare")(
           pid: child.pid,
           isRunning: sanitize("output", child.isRunning),
           awaitExit: sanitize("output", child.exitCode),
+          awaitTerminal: sanitize("output", child.awaitTerminal),
           stderr,
           awaitHeld,
           stopOwnedChild: () => sanitize("cleanup", child.kill()),

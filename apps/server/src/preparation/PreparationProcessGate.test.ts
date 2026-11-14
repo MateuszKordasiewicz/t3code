@@ -21,6 +21,7 @@ import * as TestClock from "effect/testing/TestClock";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import { preparePreparationProcessGate } from "./PreparationProcessGate.ts";
+import * as NodeChild from "./PreparationNodeChild.ts";
 
 const encode = (value: string) => new TextEncoder().encode(value);
 const input = { command: "/usr/bin/fixture", args: ["original"], cwd: "/work" };
@@ -32,8 +33,12 @@ const makeHarness = Effect.fn("test.makePreparationGateHarness")(function* (
     readonly exec?: "split" | "bad" | "oversize" | "eof";
     readonly binding?: "missing" | "wrong-unit" | "wrong-pid" | "dead";
     readonly payload?: Uint8Array;
+    readonly creationEvent?: "withheld";
   } = {},
 ) {
+  const spawnWaitStarted = yield* Deferred.make<void>();
+  const creationStarted = yield* Deferred.make<void>();
+  const spawnEvent = yield* Deferred.make<void>();
   const output = yield* Queue.unbounded<Uint8Array, Cause.Done>();
   const writes = yield* Queue.unbounded<string>();
   const entered = yield* Deferred.make<void>();
@@ -93,7 +98,7 @@ const makeHarness = Effect.fn("test.makePreparationGateHarness")(function* (
       );
     yield* Queue.end(output);
   });
-  const spawner = ChildProcessSpawner.make((selected) =>
+  const createFake = (selected: ChildProcess.Command) =>
     Effect.gen(function* () {
       state.spawns++;
       assert.strictEqual(selected._tag, "StandardCommand");
@@ -117,6 +122,7 @@ const makeHarness = Effect.fn("test.makePreparationGateHarness")(function* (
             encode(header + (options.ready === "early-exec" ? "EXEC:" + nonce + "\n" : "")),
           );
       }
+      Deferred.doneUnsafe(creationStarted, Exit.void);
       return ChildProcessSpawner.makeHandle({
         pid: ChildProcessSpawner.ProcessId(binding.pid),
         exitCode: Effect.never,
@@ -159,18 +165,70 @@ const makeHarness = Effect.fn("test.makePreparationGateHarness")(function* (
         getInputFd: () => Sink.drain,
         getOutputFd: () => Stream.empty,
       });
-    }),
+    });
+  const spawner = ChildProcessSpawner.make((selected) =>
+    createFake(selected).pipe(
+      Effect.tap(() =>
+        options.creationEvent === "withheld"
+          ? Deferred.succeed(spawnWaitStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(spawnEvent)),
+            )
+          : Effect.void,
+      ),
+    ),
   );
+  const nodeCreator: typeof NodeChild.PreparationNodeChild.Service = {
+    prepare: (image) => {
+      const selected = ChildProcess.make(image.executable, image.args, {
+        cwd: image.cwd,
+        env: image.environment,
+        extendEnv: false,
+        stdin: { stream: "pipe", endOnDone: false },
+        stdout: "pipe",
+        stderr: "pipe",
+        detached: true,
+        shell: false,
+        windowsHide: false,
+      });
+      Object.freeze(selected.args);
+      Object.freeze(selected.options);
+      Object.freeze(selected);
+      const unknown = () => new NodeChild.PreparationNodeChildError({ reason: "unknown" });
+      return Effect.succeed({
+        createLocal: () =>
+          createFake(selected).pipe(
+            Effect.map((child) =>
+              Object.freeze({
+                pid: child.pid,
+                awaitSpawn:
+                  options.creationEvent === "withheld" ? Deferred.await(spawnEvent) : Effect.void,
+                awaitTerminal: Effect.never,
+                exitCode: child.exitCode.pipe(Effect.mapError(unknown)),
+                isRunning: Effect.sync(() => state.running),
+                kill: () => child.kill().pipe(Effect.mapError(unknown), Effect.as(undefined)),
+                stdin: child.stdin.pipe(Sink.mapError(unknown)),
+                stdout: child.stdout.pipe(Stream.mapError(unknown)),
+                stderr: child.stderr.pipe(Stream.mapError(unknown)),
+              }),
+            ),
+          ),
+      });
+    },
+  };
   const layer = Layer.mergeAll(
     NodePathService.layerPosix,
     Layer.succeed(AgentScope, scope),
     Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
+    Layer.succeed(NodeChild.PreparationNodeChild, nodeCreator),
     Layer.succeed(HostProcess.Environment, { PATH: "/usr/bin:/bin" }),
     Layer.succeed(HostProcess.WorkingDirectory, "/host"),
   );
   return {
     state,
     binding,
+    creationStarted,
+    spawnWaitStarted,
+    spawnEvent,
     layer,
     output,
     writes,
@@ -489,9 +547,28 @@ it.live("gate releases a real Node payload with stdin EOF and exact output", () 
       const stdout = yield* held.awaitExec(receipt);
       assert.deepStrictEqual(Buffer.concat(yield* Stream.runCollect(stdout)), Buffer.from(payload));
       assert.strictEqual(yield* pending.awaitExit, 0);
+      assert.deepStrictEqual(yield* pending.awaitTerminal, { code: 0, signal: null });
       assert.strictEqual(new TextDecoder().decode(Buffer.concat(yield* Fiber.join(stderr))), "0");
       assert.strictEqual(NodeFS.readFileSync(marker, "utf8"), "started");
       assert.isUndefined(yield* pending.observeRetirement());
+      const stoppedMarker = NodePath.join(directory, "stopped-payload-started");
+      const stopped = yield* (yield* preparePreparationProcessGate({
+        command: process.execPath,
+        args: [
+          "-e",
+          "require('node:fs').writeFileSync(process.argv[1],'unexpected')",
+          stoppedMarker,
+        ],
+        cwd: directory,
+        env: { PATH: "/usr/bin:/bin" },
+        extendEnv: false,
+      })).spawnHeld();
+      yield* stopped.awaitHeld();
+      yield* stopped.stopOwnedChild();
+      assert.deepStrictEqual(yield* stopped.awaitTerminal, { code: null, signal: "SIGTERM" });
+      assert.strictEqual((yield* Effect.result(stopped.awaitExit))._tag, "Failure");
+      assert.isFalse(NodeFS.existsSync(stoppedMarker));
+      assert.isUndefined(yield* stopped.observeRetirement());
     }).pipe(Effect.provideService(AgentScope, scope));
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
@@ -591,6 +668,30 @@ it.effect("gate stderr has one consumer and does not expose raw child channels",
       assert.strictEqual(harness.state.kills, 1);
       assert.isFalse(yield* pending.isRunning);
       assert.strictEqual(harness.state.written, 0);
+    }).pipe(Effect.provide(harness.layer));
+  }).pipe(Effect.scoped),
+);
+
+it.effect("local gate creation completes while the Node spawn event is withheld", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHarness({ creationEvent: "withheld" });
+    yield* Effect.gen(function* () {
+      const prepared = yield* preparePreparationProcessGate(input);
+      const completed = yield* Deferred.make<void>();
+      const creating = yield* prepared.spawnHeld().pipe(
+        Effect.tap(() => Deferred.succeed(completed, undefined)),
+        Effect.forkScoped,
+      );
+      const milestone = yield* Effect.raceFirst(
+        Deferred.await(completed).pipe(Effect.as("completed")),
+        Deferred.await(harness.spawnWaitStarted).pipe(Effect.as("waiting")),
+      );
+      assert.strictEqual(milestone, "completed", "local creation must not await the spawn event");
+      const pending = yield* Fiber.join(creating);
+      assert.strictEqual(harness.state.spawns, 1);
+      assert.strictEqual(harness.state.pulls, 0);
+      assert.strictEqual(harness.state.written, 0);
+      yield* pending.stopOwnedChild();
     }).pipe(Effect.provide(harness.layer));
   }).pipe(Effect.scoped),
 );
