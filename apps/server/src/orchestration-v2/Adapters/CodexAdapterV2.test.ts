@@ -33,6 +33,7 @@ import {
   TurnItemId,
 } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
+import { buildCodexAdapterInitializeParams } from "../../provider/CodexProvider.ts";
 import * as CodexClient from "effect-codex-app-server/client";
 import * as CodexReplay from "effect-codex-app-server/replay";
 import * as CodexError from "effect-codex-app-server/errors";
@@ -1389,6 +1390,11 @@ describe("CodexAdapterV2 post-settle continuation", () => {
   const makeControlledAdapterHarness = Effect.fn("test.makeControlledAdapterHarness")(function* (
     options: {
       readonly autoReplyStarts?: boolean;
+      readonly adoptInitialized?: boolean;
+      readonly adoptionFailure?: boolean;
+      readonly rejectAcquisition?: boolean;
+      readonly compatibility?: CodexAdapterV2.CodexAdapterV2Options["compatibility"];
+      readonly resolveRuntime?: CodexAdapterV2.CodexAdapterV2Options["resolveRuntime"];
       readonly wrapper?: CodexClient.CodexAppServerControlledClientOptions<CodexError.CodexAppServerFrameSubmissionError>["wrapper"];
       readonly afterOutcome?: (
         outcome: CodexProtocol.CodexAppServerFrameOutcome,
@@ -1419,10 +1425,12 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         },
       });
     let threads = 0;
+    const methods: string[] = [];
     yield* Stream.fromQueue(outbound).pipe(
       Stream.runForEach((encoded) =>
         Effect.gen(function* () {
           const message = JSON.parse(encoded) as Message;
+          methods.push(message.method);
           if (message.method === "turn/start" || message.method === "thread/compact/start") {
             yield* Queue.offer(writes, message);
             if (options.autoReplyStarts === false) return;
@@ -1530,11 +1538,55 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           ),
         ),
     };
+    let selectedFactory = clientFactory;
+    if (options.adoptInitialized) {
+      let observer: (
+        outcome: CodexProtocol.CodexAppServerFrameOutcome,
+      ) => Effect.Effect<void> = () => Effect.void;
+      const retained = yield* clientFactory.openControlled!({
+        instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
+        threadId: ThreadId.make("factory-initial-thread"),
+        providerSessionId: ProviderSessionId.make("controlled-provider-session"),
+        runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+        settings: DEFAULT_CODEX_SETTINGS,
+        environment: {},
+        onOutcome: (outcome) => observer(outcome),
+      });
+      const initializeResponse = yield* retained.request(
+        "initialize",
+        buildCodexAdapterInitializeParams(),
+      );
+      yield* retained.notify("initialized", undefined);
+      selectedFactory = {
+        open: () => Effect.die("Initialized adoption must not fall back to legacy open"),
+        ...(options.adoptionFailure
+          ? {
+              openControlled: () =>
+                Effect.die("Initialized adoption must not open another controlled client"),
+            }
+          : {}),
+        adoptInitializedControlled: (input) =>
+          Effect.gen(function* () {
+            if (options.rejectAcquisition)
+              return yield* Effect.die("Resolver conflict must reject before acquisition");
+            if (options.adoptionFailure)
+              return yield* new ProviderAdapter.ProviderAdapterOpenSessionError({
+                driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+                providerSessionId: input.providerSessionId,
+                cause: "adoption fixture refusal",
+              });
+            observer = input.onOutcome;
+            return { client: retained, initializeResponse };
+          }),
+      };
+    }
     const adapter = yield* CodexAdapterV2.makeCodexAdapterV2({
       instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
       settings: DEFAULT_CODEX_SETTINGS,
       environment: {},
-      clientFactory,
+      clientFactory: selectedFactory,
+      ...(options.compatibility === undefined ? {} : { compatibility: options.compatibility }),
+      ...(options.resolveRuntime === undefined ? {} : { resolveRuntime: options.resolveRuntime }),
       digest: yield* Digest.Digest,
       fileSystem: yield* FileSystem.FileSystem,
       idAllocator: yield* IdAllocator.IdAllocatorV2,
@@ -1567,6 +1619,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       });
     return {
       runtime,
+      methods,
       frames,
       outcomes,
       writes,
@@ -1581,99 +1634,154 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     };
   });
 
-  it.effect("controlled adapter keeps the actual immutable turn selection off wire", () =>
-    Effect.gen(function* () {
-      const peer = yield* makeControlledAdapterHarness();
-      const threadId = ThreadId.make("controlled-actual-thread");
-      const providerThread = yield* peer.ensure(threadId);
-      const input = makeCodexTestTurnInput({
-        threadId,
-        providerThread,
-        now: yield* DateTime.now,
-        attemptId: RunAttemptId.make("controlled-actual-attempt"),
-        text: "work",
-      });
-      const nativeId = providerThread.nativeThreadRef!.nativeId;
-      const savedThread = {
-        ...providerThread,
-        nativeThreadRef: { ...providerThread.nativeThreadRef! },
-      };
-      const pending = peer.runtime.startTurn(input);
-      Object.assign(input, {
-        threadId: ThreadId.make("mutated-thread"),
-        runId: RunId.make("mutated-run"),
-      });
-      Object.assign(providerThread.nativeThreadRef!, { nativeId: "mutated-native" });
-      yield* pending;
-      const frame = yield* Queue.take(peer.frames);
-      const wire = yield* Queue.take(peer.writes);
-      assert.isString(frame.selection);
-      const selection = JSON.parse(frame.selection!) as Record<string, unknown>;
-      assert.strictEqual(selection.threadId, threadId);
-      assert.strictEqual(selection.runId, "run-controlled-actual-attempt");
-      assert.strictEqual(selection.nativeThreadId, nativeId);
-      assert.strictEqual(wire.params.threadId, nativeId);
-      assert.notInclude(JSON.stringify(wire), "invocation");
-      assert.notInclude(JSON.stringify(wire), "factory-initial-thread");
-      const otherId = ThreadId.make("controlled-sharing-thread");
-      const other = yield* peer.ensure(otherId);
-      const otherInput = makeCodexTestTurnInput({
-        threadId: otherId,
-        providerThread: other,
-        now: yield* DateTime.now,
-        attemptId: RunAttemptId.make("controlled-other-attempt"),
-        text: "other",
-      });
-      yield* peer.runtime.startTurn(otherInput);
-      const otherFrame = yield* Queue.take(peer.frames);
-      const otherWire = yield* Queue.take(peer.writes);
-      const otherSelection = JSON.parse(otherFrame.selection!) as Record<string, unknown>;
-      assert.strictEqual(otherSelection.threadId, otherId);
-      assert.strictEqual(otherSelection.nativeThreadId, other.nativeThreadRef!.nativeId);
-      assert.strictEqual(otherSelection.providerSessionId, selection.providerSessionId);
-      assert.notEqual(otherSelection.providerThreadId, selection.providerThreadId);
-      assert.notEqual(otherSelection.invocation, selection.invocation);
-      yield* peer.terminal(wire, "completed");
-      yield* peer.terminal(otherWire, "completed");
-      yield* peer.awaitTerminal(2);
-      const compactInput = makeCodexTestTurnInput({
-        threadId,
-        providerThread: savedThread,
-        now: yield* DateTime.now,
-        attemptId: RunAttemptId.make("controlled-compact-attempt"),
-        text: "/compact",
-      });
-      const compact = peer.runtime.compactThread!(compactInput);
-      Object.assign(compactInput, { runId: RunId.make("mutated-compact-run") });
-      yield* compact;
-      const compactFrame = yield* Queue.take(peer.frames);
-      const compactWire = yield* Queue.take(peer.writes);
-      const compactSelection = JSON.parse(compactFrame.selection!) as Record<string, unknown>;
-      assert.strictEqual(compactSelection.kind, "compact");
-      assert.strictEqual(compactSelection.runId, "run-controlled-compact-attempt");
-      assert.strictEqual(compactWire.params.threadId, nativeId);
-      assert.notEqual(compactSelection.invocation, selection.invocation);
-      yield* peer.terminal(compactWire, "inProgress");
-      yield* peer.terminal(compactWire, "completed");
-      yield* peer.awaitTerminal(3);
-    }).pipe(
-      Effect.scoped,
-      Effect.provide(
-        Layer.mergeAll(
-          IdAllocator.layer,
-          McpProviderSessions.layer,
-          NodeServices.layer,
-          NodeCrypto.layer,
+  it.effect.each(["acquisition", "resolver", "compatibility"] as const)(
+    "initialized Adapter adoption rejects %s without reopening or initializing",
+    (mode) =>
+      Effect.gen(function* () {
+        const error = yield* Effect.flip(
+          makeControlledAdapterHarness({
+            adoptInitialized: true,
+            adoptionFailure: mode === "acquisition",
+            rejectAcquisition: mode === "resolver",
+            ...(mode === "resolver"
+              ? {
+                  resolveRuntime: Effect.die(
+                    "Initialized adoption must not resolve a managed runtime",
+                  ),
+                }
+              : {}),
+            ...(mode === "compatibility"
+              ? {
+                  compatibility: () =>
+                    Effect.succeed({
+                      status: "broken" as const,
+                      recommendedVersion: "1.0.0",
+                      recommendedRange: null,
+                      message: null,
+                    }),
+                }
+              : {}),
+          }),
+        );
+        assert.instanceOf(error, ProviderAdapter.ProviderAdapterOpenSessionError);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
         ),
       ),
-    ),
   );
 
-  it.effect(
-    "controlled adapter preserves interruption and exact uncertainty after submission",
-    () =>
+  it.effect.each([false, true])(
+    "controlled adapter keeps immutable turn selection with initialized adoption=%s",
+    (adoptInitialized) =>
       Effect.gen(function* () {
-        const peer = yield* makeControlledAdapterHarness({ autoReplyStarts: false });
+        const versions = yield* Queue.unbounded<string>();
+        const peer = yield* makeControlledAdapterHarness({
+          adoptInitialized,
+          compatibility: (version) => Queue.offer(versions, version).pipe(Effect.as(undefined)),
+        });
+        assert.strictEqual(yield* Queue.take(versions), "0.156.1");
+        const threadId = ThreadId.make("controlled-actual-thread");
+        const providerThread = yield* peer.ensure(threadId);
+        const input = makeCodexTestTurnInput({
+          threadId,
+          providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("controlled-actual-attempt"),
+          text: "work",
+        });
+        const nativeId = providerThread.nativeThreadRef!.nativeId;
+        const savedThread = {
+          ...providerThread,
+          nativeThreadRef: { ...providerThread.nativeThreadRef! },
+        };
+        const pending = peer.runtime.startTurn(input);
+        Object.assign(input, {
+          threadId: ThreadId.make("mutated-thread"),
+          runId: RunId.make("mutated-run"),
+        });
+        Object.assign(providerThread.nativeThreadRef!, { nativeId: "mutated-native" });
+        yield* pending;
+        const frame = yield* Queue.take(peer.frames);
+        const wire = yield* Queue.take(peer.writes);
+        assert.isString(frame.selection);
+        const selection = JSON.parse(frame.selection!) as Record<string, unknown>;
+        assert.strictEqual(selection.threadId, threadId);
+        assert.strictEqual(selection.runId, "run-controlled-actual-attempt");
+        assert.strictEqual(selection.nativeThreadId, nativeId);
+        assert.strictEqual(wire.params.threadId, nativeId);
+        assert.notInclude(JSON.stringify(wire), "invocation");
+        assert.notInclude(JSON.stringify(wire), "factory-initial-thread");
+        const otherId = ThreadId.make("controlled-sharing-thread");
+        const other = yield* peer.ensure(otherId);
+        const otherInput = makeCodexTestTurnInput({
+          threadId: otherId,
+          providerThread: other,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("controlled-other-attempt"),
+          text: "other",
+        });
+        yield* peer.runtime.startTurn(otherInput);
+        const otherFrame = yield* Queue.take(peer.frames);
+        const otherWire = yield* Queue.take(peer.writes);
+        const otherSelection = JSON.parse(otherFrame.selection!) as Record<string, unknown>;
+        assert.strictEqual(otherSelection.threadId, otherId);
+        assert.strictEqual(otherSelection.nativeThreadId, other.nativeThreadRef!.nativeId);
+        assert.strictEqual(otherSelection.providerSessionId, selection.providerSessionId);
+        assert.notEqual(otherSelection.providerThreadId, selection.providerThreadId);
+        assert.notEqual(otherSelection.invocation, selection.invocation);
+        yield* peer.terminal(wire, "completed");
+        yield* peer.terminal(otherWire, "completed");
+        yield* peer.awaitTerminal(2);
+        const compactInput = makeCodexTestTurnInput({
+          threadId,
+          providerThread: savedThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("controlled-compact-attempt"),
+          text: "/compact",
+        });
+        const compact = peer.runtime.compactThread!(compactInput);
+        Object.assign(compactInput, { runId: RunId.make("mutated-compact-run") });
+        yield* compact;
+        const compactFrame = yield* Queue.take(peer.frames);
+        const compactWire = yield* Queue.take(peer.writes);
+        const compactSelection = JSON.parse(compactFrame.selection!) as Record<string, unknown>;
+        assert.strictEqual(compactSelection.kind, "compact");
+        assert.strictEqual(compactSelection.runId, "run-controlled-compact-attempt");
+        assert.strictEqual(compactWire.params.threadId, nativeId);
+        assert.notEqual(compactSelection.invocation, selection.invocation);
+        yield* peer.terminal(compactWire, "inProgress");
+        yield* peer.terminal(compactWire, "completed");
+        yield* peer.awaitTerminal(3);
+        assert.strictEqual(peer.methods.filter((method) => method === "initialize").length, 1);
+        assert.strictEqual(peer.methods.filter((method) => method === "initialized").length, 1);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+  );
+
+  it.effect.each([false, true])(
+    "controlled adapter preserves submission uncertainty with initialized adoption=%s",
+    (adoptInitialized) =>
+      Effect.gen(function* () {
+        const peer = yield* makeControlledAdapterHarness({
+          autoReplyStarts: false,
+          adoptInitialized,
+        });
         const threadId = ThreadId.make("controlled-interrupted-thread");
         const providerThread = yield* peer.ensure(threadId);
         const input = makeCodexTestTurnInput({

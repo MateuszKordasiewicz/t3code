@@ -1477,6 +1477,16 @@ export interface CodexAppServerClientFactoryShape {
     ProviderAdapter.ProviderAdapterOpenSessionError,
     Scope.Scope
   >;
+  readonly adoptInitializedControlled?: (
+    input: Parameters<NonNullable<CodexAppServerClientFactoryShape["openControlled"]>>[0],
+  ) => Effect.Effect<
+    {
+      readonly client: CodexClient.CodexAppServerControlledClient["Service"];
+      readonly initializeResponse: CodexSchema.V1InitializeResponse;
+    },
+    ProviderAdapter.ProviderAdapterOpenSessionError,
+    Scope.Scope
+  >;
 }
 
 export class CodexAppServerClientFactory extends Context.Service<
@@ -2118,6 +2128,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
     openSession: Effect.fn("CodexAdapterV2.openSession")(
       function* (input) {
         const scope = yield* Scope.Scope;
+        const adoptInitialized = clientFactory.adoptInitializedControlled;
+        if (adoptInitialized !== undefined && adapterOptions.resolveRuntime !== undefined)
+          return yield* new ProviderAdapter.ProviderAdapterOpenSessionError({
+            driver: CODEX_PROVIDER,
+            providerSessionId: input.providerSessionId,
+            cause: new ProviderSetupError({
+              instanceId: adapterOptions.instanceId,
+              operation: "runtime",
+              detail: "An initialized client cannot resolve another runtime.",
+            }),
+          });
         const resolvedRuntime =
           adapterOptions.resolveRuntime === undefined
             ? undefined
@@ -2131,7 +2152,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     }),
                 ),
               );
-        const controlledMode = clientFactory.openControlled !== undefined;
+        const controlledMode =
+          adoptInitialized !== undefined || clientFactory.openControlled !== undefined;
         const selectedSessionId = input.providerSessionId;
         const selectedInstanceId = adapterOptions.instanceId;
         let nextInvocation = 0;
@@ -2394,14 +2416,26 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           settings: resolvedRuntime?.config ?? adapterOptions.settings,
           environment: resolvedRuntime?.environment ?? adapterOptions.environment,
         };
-        const controlledClient =
-          clientFactory.openControlled === undefined
+        const adopted =
+          adoptInitialized === undefined
             ? undefined
-            : yield* clientFactory.openControlled({
+            : yield* adoptInitialized({
                 ...openInput,
                 onOutcome: observeControlledOutcome,
               });
-        const client = controlledClient ?? (yield* clientFactory.open(openInput));
+        const controlledClient =
+          adoptInitialized !== undefined
+            ? adopted!.client
+            : clientFactory.openControlled === undefined
+              ? undefined
+              : yield* clientFactory.openControlled({
+                  ...openInput,
+                  onOutcome: observeControlledOutcome,
+                });
+        const client =
+          adoptInitialized !== undefined
+            ? adopted!.client
+            : (controlledClient ?? (yield* clientFactory.open(openInput)));
         const additionalContextByThread = yield* Ref.make(
           new Map<
             string,
@@ -2443,7 +2477,25 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }),
           ),
         );
-        const initialized = yield* Ref.make(false);
+        const checkCompatibility = Effect.fn("CodexAdapterV2.checkCompatibility")(function* (
+          userAgent: string | null,
+        ) {
+          const version = userAgent && /\/(\S+)/u.exec(userAgent)?.[1];
+          const advisory =
+            version && adapterOptions.compatibility
+              ? yield* adapterOptions.compatibility(version)
+              : undefined;
+          if (advisory?.status === "broken") {
+            const target =
+              advisory.recommendedVersion ?? advisory.recommendedRange ?? "a newer version";
+            return yield* new ProviderSetupError({
+              instanceId: adapterOptions.instanceId,
+              operation: "runtime",
+              detail: `Codex ${version} does not work with this T3 Code release. Update Codex to ${target}, then retry.`,
+            });
+          }
+        });
+        const initialized = yield* Ref.make(adopted !== undefined);
         // Codex rejects a second initialize on the shared app-server.
         const initializePermit = yield* Semaphore.make(1);
         const ensureInitialized = initializePermit.withPermit(
@@ -2465,26 +2517,14 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                       : Effect.fail(error),
                 }),
               );
-            const version = userAgent && /\/(\S+)/u.exec(userAgent)?.[1];
-            const advisory =
-              version && adapterOptions.compatibility
-                ? yield* adapterOptions.compatibility(version)
-                : undefined;
-            if (advisory?.status === "broken") {
-              const target =
-                advisory.recommendedVersion ?? advisory.recommendedRange ?? "a newer version";
-              return yield* new ProviderSetupError({
-                instanceId: adapterOptions.instanceId,
-                operation: "runtime",
-                detail: `Codex ${version} does not work with this T3 Code release. Update Codex to ${target}, then retry.`,
-              });
-            }
+            yield* checkCompatibility(userAgent);
             yield* client.notify("initialized", undefined);
             yield* Ref.set(initialized, true);
           }),
         );
         // A failed open is discarded, so the next turn spawns the updated binary.
-        if (adapterOptions.compatibility !== undefined) yield* ensureInitialized;
+        if (adopted !== undefined) yield* checkCompatibility(adopted.initializeResponse.userAgent);
+        else if (adapterOptions.compatibility !== undefined) yield* ensureInitialized;
         const now = yield* DateTime.now;
         const session = providerSession({
           providerSessionId: input.providerSessionId,
