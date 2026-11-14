@@ -3550,6 +3550,7 @@ const nativeWorkspaceProcesses = Effect.fn("test.nativeWorkspaceProcesses")(func
   beforeWrap: Effect.Effect<void> = Effect.void,
   beforeCodex: Effect.Effect<void> = Effect.void,
   onCreate: (image: PreparationNode.PreparationNodeImage) => void = () => {},
+  onPayload: (image: PreparationNode.PreparationNodeImage, text: string) => void = () => {},
 ) {
   const requests: PreparationNode.PreparationNodeImage[] = [];
   const host = {
@@ -3563,6 +3564,9 @@ const nativeWorkspaceProcesses = Effect.fn("test.nativeWorkspaceProcesses")(func
     running: boolean;
     nonce: string;
     releases: number;
+    payloads: string[];
+    payloadWritten: Queue.Queue<string>;
+    initializeReply: "valid" | "missing" | "invalid" | "already" | "wrong-id";
   };
   const children = new Map<string, Child>();
   const bytes = (text: string) => new TextEncoder().encode(text);
@@ -3589,6 +3593,9 @@ const nativeWorkspaceProcesses = Effect.fn("test.nativeWorkspaceProcesses")(func
           terminal: yield* Deferred.make<{ code: number | null; signal: NodeJS.Signals | null }>(),
           running: false,
           releases: 0,
+          payloads: [],
+          payloadWritten: yield* Queue.unbounded<string>(),
+          initializeReply: "valid",
           nonce: input.args[3]!,
         };
         children.set(child.nonce, child);
@@ -3660,7 +3667,37 @@ const nativeWorkspaceProcesses = Effect.fn("test.nativeWorkspaceProcesses")(func
                   }),
                 stdin: Sink.forEach((value: Uint8Array) =>
                   Effect.sync(() => {
-                    assert.strictEqual(new TextDecoder().decode(value), `RELEASE:${child.nonce}\n`);
+                    const text = new TextDecoder().decode(value);
+                    if (child.releases && image.args[4]!.endsWith("/codex")) {
+                      child.payloads.push(text);
+                      onPayload(image, text);
+                      Queue.offerUnsafe(child.payloadWritten, text);
+                      const message = JSON.parse(text) as Record<string, unknown>;
+                      if (message.method === "initialize" && child.initializeReply !== "missing") {
+                        const id =
+                          child.initializeReply === "wrong-id"
+                            ? Number(message.id) + 1
+                            : message.id;
+                        const response =
+                          child.initializeReply === "already"
+                            ? { id, error: { code: -32600, message: "Already initialized" } }
+                            : {
+                                id,
+                                result:
+                                  child.initializeReply === "invalid"
+                                    ? { userAgent: 42 }
+                                    : {
+                                        userAgent: "fixture-codex/1",
+                                        codexHome: "/fixture-home",
+                                        platformFamily: "unix",
+                                        platformOs: "linux",
+                                      },
+                              };
+                        Queue.offerUnsafe(child.output, bytes(JSON.stringify(response) + "\n"));
+                      }
+                      return;
+                    }
+                    assert.strictEqual(text, `RELEASE:${child.nonce}\n`);
                     child.releases++;
                     const args = image.args.slice(5);
                     const code = args.includes("config") ? 1 : 0;
@@ -5128,6 +5165,613 @@ it.effect.each(["thread", "session", "changed-original"] as const)(
         const rows = yield* fixture.sql`SELECT * FROM orchestration_v2_submission_transports`;
         assert.strictEqual(rows.length, mode === "changed-original" ? 1 : 2);
         for (const row of rows) assert.strictEqual(row.settlement_json, null);
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "native %s bootstrap initializes the same retained client exactly once",
+  (kind) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        const fixture = yield* controlledNativeFixture(kind, false, false, 2, false, {
+          type: "worktree",
+          baseRef: "main",
+          branch: "native-feature",
+        });
+        const service = yield* nativeTransportEntry(fixture);
+        const transport = yield* service.createReservedTransport(producerSelection(fixture));
+        assert.isFunction(transport.bootstrap);
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        const child = harness.children.get(image.args[3]!)!;
+        assert.strictEqual(
+          (yield* Effect.result(
+            transport.client.raw.request("initialize", { clientInfo: { name: "forged" } }),
+          ))._tag,
+          "Failure",
+        );
+        assert.strictEqual(child.payloads.length, 0);
+        const initialized = yield* transport.bootstrap();
+        assert.strictEqual(initialized.kind, "protocol-initialized");
+        assert.strictEqual(initialized.transportId, transport.transportId);
+        assert.strictEqual(initialized.response.userAgent, "fixture-codex/1");
+        assert.strictEqual(child.payloads.length, 2);
+        const [initialize, notification] = child.payloads.map((text) => JSON.parse(text));
+        assert.strictEqual(initialize.id, 2);
+        assert.strictEqual(initialize.method, "initialize");
+        assert.deepStrictEqual(initialize.params.capabilities, {
+          experimentalApi: true,
+          optOutNotificationMethods: ["turn/diff/updated"],
+          extensions: {
+            "io.modelcontextprotocol/ui": { mimeTypes: ["text/html;profile=mcp-app"] },
+          },
+        });
+        assert.deepStrictEqual(notification, { method: "initialized" });
+        assert.isTrue(child.payloads.every((text) => !text.includes("selection")));
+        assert.strictEqual((yield* Effect.result(transport.bootstrap()))._tag, "Failure");
+        assert.strictEqual(
+          (yield* Effect.result(transport.client.request("account/read", {})))._tag,
+          "Failure",
+        );
+        assert.strictEqual(child.payloads.length, 2);
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT status FROM orchestration_v2_projection_runs`,
+          [{ status: "preparing" }],
+        );
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT * FROM orchestration_v2_projection_provider_sessions`,
+          [],
+        );
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT * FROM orchestration_v2_submission_attempts`,
+          [],
+        );
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT * FROM orchestration_v2_effect_outbox WHERE effect_type IN ('provider-turn.start','provider-turn.restart','provider-runtime.continue')`,
+          [],
+        );
+        assert.strictEqual((yield* transport.close()).kind, "retired");
+        assert.isFalse(child.running);
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect("native transport refuses handler close before touching the physical owner", () =>
+  Effect.gen(function* () {
+    const harness = yield* nativeWorkspaceProcesses();
+    yield* Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture("workflow", false, false, 2, false, {
+        type: "worktree",
+        baseRef: "main",
+        branch: "native-feature",
+      });
+      const service = yield* nativeTransportEntry(fixture);
+      const transport = yield* service.createReservedTransport(producerSelection(fixture));
+      const closed =
+        yield* Queue.unbounded<
+          Exit.Exit<
+            Effect.Success<ReturnType<typeof transport.close>>,
+            Effect.Error<ReturnType<typeof transport.close>>
+          >
+        >();
+      yield* transport.client.handleUnknownServerRequest(() =>
+        transport.close().pipe(
+          Effect.exit,
+          Effect.flatMap((exit) => Queue.offer(closed, exit)),
+          Effect.as({ ok: true }),
+        ),
+      );
+      const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+      const child = harness.children.get(image.args[3]!)!;
+      yield* Queue.offer(
+        child.output,
+        new TextEncoder().encode(
+          JSON.stringify({
+            id: "self-close",
+            method: "fixture/close",
+            params: {},
+          }) + "\n",
+        ),
+      );
+      const attempted = yield* Queue.take(closed);
+      assert.isTrue(Exit.isFailure(attempted));
+      if (Exit.isFailure(attempted)) {
+        const error = Cause.findErrorOption(attempted.cause);
+        assert.isTrue(Option.isSome(error));
+        if (Option.isSome(error) && "reason" in error.value)
+          assert.strictEqual(error.value.reason, "reentrant");
+      }
+      assert.isTrue(child.running);
+      assert.strictEqual(
+        (yield* fixture.sql`SELECT settlement_json FROM orchestration_v2_submission_transports`)[0]!
+          .settlement_json,
+        null,
+      );
+      assert.strictEqual((yield* transport.close()).kind, "retired");
+      assert.isFalse(child.running);
+    }).pipe(Effect.provide(harness.services));
+  }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(["invalid", "already", "missing", "wrong-id"] as const)(
+  "native bootstrap refuses %s initialize responses without a second frame",
+  (mode) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        const fixture = yield* controlledNativeFixture("workflow", false, false, 2, false, {
+          type: "worktree",
+          baseRef: "main",
+          branch: "native-feature",
+        });
+        const service = yield* nativeTransportEntry(fixture);
+        const transport = yield* service.createReservedTransport(producerSelection(fixture));
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        const child = harness.children.get(image.args[3]!)!;
+        child.initializeReply = mode;
+        const boot = yield* transport.bootstrap().pipe(Effect.exit, Effect.forkScoped);
+        yield* Queue.take(child.payloadWritten);
+        if (mode === "missing" || mode === "wrong-id") {
+          assert.strictEqual(
+            (yield* Effect.result(transport.client.raw.notify("fixture/local-completion-barrier")))
+              ._tag,
+            "Failure",
+          );
+          yield* TestClock.adjust("9 seconds");
+          assert.isUndefined(boot.pollUnsafe());
+          yield* TestClock.adjust("1 second");
+        }
+        const result = yield* Fiber.join(boot);
+        assert.isTrue(Exit.isFailure(result));
+        assert.strictEqual(child.payloads.length, 1);
+        assert.isFalse(child.running);
+        assert.strictEqual((yield* transport.close()).kind, "held");
+        assert.strictEqual((yield* Effect.result(transport.bootstrap()))._tag, "Failure");
+        assert.strictEqual(child.payloads.length, 1);
+        assert.strictEqual(
+          (yield* fixture.sql`SELECT settlement_json FROM orchestration_v2_submission_transports`)[0]!
+            .settlement_json,
+          null,
+        );
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each([
+  "revoke-before",
+  "deadline-before",
+  "revoke-after",
+  "pause-after",
+  "session-after",
+  "lost-first-return",
+  "lost-second-return",
+] as const)("native bootstrap preserves the original %s writer boundary", (mode) =>
+  Effect.gen(function* () {
+    const harness = yield* nativeWorkspaceProcesses();
+    yield* Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture("planning", false, false, 2, false, {
+        type: "worktree",
+        baseRef: "main",
+        branch: "native-feature",
+      });
+      const service = yield* nativeTransportEntry(fixture);
+      const transport = yield* service.createReservedTransport(producerSelection(fixture));
+      const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+      const child = harness.children.get(image.args[3]!)!;
+      if (mode === "revoke-before") yield* fixture.sessions.revoke(fixture.reference.sessionId);
+      if (mode === "deadline-before")
+        yield* TestClock.setTime(DateTime.makeUnsafe("2026-12-02T00:00:00Z").epochMilliseconds);
+      const original = fixture.sql.withTransaction;
+      let intercepted = 0;
+      using _boundary = vi
+        .spyOn(fixture.sql, "withTransaction")
+        .mockImplementation(<A, E, R>(work: Effect.Effect<A, E, R>) =>
+          original(work).pipe(
+            Effect.flatMap((value) =>
+              Effect.gen(function* () {
+                const target = mode === "lost-second-return" ? 2 : 1;
+                if (
+                  value !== undefined ||
+                  child.payloads.length !== target ||
+                  intercepted ||
+                  mode.endsWith("before")
+                )
+                  return value;
+                intercepted++;
+                if (mode === "revoke-after")
+                  yield* fixture.sessions.revoke(fixture.reference.sessionId);
+                else if (mode === "pause-after") yield* controlNativeFixture(fixture, "pause");
+                else if (mode === "session-after")
+                  yield* fixture.sql`UPDATE orchestration_v2_projection_provider_threads SET provider_session_id='changed',payload_json=json_set(payload_json,'$.providerSessionId','changed')`;
+                else return yield* Effect.interrupt;
+                return value;
+              }),
+            ),
+          ),
+        );
+      const result = yield* Effect.exit(transport.bootstrap());
+      assert.isTrue(Exit.isFailure(result));
+      assert.strictEqual(intercepted, mode.endsWith("before") ? 0 : 1);
+      assert.strictEqual(
+        child.payloads.length,
+        mode.endsWith("before") ? 0 : mode === "lost-second-return" ? 2 : 1,
+      );
+      assert.isFalse(child.running);
+      assert.strictEqual((yield* transport.close()).kind, "held");
+      const count = child.payloads.length;
+      assert.strictEqual((yield* Effect.result(transport.bootstrap()))._tag, "Failure");
+      assert.strictEqual(child.payloads.length, count);
+      assert.strictEqual(
+        (yield* fixture.sql`SELECT settlement_json FROM orchestration_v2_submission_transports`)[0]!
+          .settlement_json,
+        null,
+      );
+    }).pipe(Effect.provide(harness.services));
+  }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each([
+  "empty",
+  "extra-field",
+  "extra-params",
+  "null-id",
+  "string-id",
+  "fraction-id",
+  "duplicate-key",
+  "whitespace",
+  "two-lines",
+  "invalid-utf8",
+  "oversize",
+  "two-chunks",
+  "bom",
+] as const)("native bootstrap guarded Sink rejects %s before any Gate payload write", (mode) =>
+  Effect.gen(function* () {
+    const harness = yield* nativeWorkspaceProcesses();
+    yield* Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture("workflow", false, false, 2, false, {
+        type: "worktree",
+        baseRef: "main",
+        branch: "native-feature",
+      });
+      const entry = yield* nativeWorkspaceEntry(fixture);
+      const prepared = yield* entry.createReservedWorkspace(producerSelection(fixture));
+      if (prepared.preparation.kind !== "retired") throw new Error("workspace not retired");
+      const owner = yield* fixture.store.consumeNativeCodexTransportOwner(
+        prepared.preparation.job,
+        {
+          command: "/fixture-bin/codex",
+          args: ["app-server"],
+          cwd: prepared.worktree.path,
+          env: { PATH: "/fixture-bin" },
+        },
+      );
+      const io = yield* Effect.gen(function* () {
+        yield* owner.captureConstructor();
+        return yield* owner.open();
+      }).pipe(Effect.forkScoped, Effect.flatMap(Fiber.join));
+      const sent = yield* Effect.gen(function* () {
+        const profile = yield* owner.captureBootstrap();
+        const frame: Record<string, unknown> = {
+          id: 5,
+          method: "initialize",
+          params: profile.params,
+        };
+        if (mode === "extra-field") frame.extra = true;
+        if (mode === "extra-params") frame.params = { ...profile.params, extra: true };
+        if (mode === "null-id") frame.id = null;
+        if (mode === "string-id") frame.id = "5";
+        if (mode === "fraction-id") frame.id = 1.5;
+        let text = JSON.stringify(frame) + "\n";
+        if (mode === "duplicate-key") text = text.replace('{"id":5,', '{"id":5,"id":5,');
+        if (mode === "whitespace") text = " " + text;
+        if (mode === "two-lines") text += text;
+        const bytes =
+          mode === "oversize"
+            ? new Uint8Array(1048577)
+            : mode === "invalid-utf8"
+              ? new Uint8Array([255, 10])
+              : mode === "bom"
+                ? new Uint8Array([239, 187, 191, ...new TextEncoder().encode(text)])
+                : new TextEncoder().encode(text);
+        const stream =
+          mode === "empty"
+            ? Stream.empty
+            : mode === "two-chunks"
+              ? Stream.make(bytes, bytes)
+              : Stream.make(bytes);
+        return yield* Effect.exit(Stream.run(stream, io.stdin));
+      }).pipe(Effect.forkScoped, Effect.flatMap(Fiber.join));
+      assert.isTrue(Exit.isFailure(sent));
+      const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+      const child = harness.children.get(image.args[3]!)!;
+      assert.deepStrictEqual(child.payloads, []);
+      assert.strictEqual((yield* owner.close()).kind, "held");
+      assert.isFalse(child.running);
+    }).pipe(Effect.provide(harness.services));
+  }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect("native SQL close refusal leaves SDK output and bootstrap untouched", () =>
+  Effect.gen(function* () {
+    const harness = yield* nativeWorkspaceProcesses();
+    yield* Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture("workflow", false, false, 2, false, {
+        type: "worktree",
+        baseRef: "main",
+        branch: "native-feature",
+      });
+      const service = yield* nativeTransportEntry(fixture);
+      const transport = yield* service.createReservedTransport(producerSelection(fixture));
+      assert.strictEqual(
+        (yield* Effect.result(fixture.sql.withTransaction(transport.close())))._tag,
+        "Failure",
+      );
+      assert.isTrue(yield* transport.client.ownedProcess.isRunning);
+      assert.strictEqual((yield* Effect.result(transport.bootstrap()))._tag, "Success");
+      assert.strictEqual((yield* transport.close()).kind, "retired");
+    }).pipe(Effect.provide(harness.services));
+  }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(
+  ([false, true] as const).flatMap((masked) =>
+    (["caller", "constructor", "store"] as const).map((boundary) => ({ masked, boundary })),
+  ),
+)(
+  "native bootstrap joins actual SQL unwind at $boundary under mask=$masked",
+  ({ masked, boundary }) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      const storeScope = yield* Scope.make();
+      const constructorScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(constructorScope, Exit.void));
+      yield* Effect.addFinalizer(() => Scope.close(storeScope, Exit.void));
+      const entered = yield* Deferred.make<void>();
+      const unwinding = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      yield* Effect.gen(function* () {
+        const fixture = yield* controlledNativeFixture("workflow", false, false, 2, false, {
+          type: "worktree",
+          baseRef: "main",
+          branch: "native-feature",
+        }).pipe(Effect.provideService(Scope.Scope, storeScope));
+        const service = yield* nativeTransportEntry(fixture).pipe(
+          Effect.provideService(Scope.Scope, constructorScope),
+        );
+        const transport = yield* service.createReservedTransport(producerSelection(fixture));
+        const original = fixture.sql.withTransaction;
+        let armed = true;
+        using _writer = vi
+          .spyOn(fixture.sql, "withTransaction")
+          .mockImplementation(<A, E, R>(work: Effect.Effect<A, E, R>) => {
+            if (!armed) return original(work);
+            armed = false;
+            return original(
+              Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Effect.never),
+                Effect.ensuring(
+                  Deferred.succeed(unwinding, undefined).pipe(
+                    Effect.andThen(Deferred.await(release)),
+                  ),
+                ),
+              ),
+            );
+          });
+        const boot = yield* transport
+          .bootstrap()
+          .pipe(
+            (work) => (masked ? Effect.uninterruptible(work) : work),
+            Effect.exit,
+            Effect.forkScoped,
+          );
+        yield* Deferred.await(entered);
+        const stopping = yield* (
+          boundary === "caller"
+            ? Fiber.interrupt(boot)
+            : Scope.close(boundary === "store" ? storeScope : constructorScope, Exit.void)
+        ).pipe(Effect.forkScoped);
+        yield* Deferred.await(unwinding);
+        yield* Effect.sync(() => {
+          assert.isUndefined(stopping.pollUnsafe());
+          assert.isUndefined(boot.pollUnsafe());
+        }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+        yield* Fiber.join(stopping);
+        const exit = yield* Fiber.await(boot);
+        assert.isTrue(
+          Exit.isFailure(exit)
+            ? Cause.hasInterrupts(exit.cause)
+            : Exit.isFailure(exit.value) && Cause.hasInterrupts(exit.value.cause),
+        );
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        const child = harness.children.get(image.args[3]!)!;
+        assert.deepStrictEqual(child.payloads, []);
+        assert.isFalse(child.running);
+        assert.strictEqual(
+          (yield* fixture.sql`SELECT settlement_json FROM orchestration_v2_submission_transports`)[0]!
+            .settlement_json,
+          null,
+        );
+        assert.strictEqual(
+          yield* fixture.sql.withTransaction(Effect.succeed("writer released")),
+          "writer released",
+        );
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(["revoke", "initialized"] as const)(
+  "native bootstrap orders an independent grant writer with %s first",
+  (first) =>
+    Effect.gen(function* () {
+      const directory = yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "native-bootstrap-grant-")),
+        ),
+        (value) => Effect.sync(() => NodeFS.rmSync(value, { recursive: true, force: true })),
+      );
+      const filename = NodePath.join(directory, "state.sqlite");
+      yield* Effect.gen(function* () {
+        using competing = new NodeSqlite.DatabaseSync(filename);
+        let probes = 0;
+        const harness = yield* nativeWorkspaceProcesses(
+          Effect.void,
+          Effect.void,
+          () => {},
+          () => {
+            probes++;
+            assert.throws(() => competing.exec("BEGIN IMMEDIATE"), /locked/);
+          },
+        );
+        yield* Effect.gen(function* () {
+          const fixture = yield* controlledNativeFixture("workflow", false, false, 2, false, {
+            type: "worktree",
+            baseRef: "main",
+            branch: "native-feature",
+          });
+          yield* fixture.sql`PRAGMA journal_mode=WAL`;
+          const sqlB = Context.get(
+            yield* Layer.build(Layer.fresh(NodeSqliteClient.layer({ filename }))),
+            SqlClient.SqlClient,
+          );
+          const sessionsB = yield* AuthSessions.make.pipe(
+            Effect.provideService(SqlClient.SqlClient, sqlB),
+          );
+          const revoke = sessionsB.revoke({
+            sessionId: fixture.reference.sessionId,
+            revokedAt: yield* DateTime.now,
+          });
+          const service = yield* nativeTransportEntry(fixture);
+          const transport = yield* service.createReservedTransport(producerSelection(fixture));
+          const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+          const child = harness.children.get(image.args[3]!)!;
+          const original = fixture.sql.withTransaction;
+          let revoked = false;
+          using _order = vi
+            .spyOn(fixture.sql, "withTransaction")
+            .mockImplementation(<A, E, R>(work: Effect.Effect<A, E, R>) =>
+              original(work).pipe(
+                Effect.tap((value) =>
+                  Effect.gen(function* () {
+                    if (
+                      first !== "revoke" ||
+                      revoked ||
+                      value !== undefined ||
+                      child.payloads.length !== 1
+                    )
+                      return;
+                    revoked = true;
+                    assert.isTrue(yield* revoke);
+                  }),
+                ),
+              ),
+            );
+          const result = yield* Effect.result(transport.bootstrap());
+          assert.strictEqual(result._tag, first === "revoke" ? "Failure" : "Success");
+          if (first === "initialized") assert.isTrue(yield* revoke);
+          assert.strictEqual(
+            (yield* transport.close()).kind,
+            first === "revoke" ? "held" : "retired",
+          );
+          assert.strictEqual(probes, first === "revoke" ? 1 : 2);
+          assert.strictEqual(child.payloads.length, probes);
+          assert.isFalse(child.running);
+          assert.strictEqual(
+            (yield* sqlB`SELECT settlement_json FROM orchestration_v2_submission_transports`)[0]!
+              .settlement_json !== null,
+            first === "initialized",
+          );
+        }).pipe(Effect.provide(harness.services));
+      }).pipe(Effect.provide(Layer.mergeAll(testLayer(filename), Digest.layerWebCrypto)));
+    }),
+);
+
+it.effect.each(["snapshot", "stop-unmasked", "stop-masked"] as const)(
+  "native bootstrap input collection preserves its actual %s body boundary",
+  (mode) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      const waiting = yield* Deferred.make<void>();
+      const unwinding = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const mutable = yield* Deferred.make<Uint8Array>();
+      const rest = yield* Queue.unbounded<Uint8Array, Cause.Done>();
+      yield* Effect.gen(function* () {
+        const fixture = yield* controlledNativeFixture("workflow", false, false, 2, false, {
+          type: "worktree",
+          baseRef: "main",
+          branch: "native-feature",
+        });
+        const entry = yield* nativeWorkspaceEntry(fixture);
+        const prepared = yield* entry.createReservedWorkspace(producerSelection(fixture));
+        if (prepared.preparation.kind !== "retired") throw new Error("workspace not retired");
+        const owner = yield* fixture.store.consumeNativeCodexTransportOwner(
+          prepared.preparation.job,
+          {
+            command: "/fixture-bin/codex",
+            args: ["app-server"],
+            cwd: prepared.worktree.path,
+            env: { PATH: "/fixture-bin" },
+          },
+        );
+        const io = yield* Effect.gen(function* () {
+          yield* owner.captureConstructor();
+          return yield* owner.open();
+        }).pipe(Effect.forkScoped, Effect.flatMap(Fiber.join));
+        const body = yield* Effect.gen(function* () {
+          const profile = yield* owner.captureBootstrap();
+          const bytes = new TextEncoder().encode(
+            JSON.stringify({ id: 7, method: "initialize", params: profile.params }) + "\n",
+          );
+          yield* Deferred.succeed(mutable, bytes);
+          const remaining =
+            mode === "snapshot"
+              ? Stream.fromQueue(rest)
+              : Stream.never.pipe(
+                  Stream.ensuring(
+                    Deferred.succeed(unwinding, undefined).pipe(
+                      Effect.andThen(Deferred.await(release)),
+                    ),
+                  ),
+                );
+          const source = Stream.concat(
+            Stream.make(bytes),
+            Stream.unwrap(Deferred.succeed(waiting, undefined).pipe(Effect.as(remaining))),
+          );
+          yield* Stream.run(source, io.stdin);
+        }).pipe(
+          (work) => (mode === "stop-masked" ? Effect.uninterruptible(work) : work),
+          Effect.exit,
+          Effect.forkScoped,
+        );
+        yield* Deferred.await(waiting);
+        if (mode === "snapshot") {
+          const bytes = yield* Deferred.await(mutable);
+          bytes.fill(32);
+          yield* Queue.end(rest);
+          assert.isTrue(Exit.isSuccess(yield* Fiber.join(body)));
+          assert.strictEqual((yield* owner.close()).kind, "held");
+        } else {
+          const closing = yield* owner.close().pipe(Effect.forkScoped);
+          yield* Deferred.await(unwinding);
+          yield* Effect.sync(() => {
+            assert.isUndefined(closing.pollUnsafe());
+            assert.isUndefined(body.pollUnsafe());
+          }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+          assert.strictEqual((yield* Fiber.join(closing)).kind, "held");
+          const bodyExit = yield* Fiber.await(body);
+          assert.isTrue(
+            Exit.isFailure(bodyExit)
+              ? Cause.hasInterrupts(bodyExit.cause)
+              : Exit.isFailure(bodyExit.value) && Cause.hasInterrupts(bodyExit.value.cause),
+          );
+        }
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        const child = harness.children.get(image.args[3]!)!;
+        assert.isFalse(child.running);
+        assert.strictEqual(child.payloads.length, mode === "snapshot" ? 1 : 0);
+        if (mode === "snapshot")
+          assert.strictEqual(JSON.parse(child.payloads[0]!).method, "initialize");
       }).pipe(Effect.provide(harness.services));
     }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
 );

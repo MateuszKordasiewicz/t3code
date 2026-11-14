@@ -18,7 +18,7 @@ import type { ManagedServerProvider } from "@t3tools/provider-core/server/snapsh
 import type { CodexEffectiveRuntime } from "../../provider/CodexManagedRuntime.ts";
 import { classifyCodexManagedError } from "../../provider/CodexManagedErrors.ts";
 import {
-  buildCodexInitializeParams,
+  buildCodexAdapterInitializeParams,
   codexAppServerEnvironment,
   codexDefaultReasoningEffortOverride,
 } from "../../provider/CodexProvider.ts";
@@ -131,12 +131,7 @@ import { codexAppServerArgs, resolveCodexLaunchArgs } from "../../provider/codex
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
-import {
-  MCP_APP_EXTENSION_ID,
-  MCP_APP_MIME_TYPE,
-  MCP_APP_OUTPUT_KEY,
-  MCP_APP_RESOURCE_SCHEME,
-} from "@t3tools/shared/mcpApp";
+import { MCP_APP_OUTPUT_KEY, MCP_APP_RESOURCE_SCHEME } from "@t3tools/shared/mcpApp";
 import { snapshotMcpApp } from "../../mcpApps/McpAppSnapshot.ts";
 import {
   ProviderAdapterDriverCreateError,
@@ -242,11 +237,6 @@ const CodexThreadSampleResponse = Schema.Struct({ text: Schema.NullOr(Schema.Str
 const decodeCodexThreadSampleResponse = Schema.decodeUnknownEffect(CodexThreadSampleResponse);
 export const CODEX_PROMPT_SUGGESTION_PROMPT =
   "Predict the next message the user will send in this conversation. Reply with only that message, written as the user would type it, in under 20 words. Do not use tools. If there is no clear next step, reply with nothing.";
-const CODEX_CLIENT_CAPABILITIES = {
-  experimentalApi: true,
-  optOutNotificationMethods: ["turn/diff/updated"],
-  extensions: { [MCP_APP_EXTENSION_ID]: { mimeTypes: [MCP_APP_MIME_TYPE] } },
-} as const;
 
 export const CodexProviderCapabilitiesV2 = {
   sessions: {
@@ -2464,10 +2454,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
 
             const userAgent = yield* client
-              .request("initialize", {
-                clientInfo: buildCodexInitializeParams().clientInfo,
-                capabilities: CODEX_CLIENT_CAPABILITIES,
-              })
+              .request("initialize", buildCodexAdapterInitializeParams())
               .pipe(
                 Effect.map((response) => response.userAgent),
                 Effect.catchTags({

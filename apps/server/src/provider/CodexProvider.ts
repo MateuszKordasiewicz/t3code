@@ -55,6 +55,7 @@ import {
 } from "./codexUsageLimits.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import packageJson from "../../package.json" with { type: "json" };
+import { MCP_APP_EXTENSION_ID, MCP_APP_MIME_TYPE } from "@t3tools/shared/mcpApp";
 const isCodexAppServerSpawnError = Schema.is(CodexErrors.CodexAppServerSpawnError);
 const RATE_LIMITS_PROBE_TIMEOUT_MS = 3_000;
 
@@ -466,6 +467,17 @@ export function buildCodexInitializeParams(): CodexSchema.V1InitializeParams {
     },
     capabilities: {
       experimentalApi: true,
+    },
+  };
+}
+
+export function buildCodexAdapterInitializeParams() {
+  return {
+    clientInfo: buildCodexInitializeParams().clientInfo,
+    capabilities: {
+      experimentalApi: true,
+      optOutNotificationMethods: ["turn/diff/updated"],
+      extensions: { [MCP_APP_EXTENSION_ID]: { mimeTypes: [MCP_APP_MIME_TYPE] } },
     },
   };
 }

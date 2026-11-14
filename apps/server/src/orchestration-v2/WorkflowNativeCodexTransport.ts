@@ -10,6 +10,7 @@ import * as CodexClient from "effect-codex-app-server/client";
 import * as CodexErrors from "effect-codex-app-server/errors";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Cause from "effect/Cause";
 import * as Fiber from "effect/Fiber";
 import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
@@ -35,6 +36,7 @@ export class NativeCodexTransportError extends Schema.TaggedError<NativeCodexTra
 ) {}
 const decodeCodexSettings = Schema.decodeEffect(CodexSettings);
 const isNativeTransportError = Schema.is(NativeCodexTransportError);
+const isFrameSubmissionError = Schema.is(CodexErrors.CodexAppServerFrameSubmissionError);
 const failure = (reason: NativeCodexTransportError["reason"]) =>
   new NativeCodexTransportError({ reason });
 const unavailable = (method: string) =>
@@ -58,19 +60,22 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
   const resolver = yield* SpawnExecutableResolution;
   const path = yield* Path.Path;
   const serviceScope = yield* Effect.scope;
-  const entries = new Set<{
+  type Entry = {
     fiber?: Fiber.Fiber<unknown, unknown>;
+    bootstrapFiber?: Fiber.Fiber<unknown, unknown>;
     owner?: Effect.Success<ReturnType<typeof store.consumeNativeCodexTransportOwner>>;
-  }>();
+  };
+  const entries = new Set<Entry>();
   let closed = false;
-  const stop = Effect.fn("WorkflowNativeCodexTransport.stopEntry")(function* (
-    entry: typeof entries extends Set<infer A> ? A : never,
-  ) {
+  const stop = Effect.fn("WorkflowNativeCodexTransport.stopEntry")(function* (entry: Entry) {
     if (entry.fiber && entry.fiber.pollUnsafe() === undefined) entry.fiber.interruptUnsafe();
+    if (entry.bootstrapFiber && entry.bootstrapFiber.pollUnsafe() === undefined)
+      entry.bootstrapFiber.interruptUnsafe();
     const result = entry.owner
       ? yield* entry.owner.close()
       : { kind: "closed" as const, transportId: "" };
     if (entry.fiber) yield* Fiber.await(entry.fiber);
+    if (entry.bootstrapFiber) yield* Fiber.await(entry.bootstrapFiber);
     return result;
   });
   yield* Scope.addFinalizer(
@@ -91,10 +96,7 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
         Effect.gen(function* () {
           if (closed || serviceScope.state._tag === "Closed" || platform !== "linux")
             return yield* failure("closed");
-          const entry: {
-            fiber?: Fiber.Fiber<unknown, unknown>;
-            owner?: Effect.Success<ReturnType<typeof store.consumeNativeCodexTransportOwner>>;
-          } = {};
+          const entry: Entry = {};
           entries.add(entry);
           const body = Effect.gen(function* () {
             const prepared = yield* preparation;
@@ -150,6 +152,9 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
               return yield* failure("stale");
             yield* owner.captureConstructor();
             const io = yield* owner.open();
+            let bootstrapSelection: string | undefined;
+            let bootstrapMethod: "initialize" | "initialized" | undefined;
+            let bootstrapAttempted = false;
             const client = yield* CodexClient.makeControlledProcessProtocolClient(
               {
                 pid: ChildProcessSpawner.ProcessId(io.pid),
@@ -162,16 +167,72 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
                 ),
               },
               {
-                wrapper: () =>
-                  Effect.fail(
-                    new CodexErrors.CodexAppServerFrameSubmissionError({
-                      outcome: "not_submitted",
-                      reason: "wrapper",
-                    }),
-                  ),
+                wrapper: (frame, submit) =>
+                  bootstrapSelection !== undefined &&
+                  frame.selection === bootstrapSelection &&
+                  frame.method === bootstrapMethod
+                    ? submit()
+                    : Effect.fail(
+                        new CodexErrors.CodexAppServerFrameSubmissionError({
+                          outcome: "not_submitted",
+                          reason: "wrapper",
+                        }),
+                      ),
                 onOutcome: () => Effect.void,
               },
             ).pipe(Effect.provideService(Scope.Scope, owner.scope));
+            const bootstrap = Effect.fn("WorkflowNativeCodexTransport.bootstrap")(
+              function* () {
+                if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+                  return yield* failure("boundary");
+                return yield* Effect.uninterruptibleMask((resume) =>
+                  Effect.gen(function* () {
+                    if (bootstrapAttempted || closed || serviceScope.state._tag === "Closed")
+                      return yield* failure("closed");
+                    bootstrapAttempted = true;
+                    const scope = yield* Scope.make("sequential");
+                    yield* Scope.addFinalizer(serviceScope, Scope.close(scope, Exit.void));
+                    const work = Effect.gen(function* () {
+                      const profile = yield* owner.captureBootstrap();
+                      bootstrapSelection = profile.selection;
+                      bootstrapMethod = "initialize";
+                      const response = yield* client
+                        .request("initialize", profile.params, profile.selection)
+                        .pipe(Effect.timeout("10 seconds"));
+                      yield* owner.confirmInitialize();
+                      bootstrapMethod = "initialized";
+                      yield* client.notify("initialized", undefined, profile.selection);
+                      return Object.freeze({
+                        kind: "protocol-initialized" as const,
+                        transportId: owner.transportId,
+                        response,
+                      });
+                    }).pipe(
+                      Effect.interruptible,
+                      Effect.ensuring(
+                        Effect.sync(() => {
+                          bootstrapSelection = undefined;
+                          bootstrapMethod = undefined;
+                        }),
+                      ),
+                    );
+                    const fiber = yield* work.pipe(Effect.forkIn(scope));
+                    entry.bootstrapFiber = fiber;
+                    const result = yield* resume(Fiber.await(fiber)).pipe(
+                      Effect.onInterrupt(() => stop(entry).pipe(Effect.ignore)),
+                    );
+                    if (Exit.isFailure(result)) {
+                      yield* stop(entry).pipe(Effect.ignore);
+                      entries.delete(entry);
+                      return yield* Effect.failCause(result.cause);
+                    }
+                    return result.value;
+                  }),
+                );
+              },
+              Effect.mapError(() => failure("failed")),
+              Effect.interruptible,
+            );
             return Object.freeze({
               kind: "transport-created" as const,
               runState: "preparing" as const,
@@ -179,6 +240,7 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
               executionClaim: prepared.executionClaim,
               preparation: prepared.preparation,
               transportId: owner.transportId,
+              bootstrap,
               client: CodexClient.CodexAppServerControlledClient.of({
                 ...client,
                 ownedProcess: Object.freeze({
@@ -191,9 +253,25 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
                 }),
               }),
               close: Effect.fn("WorkflowNativeCodexTransport.close")(function* () {
-                const result = yield* owner.close();
-                entries.delete(entry);
-                return result;
+                if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+                  return yield* failure("boundary");
+                return yield* Effect.uninterruptibleMask((resume) =>
+                  Effect.gen(function* () {
+                    const quiet = yield* Effect.exit(resume(client.quiesceOutput));
+                    if (Exit.isFailure(quiet)) {
+                      const error = Cause.findErrorOption(quiet.cause);
+                      if (
+                        Option.isSome(error) &&
+                        isFrameSubmissionError(error.value) &&
+                        error.value.reason === "reentrant"
+                      )
+                        return yield* Effect.failCause(quiet.cause);
+                    }
+                    const result = yield* stop(entry);
+                    entries.delete(entry);
+                    return result;
+                  }),
+                );
               }),
             });
           }).pipe(Effect.scoped, Effect.interruptible);

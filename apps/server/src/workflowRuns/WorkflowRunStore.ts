@@ -32,6 +32,8 @@ import * as Fiber from "effect/Fiber";
 import * as Exit from "effect/Exit";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
+import * as Sink from "effect/Sink";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Digest from "effect/crypto/Digest";
 import * as DateTime from "effect/DateTime";
@@ -45,6 +47,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as Path from "effect/Path";
 import { stableStringify } from "@t3tools/shared/relaySigning";
 import type { ServerConfig } from "../config.ts";
+import { buildCodexAdapterInitializeParams } from "../provider/CodexProvider.ts";
 import * as NativeProtocol from "./WorkflowNativeCommandProtocol.ts";
 import * as PreparationJob from "../preparation/PreparationJob.ts";
 import * as PreparationResource from "../preparation/PreparationProcessResource.ts";
@@ -7500,6 +7503,13 @@ const makeStore = Effect.fnUntraced(function* (
         let pending: Pending | undefined;
         let held: Held | undefined;
         let constructor: Fiber.Fiber<unknown, unknown> | undefined;
+        let bootstrap: Fiber.Fiber<unknown, unknown> | undefined;
+        let bootstrapPhase: "new" | "initialize" | "confirmed" | "initialized" = "new";
+        const initializeParams = buildCodexAdapterInitializeParams();
+        const initializeJson = stableStringify(initializeParams);
+        const bootstrapSelection = NodeCrypto.randomUUID();
+        const frameAttempts = new Set<string>();
+        let initializeRequestId: number | undefined;
         let openAttempted = false;
         let createAttempted = false;
         let releaseAttempted = false;
@@ -7642,6 +7652,7 @@ const makeStore = Effect.fnUntraced(function* (
               Effect.suspend(() => {
                 if (
                   (constructor?.id === fiber.id && constructor.pollUnsafe() === undefined) ||
+                  (bootstrap?.id === fiber.id && bootstrap.pollUnsafe() === undefined) ||
                   [...bodies].some(
                     (invocation) =>
                       invocation.fiber.id === fiber.id && !Deferred.isDoneUnsafe(invocation.done),
@@ -7658,12 +7669,15 @@ const makeStore = Effect.fnUntraced(function* (
                 const cleanup = Effect.gen(function* () {
                   if (constructor && constructor.pollUnsafe() === undefined)
                     constructor.interruptUnsafe();
+                  if (bootstrap && bootstrap.pollUnsafe() === undefined)
+                    bootstrap.interruptUnsafe();
                   for (const invocation of bodies) invocation.fiber.interruptUnsafe();
                   yield* Effect.forEach(bodies, (invocation) => Deferred.await(invocation.done), {
                     concurrency: "unbounded",
                     discard: true,
                   });
                   const constructed = constructor ? yield* Fiber.await(constructor) : undefined;
+                  const initialized = bootstrap ? yield* Fiber.await(bootstrap) : undefined;
                   const closed = yield* Effect.exit(Scope.close(physical, Exit.void));
                   const stopped = pending
                     ? yield* Effect.exit(pending.stopOwnedChild())
@@ -7672,6 +7686,10 @@ const makeStore = Effect.fnUntraced(function* (
                   if (
                     !constructed ||
                     Exit.isFailure(constructed) ||
+                    (bootstrap !== undefined &&
+                      (!initialized ||
+                        Exit.isFailure(initialized) ||
+                        bootstrapPhase !== "initialized")) ||
                     Exit.isFailure(closed) ||
                     Exit.isFailure(stopped) ||
                     !pending ||
@@ -7859,8 +7877,86 @@ const makeStore = Effect.fnUntraced(function* (
               const payload = yield* selectedHeld
                 .awaitExec(receipt)
                 .pipe(Effect.provideService(Scope.Scope, physical));
+              const stdin = Sink.fromTransform((upstream) =>
+                body(
+                  Effect.gen(function* () {
+                    if (
+                      !bootstrap ||
+                      bootstrap.pollUnsafe() !== undefined ||
+                      flags.stopped ||
+                      flags.blocked
+                    )
+                      return yield* integrity();
+                    const first = yield* Effect.result(upstream);
+                    if (first._tag === "Failure" || first.success.length !== 1)
+                      return yield* integrity();
+                    const incoming = first.success[0];
+                    if (
+                      !(incoming instanceof Uint8Array) ||
+                      !incoming.byteLength ||
+                      incoming.byteLength > 1048576
+                    )
+                      return yield* integrity();
+                    const bytes = new Uint8Array(incoming);
+                    const end = yield* Effect.result(upstream);
+                    if (end._tag !== "Failure" || !Cause.isDone(end.failure))
+                      return yield* integrity();
+                    const frame = yield* Effect.try({
+                      try: () => {
+                        const text = new TextDecoder("utf-8", {
+                          fatal: true,
+                          ignoreBOM: true,
+                        }).decode(bytes);
+                        if (!text.endsWith("\n") || text.slice(0, -1).includes("\n"))
+                          throw integrity();
+                        const value = parse(text);
+                        if (
+                          !value ||
+                          typeof value !== "object" ||
+                          Array.isArray(value) ||
+                          encode(value) + "\n" !== text
+                        )
+                          throw integrity();
+                        return value as Record<string, unknown>;
+                      },
+                      catch: integrity,
+                    });
+                    const method = frame.method;
+                    const isInitialize =
+                      method === "initialize" &&
+                      Object.keys(frame).sort().join() === "id,method,params" &&
+                      typeof frame.id === "number" &&
+                      Number.isSafeInteger(frame.id) &&
+                      frame.id > 0 &&
+                      stableStringify(frame.params) === initializeJson;
+                    const isInitialized =
+                      method === "initialized" && Object.keys(frame).join() === "method";
+                    if (!isInitialize && !isInitialized) return yield* integrity();
+                    yield* writer(
+                      Effect.gen(function* () {
+                        yield* checkCurrent(true);
+                        if (
+                          !bootstrap ||
+                          bootstrap.pollUnsafe() !== undefined ||
+                          frameAttempts.has(method as string) ||
+                          (isInitialize ? bootstrapPhase !== "new" : bootstrapPhase !== "confirmed")
+                        )
+                          return yield* integrity();
+                        frameAttempts.add(method as string);
+                        yield* Stream.run(Stream.make(bytes), payload.stdin);
+                      }),
+                      () => {
+                        bootstrapPhase = isInitialize ? "initialize" : "initialized";
+                        if (isInitialize) initializeRequestId = frame.id as number;
+                      },
+                    );
+                    return [undefined] as const;
+                  }),
+                ),
+              );
               return Object.freeze({
                 ...payload,
+                stdin,
                 pid: selectedPending.pid,
                 isRunning: selectedPending.isRunning,
                 exitCode: selectedPending.awaitExit,
@@ -7876,6 +7972,45 @@ const makeStore = Effect.fnUntraced(function* (
           scope: physical as Scope.Scope,
           close,
           open,
+          captureBootstrap: Effect.fn("WorkflowRunStore.captureNativeCodexBootstrap")(function* () {
+            yield* outside();
+            const fiber = yield* Effect.withFiber(Effect.succeed);
+            const constructed = constructor?.pollUnsafe();
+            if (
+              bootstrap ||
+              !constructed ||
+              Exit.isFailure(constructed) ||
+              !actor.row?.binding_json ||
+              flags.stopped ||
+              flags.blocked ||
+              physical.state._tag === "Closed" ||
+              runtime.scope.state._tag === "Closed"
+            )
+              return yield* integrity();
+            bootstrap = fiber;
+            return Object.freeze({
+              params: structuredClone(initializeParams),
+              selection: bootstrapSelection,
+            });
+          }),
+          confirmInitialize: Effect.fn("WorkflowRunStore.confirmNativeCodexInitialize")(
+            function* () {
+              yield* outside();
+              const fiber = yield* Effect.withFiber(Effect.succeed);
+              if (
+                !bootstrap ||
+                bootstrap.id !== fiber.id ||
+                bootstrapPhase !== "initialize" ||
+                initializeRequestId === undefined ||
+                flags.stopped ||
+                flags.blocked ||
+                physical.state._tag === "Closed" ||
+                runtime.scope.state._tag === "Closed"
+              )
+                return yield* integrity();
+              bootstrapPhase = "confirmed";
+            },
+          ),
           captureConstructor: Effect.fn("WorkflowRunStore.captureNativeCodexConstructor")(
             function* () {
               yield* outside();
