@@ -3,6 +3,8 @@ import * as Schema from "effect/Schema";
 import * as HashMap from "effect/HashMap";
 import { describe, expect, it } from "vite-plus/test";
 import {
+  ReviewReplayConflict,
+  reduceTaskReviews,
   ValidationReplayConflict,
   reduceTaskValidation,
   CustodyReplayConflict,
@@ -1141,3 +1143,170 @@ function validationRecorded(sequence: number, event: object) {
     context: { sequence, eventId: id, occurredAt: base.occurredAt, commandId },
   }) as Parameters<typeof reduceTaskValidation>[1];
 }
+
+const reviewPayload = { action: "git.push", target: "origin/main", fingerprint: "sha256:payload" };
+function reviewRequest(sequence: number, reviewId = "review") {
+  return lifecycleRecorded(sequence, {
+    type: "task.action-review-requested",
+    review: {
+      ...reviewPayload,
+      taskId: "task",
+      reviewId,
+      revision: 1,
+      ...identity,
+      providerSessionId: "provider-session",
+      runId: "origin-run",
+      ruleId: "push",
+      definitionRevision: 1,
+      actionPolicyRevision: 1,
+      label: "Push",
+      preview: { content: "Exact proposed changes", artifacts: [] },
+      state: { type: "pending" },
+      createdSequence: sequence,
+      createdAt: base.occurredAt,
+      runtimeRequestId: `runtime-${reviewId}`,
+    },
+  });
+}
+const reviewBinding = {
+  taskId: "task",
+  reviewId: "review",
+  reviewRevision: 1,
+  definitionRevision: 1,
+  actionPolicyRevision: 1,
+  payloadIdentity: reviewPayload,
+  ruleId: "push",
+  runtimeRequestId: "runtime-review",
+  providerSessionId: "provider-session",
+  ...identity,
+  runId: "origin-run",
+};
+function lifecycleRecorded(
+  sequence: number,
+  event: object,
+  commandId = `lifecycle-command-${sequence}`,
+) {
+  const id = `lifecycle-${sequence}`;
+  return decode({
+    event: { ...base, commandId, ...event, id },
+    context: {
+      sequence,
+      eventId: id,
+      occurredAt: base.occurredAt,
+      commandId,
+    },
+  });
+}
+function reviewDecision(sequence: number, decision: "approve" | "reject" | "request_changes") {
+  return lifecycleRecorded(sequence, {
+    type: "task.action-review-result-recorded",
+    reviewId: "review",
+    reviewRevision: 1,
+    ...identity,
+    runId: "origin-run",
+    payloadIdentity: reviewPayload,
+    decision,
+    human: { subject: "human", sessionId: "session" },
+  });
+}
+
+describe("action review replay and complete task composition", () => {
+  it("retains all six review states and immutable human evidence across terminal outcomes", () => {
+    const request = reviewRequest(1);
+    const pending = reduceTaskReviews(
+      undefined,
+      request as Parameters<typeof reduceTaskReviews>[1],
+    );
+    expect(HashMap.getUnsafe(pending.reviews, "review").status).toBe("pending");
+    for (const [decision, status] of [
+      ["approve", "approved"],
+      ["reject", "rejected"],
+      ["request_changes", "changes_requested"],
+    ] as const) {
+      const event = reviewDecision(2, decision);
+      const decided = reduceTaskReviews(pending, event as Parameters<typeof reduceTaskReviews>[1]);
+      expect(HashMap.getUnsafe(decided.reviews, "review").status).toBe(status);
+      const invalidation = lifecycleRecorded(3, {
+        type: "task.action-review-invalidated",
+        actionPolicyRevision: 2,
+        binding: reviewBinding,
+        cause: "policy_changed",
+        reason: "Policy replaced",
+      });
+      const invalidated = reduceTaskReviews(
+        decided,
+        invalidation as Parameters<typeof reduceTaskReviews>[1],
+      );
+      expect(HashMap.getUnsafe(invalidated.reviews, "review").status).toBe("invalidated");
+      expect(HashMap.getUnsafe(invalidated.reviews, "review").decision).toEqual(event);
+      expect(reduceTaskReviews(invalidated, event as Parameters<typeof reduceTaskReviews>[1])).toBe(
+        invalidated,
+      );
+      const cancelledEvent = lifecycleRecorded(4, {
+        type: "task.action-review-cancelled",
+        binding: reviewBinding,
+        reason: "Archived",
+        source: {
+          type: "task.archive",
+          commandId: "lifecycle-command-4",
+          human: { subject: "human", sessionId: "session" },
+        },
+      });
+      const cancelled = reduceTaskReviews(
+        invalidated,
+        cancelledEvent as Parameters<typeof reduceTaskReviews>[1],
+      );
+      expect(HashMap.getUnsafe(cancelled.reviews, "review").status).toBe("cancelled");
+      expect(Array.from(HashMap.getUnsafe(cancelled.reviews, "review").outcomes)).toHaveLength(2);
+      expect(HashMap.getUnsafe(pending.reviews, "review").decision).toBeUndefined();
+    }
+  });
+
+  it("binds release purpose, exact decision and immutable alternate review identities", () => {
+    const request = reviewRequest(1);
+    for (const decision of ["approve", "reject", "request_changes"] as const) {
+      const pending = reduceTaskReviews(
+        undefined,
+        request as Parameters<typeof reduceTaskReviews>[1],
+      );
+      const decided = reduceTaskReviews(
+        pending,
+        reviewDecision(2, decision) as Parameters<typeof reduceTaskReviews>[1],
+      );
+      const releasedEvent = lifecycleRecorded(3, {
+        type: "task.action-review-continuation-released",
+        binding: reviewBinding,
+        continuationId: "continuation",
+        decisionEventId: "lifecycle-2",
+        purpose: decision === "approve" ? "approved_action" : "feedback",
+        decision,
+        reason: "Human response",
+      });
+      const released = reduceTaskReviews(
+        decided,
+        releasedEvent as Parameters<typeof reduceTaskReviews>[1],
+      );
+      expect(HashMap.getUnsafe(released.reviews, "review").release).toEqual(releasedEvent);
+      expect(
+        reduceTaskReviews(released, releasedEvent as Parameters<typeof reduceTaskReviews>[1]),
+      ).toBe(released);
+      expect(() =>
+        reduceTaskReviews(
+          released,
+          lifecycleRecorded(4, { ...releasedEvent.event }) as Parameters<
+            typeof reduceTaskReviews
+          >[1],
+        ),
+      ).toThrow(ReviewReplayConflict);
+      expect(() =>
+        reduceTaskReviews(
+          decided,
+          lifecycleRecorded(3, {
+            ...releasedEvent.event,
+            decisionEventId: "missing",
+          }) as Parameters<typeof reduceTaskReviews>[1],
+        ),
+      ).toThrow(ReviewReplayConflict);
+    }
+  });
+});
