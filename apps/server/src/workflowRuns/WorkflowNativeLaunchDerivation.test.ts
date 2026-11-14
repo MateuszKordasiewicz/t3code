@@ -12,6 +12,7 @@ import * as Sink from "effect/Sink";
 import * as PreparationNode from "../preparation/PreparationNodeChild.ts";
 import * as PreparationResource from "../preparation/PreparationProcessResource.ts";
 import * as PreparationJob from "../preparation/PreparationJob.ts";
+import * as PreparationOwner from "../preparation/PreparationProcessOwner.ts";
 import * as ThreadLaunch from "../orchestration-v2/ThreadLaunchService.ts";
 import * as NativeTransport from "../orchestration-v2/WorkflowNativeCodexTransport.ts";
 import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionManager.ts";
@@ -43,6 +44,7 @@ import * as NodePathService from "@effect/platform-node/NodePath";
 import { assert, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  ProjectId,
   EventId,
   MessageId,
   OrchestrationV2Command,
@@ -3063,8 +3065,10 @@ it.effect.each(["workflow", "planning"] as const)(
 
 const decodeProducedOperation = Schema.decodeEffect(Schema.fromJsonString(WorkflowOperationV1));
 
-const isolatedNativeMcpRegistry = Effect.fn("test.isolatedNativeMcpRegistry")(function* () {
-  return yield* McpRegistry.__testing.make().pipe(
+const isolatedNativeMcpRegistry = Effect.fn("test.isolatedNativeMcpRegistry")(function* (
+  options: McpRegistry.McpSessionRegistryOptions = {},
+) {
+  return yield* McpRegistry.__testing.make(options).pipe(
     Effect.provideService(
       HttpServer.HttpServer,
       HttpServer.HttpServer.of({
@@ -4381,6 +4385,7 @@ it.effect.each([false, true])(
 const nativeTransportEntry = Effect.fn("test.nativeTransportEntry")(function* (
   fixture: Effect.Success<ReturnType<typeof controlledNativeFixture>>,
   managedPolicy?: Parameters<typeof Settings.layerTest>[1],
+  mcp?: typeof McpProviderSessions.McpProviderSessions.Service,
 ) {
   const providerId = ProviderInstanceId.make("provider");
   const initialSettings = Context.get(
@@ -4553,7 +4558,9 @@ const nativeTransportEntry = Effect.fn("test.nativeTransportEntry")(function* (
       Layer.mergeAll(
         NodeServices.layer,
         IdAllocator.layer,
-        McpProviderSessions.layer,
+        mcp
+          ? Layer.succeed(McpProviderSessions.McpProviderSessions, mcp)
+          : McpProviderSessions.layer,
         Continuations.layer,
       ),
     ),
@@ -7691,7 +7698,7 @@ it.effect.each(
     }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
 );
 
-it.effect.each(["configured", "retained-config", "idle-release"] as const)(
+it.effect.each(["foreign-map", "retained-config", "idle-release"] as const)(
   "native Manager enforces original MCP and idle profile at %s",
   (mode) =>
     Effect.gen(function* () {
@@ -7743,7 +7750,7 @@ it.effect.each(["configured", "retained-config", "idle-release"] as const)(
           yield* Layer.build(
             Layer.fresh(
               ProviderSessionManager.layerWithOptions({
-                configureMcp: mode === "configured",
+                configureMcp: mode === "foreign-map",
                 idleTimeoutMs: 1,
               }).pipe(Layer.provide(dependencies)),
             ),
@@ -8788,4 +8795,694 @@ it.effect.each(
         yield* registry.resolve(issued.config.authorizationHeader.replace(/^Bearer\s+/, "")),
       );
     }).pipe(Effect.provide(testLayer())),
+);
+
+const configuredNativeManager = Effect.fn("test.configuredNativeManager")(function* (
+  fixture: Effect.Success<ReturnType<typeof controlledNativeFixture>>,
+  mcp: typeof McpProviderSessions.McpProviderSessions.Service,
+  registry: McpRegistry.McpSessionRegistryShape,
+  tracker?: typeof AgentScope.Service,
+) {
+  const initial = Context.get(
+    yield* Layer.build(Layer.fresh(Settings.layerTest())),
+    Settings.ServerSettingsService,
+  );
+  const state = { settings: yield* initial.getSettings };
+  const settings = Settings.ServerSettingsService.of({
+    ...initial,
+    getSettings: Effect.sync(() => state.settings),
+  });
+  const dependencies = Layer.mergeAll(
+    NodeServices.layer,
+    IdAllocator.layer,
+    Layer.succeed(McpRegistry.McpSessionRegistry, registry),
+    Layer.succeed(McpProviderSessions.McpProviderSessions, mcp),
+    Layer.succeed(Settings.ServerSettingsService, settings),
+    Layer.succeed(EventSink.EventSinkV2, Context.get(fixture.runtime, EventSink.EventSinkV2)),
+    Layer.succeed(
+      ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+      Context.get(fixture.runtime, ProviderAdapterRegistry.ProviderAdapterRegistryV2),
+    ),
+    ProjectionStore.layer.pipe(Layer.provide(Layer.succeed(SqlClient.SqlClient, fixture.sql))),
+    Layer.succeed(CommandOutputHub.CommandOutputHub, {
+      append: () => Effect.die("native output not qualified"),
+      finish: () => Effect.die("native output not qualified"),
+      subscribe: () => Stream.die("native output not qualified"),
+    }),
+    Layer.succeed(ProviderEventIngestor.ProviderEventIngestorV2, {
+      normalize: () => Effect.die("native events not qualified"),
+      ingestNormalized: () => Effect.die("native events not qualified"),
+    }),
+  );
+  const manager = Context.get(
+    yield* Layer.build(
+      Layer.fresh(
+        ProviderSessionManager.layer.pipe(Layer.provide(dependencies), (layer) =>
+          tracker ? layer.pipe(Layer.provide(Layer.succeed(AgentScope, tracker))) : layer,
+        ),
+      ),
+    ),
+    ProviderSessionManager.ProviderSessionManagerV2,
+  );
+  return { manager, state, settings };
+});
+
+it.effect.each(["workflow", "planning"] as const)(
+  "native default MCP prepares real %s authority before the first workspace action",
+  (kind) =>
+    Effect.gen(function* () {
+      let beforeWrap: Effect.Effect<void> = Effect.void;
+      const harness = yield* nativeWorkspaceProcesses(Effect.suspend(() => beforeWrap));
+      yield* Effect.gen(function* () {
+        const fixture = yield* controlledNativeFixture(kind, false, false, 2, false, {
+          type: "worktree",
+          baseRef: "main",
+          branch: "native-default-mcp",
+        });
+        const tracker = yield* AgentScope;
+        const registry = yield* isolatedNativeMcpRegistry();
+        const mcp = Context.get(
+          yield* Layer.build(Layer.fresh(McpProviderSessions.layer)),
+          McpProviderSessions.McpProviderSessions,
+        );
+        const { manager } = yield* configuredNativeManager(fixture, mcp, registry);
+        const trace: string[] = [];
+        using _clear = vi.spyOn(tracker, "clear").mockImplementation(() =>
+          Effect.sync(() => {
+            trace.push("clear");
+          }),
+        );
+        const threadId = ThreadId.make(fixture.input.threadId);
+        beforeWrap = Effect.gen(function* () {
+          trace.push("wrap");
+          const config = yield* mcp.read(threadId);
+          if (!config) throw new Error("credential missing before workspace");
+          const scope = yield* registry.resolve(
+            config.authorizationHeader.replace(/^Bearer\s+/, ""),
+          );
+          if (!scope) throw new Error("original scope missing before workspace");
+          assert.strictEqual(scope.thread.threadId, threadId);
+          assert.strictEqual(scope.thread.providerSessionId, config.providerSessionId);
+        });
+        const service = yield* nativeTransportEntry(
+          {
+            ...fixture,
+            runtime: Context.add(
+              fixture.runtime,
+              ProviderSessionManager.ProviderSessionManagerV2,
+              manager,
+            ),
+          },
+          undefined,
+          mcp,
+        );
+        const transport = yield* service.createReservedTransport(producerSelection(fixture));
+        assert.strictEqual(trace[0], "clear");
+        assert.strictEqual(trace.filter((value) => value === "clear").length, 1);
+        const config = yield* mcp.read(threadId);
+        if (!config) throw new Error("credential missing after workspace");
+        assert.notStrictEqual(
+          config.providerSessionId,
+          (transport.preparation.job.input.request.current as Record<string, unknown>)
+            .providerSessionId,
+        );
+        yield* transport.bootstrap();
+        yield* transport.createAdapterRuntime();
+        const published = yield* transport.publishRuntime();
+        assert.isTrue(yield* manager.isLive(published.runtime.providerSessionId));
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        const child = harness.children.get(image.args[3]!)!;
+        assert.strictEqual(child.payloads.length, 2);
+        assert.isFalse(child.payloads.some((text) => text.includes(config.authorizationHeader)));
+        assert.isFalse(Object.values(image.environment).includes(config.authorizationHeader));
+        assert.isTrue((yield* mcp.read(threadId)) === config);
+        yield* manager.close(published.runtime.providerSessionId);
+        assert.strictEqual((yield* transport.close()).kind, "retired");
+        assert.isTrue((yield* mcp.read(threadId)) === undefined);
+        assert.isUndefined(
+          yield* registry.resolve(config.authorizationHeader.replace(/^Bearer\s+/, "")),
+        );
+        assert.isFalse(child.running);
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+const configuredNativeEntry = Effect.fn("test.configuredNativeEntry")(function* (
+  kind: "workflow" | "planning" = "workflow",
+  registryOptions: McpRegistry.McpSessionRegistryOptions = {},
+  factoryScope?: Scope.Scope,
+) {
+  const fixture = yield* controlledNativeFixture(kind, false, false, 2, false, {
+    type: "worktree",
+    baseRef: "main",
+    branch: "native-mcp-lifecycle",
+  });
+  const registry = yield* isolatedNativeMcpRegistry(registryOptions);
+  const mcp = Context.get(
+    yield* Layer.build(Layer.fresh(McpProviderSessions.layer)),
+    McpProviderSessions.McpProviderSessions,
+  );
+  const { manager, state, settings } = yield* configuredNativeManager(fixture, mcp, registry);
+  const selected = {
+    ...fixture,
+    runtime: Context.add(fixture.runtime, ProviderSessionManager.ProviderSessionManagerV2, manager),
+  };
+  const service = yield* nativeTransportEntry(selected, undefined, mcp).pipe((work) =>
+    factoryScope ? work.pipe(Effect.provideService(Scope.Scope, factoryScope)) : work,
+  );
+  const request: McpRegistry.McpCredentialRequest = {
+    threadId: ThreadId.make(fixture.input.threadId),
+    providerInstanceId: ProviderInstanceId.make("provider"),
+    browserToolsAvailable: true,
+    capabilities: new Set(["preview"]),
+  };
+  return { fixture: selected, registry, mcp, manager, state, settings, service, request };
+});
+
+it.effect.each([false, true] as const)(
+  "native borrowed MCP release guards its original callback under descendant=%s",
+  (descendant) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        const { fixture, registry, mcp, manager, service, request } =
+          yield* configuredNativeEntry();
+        const borrowed = yield* registry.issue(request);
+        yield* mcp.set(borrowed.config);
+        const transport = yield* service.createReservedTransport(producerSelection(fixture));
+        assert.isTrue((yield* mcp.read(request.threadId)) === borrowed.config);
+        yield* transport.bootstrap();
+        yield* transport.createAdapterRuntime();
+        const published = yield* transport.publishRuntime();
+        const originalOwner = yield* Store.readNativeManagerWorkspaceOwner(
+          fixture.store,
+          transport.preparation.job,
+          fixture.sql,
+        );
+        const original = registry.revokeProviderSession;
+        let callbacks = 0;
+        using _revoke = vi.spyOn(registry, "revokeProviderSession").mockImplementation((id) =>
+          Effect.gen(function* () {
+            callbacks++;
+            const assertion = PreparationOwner.assertCanStop(originalOwner);
+            const guarded = yield* Effect.exit(
+              descendant ? assertion.pipe(Effect.forkChild, Effect.flatMap(Fiber.join)) : assertion,
+            );
+            assert.isTrue(Exit.isFailure(guarded));
+            const again = manager.close(published.runtime.providerSessionId);
+            const refused = yield* Effect.exit(
+              descendant ? again.pipe(Effect.forkChild, Effect.flatMap(Fiber.join)) : again,
+            );
+            assert.isTrue(Exit.isFailure(refused));
+            yield* original(id);
+          }),
+        );
+        yield* manager.close(published.runtime.providerSessionId);
+        assert.strictEqual(callbacks, 1);
+        assert.isTrue((yield* mcp.read(request.threadId)) === undefined);
+        assert.isUndefined(
+          yield* registry.resolve(borrowed.config.authorizationHeader.replace(/^Bearer\s+/, "")),
+        );
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect(
+  "native MCP refuses a map replacement during final policy resolution before SDK birth",
+  () =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        const { fixture, registry, mcp, service, request } = yield* configuredNativeEntry();
+        const winner = yield* registry.issue(request);
+        let snapshots = 0;
+        let armed = false;
+        let replacements = 0;
+        service.facts.beforeSnapshot = Effect.sync(() => {
+          if (++snapshots === 2) armed = true;
+        });
+        const original = registry.resolve;
+        using _resolve = vi.spyOn(registry, "resolve").mockImplementation((token) =>
+          original(token).pipe(
+            Effect.tap(() => {
+              if (!armed) return Effect.void;
+              armed = false;
+              replacements++;
+              return mcp.set(winner.config);
+            }),
+          ),
+        );
+        const result = yield* Effect.exit(
+          service.createReservedTransport(producerSelection(fixture)),
+        );
+        assert.strictEqual(replacements, 1);
+        assert.strictEqual(
+          harness.requests.filter((image) => image.args[4] === "/fixture-bin/codex").length,
+          0,
+        );
+        assert.isTrue(Exit.isFailure(result));
+        assert.isTrue((yield* mcp.read(request.threadId)) === winner.config);
+        assert.isDefined(
+          yield* original(winner.config.authorizationHeader.replace(/^Bearer\s+/, "")),
+        );
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect("native MCP refuses a policy change during final resolution before SDK birth", () =>
+  Effect.gen(function* () {
+    const harness = yield* nativeWorkspaceProcesses();
+    yield* Effect.gen(function* () {
+      const { fixture, registry, service, state } = yield* configuredNativeEntry();
+      let snapshots = 0;
+      let armed = false;
+      let changes = 0;
+      service.facts.beforeSnapshot = Effect.sync(() => {
+        if (++snapshots === 2) armed = true;
+      });
+      const original = registry.resolve;
+      using _resolve = vi.spyOn(registry, "resolve").mockImplementation((token) =>
+        original(token).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              if (!armed) return;
+              armed = false;
+              changes++;
+              state.settings = { ...state.settings, enableAgentBrowserAccess: false };
+            }),
+          ),
+        ),
+      );
+      const result = yield* Effect.exit(
+        service.createReservedTransport(producerSelection(fixture)),
+      );
+      assert.strictEqual(changes, 1);
+      assert.strictEqual(
+        harness.requests.filter((image) => image.args[4] === "/fixture-bin/codex").length,
+        0,
+      );
+      assert.isTrue(Exit.isFailure(result));
+    }).pipe(Effect.provide(harness.services));
+  }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each([
+  "borrow",
+  "rotate-browser",
+  "rotate-lineage",
+  "device",
+  "browser-optout",
+  "project-lookup-withheld",
+  "linked",
+] as const)("native MCP uses actual configured policy at %s", (mode) =>
+  Effect.gen(function* () {
+    const harness = yield* nativeWorkspaceProcesses();
+    yield* Effect.gen(function* () {
+      const { fixture, registry, mcp, manager, service, request, state } =
+        yield* configuredNativeEntry();
+      const borrowed =
+        mode === "borrow" || mode.startsWith("rotate")
+          ? yield* registry.issue({
+              ...request,
+              ...(mode === "rotate-lineage" ? { subagent: true } : {}),
+            })
+          : undefined;
+      if (borrowed) yield* mcp.set(borrowed.config);
+      if (mode === "rotate-browser" || mode === "browser-optout")
+        state.settings = { ...state.settings, enableAgentBrowserAccess: false };
+      if (mode === "device") state.settings = { ...state.settings, enableAgentDeviceAccess: true };
+      if (mode === "project-lookup-withheld")
+        state.settings = {
+          ...state.settings,
+          projectSettingsOverrides: {
+            [ProjectId.make("project")]: { enableAgentBrowserAccess: false },
+          },
+        };
+      if (mode === "linked")
+        state.settings = { ...state.settings, linkedEnvironmentsEnabled: true };
+      let issued = 0;
+      const original = registry.issue;
+      using _issue = vi.spyOn(registry, "issue").mockImplementation((input) =>
+        Effect.gen(function* () {
+          issued++;
+          assert.isTrue(Option.isSome(yield* Effect.serviceOption(fixture.sql.transactionService)));
+          return yield* original(input);
+        }),
+      );
+      const transport = yield* service.createReservedTransport(producerSelection(fixture));
+      const config = yield* mcp.read(request.threadId);
+      if (!config) throw new Error("native MCP policy config missing");
+      assert.strictEqual(issued, mode === "borrow" ? 0 : 1);
+      if (borrowed) {
+        assert.strictEqual(config === borrowed.config, mode === "borrow");
+        if (mode.startsWith("rotate"))
+          assert.isUndefined(
+            yield* registry.resolve(borrowed.config.authorizationHeader.replace(/^Bearer\s+/, "")),
+          );
+      }
+      const scope = yield* registry.resolve(config.authorizationHeader.replace(/^Bearer\s+/, ""));
+      if (!scope) throw new Error("native MCP policy scope missing");
+      assert.strictEqual(
+        scope.capabilities.has("preview"),
+        mode !== "rotate-browser" &&
+          mode !== "browser-optout" &&
+          mode !== "project-lookup-withheld",
+      );
+      assert.strictEqual(scope.capabilities.has("device"), mode === "device");
+      assert.isFalse(scope.thread.subagent === true);
+      yield* transport.bootstrap();
+      yield* transport.createAdapterRuntime();
+      const published = yield* transport.publishRuntime();
+      yield* manager.close(published.runtime.providerSessionId);
+      assert.strictEqual((yield* transport.close()).kind, "retired");
+      assert.isTrue((yield* mcp.read(request.threadId)) === undefined);
+      assert.isUndefined(
+        yield* registry.resolve(config.authorizationHeader.replace(/^Bearer\s+/, "")),
+      );
+    }).pipe(Effect.provide(harness.services));
+  }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(["expired", "forged-namespace", "revoked-grant"] as const)(
+  "native MCP refuses %s before workspace and preserves unowned credentials",
+  (mode) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        let timestamp = 1000;
+        const { fixture, registry, mcp, service, request } = yield* configuredNativeEntry(
+          "workflow",
+          { now: () => timestamp, livenessWindowMs: 100 },
+        );
+        const borrowed = yield* registry.issue(request);
+        const selected =
+          mode === "forged-namespace"
+            ? { ...borrowed.config, providerSessionId: "unproved-namespace" }
+            : borrowed.config;
+        yield* mcp.set(selected);
+        if (mode === "expired") timestamp = 2000;
+        if (mode === "revoked-grant") yield* fixture.sessions.revoke(fixture.reference.sessionId);
+        let issues = 0;
+        let resolves = 0;
+        let revokes = 0;
+        const issue = registry.issue;
+        const resolve = registry.resolve;
+        const revoke = registry.revokeProviderSession;
+        using _issue = vi.spyOn(registry, "issue").mockImplementation((input) => {
+          issues++;
+          return issue(input);
+        });
+        using _resolve = vi.spyOn(registry, "resolve").mockImplementation((token) => {
+          resolves++;
+          return resolve(token);
+        });
+        using _revoke = vi.spyOn(registry, "revokeProviderSession").mockImplementation((id) => {
+          revokes++;
+          return revoke(id);
+        });
+        using _thread = vi
+          .spyOn(registry, "revokeThread")
+          .mockImplementation(() =>
+            Effect.die("native must not revoke an unproved thread namespace"),
+          );
+        const result = yield* Effect.exit(
+          service.createReservedTransport(producerSelection(fixture)),
+        );
+        assert.isTrue(Exit.isFailure(result));
+        assert.strictEqual(issues, 0);
+        assert.strictEqual(revokes, 0);
+        assert.strictEqual(resolves > 0, mode !== "revoked-grant");
+        assert.strictEqual(harness.requests.length, 0);
+        assert.isTrue((yield* mcp.read(request.threadId)) === selected);
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each([false, true] as const)(
+  "native MCP profile failure joins its own cleanup with borrowed=%s",
+  (borrowed) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        const { fixture, registry, mcp, manager, service, request } =
+          yield* configuredNativeEntry();
+        const original = registry.issue;
+        let observed: McpRegistry.McpIssuedCredential | undefined;
+        const previous = borrowed ? yield* original(request) : undefined;
+        if (previous) yield* mcp.set(previous.config);
+        using _issue = vi.spyOn(registry, "issue").mockImplementation((input) =>
+          original(input).pipe(
+            Effect.tap((value) =>
+              Effect.sync(() => {
+                observed = value;
+              }),
+            ),
+          ),
+        );
+        service.facts.beforeSnapshot = Effect.die("native fixture profile failed after workspace");
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(service.createReservedTransport(producerSelection(fixture))),
+          ),
+        );
+        const selected = previous ?? observed;
+        if (!selected) throw new Error("native MCP fixture did not observe original issuance");
+        const token = selected.config.authorizationHeader.replace(/^Bearer\s+/, "");
+        assert.strictEqual((yield* registry.resolve(token)) !== undefined, borrowed);
+        assert.isTrue((yield* mcp.read(request.threadId)) === previous?.config);
+        assert.strictEqual(
+          harness.requests.filter((image) => image.args[4] === "/fixture-bin/codex").length,
+          0,
+        );
+        if (previous) {
+          const ordinary = yield* nativeManagerOrdinaryAdapter(fixture);
+          using _adapter = ordinary.spy;
+          const sid = ProviderSessionId.make("ordinary-after-native-borrowed-failure");
+          yield* manager.open(ordinaryNativeManagerInput(request.threadId, sid));
+          assert.isTrue(yield* manager.isLive(sid));
+          yield* manager.close(sid);
+          assert.isUndefined(yield* registry.resolve(token));
+          assert.isTrue((yield* mcp.read(request.threadId)) === undefined);
+        }
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(["foreign-map", "copied-map", "foreign-tracker"] as const)(
+  "native MCP refuses original service mismatch at %s before attribution",
+  (mode) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        const fixture = yield* controlledNativeFixture("workflow", false, false, 2, false, {
+          type: "worktree",
+          baseRef: "main",
+          branch: "native-mcp-realm",
+        });
+        const registry = yield* isolatedNativeMcpRegistry();
+        const originalMap = Context.get(
+          yield* Layer.build(Layer.fresh(McpProviderSessions.layer)),
+          McpProviderSessions.McpProviderSessions,
+        );
+        const selected = mode === "copied-map" ? { ...originalMap } : originalMap;
+        const factoryMap =
+          mode === "foreign-map"
+            ? Context.get(
+                yield* Layer.build(Layer.fresh(McpProviderSessions.layer)),
+                McpProviderSessions.McpProviderSessions,
+              )
+            : selected;
+        const tracker = yield* AgentScope;
+        const { manager } = yield* configuredNativeManager(
+          fixture,
+          selected,
+          registry,
+          mode === "foreign-tracker" ? { ...tracker } : tracker,
+        );
+        let issues = 0;
+        const original = registry.issue;
+        using _issue = vi.spyOn(registry, "issue").mockImplementation((input) => {
+          issues++;
+          return original(input);
+        });
+        const result = yield* Effect.exit(
+          Effect.gen(function* () {
+            const service = yield* nativeTransportEntry(
+              {
+                ...fixture,
+                runtime: Context.add(
+                  fixture.runtime,
+                  ProviderSessionManager.ProviderSessionManagerV2,
+                  manager,
+                ),
+              },
+              undefined,
+              factoryMap,
+            );
+            return yield* service.createReservedTransport(producerSelection(fixture));
+          }),
+        );
+        assert.isTrue(Exit.isFailure(result));
+        assert.strictEqual(issues, 0);
+        assert.strictEqual(harness.requests.length, 0);
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_process_resources`,
+          [],
+        );
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(
+  ([false, true] as const).flatMap((borrowed) =>
+    ([false, true] as const).flatMap((masked) =>
+      (["caller", "factory", "store", "manager"] as const).map((boundary) => ({
+        borrowed,
+        masked,
+        boundary,
+      })),
+    ),
+  ),
+)(
+  "native MCP joins preparation at $boundary with borrowed=$borrowed mask=$masked",
+  ({ borrowed, masked, boundary }) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      const storeScope = yield* Scope.make();
+      const factoryScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(storeScope, Exit.void));
+      yield* Effect.addFinalizer(() => Scope.close(factoryScope, Exit.void));
+      yield* Effect.gen(function* () {
+        const { fixture, registry, mcp, manager, service, request } = yield* configuredNativeEntry(
+          "workflow",
+          {},
+          factoryScope,
+        ).pipe(Effect.provideService(Scope.Scope, storeScope));
+        const previous = borrowed ? yield* registry.issue(request) : undefined;
+        if (previous) yield* mcp.set(previous.config);
+        const entered = yield* Deferred.make<void>();
+        const unwinding = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const issue = registry.issue;
+        const resolve = registry.resolve;
+        let observed: McpRegistry.McpIssuedCredential | undefined;
+        using _issue = vi.spyOn(registry, "issue").mockImplementation((input) =>
+          issue(input).pipe(
+            Effect.tap((value) =>
+              Effect.sync(() => {
+                observed = value;
+              }),
+            ),
+            Effect.tap(() =>
+              borrowed
+                ? Effect.void
+                : Deferred.succeed(entered, undefined).pipe(
+                    Effect.andThen(Deferred.await(release)),
+                  ),
+            ),
+          ),
+        );
+        using _resolve = vi
+          .spyOn(registry, "resolve")
+          .mockImplementation((token) =>
+            resolve(token).pipe(
+              Effect.tap(() =>
+                borrowed
+                  ? Deferred.succeed(entered, undefined).pipe(
+                      Effect.andThen(Effect.never),
+                      Effect.ensuring(
+                        Deferred.succeed(unwinding, undefined).pipe(
+                          Effect.andThen(Deferred.await(release)),
+                        ),
+                      ),
+                    )
+                  : Effect.void,
+              ),
+            ),
+          );
+        const creating = yield* service
+          .createReservedTransport(producerSelection(fixture))
+          .pipe(
+            (work) => (masked ? Effect.uninterruptible(work) : work),
+            Effect.exit,
+            Effect.forkScoped,
+          );
+        yield* Deferred.await(entered);
+        const stopping = yield* (
+          boundary === "caller"
+            ? Fiber.interrupt(creating)
+            : boundary === "factory"
+              ? Scope.close(factoryScope, Exit.void)
+              : boundary === "store"
+                ? Scope.close(storeScope, Exit.void)
+                : manager.shutdown
+        ).pipe(Effect.forkScoped({ startImmediately: true }));
+        if (borrowed) yield* Deferred.await(unwinding);
+        yield* Effect.sync(() => {
+          assert.isUndefined(stopping.pollUnsafe());
+          assert.isUndefined(creating.pollUnsafe());
+        }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+        yield* Fiber.join(stopping);
+        const result = yield* Fiber.await(creating);
+        assert.isTrue(Exit.isFailure(result) || Exit.isFailure(result.value));
+        const selected = previous ?? observed;
+        if (!selected) throw new Error("native MCP preparation did not observe original issue");
+        assert.strictEqual(
+          (yield* resolve(selected.config.authorizationHeader.replace(/^Bearer\s+/, ""))) !==
+            undefined,
+          borrowed,
+        );
+        assert.isTrue((yield* mcp.read(request.threadId)) === previous?.config);
+        assert.strictEqual(harness.requests.length, 0);
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT * FROM orchestration_v2_submission_transports`,
+          [],
+        );
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(
+  (["bootstrap", "adapter", "publication"] as const).flatMap((phase) =>
+    (["replacement", "policy"] as const).map((drift) => ({ phase, drift })),
+  ),
+)("native MCP refuses $drift drift before $phase", ({ phase, drift }) =>
+  Effect.gen(function* () {
+    const harness = yield* nativeWorkspaceProcesses();
+    yield* Effect.gen(function* () {
+      const { fixture, registry, mcp, service, request, state } = yield* configuredNativeEntry();
+      const replacement = yield* registry.issue(request);
+      const transport = yield* service.createReservedTransport(producerSelection(fixture));
+      const original = yield* mcp.read(request.threadId);
+      if (!original) throw new Error("native MCP credential missing before drift");
+      if (phase !== "bootstrap") yield* transport.bootstrap();
+      if (phase === "publication") yield* transport.createAdapterRuntime();
+      if (drift === "replacement") yield* mcp.set(replacement.config);
+      else state.settings = { ...state.settings, enableAgentBrowserAccess: false };
+      const result = yield* Effect.exit(
+        phase === "bootstrap"
+          ? transport.bootstrap().pipe(Effect.asVoid)
+          : phase === "adapter"
+            ? transport.createAdapterRuntime().pipe(Effect.asVoid)
+            : transport.publishRuntime().pipe(Effect.asVoid),
+      );
+      assert.isTrue(Exit.isFailure(result));
+      const cleanup = yield* transport.close();
+      assert.strictEqual(cleanup.kind, phase === "bootstrap" ? "retired" : "held");
+      assert.isUndefined(
+        yield* registry.resolve(original.authorizationHeader.replace(/^Bearer\s+/, "")),
+      );
+      assert.isTrue(
+        (yield* mcp.read(request.threadId)) ===
+          (drift === "replacement" ? replacement.config : undefined),
+      );
+      assert.isDefined(
+        yield* registry.resolve(replacement.config.authorizationHeader.replace(/^Bearer\s+/, "")),
+      );
+      const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+      const child = harness.children.get(image.args[3]!)!;
+      assert.isFalse(child.running);
+      assert.strictEqual(child.payloads.length, phase === "bootstrap" ? 0 : 2);
+    }).pipe(Effect.provide(harness.services));
+  }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
 );

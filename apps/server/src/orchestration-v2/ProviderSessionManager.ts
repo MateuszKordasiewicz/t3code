@@ -1,6 +1,8 @@
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
+import { stableStringify } from "@t3tools/shared/relaySigning";
+import type { McpProviderSessionConfig } from "@t3tools/provider-core/server/mcpSession";
 import {
   isOrchestrationV2WorkActive,
   ModelSelection,
@@ -237,6 +239,7 @@ export class NativeManagerRuntimeError extends Schema.TaggedError<NativeManagerR
   },
 ) {}
 export interface NativeManagerRegistration {
+  readonly mcp: typeof McpProviderSessions.McpProviderSessions.Service;
   readonly store: object;
   readonly owner: object;
   readonly sql: SqlClient.SqlClient;
@@ -258,6 +261,11 @@ interface NativeManagerReceiver {
   ) => Effect.Effect<void, NativeManagerRuntimeError>;
   readonly preflight: (
     sink: EventSink.EventSinkV2["Service"],
+    mcp?: typeof McpProviderSessions.McpProviderSessions.Service,
+  ) => Effect.Effect<void, NativeManagerRuntimeError>;
+  readonly checkMcp: (
+    owner: object,
+    mcp: typeof McpProviderSessions.McpProviderSessions.Service,
   ) => Effect.Effect<void, NativeManagerRuntimeError>;
   readonly reserve: (
     registration: NativeManagerRegistration,
@@ -281,10 +289,21 @@ const nativeReceiver = Effect.fn("ProviderSessionManager.nativeReceiver")(functi
   return receiver;
 });
 export const assertNativeManagerReceiver = Effect.fn("ProviderSessionManager.assertNativeReceiver")(
-  function* (manager: ProviderSessionManagerV2["Service"], sink: EventSink.EventSinkV2["Service"]) {
-    yield* (yield* nativeReceiver(manager)).preflight(sink);
+  function* (
+    manager: ProviderSessionManagerV2["Service"],
+    sink: EventSink.EventSinkV2["Service"],
+    mcp: typeof McpProviderSessions.McpProviderSessions.Service,
+  ) {
+    yield* (yield* nativeReceiver(manager)).preflight(sink, mcp);
   },
 );
+export const checkNativeManagerMcp = Effect.fn("ProviderSessionManager.checkNativeMcp")(function* (
+  manager: ProviderSessionManagerV2["Service"],
+  owner: object,
+  mcp: typeof McpProviderSessions.McpProviderSessions.Service,
+) {
+  yield* (yield* nativeReceiver(manager)).checkMcp(owner, mcp);
+});
 export const reserveNativeManagerPreparation = Effect.fn(
   "ProviderSessionManager.reserveNativePreparation",
 )(function* (
@@ -521,6 +540,16 @@ export const layerWithOptions = (
           }),
       );
       const sessions = yield* Ref.make(new Map<string, LiveSessionEntry>());
+      type NativeMcpState = {
+        readonly config: McpProviderSessionConfig;
+        readonly id: string;
+        readonly issued: boolean;
+        readonly key: string;
+        readonly policyKey: string;
+        readonly linked: boolean | null | undefined;
+        reservationActive: boolean;
+        installed: boolean;
+      };
       type NativeRecord = {
         owner: object;
         readonly store: object;
@@ -529,6 +558,7 @@ export const layerWithOptions = (
         readonly cleanupCallbacks: Set<() => void>;
         readonly onHandoff: () => void;
         registration?: NativeManagerRegistration;
+        mcp?: NativeMcpState;
         source?: WorkflowRunStore.NativeManagerOwnerSource;
         readonly sessionId: ProviderSessionId;
         readonly threadId: ThreadId;
@@ -633,19 +663,249 @@ export const layerWithOptions = (
       };
       const isMcpCredentialReserved = (threadId: ThreadId, mcpCredentialId: string) =>
         (mcpCredentialReservations.get(mcpReservationKey(threadId, mcpCredentialId)) ?? 0) > 0;
+      const mcpConfigKey = (config: McpProviderSessionConfig) =>
+        stableStringify({
+          environmentId: config.environmentId,
+          threadId: config.threadId,
+          providerSessionId: config.providerSessionId,
+          providerInstanceId: config.providerInstanceId,
+          endpoint: config.endpoint,
+          authorizationHeader: config.authorizationHeader,
+          browserToolsAvailable: config.browserToolsAvailable,
+          capabilities: [...(config.capabilities ?? [])].sort(),
+          agentDeviceEnvironment: config.agentDeviceEnvironment ?? null,
+        });
+      const readNativeMcpSettingsKey = Effect.fn("ProviderSessionManager.readNativeMcpSettingsKey")(
+        function* () {
+          if (Option.isNone(serverSettings)) return "absent";
+          const result = yield* Effect.result(serverSettings.value.getSettings);
+          if (result._tag === "Failure") return "unavailable";
+          const settings = result.success;
+          return stableStringify({
+            browser: settings.enableAgentBrowserAccess,
+            device: settings.enableAgentDeviceAccess,
+            linked: settings.linkedEnvironmentsEnabled,
+            overrides: Object.fromEntries(
+              Object.entries(settings.projectSettingsOverrides)
+                .filter(
+                  ([, value]) =>
+                    value.enableAgentBrowserAccess !== undefined ||
+                    value.enableAgentDeviceAccess !== undefined,
+                )
+                .map(([id, value]) => [
+                  id,
+                  {
+                    browser: value.enableAgentBrowserAccess ?? null,
+                    device: value.enableAgentDeviceAccess ?? null,
+                  },
+                ]),
+            ),
+          });
+        },
+      );
+      const readNativeMcpPolicy = Effect.fn("ProviderSessionManager.readNativeMcpPolicy")(
+        function* (threadId: ThreadId) {
+          const settingsKey = yield* readNativeMcpSettingsKey();
+          const { browser, device } = yield* agentAccessSettings(threadId);
+          const subagent = yield* projectionStore.getThread(threadId).pipe(
+            Effect.map((thread) => thread.lineage.relationshipToParent === "subagent"),
+            Effect.orElseSucceed(() => false),
+          );
+          const linked = yield* readLinkedEnvironments;
+          if ((yield* readNativeMcpSettingsKey()) !== settingsKey)
+            return yield* nativeManagerError("profile");
+          const capabilities = new Set<import("../mcp/McpInvocationContext.ts").McpCapability>([
+            "orchestration",
+            "worktree",
+            "pull-requests",
+          ]);
+          if (browser) capabilities.add("preview");
+          if (device) capabilities.add("device");
+          return {
+            browser,
+            device,
+            subagent,
+            linked,
+            capabilities,
+            key: stableStringify({
+              browser,
+              device,
+              subagent,
+              linked: linked === undefined ? "absent" : linked === null ? "unavailable" : linked,
+            }),
+          };
+        },
+      );
+      const dropNativeMcpReservation = (record: NativeRecord) => {
+        if (record.mcp?.reservationActive) {
+          record.mcp.reservationActive = false;
+          dropMcpCredentialReservation(record.threadId, record.mcp.id);
+        }
+      };
+      const mcpHeldElsewhere = (record: NativeRecord, id: string) =>
+        isMcpCredentialReserved(record.threadId, id) ||
+        [...Ref.getUnsafe(sessions).values()].some(
+          (entry) =>
+            entry.nativeOwner !== record.owner &&
+            (entry.attachedThreadIds.has(record.threadId) ||
+              entry.mcpCredentialIdByThread.get(record.threadId) === id),
+        );
+      const prepareNativeMcp = Effect.fn("ProviderSessionManager.prepareOriginalNativeMcp")(
+        function* (record: NativeRecord) {
+          const policy = yield* readNativeMcpPolicy(record.threadId);
+          yield* record.preparation.checkReservation();
+          const previous = yield* mcpSessions.read(record.threadId);
+          let recognized = false;
+          if (previous !== undefined) {
+            Object.freeze(previous);
+            record.mcp = {
+              config: previous,
+              id: previous.providerSessionId,
+              issued: false,
+              key: mcpConfigKey(previous),
+              policyKey: policy.key,
+              linked: policy.linked,
+              reservationActive: true,
+              installed: true,
+            };
+            reserveMcpCredential(record.threadId, previous.providerSessionId);
+            const resolved = yield* mcpSessionRegistry.resolve(
+              previous.authorizationHeader.replace(/^Bearer\s+/, ""),
+            );
+            if (
+              !resolved ||
+              resolved.environmentId !== record.preparation.environmentId ||
+              previous.environmentId !== resolved.environmentId ||
+              resolved.thread.threadId !== record.threadId ||
+              previous.threadId !== record.threadId ||
+              resolved.thread.providerSessionId !== previous.providerSessionId ||
+              resolved.thread.providerInstanceId !== previous.providerInstanceId
+            )
+              return yield* nativeManagerError("profile");
+            recognized = true;
+            const expectedCapabilities = [...policy.capabilities].sort().join(",");
+            if (
+              previous.providerInstanceId === record.instanceId &&
+              [...resolved.capabilities].sort().join(",") === expectedCapabilities &&
+              [...(previous.capabilities ?? [])].sort().join(",") === expectedCapabilities &&
+              previous.browserToolsAvailable === policy.browser &&
+              (resolved.thread.subagent === true) === policy.subagent
+            ) {
+              yield* record.preparation.checkReservation();
+              return { mcpCredentialId: previous.providerSessionId, issued: false };
+            }
+          }
+          const issued = yield* record.preparation.issueMcp(mcpSessionRegistry, mcpSessions, {
+            threadId: record.threadId,
+            providerInstanceId: record.instanceId,
+            browserToolsAvailable: policy.browser,
+            capabilities: policy.capabilities,
+            subagent: policy.subagent,
+          });
+          yield* Effect.uninterruptible(
+            Effect.gen(function* () {
+              dropNativeMcpReservation(record);
+              record.mcp = {
+                config: issued.config,
+                id: issued.config.providerSessionId,
+                issued: true,
+                key: mcpConfigKey(issued.config),
+                policyKey: policy.key,
+                linked: policy.linked,
+                reservationActive: true,
+                installed: false,
+              };
+              reserveMcpCredential(record.threadId, record.mcp.id);
+              const installed = yield* McpProviderSessions.replaceIfCurrent(
+                mcpSessions,
+                record.threadId,
+                previous,
+                issued.config,
+              );
+              if (!installed) return yield* nativeManagerError("state");
+              record.mcp.installed = true;
+            }),
+          );
+          if (recognized && previous && !mcpHeldElsewhere(record, previous.providerSessionId))
+            yield* mcpSessionRegistry.revokeProviderSession(previous.providerSessionId);
+          return { mcpCredentialId: issued.config.providerSessionId, issued: true };
+        },
+      );
+      const checkNativeMcp = Effect.fn("ProviderSessionManager.checkOriginalNativeMcp")(
+        function* (
+          owner: object,
+          selected: typeof McpProviderSessions.McpProviderSessions.Service,
+        ) {
+          const record = nativeRecords.get(owner);
+          if (!record || record.closing) return yield* nativeManagerError("state");
+          if (options.configureMcp === false) {
+            if ((yield* mcpSessions.read(record.threadId)) !== undefined)
+              return yield* nativeManagerError("profile");
+            return;
+          }
+          const retained = record.mcp;
+          if (
+            selected !== mcpSessions ||
+            !McpProviderSessions.isService(selected) ||
+            !retained?.installed ||
+            (yield* mcpSessions.read(record.threadId)) !== retained.config ||
+            mcpConfigKey(retained.config) !== retained.key
+          )
+            return yield* nativeManagerError("profile");
+          yield* record.preparation.assertAgentScope(agentScope);
+          const policy = yield* readNativeMcpPolicy(record.threadId);
+          const resolved = yield* mcpSessionRegistry.resolve(
+            retained.config.authorizationHeader.replace(/^Bearer\s+/, ""),
+          );
+          const finalPolicy = yield* readNativeMcpPolicy(record.threadId);
+          if (
+            policy.key !== retained.policyKey ||
+            finalPolicy.key !== retained.policyKey ||
+            !resolved ||
+            resolved.environmentId !== record.preparation.environmentId ||
+            resolved.thread.threadId !== record.threadId ||
+            resolved.thread.providerSessionId !== retained.id ||
+            resolved.thread.providerInstanceId !== record.instanceId ||
+            [...resolved.capabilities].sort().join(",") !==
+              [...policy.capabilities].sort().join(",") ||
+            (resolved.thread.subagent === true) !== policy.subagent ||
+            record.closing ||
+            nativeSealed ||
+            layerScope.state._tag === "Closed" ||
+            (yield* mcpSessions.read(record.threadId)) !== retained.config ||
+            mcpConfigKey(retained.config) !== retained.key
+          )
+            return yield* nativeManagerError("profile");
+        },
+        Effect.mapError((cause) => nativeManagerError("profile", cause)),
+      );
       const mcpPrepareLock = yield* KeyedLock.make<ThreadId>();
       /** Serialize prepares per thread so concurrent rotations cannot revoke each other's credentials. */
-      const prepareMcpSession = (
+      function prepareMcpSession(
         threadId: ThreadId,
         providerInstanceId: ProviderInstanceId,
-      ): Effect.Effect<PreparedMcpCredential> =>
-        options.configureMcp === false
+      ): Effect.Effect<PreparedMcpCredential>;
+      function prepareMcpSession(
+        threadId: ThreadId,
+        providerInstanceId: ProviderInstanceId,
+        native: NativeRecord,
+      ): Effect.Effect<
+        PreparedMcpCredential,
+        NativeManagerRuntimeError | WorkflowRunStore.NativeManagerSourceError
+      >;
+      function prepareMcpSession(
+        threadId: ThreadId,
+        providerInstanceId: ProviderInstanceId,
+        native?: NativeRecord,
+      ) {
+        return options.configureMcp === false
           ? mcpSessions
               .clear(threadId)
               .pipe(Effect.as<PreparedMcpCredential>({ mcpCredentialId: undefined, issued: false }))
           : mcpPrepareLock.withLock(
               threadId,
               Effect.gen(function* () {
+                if (native) return yield* prepareNativeMcp(native);
                 // Live providers build MCP clients once; reuse credentials across workspace handoffs.
                 const { browser: browserToolsAvailable, device: deviceToolsAvailable } =
                   yield* agentAccessSettings(threadId);
@@ -699,6 +959,7 @@ export const layerWithOptions = (
                 return { mcpCredentialId: credential.config.providerSessionId, issued: true };
               }),
             );
+      }
       const clearMcpSession = (threadId: ThreadId, mcpCredentialId?: string) =>
         mcpCredentialId === undefined
           ? mcpSessionRegistry
@@ -2772,6 +3033,28 @@ export const layerWithOptions = (
                   record.continuation.interruptUnsafe();
                 if (record.continuation) yield* Fiber.await(record.continuation);
                 const original = yield* record.preparation.close();
+                dropNativeMcpReservation(record);
+                if (
+                  record.mcp &&
+                  !record.mcp.issued &&
+                  record.published &&
+                  !mcpHeldElsewhere(record, record.mcp.id)
+                ) {
+                  const retained = record.mcp;
+                  yield* PreparationOwner.withOperation(
+                    record.preparation.owner,
+                    Effect.gen(function* () {
+                      yield* mcpSessionRegistry.revokeProviderSession(retained.id);
+                      yield* McpProviderSessions.replaceIfCurrent(
+                        mcpSessions,
+                        record.threadId,
+                        retained.config,
+                        undefined,
+                      );
+                    }),
+                    "native",
+                  );
+                }
                 const retired = record.prepared
                   ? yield* eventSink.retireNativeSession!(
                       record.store,
@@ -2806,6 +3089,7 @@ export const layerWithOptions = (
       );
       const nativePreflight = Effect.fn("ProviderSessionManager.nativePreflight")(function* (
         sink: EventSink.EventSinkV2["Service"],
+        selected: typeof McpProviderSessions.McpProviderSessions.Service = mcpSessions,
       ) {
         if (
           nativeSealed ||
@@ -2814,7 +3098,8 @@ export const layerWithOptions = (
         )
           return yield* nativeManagerError("closed");
         if (
-          options.configureMcp !== false ||
+          (options.configureMcp !== false &&
+            (selected !== mcpSessions || !McpProviderSessions.isService(mcpSessions))) ||
           sink !== eventSink ||
           !eventSink.prepareNativeSession ||
           !eventSink.attachNativeSession ||
@@ -2889,10 +3174,20 @@ export const layerWithOptions = (
             .withLock(
               record.sessionId,
               Effect.gen(function* () {
-                if ((yield* mcpSessions.read(record.threadId)) !== undefined)
+                if (
+                  options.configureMcp === false &&
+                  (yield* mcpSessions.read(record.threadId)) !== undefined
+                )
                   return yield* nativeManagerError("profile");
                 if (!(yield* reserveNativeSlot(record))) return yield* nativeManagerError("state");
                 yield* preparation.checkReservation();
+                if (options.configureMcp !== false) {
+                  yield* preparation.assertAgentScope(agentScope);
+                  yield* prepareMcpSession(record.threadId, record.instanceId, record);
+                  yield* preparation.checkReservation();
+                  yield* agentScope.clear(record.threadId);
+                  yield* checkNativeMcp(record.owner, mcpSessions);
+                }
               }),
             )
             .pipe(Effect.timeout("10 seconds"));
@@ -2917,7 +3212,7 @@ export const layerWithOptions = (
       );
       const reserveNative = Effect.fn("ProviderSessionManager.reserveOriginalNativeOwner")(
         function* (registration: NativeManagerRegistration) {
-          yield* nativePreflight(registration.sink);
+          yield* nativePreflight(registration.sink, registration.mcp);
           const source = yield* WorkflowRunStore.readNativeManagerOwner(
             registration.store,
             registration.owner,
@@ -2949,13 +3244,9 @@ export const layerWithOptions = (
             .withLock(
               record.sessionId,
               Effect.gen(function* () {
-                if (
-                  nativeSealed ||
-                  record.closing ||
-                  record.cleanup ||
-                  (yield* mcpSessions.read(record.threadId)) !== undefined
-                )
+                if (nativeSealed || record.closing || record.cleanup)
                   return yield* nativeManagerError("state");
+                yield* checkNativeMcp(registration.owner, registration.mcp);
                 yield* eventSink.prepareNativeSession!(registration.store, registration.owner);
                 record.prepared = true;
                 record.onHandoff();
@@ -2997,9 +3288,13 @@ export const layerWithOptions = (
                   nativeOwner: owner,
                   attachedThreadIds: new Set([record.threadId]),
                   loadedProviderThreadKeyByThread: new Map(),
-                  openedWithLinkedEnvironments: undefined,
-                  linkedEnvironmentsByThread: new Map(),
-                  mcpCredentialIdByThread: new Map(),
+                  openedWithLinkedEnvironments: record.mcp?.linked,
+                  linkedEnvironmentsByThread: record.mcp
+                    ? new Map([[record.threadId, record.mcp.linked]])
+                    : new Map(),
+                  mcpCredentialIdByThread: record.mcp
+                    ? new Map([[record.threadId, record.mcp.id]])
+                    : new Map(),
                   supportsMultipleProviderThreads:
                     constructed.runtime.providerSession.capabilities.sessions
                       .supportsMultipleProviderThreadsPerSession,
@@ -3052,6 +3347,7 @@ export const layerWithOptions = (
                       return [true, next] as const;
                     });
                     if (!visible) return yield* nativeManagerError("state");
+                    dropNativeMcpReservation(record);
                     Deferred.doneUnsafe(record.activation, Exit.void);
                     yield* scheduleIdleRelease(record.sessionId);
                     return completed.value.exposedRuntime;
@@ -3644,6 +3940,7 @@ export const layerWithOptions = (
       } satisfies ProviderSessionManagerV2Shape);
       nativeManagerReceivers.set(manager, {
         preflight: nativePreflight,
+        checkMcp: checkNativeMcp,
         reservePreparation,
         reserve: reserveNative,
         publish: publishNative,

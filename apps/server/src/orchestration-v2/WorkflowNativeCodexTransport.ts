@@ -71,7 +71,8 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
   const store = yield* Store.WorkflowRunStore;
   const manager = yield* Manager.ProviderSessionManagerV2;
   const eventSink = yield* EventSink.EventSinkV2;
-  yield* Manager.assertNativeManagerReceiver(manager, eventSink);
+  const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+  yield* Manager.assertNativeManagerReceiver(manager, eventSink, mcpSessions);
   const workspace = yield* Workspace.makeNativeWorkspacePreparation(coordinator);
   const settings = yield* Settings.ServerSettingsService;
   const instances = yield* ProviderInstances.ProviderInstanceRegistry;
@@ -80,7 +81,6 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
   const fileSystem = yield* FileSystem.FileSystem;
   const digest = yield* Digest.Digest;
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
-  const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
   const continuationRequests = yield* Continuations.ProviderContinuationRequests;
   const serverConfig = yield* ServerConfig;
   const environment = Object.freeze({ ...(yield* HostProcess.Environment) });
@@ -270,6 +270,11 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
                 const fresh = yield* readProfile(ProjectId.make(job.input.projectId), instanceId);
                 if (fresh.instance !== profile.instance || fresh.key !== profile.key)
                   return yield* failure("profile");
+                yield* Manager.checkNativeManagerMcp(
+                  manager,
+                  originalPreparationOwner,
+                  mcpSessions,
+                );
               },
             );
             const owner = yield* store.consumeNativeCodexTransportOwner(prepared.preparation.job, {
@@ -289,6 +294,7 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
                 yield* owner.captureConstructor();
                 entry.managerAttempted = true;
                 yield* Manager.reserveNativeManagerRuntime(manager, {
+                  mcp: mcpSessions,
                   store,
                   owner,
                   sql,
@@ -313,6 +319,7 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
                     },
                   ),
                 });
+                yield* checkProfile();
                 const io = yield* owner.open();
                 let bootstrapSelection: string | undefined;
                 let bootstrapMethod: "initialize" | "initialized" | undefined;
@@ -380,6 +387,7 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
                         const scope = yield* Scope.make("sequential");
                         yield* Scope.addFinalizer(serviceScope, Scope.close(scope, Exit.void));
                         const work = Effect.gen(function* () {
+                          yield* checkProfile();
                           const profile = yield* owner.captureBootstrap();
                           bootstrapSelection = profile.selection;
                           bootstrapMethod = "initialize";
