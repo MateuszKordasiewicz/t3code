@@ -95,6 +95,7 @@ import Migration0089 from "./Migrations/089_ProviderSubmissionLookup.ts";
 import Migration0090 from "./Migrations/090_ThreadPreparationJobs.ts";
 import Migration0091 from "./Migrations/091_PrecreationNativeSelectionLookup.ts";
 import Migration0092 from "./Migrations/092_PreparationProcesses.ts";
+import Migration0093 from "./Migrations/093_NativeConversationReceipt.ts";
 
 const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
@@ -190,6 +191,7 @@ const migrationEntries = [
   [90, "ThreadPreparationJobs", Migration0090],
   [91, "PrecreationNativeSelectionLookup", Migration0091],
   [92, "PreparationProcesses", Migration0092],
+  [93, "NativeConversationReceipt", Migration0093],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);

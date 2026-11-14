@@ -5,6 +5,7 @@ import { describe, expect, it } from "@effect/vitest";
 import { stableStringify } from "@t3tools/shared/relaySigning";
 
 import { WorkflowCanonicalHash } from "../workflowRuns/WorkflowCanonicalHash.ts";
+import * as SubmissionCodec from "./ProviderSubmissionCodec.ts";
 import {
   assertStoredAttemptMatchesFrame,
   decodeSubmissionTransportData,
@@ -716,4 +717,433 @@ it("decodes only present attempt resource data and never invents missing frame p
       local_observed_at: createdAt,
     }),
   ).toMatchObject({ local_outcome: "not_submitted" });
+});
+
+function conversationFixture(enabled = true) {
+  const selected = {
+    v: 1,
+    kind: "fresh-conversation",
+    transportId,
+    environmentId: "environment",
+    projectId: "project",
+    threadId: "thread",
+    runId: "run",
+    runOrdinal: 1,
+    attemptId: "attempt",
+    rootNodeId: "root",
+    intentId: "intent",
+    driver: "codex",
+    providerInstanceId: "instance",
+    providerSessionId: "session",
+    providerThreadId: "original-provider-row",
+    invocation: 1,
+    expectedClaim: {
+      operationId: "operation",
+      expectedFingerprint: hash,
+      expectedGeneration: 0,
+      bootId: "boot",
+      workerId: "worker",
+    },
+  };
+  const context = {
+    transportId,
+    environmentId: "environment",
+    projectId: "project",
+    driver: "codex",
+    providerInstanceId: "instance",
+    providerSessionId: "session",
+    expectedSelection: selected,
+  };
+  const secret = "synthetic_native_conversation_credential_0123456789";
+  const server = {
+    url: "http://127.0.0.1:9999/mcp",
+    tool_timeout_sec: 3900,
+    http_headers: { Authorization: `Bearer ${secret}` },
+  };
+  const params = {
+    model: "fixture-model",
+    cwd: "/fixture/workspace",
+    config: {
+      "tools.update_plan.enabled": true,
+      mcp_optional_startup_grace_ms: 10000,
+      "features.concurrent_reasoning_summaries": true,
+      "shell_environment_policy.set.T3CODE_THREAD_ID": selected.threadId,
+      ...(enabled
+        ? {
+            "mcp_servers.t3-code": { ...server, disabled_tools: ["t3_thread_wait"] },
+            "mcp_servers.t3-code-direct": {
+              ...server,
+              enabled_tools: ["t3_thread_wait"],
+              omit_tools_from: ["code_mode", "deferred"],
+            },
+          }
+        : {}),
+    },
+  };
+  const mcp = enabled
+    ? {
+        mode: "issued",
+        credentialId: "credential-namespace",
+        capabilities: ["orchestration", "pull-requests", "worktree"],
+        browserToolsAvailable: false,
+        subagent: false,
+        linked: "absent",
+      }
+    : { mode: "disabled" };
+  const encoded = JSON.stringify({ id: 3, method: "thread/start", params }) + "\n";
+  const frame = {
+    encoded,
+    byteLength: new TextEncoder().encode(encoded).byteLength,
+    method: "thread/start",
+    requestId: 3,
+    selection: stableStringify(selected),
+  };
+  return { context, selected, params, mcp, frame, secret };
+}
+
+it.each([false, true])(
+  "captures fresh conversation evidence with MCP=%s without credential preimages",
+  (enabled) => {
+    const fixture = conversationFixture(enabled);
+    const snapshot = SubmissionCodec.snapshotConversationFrame;
+    const receipt = snapshot(
+      fixture.context,
+      fixture.frame,
+      fixture.params,
+      fixture.mcp,
+      createdAt,
+    );
+    expect(receipt).toMatchObject({
+      method: "thread/start",
+      provider_thread_id: "original-provider-row",
+      local_outcome: null,
+      response_json: null,
+    });
+    expect(JSON.stringify(receipt)).not.toContain(fixture.secret);
+    expect(JSON.stringify(receipt)).not.toContain("Authorization");
+    expect(receipt).not.toHaveProperty("frame_hash");
+    expect(receipt).not.toHaveProperty("native_thread_id");
+    expect(receipt).not.toHaveProperty("provider_turn_ordinal");
+  },
+);
+
+function conversationFrame(params: unknown, selection: unknown, id = 3) {
+  const encoded = JSON.stringify({ id, method: "thread/start", params }) + "\n";
+  return {
+    encoded,
+    byteLength: new TextEncoder().encode(encoded).byteLength,
+    method: "thread/start",
+    requestId: id,
+    selection: stableStringify(selection),
+  };
+}
+
+it("compares exact ephemeral conversation input while hashing only the nonsecret projection", () => {
+  const fixture = conversationFixture();
+  const snapshot = SubmissionCodec.snapshotConversationFrame;
+  const row = snapshot(fixture.context, fixture.frame, fixture.params, fixture.mcp, createdAt);
+  const secondSecret = "a_different_synthetic_conversation_credential_987654321";
+  const changed = JSON.parse(
+    JSON.stringify(fixture.params).replaceAll(fixture.secret, secondSecret),
+  );
+  const changedFrame = conversationFrame(changed, fixture.selected);
+  invalid(() => snapshot(fixture.context, changedFrame, fixture.params, fixture.mcp, createdAt));
+  expect(snapshot(fixture.context, changedFrame, changed, fixture.mcp, createdAt)).toEqual(row);
+  expect(row.input_hash).toBe(tagged("provider-conversation-input", JSON.parse(row.input_json)));
+  expect(SubmissionCodec.decodeConversationReceiptData(row)).toEqual(row);
+  expect(Object.isFrozen(row)).toBe(true);
+  SubmissionCodec.assertStoredConversationMatchesFrame(
+    row,
+    fixture.context,
+    fixture.frame,
+    fixture.params,
+    fixture.mcp,
+  );
+  invalid(
+    () =>
+      SubmissionCodec.assertStoredConversationMatchesFrame(
+        { ...row, request_id_json: "4" },
+        fixture.context,
+        fixture.frame,
+        fixture.params,
+        fixture.mcp,
+      ),
+    "conflict",
+  );
+});
+
+it("rejects forged conversation frames, source selections, unsupported configuration and secret aliases", () => {
+  const f = conversationFixture();
+  const snapshot = SubmissionCodec.snapshotConversationFrame;
+  const withParams = (params: unknown) =>
+    snapshot(f.context, conversationFrame(params, f.selected), params, f.mcp, createdAt);
+  for (const frame of [
+    { ...f.frame, extra: 1 },
+    { ...f.frame, byteLength: f.frame.byteLength + 1 },
+    { ...f.frame, method: "turn/start" },
+    { ...f.frame, requestId: "3" },
+    { ...f.frame, selection: stableStringify({ ...f.selected, invocation: 2 }) },
+    { ...f.frame, encoded: f.frame.encoded + "\n", byteLength: f.frame.byteLength + 1 },
+    conversationFrame({ ...f.params, cwd: "x".repeat(1048576) }, f.selected),
+    conversationFrame(f.params, f.selected, 0),
+    conversationFrame(f.params, { ...f.selected, expectedClaim: null }),
+    conversationFrame(f.params, { ...f.selected, nativeThreadId: "invented" }),
+  ])
+    invalid(() => snapshot(f.context, frame, f.params, f.mcp, createdAt));
+  for (const params of [
+    { ...f.params, developerInstructions: f.secret },
+    { ...f.params, config: { ...f.params.config, secret: f.secret } },
+    { ...f.params, config: { ...f.params.config, "mcp_servers.foreign": { token: f.secret } } },
+    {
+      ...f.params,
+      config: {
+        ...f.params.config,
+        "shell_environment_policy.set.T3CODE_THREAD_ID": "foreign-thread",
+      },
+    },
+    { ...f.params, model: f.secret },
+    { ...f.params, cwd: `/workspace/${f.secret}` },
+    {
+      ...f.params,
+      config: {
+        ...f.params.config,
+        "mcp_servers.t3-code-direct": {
+          ...f.params.config["mcp_servers.t3-code-direct"],
+          http_headers: { Authorization: "Bearer wrong_credential_value_0000000000000000000000" },
+        },
+      },
+    },
+  ]) {
+    invalid(() => withParams(params));
+    try {
+      withParams(params);
+    } catch (error) {
+      expect(String(error)).toBe("ProviderSubmissionCodecError: Provider submission data invalid");
+      expect(String(error)).not.toContain(f.secret);
+    }
+  }
+  invalid(() =>
+    snapshot({ ...f.context, environmentId: "foreign" }, f.frame, f.params, f.mcp, createdAt),
+  );
+  invalid(() => snapshot(f.context, f.frame, f.params, { mode: "disabled" }, createdAt));
+  invalid(() =>
+    snapshot(f.context, f.frame, f.params, { ...f.mcp, credentialId: f.secret }, createdAt),
+  );
+  invalid(() =>
+    snapshot(f.context, f.frame, f.params, { ...f.mcp, capabilities: ["arbitrary"] }, createdAt),
+  );
+});
+
+it("records one local conversation outcome and then only the original returned identity", () => {
+  const f = conversationFixture();
+  const row = SubmissionCodec.snapshotConversationFrame(
+    f.context,
+    f.frame,
+    f.params,
+    f.mcp,
+    createdAt,
+  );
+  const response = {
+    v: 1,
+    nativeThreadId: "native-conversation",
+    returnedProviderThreadId: "derived-provider-row",
+    driver: "codex",
+    providerInstanceId: "instance",
+    providerSessionId: "session",
+    threadId: "thread",
+  };
+  const outcome = { kind: "submitted", reason: "completed" };
+  invalid(
+    () => SubmissionCodec.encodeConversationResponseData(row, response, createdAt, credential(f)),
+    "conflict",
+  );
+  const submitted = SubmissionCodec.encodeConversationOutcomeData(row, outcome, createdAt);
+  expect(SubmissionCodec.encodeConversationOutcomeData(submitted, outcome, createdAt)).toEqual(
+    submitted,
+  );
+  const opened = SubmissionCodec.encodeConversationResponseData(
+    submitted,
+    response,
+    createdAt,
+    credential(f),
+  );
+  expect(
+    SubmissionCodec.encodeConversationResponseData(opened, response, createdAt, credential(f)),
+  ).toEqual(opened);
+  expect(JSON.parse(String(opened.response_json))).toEqual(response);
+  expect(opened.provider_thread_id).toBe("original-provider-row");
+  expect(SubmissionCodec.decodeConversationReceiptData(opened)).toEqual(opened);
+  for (const change of [
+    { kind: "unknown", reason: "sink" },
+    { kind: "not_submitted", reason: "wrapper" },
+    { kind: "submitted", reason: "interrupted" },
+    { ...outcome, frame: f.frame },
+  ])
+    invalid(
+      () => SubmissionCodec.encodeConversationOutcomeData(submitted, change, createdAt),
+      "conflict",
+    );
+  for (const change of [
+    { ...response, nativeThreadId: "replacement" },
+    { ...response, providerSessionId: "foreign" },
+    { ...response, rawResponse: { token: f.secret } },
+  ])
+    invalid(
+      () =>
+        SubmissionCodec.encodeConversationResponseData(opened, change, createdAt, credential(f)),
+      "conflict",
+    );
+  for (const kind of ["unknown", "not_submitted"] as const) {
+    const unresolved = SubmissionCodec.encodeConversationOutcomeData(
+      row,
+      { kind, reason: "sink" },
+      createdAt,
+    );
+    expect(SubmissionCodec.decodeConversationReceiptData(unresolved)).toEqual(unresolved);
+    invalid(
+      () =>
+        SubmissionCodec.encodeConversationResponseData(
+          unresolved,
+          response,
+          createdAt,
+          credential(f),
+        ),
+      "conflict",
+    );
+  }
+});
+
+it("rejects malformed durable conversation evidence without accepting absent secret preimages as proof", () => {
+  const f = conversationFixture();
+  const row = SubmissionCodec.snapshotConversationFrame(
+    f.context,
+    f.frame,
+    f.params,
+    f.mcp,
+    createdAt,
+  );
+  for (const patch of [
+    { extra: "unknown" },
+    { transport_id: "foreign" },
+    { intent_id: "foreign" },
+    { input_hash: "b".repeat(64) },
+    { selection_hash: "c".repeat(64) },
+    { request_id_json: "3.0" },
+    { request_id_json: '"3"' },
+    { created_at: "bad" },
+    { local_outcome: "unknown" },
+    { local_outcome: "submitted", local_reason: "sink", local_observed_at: createdAt },
+    { response_json: "{}", response_hash: hash, response_observed_at: createdAt },
+    { input_json: stableStringify({ ...JSON.parse(row.input_json), token: f.secret }) },
+  ])
+    invalid(() => SubmissionCodec.decodeConversationReceiptData({ ...row, ...patch }));
+  const input = JSON.parse(row.input_json);
+  input.mcp.capabilities.reverse();
+  invalid(() =>
+    SubmissionCodec.decodeConversationReceiptData({ ...row, input_json: stableStringify(input) }),
+  );
+  invalid(() => decodeSubmissionAttemptResourceData(row));
+});
+
+it("refuses original credential material returned as conversation identity", () => {
+  const f = conversationFixture();
+  const row = SubmissionCodec.snapshotConversationFrame(
+    f.context,
+    f.frame,
+    f.params,
+    f.mcp,
+    createdAt,
+  );
+  const submitted = SubmissionCodec.encodeConversationOutcomeData(
+    row,
+    { kind: "submitted", reason: "completed" },
+    createdAt,
+  );
+  for (const field of ["nativeThreadId", "returnedProviderThreadId"]) {
+    for (const secret of [f.secret, `Bearer ${f.secret}`]) {
+      invalid(
+        () =>
+          SubmissionCodec.encodeConversationResponseData(
+            submitted,
+            {
+              v: 1,
+              nativeThreadId: "original-native-thread",
+              returnedProviderThreadId: "derived-row",
+              [field]: secret,
+              driver: "codex",
+              providerInstanceId: "instance",
+              providerSessionId: "session",
+              threadId: "thread",
+            },
+            createdAt,
+            credential(f),
+          ),
+        "conflict",
+      );
+    }
+  }
+});
+
+function credential(f: ReturnType<typeof conversationFixture>) {
+  return {
+    mode: "issued",
+    credentialId: "credential-namespace",
+    authorizationHeader: `Bearer ${f.secret}`,
+  };
+}
+
+it("bounds returned conversation evidence and requires its original ephemeral credential context", () => {
+  const f = conversationFixture();
+  const row = SubmissionCodec.snapshotConversationFrame(
+    f.context,
+    f.frame,
+    f.params,
+    f.mcp,
+    createdAt,
+  );
+  const submitted = SubmissionCodec.encodeConversationOutcomeData(
+    row,
+    { kind: "submitted", reason: "completed" },
+    createdAt,
+  );
+  const response = {
+    v: 1,
+    nativeThreadId: "original-native-thread",
+    returnedProviderThreadId: "derived-row",
+    driver: "codex",
+    providerInstanceId: "instance",
+    providerSessionId: "session",
+    threadId: "thread",
+  };
+  for (const descriptor of [
+    undefined,
+    { mode: "disabled" },
+    { ...credential(f), credentialId: "foreign" },
+  ])
+    invalid(
+      () =>
+        SubmissionCodec.encodeConversationResponseData(submitted, response, createdAt, descriptor),
+      "conflict",
+    );
+  for (const nativeThreadId of ["x".repeat(16384), "🛶".repeat(4096)]) {
+    const oversized = { ...response, nativeThreadId };
+    invalid(() =>
+      SubmissionCodec.decodeConversationReceiptData({
+        ...submitted,
+        response_json: stableStringify(oversized),
+        response_hash: tagged("provider-conversation-response", oversized),
+        response_observed_at: createdAt,
+      }),
+    );
+    invalid(
+      () =>
+        SubmissionCodec.encodeConversationResponseData(
+          submitted,
+          { ...response, nativeThreadId },
+          createdAt,
+          credential(f),
+        ),
+      "conflict",
+    );
+  }
 });

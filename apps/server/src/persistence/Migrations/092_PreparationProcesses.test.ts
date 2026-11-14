@@ -184,10 +184,12 @@ it.effect(
         yield* sql`INSERT INTO workflow_native_reservation_material VALUES ('intent','{}',${hash})`;
         yield* sql`INSERT INTO orchestration_v2_projection_provider_threads(provider_thread_id,thread_id,provider,status,updated_at,payload_json) VALUES ('provider','thread','codex','not_loaded',${at},'{}')`;
         const before = yield* snapshot();
-        assert.deepStrictEqual(yield* runMigrations(), [[92, "PreparationProcesses"]]);
+        assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 92 }), [
+          [92, "PreparationProcesses"],
+        ]);
         assert.deepStrictEqual(yield* snapshot(), before);
         assert.deepStrictEqual(yield* rows(), []);
-        assert.deepStrictEqual(yield* runMigrations(), []);
+        assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 92 }), []);
         for (const id of ["child", "sibling"])
           yield* sql`INSERT INTO ${sql(table)} ${sql.insert(resource(id))}`;
         yield* bind();
@@ -204,7 +206,7 @@ it.effect(
       }).pipe(Effect.provide(NodeSqliteClient.layer({ filename })));
       yield* Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
-        assert.deepStrictEqual(yield* runMigrations(), []);
+        assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 92 }), []);
         assert.deepStrictEqual(yield* snapshot(), retained.before);
         assert.deepStrictEqual(yield* rows(), retained.resources);
         assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);

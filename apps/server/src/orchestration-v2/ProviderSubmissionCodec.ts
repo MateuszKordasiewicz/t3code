@@ -484,3 +484,402 @@ export function assertStoredAttemptMatchesFrame(
     }
   }, "conflict");
 }
+
+const decodeConversationParams = Schema.decodeUnknownSync(CodexSchema.V2ThreadStartParams);
+const conversationSelectionKeys =
+  "v kind transportId environmentId projectId threadId runId runOrdinal attemptId rootNodeId intentId driver providerInstanceId providerSessionId providerThreadId invocation expectedClaim".split(
+    " ",
+  );
+const conversationKeys =
+  "format_version transport_id environment_id project_id thread_id run_id run_ordinal attempt_id root_node_id intent_id driver provider_instance_id provider_session_id provider_thread_id method selection_json selection_hash input_json input_hash request_id_json created_at local_outcome local_reason local_observed_at response_json response_hash response_observed_at".split(
+    " ",
+  );
+const conversationObservationKeys = [
+  "local_outcome",
+  "local_reason",
+  "local_observed_at",
+  "response_json",
+  "response_hash",
+  "response_observed_at",
+];
+function conversationSelection(input: unknown) {
+  const value = exact(input, conversationSelectionKeys);
+  requireData(value.v === 1 && value.kind === "fresh-conversation" && value.driver === "codex");
+  return {
+    v: 1,
+    kind: "fresh-conversation",
+    transportId: uuid(value.transportId),
+    environmentId: text(value.environmentId),
+    projectId: text(value.projectId),
+    threadId: text(value.threadId),
+    runId: text(value.runId),
+    runOrdinal: integer(value.runOrdinal, 1),
+    attemptId: text(value.attemptId),
+    rootNodeId: text(value.rootNodeId),
+    intentId: text(value.intentId),
+    driver: "codex",
+    providerInstanceId: text(value.providerInstanceId),
+    providerSessionId: text(value.providerSessionId),
+    providerThreadId: text(value.providerThreadId),
+    invocation: integer(value.invocation, 1),
+    expectedClaim: claim(value.expectedClaim),
+  };
+}
+function conversationMcp(input: unknown) {
+  requireData(input !== null && typeof input === "object");
+  if (Reflect.get(input, "mode") === "disabled") {
+    exact(input, ["mode"]);
+    return { mode: "disabled" as const };
+  }
+  const value = exact(input, [
+    "mode",
+    "credentialId",
+    "capabilities",
+    "browserToolsAvailable",
+    "subagent",
+    "linked",
+  ]);
+  requireData(
+    value.mode === "issued" &&
+      typeof value.browserToolsAvailable === "boolean" &&
+      typeof value.subagent === "boolean",
+  );
+  requireData(
+    value.linked === "absent" ||
+      value.linked === "unavailable" ||
+      typeof value.linked === "boolean",
+  );
+  requireData(Array.isArray(value.capabilities));
+  const capabilities = value.capabilities.map(text).sort();
+  requireData(
+    new Set(capabilities).size === capabilities.length &&
+      capabilities.every((item) =>
+        ["orchestration", "worktree", "pull-requests", "preview", "device"].includes(item),
+      ),
+  );
+  requireData(
+    ["orchestration", "worktree", "pull-requests"].every((item) => capabilities.includes(item)) &&
+      capabilities.includes("preview") === value.browserToolsAvailable,
+  );
+  return {
+    mode: "issued" as const,
+    credentialId: text(value.credentialId),
+    capabilities,
+    browserToolsAvailable: value.browserToolsAvailable,
+    subagent: value.subagent,
+    linked: value.linked,
+  };
+}
+function conversationInput(input: unknown, selected: ReturnType<typeof conversationSelection>) {
+  const value = exact(input, ["v", "model", "cwd", "options", "mcp"]);
+  requireData(value.v === 1);
+  const options = exact(value.options, [
+    "updatePlan",
+    "mcpStartupGraceMs",
+    "concurrentReasoningSummaries",
+    "shellThreadId",
+  ]);
+  requireData(
+    options.updatePlan === true &&
+      options.mcpStartupGraceMs === 10000 &&
+      options.concurrentReasoningSummaries === true &&
+      options.shellThreadId === selected.threadId,
+  );
+  return {
+    v: 1,
+    model: value.model === null ? null : text(value.model),
+    cwd: value.cwd === null ? null : text(value.cwd),
+    options: {
+      updatePlan: true,
+      mcpStartupGraceMs: 10000,
+      concurrentReasoningSummaries: true,
+      shellThreadId: selected.threadId,
+    },
+    mcp: conversationMcp(value.mcp),
+  };
+}
+function conversationParams(
+  input: unknown,
+  selected: ReturnType<typeof conversationSelection>,
+  mcpInput: unknown,
+) {
+  const decoded = decodeConversationParams(input, { onExcessProperty: "error" });
+  requireData(stableStringify(decoded) === stableStringify(input));
+  const params = exact(input, [
+    "config",
+    ...(Object.hasOwn(decoded, "model") ? ["model"] : []),
+    ...(Object.hasOwn(decoded, "cwd") ? ["cwd"] : []),
+  ]);
+  const mcp = conversationMcp(mcpInput);
+  const config = exact(params.config, [
+    "tools.update_plan.enabled",
+    "mcp_optional_startup_grace_ms",
+    "features.concurrent_reasoning_summaries",
+    "shell_environment_policy.set.T3CODE_THREAD_ID",
+    ...(mcp.mode === "issued" ? ["mcp_servers.t3-code", "mcp_servers.t3-code-direct"] : []),
+  ]);
+  requireData(
+    config["tools.update_plan.enabled"] === true &&
+      config.mcp_optional_startup_grace_ms === 10000 &&
+      config["features.concurrent_reasoning_summaries"] === true &&
+      config["shell_environment_policy.set.T3CODE_THREAD_ID"] === selected.threadId,
+  );
+  let token: string | undefined;
+  if (mcp.mode === "issued") {
+    const server = exact(config["mcp_servers.t3-code"], [
+      "url",
+      "tool_timeout_sec",
+      "http_headers",
+      "disabled_tools",
+    ]);
+    const direct = exact(config["mcp_servers.t3-code-direct"], [
+      "url",
+      "tool_timeout_sec",
+      "http_headers",
+      "enabled_tools",
+      "omit_tools_from",
+    ]);
+    const header = text(exact(server.http_headers, ["Authorization"]).Authorization);
+    requireData(/^Bearer [A-Za-z0-9_-]{32,}$/.test(header));
+    requireData(
+      text(server.url) === direct.url &&
+        server.tool_timeout_sec === 3900 &&
+        direct.tool_timeout_sec === 3900 &&
+        exact(direct.http_headers, ["Authorization"]).Authorization === header,
+    );
+    requireData(
+      stableStringify(server.disabled_tools) === '["t3_thread_wait"]' &&
+        stableStringify(direct.enabled_tools) === '["t3_thread_wait"]' &&
+        stableStringify(direct.omit_tools_from) === '["code_mode","deferred"]',
+    );
+    token = header.slice("Bearer ".length);
+  }
+  const result = conversationInput(
+    {
+      v: 1,
+      model: Object.hasOwn(params, "model") ? text(params.model) : null,
+      cwd: Object.hasOwn(params, "cwd") ? text(params.cwd) : null,
+      options: {
+        updatePlan: true,
+        mcpStartupGraceMs: 10000,
+        concurrentReasoningSummaries: true,
+        shellThreadId: selected.threadId,
+      },
+      mcp,
+    },
+    selected,
+  );
+  if (token) requireData(!stableStringify({ selected, result }).includes(token));
+  return result;
+}
+function conversationSnapshot(
+  contextInput: unknown,
+  frameInput: unknown,
+  expectedParams: unknown,
+  mcp: unknown,
+  at: unknown,
+) {
+  const context = exact(contextInput, [...turnContextKeys, "expectedSelection"]);
+  const selected = conversationSelection(context.expectedSelection);
+  const original = turnContext(
+    Object.fromEntries(turnContextKeys.map((key) => [key, context[key]])),
+  );
+  for (const [key, value] of Object.entries(original))
+    requireData(Reflect.get(selected, key) === value);
+  const frame = exact(frameInput, ["encoded", "byteLength", "method", "requestId", "selection"]);
+  const encoded = text(frame.encoded);
+  const bytes = new TextEncoder().encode(encoded).byteLength;
+  requireData(bytes === frame.byteLength && bytes <= 1048576 && encoded.endsWith("\n"));
+  const request = exact(compactJson(encoded.slice(0, -1)), ["id", "method", "params"]);
+  requireData(frame.method === "thread/start" && request.method === "thread/start");
+  const id = integer(request.id, 1);
+  requireData(frame.requestId === id && frame.selection === stableStringify(selected));
+  requireData(stableStringify(request.params) === stableStringify(expectedParams));
+  const input = conversationParams(request.params, selected, mcp);
+  return {
+    format_version: 1,
+    transport_id: selected.transportId,
+    environment_id: selected.environmentId,
+    project_id: selected.projectId,
+    thread_id: selected.threadId,
+    run_id: selected.runId,
+    run_ordinal: selected.runOrdinal,
+    attempt_id: selected.attemptId,
+    root_node_id: selected.rootNodeId,
+    intent_id: selected.intentId,
+    driver: selected.driver,
+    provider_instance_id: selected.providerInstanceId,
+    provider_session_id: selected.providerSessionId,
+    provider_thread_id: selected.providerThreadId,
+    method: "thread/start",
+    selection_json: stableStringify(selected),
+    selection_hash: tagged("provider-conversation-selection", selected),
+    input_json: stableStringify(input),
+    input_hash: tagged("provider-conversation-input", input),
+    request_id_json: JSON.stringify(id),
+    created_at: timestamp(at),
+    local_outcome: null,
+    local_reason: null,
+    local_observed_at: null,
+    response_json: null,
+    response_hash: null,
+    response_observed_at: null,
+  };
+}
+export function snapshotConversationFrame(
+  context: unknown,
+  frame: unknown,
+  expectedParams: unknown,
+  mcp: unknown,
+  at: unknown,
+) {
+  return boundary(() =>
+    conversationSnapshot(own(context), own(frame), own(expectedParams), own(mcp), own(at)),
+  );
+}
+function conversationResponse(input: unknown, selected: ReturnType<typeof conversationSelection>) {
+  const response = exact(input, [
+    "v",
+    "nativeThreadId",
+    "returnedProviderThreadId",
+    "driver",
+    "providerInstanceId",
+    "providerSessionId",
+    "threadId",
+  ]);
+  requireData(new TextEncoder().encode(stableStringify(response)).byteLength <= 16384);
+  requireData(
+    response.v === 1 &&
+      response.driver === "codex" &&
+      response.providerInstanceId === selected.providerInstanceId &&
+      response.providerSessionId === selected.providerSessionId &&
+      response.threadId === selected.threadId,
+  );
+  return {
+    v: 1,
+    nativeThreadId: text(response.nativeThreadId),
+    returnedProviderThreadId: text(response.returnedProviderThreadId),
+    driver: "codex",
+    providerInstanceId: selected.providerInstanceId,
+    providerSessionId: selected.providerSessionId,
+    threadId: selected.threadId,
+  };
+}
+function conversationReceipt(input: unknown) {
+  const row = exact(input, conversationKeys);
+  requireData(row.format_version === 1 && row.method === "thread/start");
+  const selected = conversationSelection(storedJson(row.selection_json));
+  const shadows = {
+    transport_id: selected.transportId,
+    environment_id: selected.environmentId,
+    project_id: selected.projectId,
+    thread_id: selected.threadId,
+    run_id: selected.runId,
+    run_ordinal: selected.runOrdinal,
+    attempt_id: selected.attemptId,
+    root_node_id: selected.rootNodeId,
+    intent_id: selected.intentId,
+    driver: selected.driver,
+    provider_instance_id: selected.providerInstanceId,
+    provider_session_id: selected.providerSessionId,
+    provider_thread_id: selected.providerThreadId,
+  };
+  for (const [key, value] of Object.entries(shadows)) requireData(row[key] === value);
+  requireData(row.selection_hash === tagged("provider-conversation-selection", selected));
+  const inputData = conversationInput(storedJson(row.input_json), selected);
+  requireData(stableStringify(inputData) === row.input_json);
+  requireData(row.input_hash === tagged("provider-conversation-input", inputData));
+  integer(storedJson(row.request_id_json), 1);
+  timestamp(row.created_at);
+  if (evidenceGroup(row, ["local_outcome", "local_reason", "local_observed_at"])) {
+    requireData(
+      row.local_outcome === "submitted" ||
+        row.local_outcome === "not_submitted" ||
+        row.local_outcome === "unknown",
+    );
+    requireData(typeof row.local_reason === "string" && reasons.has(row.local_reason));
+    requireData((row.local_outcome === "submitted") === (row.local_reason === "completed"));
+    timestamp(row.local_observed_at);
+  }
+  if (evidenceGroup(row, ["response_json", "response_hash", "response_observed_at"])) {
+    requireData(row.local_outcome === "submitted");
+    const response = conversationResponse(storedJson(row.response_json), selected);
+    requireData(row.response_hash === tagged("provider-conversation-response", response));
+    timestamp(row.response_observed_at);
+  }
+  return row;
+}
+export function decodeConversationReceiptData(input: unknown) {
+  return boundary(() => conversationReceipt(own(input)));
+}
+export function assertStoredConversationMatchesFrame(
+  input: unknown,
+  context: unknown,
+  frame: unknown,
+  expectedParams: unknown,
+  mcp: unknown,
+): void {
+  boundary(() => {
+    const row = conversationReceipt(own(input));
+    const expected = conversationSnapshot(
+      own(context),
+      own(frame),
+      own(expectedParams),
+      own(mcp),
+      row.created_at,
+    );
+    for (const [key, value] of Object.entries(expected)) {
+      if (!conversationObservationKeys.includes(key)) requireData(row[key] === value);
+    }
+  }, "conflict");
+}
+export function encodeConversationOutcomeData(input: unknown, outcome: unknown, at: unknown) {
+  return boundary(() => {
+    const row = conversationReceipt(own(input));
+    const value = exact(own(outcome), ["kind", "reason"]);
+    const update = {
+      local_outcome: value.kind,
+      local_reason: value.reason,
+      local_observed_at: timestamp(at),
+    };
+    for (const [key, value] of Object.entries(update))
+      requireData(row[key] === null || row[key] === value);
+    return conversationReceipt({ ...row, ...update });
+  }, "conflict");
+}
+export function encodeConversationResponseData(
+  input: unknown,
+  response: unknown,
+  at: unknown,
+  credential: unknown,
+) {
+  return boundary(() => {
+    const row = conversationReceipt(own(input));
+    requireData(row.local_outcome === "submitted");
+    const value = conversationResponse(
+      own(response),
+      conversationSelection(storedJson(row.selection_json)),
+    );
+    const selected = conversationSelection(storedJson(row.selection_json));
+    const mcp = conversationInput(storedJson(row.input_json), selected).mcp;
+    const descriptor = exact(
+      own(credential),
+      mcp.mode === "disabled" ? ["mode"] : ["mode", "credentialId", "authorizationHeader"],
+    );
+    requireData(descriptor.mode === mcp.mode);
+    if (mcp.mode === "issued") {
+      requireData(descriptor.credentialId === mcp.credentialId);
+      const header = text(descriptor.authorizationHeader);
+      requireData(/^Bearer [A-Za-z0-9_-]{32,}$/.test(header));
+      requireData(!stableStringify(value).includes(header.slice("Bearer ".length)));
+    }
+    const update = {
+      response_json: stableStringify(value),
+      response_hash: tagged("provider-conversation-response", value),
+      response_observed_at: timestamp(at),
+    };
+    for (const [key, value] of Object.entries(update))
+      requireData(row[key] === null || row[key] === value);
+    return conversationReceipt({ ...row, ...update });
+  }, "conflict");
+}
