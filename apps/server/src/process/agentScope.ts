@@ -234,6 +234,19 @@ export const make = Effect.gen(function* () {
   const { stateDir } = yield* ServerConfig.ServerConfig;
   const ownedSlice = ownedAgentSlice(stateDir);
   const layerScope = yield* Effect.scope;
+  const hostBoot = yield* Effect.cached(
+    fileSystem.readFileString("/proc/sys/kernel/random/boot_id").pipe(
+      Effect.catchCause(recoverBindingRead),
+      Effect.map((text) => {
+        if (text === undefined) return undefined;
+        const value = text.endsWith("\n") ? text.slice(0, -1) : text;
+        return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value) &&
+          value !== "00000000-0000-0000-0000-000000000000"
+          ? value
+          : undefined;
+      }),
+    ),
+  );
 
   const resolve = (command: string, env: NodeJS.ProcessEnv) =>
     resolveCommandPath(command, { env }).pipe(
@@ -738,8 +751,12 @@ export const make = Effect.gen(function* () {
           ...(owned ? [] : ["--collect"]),
         ],
       };
+      const hostBootId = yield* hostBoot;
       return {
         ...agentScopeCommand({ command: resolved, args, scope: systemdScope }),
+        ...(hostBootId === undefined
+          ? {}
+          : { hostIdentity: Object.freeze({ hostBootId, scopeNamespace: systemdScope.slice }) }),
         unit,
         custody: yield* makeCustody(scope.systemctl, unit),
       };

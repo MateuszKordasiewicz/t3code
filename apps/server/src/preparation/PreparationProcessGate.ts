@@ -183,6 +183,25 @@ const prepareOwned = Effect.fn("PreparationProcessGate.prepare")(
       env: owned.env,
       ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
     });
+    const hostIdentity = yield* Effect.try({
+      try: () => {
+        const descriptor = Object.getOwnPropertyDescriptor(launch, "hostIdentity");
+        if (!descriptor?.enumerable || !("value" in descriptor))
+          throw failure("prepare", "unavailable");
+        const raw = properties(descriptor.value);
+        if (
+          Object.keys(raw).sort().join() !== "hostBootId,scopeNamespace" ||
+          typeof raw.hostBootId !== "string" ||
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(raw.hostBootId) ||
+          raw.hostBootId === "00000000-0000-0000-0000-000000000000" ||
+          typeof raw.scopeNamespace !== "string" ||
+          !/^app-t3code-agents-[0-9a-f]{12}\.slice$/.test(raw.scopeNamespace)
+        )
+          throw failure("prepare", "unavailable");
+        return Object.freeze({ hostBootId: raw.hostBootId, scopeNamespace: raw.scopeNamespace });
+      },
+      catch: () => failure("prepare", "unavailable"),
+    });
     const original = launch.custody;
     const unit = launch.unit;
     const executable = launch.command;
@@ -216,8 +235,9 @@ const prepareOwned = Effect.fn("PreparationProcessGate.prepare")(
       environment: owned.env,
     });
     const preparedChild = yield* creator.prepare(image);
-    const creationInputHash = WorkflowCanonicalHash.tagged("t3.preparation-creation-input.v2", {
-      v: 2,
+    const creationInputHash = WorkflowCanonicalHash.tagged("t3.preparation-creation-input.v3", {
+      v: 3,
+      hostIdentity,
       creator: "synchronous-node-v1",
       platform: "linux",
       runtime: { kind: "node", version: process.versions.node },
@@ -238,6 +258,7 @@ const prepareOwned = Effect.fn("PreparationProcessGate.prepare")(
     let spawned = false;
     return Object.freeze({
       creationInputHash,
+      hostIdentity,
       proposedUnit: unit,
       spawnHeld: Effect.fn("PreparationProcessGate.spawnHeld")(function* () {
         if (spawned) return yield* failure("spawn", "used");

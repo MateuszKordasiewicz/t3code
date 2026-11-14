@@ -1,11 +1,17 @@
 // @effect-diagnostics nodeBuiltinImport:off -- Real subprocess fixtures use isolated temporary files.
 import * as NodeFS from "node:fs";
+import * as NodeCrypto from "node:crypto";
+import { vi } from "vite-plus/test";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as NodePathService from "@effect/platform-node/NodePath";
-import { AgentScope, type AgentScopeCustody } from "@t3tools/shared/AgentScope";
+import {
+  AgentScope,
+  type AgentScopeCustody,
+  type AgentScopeHostIdentity,
+} from "@t3tools/shared/AgentScope";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
@@ -23,7 +29,13 @@ import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { preparePreparationProcessGate } from "./PreparationProcessGate.ts";
 import * as NodeChild from "./PreparationNodeChild.ts";
 
+vi.mock("node:crypto", { spy: true });
+
 const encode = (value: string) => new TextEncoder().encode(value);
+const fixtureHost = Object.freeze({
+  hostBootId: "12345678-1234-4234-8234-123456789abc",
+  scopeNamespace: "app-t3code-agents-123456789abc.slice",
+});
 const input = { command: "/usr/bin/fixture", args: ["original"], cwd: "/work" };
 const makeHarness = Effect.fn("test.makePreparationGateHarness")(function* (
   options: {
@@ -34,6 +46,7 @@ const makeHarness = Effect.fn("test.makePreparationGateHarness")(function* (
     readonly binding?: "missing" | "wrong-unit" | "wrong-pid" | "dead";
     readonly payload?: Uint8Array;
     readonly creationEvent?: "withheld";
+    readonly hostIdentity?: unknown;
   } = {},
 ) {
   const spawnWaitStarted = yield* Deferred.make<void>();
@@ -46,7 +59,16 @@ const makeHarness = Effect.fn("test.makePreparationGateHarness")(function* (
   const writerClosed = yield* Deferred.make<void>();
   const readStarted = yield* Deferred.make<void>();
   const readRequests = yield* Queue.unbounded<void>();
-  const state = { wraps: 0, spawns: 0, binds: 0, pulls: 0, written: 0, kills: 0, running: true };
+  const state = {
+    prepares: 0,
+    wraps: 0,
+    spawns: 0,
+    binds: 0,
+    pulls: 0,
+    written: 0,
+    kills: 0,
+    running: true,
+  };
   let nonce = "";
   let command: ChildProcess.StandardCommand | undefined;
   const binding = Object.freeze({
@@ -78,7 +100,15 @@ const makeHarness = Effect.fn("test.makePreparationGateHarness")(function* (
       Effect.sync(() => {
         state.wraps++;
         nonce = request.args[3]!;
-        return { command: request.command, args: request.args, unit: binding.unit, custody };
+        return {
+          command: request.command,
+          args: request.args,
+          unit: binding.unit,
+          custody,
+          ...(options.hostIdentity === null
+            ? {}
+            : { hostIdentity: (options.hostIdentity ?? fixtureHost) as AgentScopeHostIdentity }),
+        };
       }),
   };
   const emitExec = Effect.fn("test.emitPreparationExec")(function* () {
@@ -179,6 +209,7 @@ const makeHarness = Effect.fn("test.makePreparationGateHarness")(function* (
   );
   const nodeCreator: typeof NodeChild.PreparationNodeChild.Service = {
     prepare: (image) => {
+      state.prepares++;
       const selected = ChildProcess.make(image.executable, image.args, {
         cwd: image.cwd,
         env: image.environment,
@@ -433,6 +464,7 @@ it.effect("gate owns image inputs before evaluation and never exposes the privat
       assert.match(prepared.creationInputHash, /^[0-9a-f]{64}$/);
       assert.deepStrictEqual(Object.keys(prepared).sort(), [
         "creationInputHash",
+        "hostIdentity",
         "proposedUnit",
         "spawnHeld",
       ]);
@@ -528,6 +560,7 @@ it.live("gate releases a real Node payload with stdin EOF and exact output", () 
           args: request.args,
           unit: "real-gate-fixture.scope",
           custody,
+          hostIdentity: fixtureHost,
         }),
     };
     yield* Effect.gen(function* () {
@@ -692,6 +725,86 @@ it.effect("local gate creation completes while the Node spawn event is withheld"
       assert.strictEqual(harness.state.pulls, 0);
       assert.strictEqual(harness.state.written, 0);
       yield* pending.stopOwnedChild();
+    }).pipe(Effect.provide(harness.layer));
+  }).pipe(Effect.scoped),
+);
+
+it.effect.each([
+  null,
+  { ...fixtureHost, hostBootId: "bad" },
+  { ...fixtureHost, scopeNamespace: "app-t3code-agents.slice" },
+])(
+  "refuses unavailable or malformed launch host identity %j before creator preparation",
+  (hostIdentity) =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ hostIdentity });
+      const result = yield* Effect.result(
+        preparePreparationProcessGate(input).pipe(Effect.provide(harness.layer)),
+      );
+      assert.strictEqual(result._tag, "Failure");
+      assert.strictEqual(harness.state.prepares, 0);
+      assert.strictEqual(harness.state.spawns, 0);
+    }).pipe(Effect.scoped),
+);
+
+it.effect("rejects malformed host descriptors before creator preparation", () =>
+  Effect.gen(function* () {
+    let reads = 0;
+    const getter = Object.defineProperty(
+      { scopeNamespace: fixtureHost.scopeNamespace },
+      "hostBootId",
+      {
+        enumerable: true,
+        get: () => {
+          reads++;
+          return fixtureHost.hostBootId;
+        },
+      },
+    );
+    for (const hostIdentity of [
+      getter,
+      { ...fixtureHost, extra: true },
+      { ...fixtureHost, hostBootId: fixtureHost.hostBootId + "\n" },
+      { ...fixtureHost, scopeNamespace: fixtureHost.scopeNamespace + "\n" },
+      { ...fixtureHost, hostBootId: "00000000-0000-0000-0000-000000000000" },
+      Object.create(fixtureHost),
+      { ...fixtureHost, [Symbol("host")]: "extra" },
+    ]) {
+      const harness = yield* makeHarness({ hostIdentity });
+      assert.strictEqual(
+        (yield* Effect.result(
+          preparePreparationProcessGate(input).pipe(Effect.provide(harness.layer)),
+        ))._tag,
+        "Failure",
+      );
+      assert.strictEqual(harness.state.prepares, 0);
+      assert.strictEqual(harness.state.spawns, 0);
+    }
+    assert.strictEqual(reads, 0);
+  }).pipe(Effect.scoped),
+);
+
+it.effect("owns host identity and binds only its changed facts into a fixed-nonce image", () =>
+  Effect.gen(function* () {
+    using nonce = vi
+      .spyOn(NodeCrypto, "randomUUID")
+      .mockReturnValue("00000000-0000-4000-8000-000000000001");
+    const hostIdentity: { hostBootId: string; scopeNamespace: string } = { ...fixtureHost };
+    const harness = yield* makeHarness({ hostIdentity });
+    yield* Effect.gen(function* () {
+      const first = yield* preparePreparationProcessGate(input);
+      assert.deepStrictEqual(first.hostIdentity, fixtureHost);
+      assert.isTrue(Object.isFrozen(first.hostIdentity));
+      assert.notStrictEqual(first.hostIdentity, hostIdentity);
+      hostIdentity.hostBootId = "12345678-1234-4234-8234-123456789abd";
+      const second = yield* preparePreparationProcessGate(input);
+      assert.deepStrictEqual(first.hostIdentity, fixtureHost);
+      assert.notStrictEqual(first.creationInputHash, second.creationInputHash);
+      hostIdentity.scopeNamespace = "app-t3code-agents-123456789abd.slice";
+      const third = yield* preparePreparationProcessGate(input);
+      assert.notStrictEqual(second.creationInputHash, third.creationInputHash);
+      assert.strictEqual(harness.state.spawns, 0);
+      assert.strictEqual(nonce.mock.calls.length, 3);
     }).pipe(Effect.provide(harness.layer));
   }).pipe(Effect.scoped),
 );

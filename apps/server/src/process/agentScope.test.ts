@@ -8,6 +8,7 @@ import { assert, describe, expect, it } from "@effect/vitest";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
@@ -61,9 +62,14 @@ const withFakeSystemd = <A, E>(
     readonly cgroupRoot: string;
     readonly procRoot: string;
     readonly procReads: ReadonlyArray<string>;
+    readonly bootReads: ReadonlyArray<string>;
   }) => Effect.Effect<A, E, Scope.Scope>,
   // A user manager older than systemd 253 rejects OOMPolicy on scopes.
   {
+    beforeBootRead,
+    bootText = "12345678-1234-4234-8234-123456789abc\n",
+    runtimeDir = "/run/user/1",
+    platform = "linux",
     oomPolicy = true,
     stopFails = false,
     transformBindingShow,
@@ -73,6 +79,10 @@ const withFakeSystemd = <A, E>(
     transformBlockingStop,
     beforeCgroupIO,
   }: {
+    readonly beforeBootRead?: Effect.Effect<void, PlatformError.PlatformError>;
+    readonly bootText?: string | null;
+    readonly runtimeDir?: string;
+    readonly platform?: "linux" | "darwin";
     readonly oomPolicy?: boolean;
     readonly stopFails?: boolean;
     readonly transformBindingShow?: (
@@ -94,6 +104,10 @@ const withFakeSystemd = <A, E>(
     }
     const cgroupRoot = NodePath.join(bin, "cgroup");
     const procRoot = NodePath.join(bin, "proc");
+    const bootDirectory = NodePath.join(procRoot, "sys/kernel/random");
+    NodeFS.mkdirSync(bootDirectory, { recursive: true });
+    if (bootText !== null) NodeFS.writeFileSync(NodePath.join(bootDirectory, "boot_id"), bootText);
+    const bootReads: string[] = [];
     const procReads: Array<string> = [];
     const units = new Map<string, FakeUnit>();
     const calls: Array<ReadonlyArray<string>> = [];
@@ -154,8 +168,8 @@ const withFakeSystemd = <A, E>(
     const fileSystem = yield* FileSystem.FileSystem;
     const scope = yield* make.pipe(
       Effect.provideService(ProcessRunner.ProcessRunner, runner),
-      Effect.provideService(HostProcess.Platform, "linux"),
-      Effect.provideService(HostProcess.Environment, { PATH: bin, XDG_RUNTIME_DIR: "/run/user/1" }),
+      Effect.provideService(HostProcess.Platform, platform),
+      Effect.provideService(HostProcess.Environment, { PATH: bin, XDG_RUNTIME_DIR: runtimeDir }),
       Effect.provideService(FileSystem.FileSystem, {
         ...fileSystem,
         stat: (file) =>
@@ -170,29 +184,47 @@ const withFakeSystemd = <A, E>(
             ),
           ),
         readFileString: (path, encoding) =>
-          path.startsWith("/proc/")
+          path === "/proc/sys/kernel/random/boot_id"
             ? Effect.sync(() => {
-                procReads.push(path);
+                bootReads.push(path);
               }).pipe(
-                Effect.andThen(beforeProcRead ? beforeProcRead(path) : Effect.void),
+                Effect.andThen(beforeBootRead ?? Effect.void),
                 Effect.andThen(
-                  fileSystem.readFileString(path.replace("/proc", procRoot), encoding),
+                  fileSystem.readFileString(NodePath.join(bootDirectory, "boot_id"), encoding),
                 ),
               )
-            : (path.startsWith("/sys/fs/cgroup/") && beforeCgroupIO
-                ? beforeCgroupIO(path)
-                : Effect.void
-              ).pipe(
-                Effect.andThen(
-                  fileSystem.readFileString(path.replace("/sys/fs/cgroup", cgroupRoot), encoding),
+            : path.startsWith("/proc/")
+              ? Effect.sync(() => {
+                  procReads.push(path);
+                }).pipe(
+                  Effect.andThen(beforeProcRead ? beforeProcRead(path) : Effect.void),
+                  Effect.andThen(
+                    fileSystem.readFileString(path.replace("/proc", procRoot), encoding),
+                  ),
+                )
+              : (path.startsWith("/sys/fs/cgroup/") && beforeCgroupIO
+                  ? beforeCgroupIO(path)
+                  : Effect.void
+                ).pipe(
+                  Effect.andThen(
+                    fileSystem.readFileString(path.replace("/sys/fs/cgroup", cgroupRoot), encoding),
+                  ),
                 ),
-              ),
         writeFileString: (path, data, options) =>
           fileSystem.writeFileString(path.replace("/sys/fs/cgroup", cgroupRoot), data, options),
       }),
     );
     const { stateDir } = yield* ServerConfig.ServerConfig;
-    return yield* body({ scope, units, calls, stateDir, cgroupRoot, procRoot, procReads }).pipe(
+    return yield* body({
+      scope,
+      units,
+      calls,
+      stateDir,
+      cgroupRoot,
+      procRoot,
+      procReads,
+      bootReads,
+    }).pipe(
       Effect.ensuring(Effect.sync(() => NodeFS.rmSync(bin, { recursive: true, force: true }))),
     );
   }).pipe(
@@ -1666,4 +1698,130 @@ it.effect.each([false, true])(
         },
       );
     }),
+);
+
+it.effect("captures fixed host boot and actual selected scope namespace once per instance", () =>
+  withFakeSystemd(({ scope, stateDir, procRoot, bootReads }) =>
+    Effect.gen(function* () {
+      yield* scope.wrap({ command: "missing-host-agent", args: [], name: "preparation" });
+      assert.deepStrictEqual(bootReads, []);
+      const first = yield* scope.wrap({ command: "agent", args: [], name: "preparation" });
+      assert.deepStrictEqual(first.hostIdentity, {
+        hostBootId: "12345678-1234-4234-8234-123456789abc",
+        scopeNamespace: ownedAgentSlice(stateDir),
+      });
+      assert.isTrue(Object.isFrozen(first.hostIdentity));
+      NodeFS.writeFileSync(
+        NodePath.join(procRoot, "sys/kernel/random/boot_id"),
+        "changed-after-capture",
+      );
+      const shared = yield* scope.wrap({
+        command: "agent",
+        args: [],
+        name: "terminal",
+        survivesRestart: true,
+      });
+      assert.deepStrictEqual(shared.hostIdentity, {
+        hostBootId: "12345678-1234-4234-8234-123456789abc",
+        scopeNamespace: "app-t3code-agents.slice",
+      });
+      assert.deepStrictEqual(bootReads, ["/proc/sys/kernel/random/boot_id"]);
+    }),
+  ),
+);
+
+it.effect.each([
+  null,
+  "",
+  "00000000-0000-0000-0000-000000000000",
+  "12345678-1234-4234-8234-123456789ABC",
+  "12345678-1234-4234-8234-123456789abc\n\n",
+  "12345678-1234-4234-8234-123456789abc\r\n",
+  "12345678-1234-4234-8234-123456789abc ",
+])("keeps malformed or unreadable boot identity absent and cached: %j", (bootText) =>
+  withFakeSystemd(
+    ({ scope, procRoot, bootReads }) =>
+      Effect.gen(function* () {
+        const first = yield* scope.wrap({ command: "agent", args: [], name: "preparation" });
+        assert.isDefined(first.unit);
+        assert.isDefined(first.custody);
+        assert.isFalse(Object.hasOwn(first, "hostIdentity"));
+        NodeFS.writeFileSync(
+          NodePath.join(procRoot, "sys/kernel/random/boot_id"),
+          "12345678-1234-4234-8234-123456789abc\n",
+        );
+        const second = yield* scope.wrap({ command: "agent", args: [], name: "preparation" });
+        assert.isFalse(Object.hasOwn(second, "hostIdentity"));
+        assert.deepStrictEqual(bootReads, ["/proc/sys/kernel/random/boot_id"]);
+      }),
+    { bootText },
+  ),
+);
+
+it.effect.each(["no-manager", "unsupported"] as const)(
+  "does not read host boot on %s route",
+  (route) =>
+    withFakeSystemd(
+      ({ scope, bootReads }) =>
+        Effect.gen(function* () {
+          const launch = yield* scope.wrap({ command: "agent", args: [], name: "preparation" });
+          assert.isUndefined(launch.hostIdentity);
+          assert.isUndefined(launch.unit);
+          assert.deepStrictEqual(bootReads, []);
+        }),
+      route === "no-manager" ? { runtimeDir: "" } : { platform: "darwin" },
+    ),
+);
+
+it.effect("preserves and caches an unexpected host read defect rather than host absence", () =>
+  withFakeSystemd(
+    ({ scope, bootReads }) =>
+      Effect.gen(function* () {
+        for (let index = 0; index < 2; index++) {
+          const exit = yield* Effect.exit(
+            scope.wrap({ command: "agent", args: [], name: "preparation" }),
+          );
+          assert.isTrue(Exit.isFailure(exit));
+          if (Exit.isFailure(exit)) assert.isTrue(exit.cause.reasons.some(Cause.isDieReason));
+        }
+        assert.deepStrictEqual(bootReads, ["/proc/sys/kernel/random/boot_id"]);
+      }),
+    { beforeBootRead: Effect.die("unexpected fixture boot read defect") },
+  ),
+);
+
+it.effect("preserves actual host read interruption and abandons the incomplete cache entry", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let reads = 0;
+    yield* withFakeSystemd(
+      ({ scope, bootReads }) =>
+        Effect.gen(function* () {
+          const first = yield* scope
+            .wrap({ command: "agent", args: [], name: "preparation" })
+            .pipe(Effect.forkScoped);
+          yield* Deferred.await(entered);
+          yield* Fiber.interrupt(first);
+          const exit = yield* Fiber.await(first);
+          assert.isTrue(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause));
+          yield* Deferred.succeed(release, undefined);
+          const next = yield* scope.wrap({ command: "agent", args: [], name: "preparation" });
+          assert.strictEqual(next.hostIdentity?.hostBootId, "12345678-1234-4234-8234-123456789abc");
+          assert.deepStrictEqual(bootReads, [
+            "/proc/sys/kernel/random/boot_id",
+            "/proc/sys/kernel/random/boot_id",
+          ]);
+        }),
+      {
+        beforeBootRead: Effect.gen(function* () {
+          reads++;
+          if (reads === 1) {
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(release);
+          }
+        }),
+      },
+    );
+  }).pipe(Effect.scoped),
 );

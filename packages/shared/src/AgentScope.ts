@@ -42,6 +42,12 @@ export interface AgentScopeCommand {
   /** The systemd scope the command runs in, for `stop`. */
   readonly unit?: string | undefined;
   readonly custody?: AgentScopeCustody;
+  readonly hostIdentity?: AgentScopeHostIdentity;
+}
+
+export interface AgentScopeHostIdentity {
+  readonly hostBootId: string;
+  readonly scopeNamespace: string;
 }
 
 export interface AgentScopeBinding {
