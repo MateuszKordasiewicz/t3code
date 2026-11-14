@@ -99,46 +99,74 @@ const matchingPageIndex = (kept: ReadonlyArray<KeptHtmlRender>, input: PageInput
   return matches.length === 1 ? matches[0]! : -1;
 };
 
+interface SessionState {
+  readonly sessions: ReadonlyMap<ThreadId, McpProviderSessionConfig>;
+  readonly htmlRenders: ReadonlyMap<ThreadId, ReadonlyArray<KeptHtmlRender>>;
+}
+
+const serviceStates = new WeakMap<object, Ref.Ref<SessionState>>();
+
+export const isService = (service: object) => serviceStates.has(service);
+
+const replaceSession = (
+  current: SessionState,
+  threadId: ThreadId,
+  replacement: McpProviderSessionConfig | undefined,
+): SessionState => {
+  const sessions = new Map(current.sessions);
+  if (replacement === undefined) sessions.delete(threadId);
+  else sessions.set(threadId, replacement);
+  if (
+    replacement === undefined ||
+    current.sessions.get(threadId)?.providerSessionId !== replacement.providerSessionId
+  ) {
+    const htmlRenders = new Map(current.htmlRenders);
+    htmlRenders.delete(threadId);
+    return { sessions, htmlRenders };
+  }
+  return { sessions, htmlRenders: current.htmlRenders };
+};
+
+export const replaceIfCurrent = Effect.fn("McpProviderSessions.replaceIfCurrent")(function* (
+  service: object,
+  threadId: ThreadId,
+  expected: McpProviderSessionConfig | undefined,
+  replacement: McpProviderSessionConfig | undefined,
+) {
+  const state = serviceStates.get(service);
+  if (!state) return false;
+  return yield* Ref.modify(state, (current) => {
+    if (
+      !threadId.trim() ||
+      (expected !== undefined && expected.threadId !== threadId) ||
+      (replacement !== undefined && replacement.threadId !== threadId) ||
+      current.sessions.get(threadId) !== expected
+    )
+      return [false, current];
+    return [true, replaceSession(current, threadId, replacement)];
+  });
+});
+
 const make = Effect.gen(function* () {
-  const sessions = yield* Ref.make(new Map<ThreadId, McpProviderSessionConfig>());
-  const htmlRenders = yield* Ref.make(new Map<ThreadId, ReadonlyArray<KeptHtmlRender>>());
-  return McpProviderSessions.of({
-    set: Effect.fn("McpProviderSessions.set")(function* (config) {
-      const current = yield* Ref.get(sessions);
-      if (current.get(config.threadId)?.providerSessionId !== config.providerSessionId) {
-        yield* Ref.update(htmlRenders, (kept) => {
-          const next = new Map(kept);
-          next.delete(config.threadId);
-          return next;
-        });
-      }
-      yield* Ref.update(sessions, (current) => new Map(current).set(config.threadId, config));
+  const state = yield* Ref.make<SessionState>({ sessions: new Map(), htmlRenders: new Map() });
+  const service = McpProviderSessions.of({
+    set: Effect.fn("McpProviderSessions.set")(function (config) {
+      return Ref.update(state, (current) => replaceSession(current, config.threadId, config));
     }),
     read: Effect.fn("McpProviderSessions.read")(function (threadId) {
-      return Ref.get(sessions).pipe(Effect.map((current) => current.get(threadId)));
+      return Ref.get(state).pipe(Effect.map((current) => current.sessions.get(threadId)));
     }),
     clear: Effect.fn("McpProviderSessions.clear")(function (threadId) {
-      return Ref.update(sessions, (current) => {
-        const next = new Map(current);
-        next.delete(threadId);
-        return next;
-      }).pipe(
-        Effect.andThen(
-          Ref.update(htmlRenders, (current) => {
-            const next = new Map(current);
-            next.delete(threadId);
-            return next;
-          }),
-        ),
-      );
+      return Ref.update(state, (current) => replaceSession(current, threadId, undefined));
     }),
     recordHtmlRender: Effect.fn("McpProviderSessions.recordHtmlRender")(
       function (threadId, input, reference) {
-        return Ref.update(htmlRenders, (current) =>
-          new Map(current).set(
+        return Ref.update(state, (current) => ({
+          sessions: current.sessions,
+          htmlRenders: new Map(current.htmlRenders).set(
             threadId,
             [
-              ...(current.get(threadId) ?? []),
+              ...(current.htmlRenders.get(threadId) ?? []),
               {
                 path: input.path,
                 title: input.title,
@@ -153,13 +181,13 @@ const make = Effect.gen(function* () {
               },
             ].slice(-MAX_KEPT_HTML_RENDERS),
           ),
-        );
+        }));
       },
     ),
     takeHtmlRender: Effect.fn("McpProviderSessions.takeHtmlRender")(
       function (threadId, input, reported) {
-        return Ref.modify(htmlRenders, (current) => {
-          const kept = current.get(threadId) ?? [];
+        return Ref.modify(state, (current) => {
+          const kept = current.htmlRenders.get(threadId) ?? [];
           const index =
             reported === undefined
               ? matchingPageIndex(kept, input)
@@ -168,17 +196,19 @@ const make = Effect.gen(function* () {
             return [undefined, current];
           }
           const rest = kept.filter((_, keptIndex) => keptIndex !== index);
-          const next = new Map(current);
+          const next = new Map(current.htmlRenders);
           if (rest.length === 0) {
             next.delete(threadId);
           } else {
             next.set(threadId, rest);
           }
-          return [kept[index]!.reference, next];
+          return [kept[index]!.reference, { sessions: current.sessions, htmlRenders: next }];
         });
       },
     ),
   });
+  serviceStates.set(service, state);
+  return service;
 });
 
 export const layer = Layer.effect(McpProviderSessions, make);

@@ -257,6 +257,83 @@ describe("HtmlRender", () => {
       yield* htmlRender.publish({ threadId, ...page });
       yield* mcpSessions.clear(threadId);
       expect(yield* mcpSessions.takeHtmlRender(threadId, page)).toBe(undefined);
+
+      assert.isFunction(McpProviderSessions.replaceIfCurrent);
+      expect(McpProviderSessions.isService(mcpSessions)).toBe(true);
+      expect(McpProviderSessions.isService({ ...mcpSessions })).toBe(false);
+      const otherThread = ThreadId.make("other-html-render");
+      const other = { ...session, threadId: otherThread };
+      yield* mcpSessions.set(other);
+      yield* mcpSessions.recordHtmlRender(otherThread, page, reference);
+      expect(
+        yield* McpProviderSessions.replaceIfCurrent(mcpSessions, threadId, undefined, session),
+      ).toBe(true);
+      expect(yield* mcpSessions.read(threadId)).toBe(session);
+      yield* mcpSessions.recordHtmlRender(threadId, page, reference);
+      for (const [service, expected, next] of [
+        [mcpSessions, undefined, session],
+        [mcpSessions, { ...session }, undefined],
+        [{ ...mcpSessions }, session, undefined],
+        [mcpSessions, other, undefined],
+        [mcpSessions, session, other],
+      ] as const) {
+        expect(yield* McpProviderSessions.replaceIfCurrent(service, threadId, expected, next)).toBe(
+          false,
+        );
+        expect(yield* mcpSessions.read(threadId)).toBe(session);
+      }
+      expect(yield* mcpSessions.takeHtmlRender(threadId, page)).toEqual(reference);
+      const sameCredential = { ...session, browserToolsAvailable: true };
+      yield* mcpSessions.recordHtmlRender(threadId, page, reused);
+      expect(
+        yield* McpProviderSessions.replaceIfCurrent(mcpSessions, threadId, session, sameCredential),
+      ).toBe(true);
+      expect(yield* mcpSessions.takeHtmlRender(threadId, page)).toEqual(reused);
+      yield* mcpSessions.recordHtmlRender(threadId, page, reference);
+      const winner = { ...session, providerSessionId: "conditional-winner" };
+      expect(
+        yield* McpProviderSessions.replaceIfCurrent(mcpSessions, threadId, sameCredential, winner),
+      ).toBe(true);
+      expect(yield* mcpSessions.takeHtmlRender(threadId, page)).toBe(undefined);
+      yield* mcpSessions.recordHtmlRender(threadId, page, replacement);
+      expect(
+        yield* McpProviderSessions.replaceIfCurrent(
+          mcpSessions,
+          threadId,
+          sameCredential,
+          undefined,
+        ),
+      ).toBe(false);
+      expect(yield* mcpSessions.read(threadId)).toBe(winner);
+      expect(yield* mcpSessions.takeHtmlRender(threadId, page)).toEqual(replacement);
+      yield* mcpSessions.recordHtmlRender(threadId, page, replacement);
+      expect(
+        yield* McpProviderSessions.replaceIfCurrent(mcpSessions, threadId, winner, undefined),
+      ).toBe(true);
+      expect(yield* mcpSessions.read(threadId)).toBe(undefined);
+      expect(yield* mcpSessions.takeHtmlRender(threadId, page)).toBe(undefined);
+      expect(yield* mcpSessions.read(otherThread)).toBe(other);
+      expect(yield* mcpSessions.takeHtmlRender(otherThread, page)).toEqual(reference);
+      const foreign = yield* McpProviderSessions.McpProviderSessions.pipe(
+        Effect.provide(Layer.fresh(McpProviderSessions.layer)),
+      );
+      expect(
+        yield* McpProviderSessions.replaceIfCurrent(foreign, threadId, undefined, session),
+      ).toBe(true);
+      expect(yield* mcpSessions.read(threadId)).toBe(undefined);
+      expect(yield* foreign.read(threadId)).toBe(session);
+      expect(McpProviderSessions.isService(foreign)).toBe(true);
+      yield* mcpSessions.recordHtmlRender(threadId, page, reference);
+      expect(
+        yield* McpProviderSessions.replaceIfCurrent(mcpSessions, threadId, undefined, session),
+      ).toBe(true);
+      expect(yield* mcpSessions.takeHtmlRender(threadId, page)).toBe(undefined);
+      yield* mcpSessions.clear(threadId);
+      yield* mcpSessions.recordHtmlRender(threadId, page, reference);
+      expect(
+        yield* McpProviderSessions.replaceIfCurrent(mcpSessions, threadId, undefined, undefined),
+      ).toBe(true);
+      expect(yield* mcpSessions.takeHtmlRender(threadId, page)).toBe(undefined);
     }).pipe(Effect.provide(layerTest)),
   );
 
