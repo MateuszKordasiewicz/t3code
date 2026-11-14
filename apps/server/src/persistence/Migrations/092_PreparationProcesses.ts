@@ -138,7 +138,9 @@ export default Effect.gen(function* () {
       ${jsonDigest(settlement, "contextHash")} AND ${member(settlement, "contextHash")}=creation_context_hash AND
       ${jsonInteger(settlement, "priorVersion")} AND ${type(settlement, "childExit", "object")} AND
       ${jsonInteger(settlement, "childExit.pid", 1)} AND ${member(settlement, "childExit.pid")}=child_pid AND
-      ${jsonInteger(settlement, "childExit.exitCode")} AND ${type(settlement, "scope", "object")} AND
+      ((${jsonInteger(settlement, "childExit.exitCode")} AND ${type(settlement, "childExit.signal", "null")}) OR
+       (${type(settlement, "childExit.exitCode", "null")} AND ${jsonText(settlement, "childExit.signal")})) AND
+      ${type(settlement, "scope", "object")} AND
       ${type(settlement, "scope.binding", "object")} AND ${type(settlement, "scope.observation", "text")} AND
       ${member(settlement, "scope.observation")} IN ('empty','removed') AND
       ${bindingFields.map((field) => `${type(settlement, `scope.binding.${field}`, field === "pid" ? "integer" : "text")} AND ${member(settlement, `scope.binding.${field}`)} IS ${member(binding, field)}`).join(" AND ")},0)))

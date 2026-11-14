@@ -124,7 +124,7 @@ const settlement = (id: string, priorVersion: number) => ({
   resourceId: id,
   contextHash: hash,
   priorVersion,
-  childExit: { pid: 123, exitCode: 0 },
+  childExit: { pid: 123, exitCode: 0, signal: null },
   scope: { binding: binding(id), observation: "removed" },
 });
 const seedParent = Effect.fn("test.seedProcessParent")(function* (id = "parent", native = false) {
@@ -441,6 +441,40 @@ const currentFields = [
   "providerSessionId",
   "nativeThreadId",
 ];
+
+it.effect("retains a signal terminal event without fabricating a numeric exit code", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations();
+    yield* seedParent();
+    yield* sql`INSERT INTO ${sql(table)} ${sql.insert(resource())}`;
+    yield* bind();
+    const evidence = {
+      ...settlement("child", 2),
+      childExit: { pid: 123, exitCode: null, signal: "SIGTERM" },
+    };
+    for (const patch of [
+      { exitCode: null, signal: null },
+      { exitCode: 0, signal: "SIGTERM" },
+      { exitCode: null, signal: "" },
+      { exitCode: null, signal: 15 },
+      { exitCode: null, signal: [] },
+      { exitCode: null, signal: {} },
+      { exitCode: "0", signal: null },
+      { exitCode: true, signal: null },
+    ])
+      yield* reject(
+        sql`UPDATE ${sql(table)} SET record_version=3,state='settled',settlement_json=${JSON.stringify({ ...evidence, childExit: { pid: 123, ...patch } })},settlement_hash=${hash},settled_at=${at} WHERE resource_id='child'`,
+      );
+    for (const path of ["childExit.exitCode", "childExit.signal"])
+      yield* reject(
+        sql`UPDATE ${sql(table)} SET record_version=3,state='settled',settlement_json=${JSON.stringify(change(evidence, path, undefined))},settlement_hash=${hash},settled_at=${at} WHERE resource_id='child'`,
+      );
+    yield* sql`UPDATE ${sql(table)} SET record_version=3,state='settled',settlement_json=${JSON.stringify(evidence)},settlement_hash=${hash},settled_at=${at} WHERE resource_id='child'`;
+    const [retained] = yield* rows();
+    assert.deepStrictEqual(JSON.parse(retained!.settlement_json as string), evidence);
+  }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+);
 
 it.effect("retains exact immutable history against replacements, stale versions and rearm", () =>
   Effect.gen(function* () {

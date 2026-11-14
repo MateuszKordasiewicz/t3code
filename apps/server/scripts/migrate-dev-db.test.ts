@@ -551,7 +551,7 @@ const seedOperationalWorkflow = Effect.fn("test.seedOperationalWorkflowForDevCop
           resourceId: id,
           contextHash: hash,
           priorVersion: 1,
-          childExit: { pid: 101, exitCode: 0 },
+          childExit: { pid: 101, exitCode: 0, signal: null },
           scope: { binding, observation: "removed" },
         };
         yield* sql`UPDATE orchestration_v2_preparation_process_resources SET record_version=2,state='settled',settlement_json=${JSON.stringify(settlement)},settlement_hash=${hash},settled_at=${at} WHERE resource_id=${id}`;
