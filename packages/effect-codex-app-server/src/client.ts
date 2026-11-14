@@ -454,6 +454,11 @@ const snapshotControlledChild = (command: ChildProcess.Command) =>
     catch: (cause) => new CodexError.CodexAppServerSpawnError({ cause }),
   });
 
+const CurrentControlledHandlers = Context.Reference<ReadonlySet<symbol>>(
+  "effect-codex-app-server/CurrentControlledHandlers",
+  { defaultValue: () => new Set() },
+);
+
 type ControlledProcessIo = Pick<
   ChildProcessSpawner.ChildProcessHandle,
   "pid" | "stdin" | "stdout" | "stderr" | "exitCode"
@@ -516,9 +521,38 @@ const makeControlledProcessProtocol = Effect.fn(
         ? Effect.fail(encoded.failure)
         : transport.notify(method, encoded.success, selection);
     };
+    const marker = Symbol("controlled-client-handler");
+    // Per-event callbacks share routing spans and inherit the SDK cleanup context.
+    const inHandler = Effect.fnUntraced(function* <A, E, R>(work: Effect.Effect<A, E, R>) {
+      const previous = yield* CurrentControlledHandlers;
+      return yield* work.pipe(
+        Effect.provideService(CurrentControlledHandlers, new Set([...previous, marker])),
+      );
+    });
+    const handlers: typeof state.handlers = {
+      handleServerRequest: (method, handler) =>
+        state.handlers.handleServerRequest(method, (payload) => inHandler(handler(payload))),
+      handleServerNotification: (method, handler) =>
+        state.handlers.handleServerNotification(method, (payload) => inHandler(handler(payload))),
+      handleUnknownServerRequest: (handler) =>
+        state.handlers.handleUnknownServerRequest((method, params) =>
+          inHandler(handler(method, params)),
+        ),
+      handleUnknownServerNotification: (handler) =>
+        state.handlers.handleUnknownServerNotification((method, params) =>
+          inHandler(handler(method, params)),
+        ),
+    };
     return Object.freeze({
-      ...state.handlers,
-      quiesceOutput: transport.quiesceOutput,
+      ...handlers,
+      quiesceOutput: Effect.gen(function* () {
+        if ((yield* CurrentControlledHandlers).has(marker))
+          return yield* new CodexError.CodexAppServerFrameSubmissionError({
+            outcome: "not_submitted",
+            reason: "reentrant",
+          });
+        return yield* transport.quiesceOutput;
+      }),
       awaitTermination: Deferred.await(state.termination),
       raw: {
         notifications: transport.incomingNotifications,

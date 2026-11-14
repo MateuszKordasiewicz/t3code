@@ -11,6 +11,8 @@ import * as Ref from "effect/Ref";
 import * as References from "effect/References";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as Sink from "effect/Sink";
+import * as Cause from "effect/Cause";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -685,4 +687,124 @@ it.live("failed protocol assembly leaves physical cleanup with the caller", () =
     yield* Effect.exit(handle.exitCode);
     assert.isFalse(yield* handle.isRunning);
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+const makeCloseGuardPeer = Effect.fn("test.makeCloseGuardPeer")(function* () {
+  const input = yield* Queue.unbounded<Uint8Array, Cause.Done>();
+  const output = yield* Queue.unbounded<string>();
+  const client = yield* CodexClient.makeControlledProcessProtocolClient(
+    {
+      pid: ChildProcessSpawner.ProcessId(1),
+      stdin: Sink.forEach((bytes: Uint8Array) =>
+        Queue.offer(output, new TextDecoder().decode(bytes)),
+      ),
+      stdout: Stream.fromQueue(input),
+      stderr: Stream.empty,
+      exitCode: Effect.never,
+    },
+    { wrapper: (_frame, submit) => submit(), onOutcome: () => Effect.void },
+  );
+  return { client, input, output };
+});
+it.effect.each([
+  "typed-request",
+  "unknown-request",
+  "typed-notification",
+  "unknown-notification",
+] as const)("controlled client rejects own quiescence from an incoming %s callback", (kind) =>
+  Effect.gen(function* () {
+    const peer = yield* makeCloseGuardPeer();
+    const other = yield* makeCloseGuardPeer();
+    const scope = yield* Effect.scope;
+    const observations = yield* Queue.unbounded<{
+      self: Result.Result<void, CodexError.CodexAppServerError>;
+      other: Result.Result<void, CodexError.CodexAppServerError>;
+    }>();
+    const descendant =
+      yield* Queue.unbounded<Result.Result<void, CodexError.CodexAppServerError>>();
+    const release = yield* Deferred.make<void>();
+    const inspect = Effect.gen(function* () {
+      const self = yield* Effect.result(peer.client.quiesceOutput);
+      const foreign = yield* Effect.result(other.client.quiesceOutput);
+      yield* Queue.offer(observations, { self, other: foreign });
+      if (kind === "unknown-request")
+        yield* Deferred.await(release).pipe(
+          Effect.andThen(Effect.result(peer.client.quiesceOutput)),
+          Effect.flatMap((result) => Queue.offer(descendant, result)),
+          Effect.forkIn(scope),
+        );
+    });
+    const typedRequest = kind === "typed-request";
+    const isRequest = typedRequest || kind === "unknown-request";
+    if (typedRequest)
+      yield* peer.client.handleServerRequest("item/tool/requestUserInput", () =>
+        inspect.pipe(Effect.as({ answers: { approved: { answers: ["yes"] } } })),
+      );
+    else if (kind === "unknown-request")
+      yield* peer.client.handleUnknownServerRequest(() => inspect.pipe(Effect.as({ ok: true })));
+    else if (kind === "typed-notification")
+      yield* peer.client.handleServerNotification("item/agentMessage/delta", () => inspect);
+    else yield* peer.client.handleUnknownServerNotification(() => inspect);
+    const method = typedRequest
+      ? "item/tool/requestUserInput"
+      : kind === "typed-notification"
+        ? "item/agentMessage/delta"
+        : "fixture/close";
+    const params = typedRequest
+      ? {
+          isBlocking: true,
+          itemId: "item",
+          threadId: "thread",
+          turnId: "turn",
+          questions: [
+            {
+              id: "approved",
+              header: "Approve",
+              question: "Continue?",
+              options: [{ label: "yes", description: "Continue" }],
+            },
+          ],
+        }
+      : kind === "typed-notification"
+        ? { delta: "ready", itemId: "item", threadId: "thread", turnId: "turn" }
+        : {};
+    yield* Queue.offer(
+      peer.input,
+      new TextEncoder().encode(
+        JSON.stringify({
+          ...(isRequest ? { id: "incoming" } : {}),
+          method,
+          params,
+        }) + "\n",
+      ),
+    );
+    const observed = yield* Queue.take(observations);
+    assert.isTrue(Result.isFailure(observed.self));
+    if (Result.isFailure(observed.self)) {
+      assert.instanceOf(observed.self.failure, CodexError.CodexAppServerFrameSubmissionError);
+      if (observed.self.failure._tag === "CodexAppServerFrameSubmissionError") {
+        assert.strictEqual(observed.self.failure.reason, "reentrant");
+        assert.strictEqual(observed.self.failure.outcome, "not_submitted");
+      }
+    }
+    assert.isTrue(Result.isSuccess(observed.other));
+    if (isRequest) {
+      const response = JSON.parse(yield* Queue.take(peer.output));
+      assert.strictEqual(response.id, "incoming");
+      assert.isDefined(response.result);
+    }
+    if (kind === "unknown-request") {
+      yield* Deferred.succeed(release, undefined);
+      const inherited = yield* Queue.take(descendant);
+      assert.isTrue(Result.isFailure(inherited));
+      if (
+        Result.isFailure(inherited) &&
+        inherited.failure._tag === "CodexAppServerFrameSubmissionError"
+      )
+        assert.strictEqual(inherited.failure.reason, "reentrant");
+    }
+    yield* peer.client.raw.notify("fixture/external");
+    assert.strictEqual(JSON.parse(yield* Queue.take(peer.output)).method, "fixture/external");
+    yield* peer.client.quiesceOutput;
+  }).pipe(Effect.scoped),
 );
