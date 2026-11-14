@@ -454,22 +454,16 @@ const snapshotControlledChild = (command: ChildProcess.Command) =>
     catch: (cause) => new CodexError.CodexAppServerSpawnError({ cause }),
   });
 
-const makeOwnedControlledClient = Effect.fn(
-  "effect-codex-app-server/CodexAppServerControlledClient.makeChildProcess",
-)(function* <E>(
-  command: ChildProcess.StandardCommand,
-  options: CodexAppServerControlledClientOptions<E>,
-) {
+type ControlledProcessIo = Pick<
+  ChildProcessSpawner.ChildProcessHandle,
+  "pid" | "stdin" | "stdout" | "stderr" | "exitCode"
+>;
+
+const makeControlledProcessProtocol = Effect.fn(
+  "effect-codex-app-server/CodexAppServerControlledClient.makeProcessProtocol",
+)(function* <E>(handle: ControlledProcessIo, options: CodexAppServerControlledClientOptions<E>) {
   const owner = yield* Scope.fork(yield* Scope.Scope, "sequential");
   return yield* Effect.gen(function* () {
-    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-    const handle = yield* spawner
-      .spawn(command)
-      .pipe(
-        Effect.mapError(
-          (cause) => new CodexError.CodexAppServerSpawnError({ command: command.command, cause }),
-        ),
-      );
     const stderr = yield* makeStderrTail(handle.stderr);
     const state = yield* makeClientState();
     const transport = yield* CodexProtocol.makeControlledCodexAppServerProtocol({
@@ -522,14 +516,9 @@ const makeOwnedControlledClient = Effect.fn(
         ? Effect.fail(encoded.failure)
         : transport.notify(method, encoded.success, selection);
     };
-    return CodexAppServerControlledClient.of({
+    return Object.freeze({
       ...state.handlers,
       quiesceOutput: transport.quiesceOutput,
-      ownedProcess: Object.freeze({
-        pid: handle.pid,
-        isRunning: handle.isRunning,
-        awaitExit: handle.exitCode,
-      }),
       awaitTermination: Deferred.await(state.termination),
       raw: {
         notifications: transport.incomingNotifications,
@@ -541,6 +530,51 @@ const makeOwnedControlledClient = Effect.fn(
       },
       request,
       notify,
+    });
+  }).pipe(
+    Scope.provide(owner),
+    Effect.onExit((exit) => (Exit.isFailure(exit) ? Scope.close(owner, exit) : Effect.void)),
+  );
+});
+
+export function makeControlledProcessProtocolClient<E>(
+  handle: ControlledProcessIo,
+  options: CodexAppServerControlledClientOptions<E>,
+) {
+  const captured = {
+    pid: handle.pid,
+    stdin: handle.stdin,
+    stdout: handle.stdout,
+    stderr: handle.stderr,
+    exitCode: handle.exitCode,
+  };
+  return makeControlledProcessProtocol(captured, { ...options });
+}
+
+const makeOwnedControlledClient = Effect.fn(
+  "effect-codex-app-server/CodexAppServerControlledClient.makeChildProcess",
+)(function* <E>(
+  command: ChildProcess.StandardCommand,
+  options: CodexAppServerControlledClientOptions<E>,
+) {
+  const owner = yield* Scope.fork(yield* Scope.Scope, "sequential");
+  return yield* Effect.gen(function* () {
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const handle = yield* spawner
+      .spawn(command)
+      .pipe(
+        Effect.mapError(
+          (cause) => new CodexError.CodexAppServerSpawnError({ command: command.command, cause }),
+        ),
+      );
+    const client = yield* makeControlledProcessProtocolClient(handle, options);
+    return CodexAppServerControlledClient.of({
+      ...client,
+      ownedProcess: Object.freeze({
+        pid: handle.pid,
+        isRunning: handle.isRunning,
+        awaitExit: handle.exitCode,
+      }),
     });
   }).pipe(
     Scope.provide(owner),

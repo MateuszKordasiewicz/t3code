@@ -10,6 +10,7 @@ import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as References from "effect/References";
 import * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -533,4 +534,155 @@ it.effect.each(["millis", "nanos"] as const)(
           expected,
         );
     }).pipe(Effect.scoped),
+);
+
+it.live(
+  "assembles controlled protocol over caller-owned IO without spawning or claiming the process",
+  () =>
+    Effect.gen(function* () {
+      assert.isFunction(CodexClient.makeControlledProcessProtocolClient);
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const processScope = yield* Scope.make("sequential");
+      const protocolScope = yield* Scope.make("sequential");
+      yield* Effect.addFinalizer(() => Scope.close(processScope, Exit.void));
+      yield* Effect.addFinalizer(() => Scope.close(protocolScope, Exit.void));
+      const handle = yield* spawner
+        .spawn(
+          ChildProcess.make(process.execPath, [yield* mockPeerPath], {
+            stdin: { stream: "pipe", endOnDone: false },
+            stdout: "pipe",
+            stderr: "pipe",
+            forceKillAfter: "2 seconds",
+          }),
+        )
+        .pipe(Scope.provide(processScope));
+      const frames = yield* Queue.unbounded<CodexProtocol.CodexAppServerControlledFrame>();
+      const outcomes = yield* Queue.unbounded<CodexProtocol.CodexAppServerFrameOutcome>();
+      let deny = false;
+      const refusal = () =>
+        new CodexError.CodexAppServerFrameSubmissionError({
+          outcome: "not_submitted",
+          reason: "wrapper",
+        });
+      const options = {
+        wrapper: (frame, submit) =>
+          Queue.offer(frames, frame).pipe(
+            Effect.andThen(Effect.suspend(() => (deny ? Effect.fail(refusal()) : submit()))),
+          ),
+        onOutcome: (outcome) => Queue.offer(outcomes, outcome).pipe(Effect.asVoid),
+      } satisfies CodexClient.CodexAppServerControlledClientOptions<CodexError.CodexAppServerFrameSubmissionError>;
+      const supplied = {
+        pid: handle.pid,
+        stdin: handle.stdin,
+        stdout: handle.stdout,
+        stderr: handle.stderr,
+        exitCode: handle.exitCode,
+      };
+      const assembling = CodexClient.makeControlledProcessProtocolClient(supplied, options);
+      supplied.stdout = Stream.never;
+      options.wrapper = () => Effect.fail(refusal());
+      const client = yield* assembling.pipe(
+        Scope.provide(protocolScope),
+        Effect.provideService(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() => Effect.die("protocol assembly must not spawn")),
+        ),
+      );
+      assert.isFalse(Object.hasOwn(client, "ownedProcess"));
+      const payload = {
+        clientInfo: { name: "retained-pipe", version: "1" },
+        capabilities: { experimentalApi: true },
+      };
+      const initialize = client.request("initialize", payload, "typed-selection");
+      const rawPayload = { nested: { value: "original" } };
+      const raw = client.raw.request("account/read", rawPayload, "raw-selection");
+      payload.clientInfo.name = "changed after call";
+      rawPayload.nested.value = "changed after call";
+      assert.strictEqual((yield* initialize).userAgent, "mock-codex-app-server");
+      assert.isObject(yield* raw);
+      const observed = yield* Queue.takeN(frames, 2);
+      assert.deepStrictEqual(
+        observed.map((frame) => frame.selection),
+        ["typed-selection", "raw-selection"],
+      );
+      assert.isTrue(observed.every((frame) => !frame.encoded.includes("selection")));
+      expect(JSON.parse(observed[0]!.encoded)).toMatchObject({
+        params: { clientInfo: { name: "retained-pipe" } },
+      });
+      expect(JSON.parse(observed[1]!.encoded)).toMatchObject({
+        params: { nested: { value: "original" } },
+      });
+      const invalid = yield* client
+        .request("initialize", {
+          // @ts-expect-error A runtime caller can omit the required client name.
+          clientInfo: { version: "1" },
+        })
+        .pipe(Effect.flip);
+      assert.instanceOf(invalid, CodexError.CodexAppServerRequestError);
+      assert.strictEqual(yield* Queue.size(frames), 0);
+      if (invalid._tag !== "CodexAppServerRequestError")
+        return yield* Effect.die("expected schema failure");
+      yield* Queue.takeN(outcomes, 2);
+      deny = true;
+      const refused = [
+        client.request("account/read", {}, "typed-denied").pipe(Effect.asVoid),
+        client.raw.request("account/read", {}, "raw-denied").pipe(Effect.asVoid),
+        client.notify("initialized", undefined, "typed-notification-denied"),
+        client.raw.notify("initialized", undefined, "raw-notification-denied"),
+        client.raw.respond("response", {}, "response-denied"),
+        client.raw.respondError("response-error", invalid, "response-error-denied"),
+      ];
+      for (const work of refused) {
+        const error = yield* work.pipe(Effect.flip);
+        assert.instanceOf(error, CodexError.CodexAppServerFrameSubmissionError);
+        if (error._tag === "CodexAppServerFrameSubmissionError")
+          assert.strictEqual(error.outcome, "not_submitted");
+      }
+      const denied = yield* Queue.takeN(outcomes, refused.length);
+      assert.isTrue(denied.every((outcome) => outcome.outcome === "not_submitted"));
+      yield* client.quiesceOutput;
+      yield* Scope.close(protocolScope, Exit.void);
+      assert.isTrue(yield* handle.isRunning);
+      assert.instanceOf(
+        yield* client.request("account/read", {}).pipe(Effect.flip),
+        CodexError.CodexAppServerFrameSubmissionError,
+      );
+      yield* Scope.close(processScope, Exit.void);
+      yield* Effect.exit(handle.exitCode);
+      assert.isFalse(yield* handle.isRunning);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.live("failed protocol assembly leaves physical cleanup with the caller", () =>
+  Effect.gen(function* () {
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const physical = yield* Scope.make("sequential");
+    yield* Effect.addFinalizer(() => Scope.close(physical, Exit.void));
+    const handle = yield* spawner
+      .spawn(
+        ChildProcess.make(process.execPath, [yield* mockPeerPath], {
+          stdin: { stream: "pipe", endOnDone: false },
+          stdout: "pipe",
+          stderr: "pipe",
+          forceKillAfter: "2 seconds",
+        }),
+      )
+      .pipe(Scope.provide(physical));
+    const error = yield* CodexClient.makeControlledProcessProtocolClient(handle, {
+      wrapper: (_frame, submit) => submit(),
+      onOutcome: () => Effect.void,
+      testSinkTimeoutMs: 0,
+    }).pipe(
+      Effect.flip,
+      Effect.provideService(
+        ChildProcessSpawner.ChildProcessSpawner,
+        ChildProcessSpawner.make(() => Effect.die("protocol assembly must not spawn")),
+      ),
+    );
+    assert.instanceOf(error, CodexError.CodexAppServerFrameSubmissionError);
+    assert.isTrue(yield* handle.isRunning);
+    yield* Scope.close(physical, Exit.void);
+    yield* Effect.exit(handle.exitCode);
+    assert.isFalse(yield* handle.isRunning);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
