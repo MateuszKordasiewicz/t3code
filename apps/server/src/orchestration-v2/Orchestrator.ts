@@ -5857,8 +5857,33 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
     effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+    native?: NativeDispatchHint,
   ) {
     let projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+    if (native !== undefined) {
+      const activeProviderThread = projection.providerThreads.find(
+        (thread) => thread.id === projection.thread.activeProviderThreadId,
+      );
+      if (
+        native.phase !== "message" ||
+        command.dispatchMode.type !== "defer_start" ||
+        projection.runs.length !== 0 ||
+        (yield* projectionStore
+          .getMessageCount(command.threadId)
+          .pipe(mapDispatchError(command))) !== 0 ||
+        pendingForkTransferForThread(projection) !== undefined ||
+        pendingMergeBackTransfersForThread(projection).length !== 0 ||
+        (activeProviderThread !== undefined &&
+          activeProviderThread.providerInstanceId !==
+            (command.modelSelection?.instanceId ?? projection.thread.providerInstanceId))
+      )
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause:
+            "Native initial messages require an empty target without pending context transfers or a provider switch.",
+        });
+    }
     if (command.manualContinuationOfRunId !== undefined) {
       const source = projection.runs.find((run) => run.id === command.manualContinuationOfRunId);
       const limited = latestRootProviderFailure(source ?? null, projection.turnItems);
@@ -6828,14 +6853,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ),
       );
       const providerSessionId =
-        reusableProviderThread?.providerSessionId ??
-        (yield* mapDispatchError(command)(
-          providerSessionIdFor({
-            adapter,
-            providerInstanceId: modelSelection.instanceId,
-            threadId: command.threadId,
-          }),
-        ));
+        native !== undefined
+          ? yield* mapDispatchError(command)(
+              idAllocator.allocate.providerSession({
+                providerInstanceId: modelSelection.instanceId,
+                threadId: command.threadId,
+              }),
+            )
+          : (reusableProviderThread?.providerSessionId ??
+            (yield* mapDispatchError(command)(
+              providerSessionIdFor({
+                adapter,
+                providerInstanceId: modelSelection.instanceId,
+                threadId: command.threadId,
+              }),
+            )));
       const providerThreadId =
         reusableProviderThread?.id ??
         idAllocator.derive.providerThread({
@@ -13461,6 +13493,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const dispatchOnce = Effect.fn("orchestrationV2.dispatch.once")(function* (
     command: OrchestrationV2ServerCommand,
     sideChatIds: ReadonlyArray<ThreadId>,
+    native?: NativeDispatchHint,
   ): Effect.fn.Return<
     {
       readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
@@ -13655,7 +13688,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 text: guestSend.text,
                 context: { version: 1 as const, records: [], guest: guestSend.guest },
               };
-        cancelUnsettledEffects = yield* dispatchMessage(dispatched, events, effects);
+        cancelUnsettledEffects = yield* dispatchMessage(dispatched, events, effects, native);
         yield* recordSubagentFollowup(dispatched, events).pipe(mapDispatchError(command));
         break;
       }
@@ -13984,7 +14017,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (shell !== null) yield* refuseAboveDispatchModeLimit(command, threadId, shell);
     }
 
-    const plan = yield* dispatchOnce(command, sideChatIds).pipe(
+    const plan = yield* dispatchOnce(command, sideChatIds, native).pipe(
       Effect.tap((planned) => refuseAboveRuntimeModeCeiling(command, planned.events)),
       Effect.filterOrFail(
         (planned) =>

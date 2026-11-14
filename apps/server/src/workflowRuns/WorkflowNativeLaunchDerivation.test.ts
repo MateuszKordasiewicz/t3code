@@ -1358,6 +1358,7 @@ const seedAdmission = Effect.gen(function* () {
     sourcePacketHash,
   };
 });
+const decodePlanningSessionFixture = Schema.decodeUnknownSync(PlanningSessionV1);
 const decodePassFixture = Schema.decodeSync(PlanningPassV1);
 const decodeOperationFixture = Schema.decodeSync(WorkflowOperationV1);
 const admissionInput = (
@@ -2352,34 +2353,51 @@ it.effect("owns hinted commands and hint before returning the dispatch Effect", 
   }).pipe(Effect.provide(testLayer())),
 );
 
-it.effect("native decision refusal leaves no rejected receipt for an occupied reuse target", () =>
-  Effect.gen(function* () {
-    const { derived } = yield* workflowDecision(true);
-    const runtime = yield* proofOrchestrator();
-    const orchestrator = Context.get(runtime, Orchestrator.OrchestratorV2);
-    const sql = yield* SqlClient.SqlClient;
-    yield* orchestrator.dispatch(existingThreadCommand(derived));
-    yield* orchestrator.dispatch({
-      ...derived.messageCommand,
-      commandId: CommandId.make("existing-message-command"),
-      messageId: MessageId.make("existing-message"),
-    });
-    const before = yield* nativeCounts;
-    assert.instanceOf(
-      yield* Effect.flip(
-        orchestrator.dispatch(derived.claimCommand, {
+it.effect.each(["before-claim", "after-claim"] as const)(
+  "native decision refusal leaves no rejected receipt when occupied %s",
+  (stage) =>
+    Effect.gen(function* () {
+      const { derived } = yield* workflowDecision(true);
+      const runtime = yield* proofOrchestrator();
+      const orchestrator = Context.get(runtime, Orchestrator.OrchestratorV2);
+      const sql = yield* SqlClient.SqlClient;
+      yield* orchestrator.dispatch(existingThreadCommand(derived));
+      if (stage === "after-claim")
+        yield* orchestrator.dispatch(derived.claimCommand, {
           intentId: derived.reservation.intentId,
           phase: "claim",
-        }),
-      ),
-      Orchestrator.OrchestratorDispatchError,
-    );
-    assert.deepStrictEqual(yield* nativeCounts, before);
-    assert.deepStrictEqual(
-      yield* sql`SELECT * FROM orchestration_command_receipts WHERE command_id = ${derived.claimCommand.commandId}`,
-      [],
-    );
-  }).pipe(Effect.provide(testLayer())),
+        });
+      yield* orchestrator.dispatch({
+        ...derived.messageCommand,
+        commandId: CommandId.make("existing-message-command"),
+        messageId: MessageId.make("existing-message"),
+      });
+      const sink = Context.get(runtime, EventSink.EventSinkV2);
+      const original = sink.commitNativeCommand;
+      if (!original) throw new Error("native writer missing");
+      let writes = 0;
+      using _writer = vi.spyOn(sink, "commitNativeCommand").mockImplementation((input) => {
+        writes++;
+        return original(input);
+      });
+      const command = stage === "before-claim" ? derived.claimCommand : derived.messageCommand;
+      const before = yield* nativeCounts;
+      assert.instanceOf(
+        yield* Effect.flip(
+          orchestrator.dispatch(command, {
+            intentId: derived.reservation.intentId,
+            phase: stage === "before-claim" ? "claim" : "message",
+          }),
+        ),
+        Orchestrator.OrchestratorDispatchError,
+      );
+      assert.strictEqual(writes, 0);
+      assert.deepStrictEqual(yield* nativeCounts, before);
+      assert.deepStrictEqual(
+        yield* sql`SELECT * FROM orchestration_command_receipts WHERE command_id = ${command.commandId}`,
+        [],
+      );
+    }).pipe(Effect.provide(testLayer())),
 );
 
 it.effect(
@@ -2389,13 +2407,21 @@ it.effect(
       const { derived } = yield* workflowDecision();
       const arrived = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
-      let capabilityCalls = 0;
+      let allocationCalls = 0;
       const gate = Effect.gen(function* () {
-        capabilityCalls += 1;
+        allocationCalls += 1;
         yield* Deferred.succeed(arrived, undefined);
         yield* Deferred.await(release);
       });
-      const runtime = yield* proofOrchestrator(true, gate);
+      const allocator = Context.get(
+        yield* Layer.build(IdAllocator.layer),
+        IdAllocator.IdAllocatorV2,
+      );
+      const allocate = allocator.allocate.providerSession;
+      using _allocation = vi
+        .spyOn(allocator.allocate, "providerSession")
+        .mockImplementation((input) => gate.pipe(Effect.andThen(allocate(input))));
+      const runtime = yield* proofOrchestrator();
       const orchestrator = Context.get(runtime, Orchestrator.OrchestratorV2);
       const sql = yield* SqlClient.SqlClient;
       yield* orchestrator.dispatch(derived.claimCommand, {
@@ -2429,12 +2455,12 @@ it.effect(
         yield* sql`SELECT stream_id, event_type FROM orchestration_events WHERE command_id = ${derived.messageCommand.commandId}`,
         [{ stream_id: otherThread, event_type: "thread.created" }],
       );
-      const callsBeforeReplay = capabilityCalls;
+      const callsBeforeReplay = allocationCalls;
       assert.instanceOf(
         yield* Effect.flip(orchestrator.dispatch(derived.messageCommand, hint)),
         Orchestrator.OrchestratorDispatchError,
       );
-      assert.strictEqual(capabilityCalls, callsBeforeReplay);
+      assert.strictEqual(allocationCalls, callsBeforeReplay);
       assert.deepStrictEqual(yield* nativeCounts, afterCompeting);
     }).pipe(Effect.provide(testLayer())),
 );
@@ -2649,6 +2675,7 @@ const controlledNativeFixture = Effect.fn("test.controlledNativeFixture")(functi
     derivation.deriveInTransaction({ intentId: input.intentId }),
   );
   return {
+    binding,
     kind,
     config,
     sql,
@@ -2679,6 +2706,19 @@ it.effect.each([
     assert.isDefined(created);
     if (created?.event.type !== "run.created") throw new Error("run missing");
     assert.strictEqual(created.event.payload.userMessageId, input.messageId);
+    const providerThread = result.storedEvents.find(
+      ({ event }) => event.type === "provider-thread.updated",
+    );
+    if (providerThread?.event.type !== "provider-thread.updated")
+      throw new Error("provider thread missing");
+    const allocator = Context.get(yield* Layer.build(IdAllocator.layer), IdAllocator.IdAllocatorV2);
+    assert.isString(providerThread.event.payload.providerSessionId);
+    assert.notStrictEqual(
+      providerThread.event.payload.providerSessionId,
+      allocator.derive.providerSession({
+        providerInstanceId: ProviderInstanceId.make(input.launch.modelSelection.instanceId),
+      }),
+    );
     const sql = yield* SqlClient.SqlClient;
     assert.strictEqual((yield* sql`SELECT * FROM workflow_native_command_proofs`).length, 2);
     assert.deepStrictEqual(
@@ -6404,4 +6444,414 @@ it.effect.each(["workflow", "planning"] as const)(
         assert.strictEqual(child.payloads.length, 2);
       }).pipe(Effect.provide(harness.services));
     }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect(
+  "native workflow and planning transports keep independent sessions and workspaces live together",
+  () =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        const fixture = yield* controlledNativeFixture("workflow", false, false, 2, false, {
+          type: "worktree",
+          baseRef: "main",
+          branch: "native-overlap-workflow",
+        });
+        const siblingSession = decodePlanningSessionFixture({
+          ...session,
+          id: "native-overlap-planning",
+        });
+        yield* fixture.store.beginPlanning({
+          session: siblingSession,
+          now: facts.now,
+          context,
+          command: { commandId: "begin-native-overlap", receiptId: "begin-native-overlap" },
+        });
+        const reservationInput = planningReservation(
+          admissionInput(fixture.binding, "overlap", siblingSession),
+        );
+        const input = {
+          ...reservationInput,
+          materialVersion: 2 as const,
+          authority: fixture.reference,
+          launch: {
+            ...reservationInput.launch,
+            reuseExistingThread: false,
+            workspaceStrategy: {
+              type: "worktree" as const,
+              baseRef: "main",
+              branch: "native-overlap-planning",
+            },
+          },
+        };
+        yield* fixture.store.reservePlanningNativeIntent(input);
+        const derivation = yield* Derivation.make.pipe(
+          Effect.provideService(Store.WorkflowRunStore, fixture.store),
+        );
+        const derived = yield* fixture.sql.withTransaction(
+          derivation.deriveInTransaction({ intentId: input.intentId }),
+        );
+        const sibling = { ...fixture, kind: "planning" as const, input, derived };
+        const service = yield* nativeTransportEntry(fixture);
+        const first = yield* service.createReservedTransport(producerSelection(fixture));
+        yield* first.bootstrap();
+        const firstRuntime = yield* first.createAdapterRuntime();
+        const second = yield* service.createReservedTransport(producerSelection(sibling));
+        yield* second.bootstrap();
+        const secondRuntime = yield* second.createAdapterRuntime();
+        assert.notStrictEqual(
+          firstRuntime.runtime.providerSession.id,
+          secondRuntime.runtime.providerSession.id,
+        );
+        assert.notStrictEqual(
+          firstRuntime.runtime.providerSession.cwd,
+          secondRuntime.runtime.providerSession.cwd,
+        );
+        assert.isTrue(yield* first.client.ownedProcess.isRunning);
+        assert.isTrue(yield* second.client.ownedProcess.isRunning);
+        const paths = (yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_jobs`).map(
+          (row) => {
+            const job = PreparationJob.decodeRow(row);
+            if (job.codeClosedAt === null) throw new Error("workspace evidence missing");
+            return PreparationJob.ownWorkspaceSettlement(
+              job.settlement,
+              job.input,
+              job.recordVersion - 1,
+              job.codeClosedAt,
+            ).workspace.path;
+          },
+        );
+        assert.strictEqual(new Set(paths).size, 2);
+        assert.deepStrictEqual(
+          paths.toSorted(),
+          [
+            firstRuntime.runtime.providerSession.cwd,
+            secondRuntime.runtime.providerSession.cwd,
+          ].toSorted(),
+        );
+        const children = harness.requests
+          .filter((image) => image.args[4] === "/fixture-bin/codex")
+          .map((image) => harness.children.get(image.args[3]!)!);
+        assert.strictEqual(children.length, 2);
+        assert.isTrue(children.every((child) => child.running && child.payloads.length === 2));
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT status FROM orchestration_v2_projection_runs ORDER BY run_id`,
+          [{ status: "preparing" }, { status: "preparing" }],
+        );
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT * FROM orchestration_v2_projection_provider_sessions`,
+          [],
+        );
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT * FROM orchestration_v2_submission_attempts`,
+          [],
+        );
+        assert.strictEqual((yield* first.close()).kind, "retired");
+        assert.isTrue(yield* second.client.ownedProcess.isRunning);
+        assert.strictEqual((yield* second.close()).kind, "retired");
+        assert.isTrue(children.every((child) => !child.running));
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect(
+  "native allocation preserves ordinary sharing and exact historical shared-session replay after reopen",
+  () =>
+    Effect.gen(function* () {
+      const directory = yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "native-session-replay-")),
+        ),
+        (value) => Effect.sync(() => NodeFS.rmSync(value, { recursive: true, force: true })),
+      );
+      const filename = NodePath.join(directory, "state.sqlite");
+      const saved = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const fixture = yield* controlledNativeFixture("workflow");
+          const decisions = yield* Effect.gen(function* () {
+            yield* runMigrations();
+            yield* seedProject;
+            const ordinary = Context.get(
+              yield* proofOrchestrator(false, Effect.void, undefined, fixture.config),
+              Orchestrator.OrchestratorV2,
+            );
+            const claim = yield* ordinary.dispatch(fixture.derived.claimCommand);
+            const message = yield* ordinary.dispatch(fixture.derived.messageCommand);
+            const otherThread = ThreadId.make("ordinary-sharing-control");
+            yield* ordinary.dispatch(
+              existingThreadCommand(fixture.derived, "ordinary-sharing-create", otherThread),
+            );
+            const other = yield* ordinary.dispatch({
+              ...fixture.derived.messageCommand,
+              threadId: otherThread,
+              commandId: CommandId.make("ordinary-sharing-message"),
+              messageId: MessageId.make("ordinary-sharing-message"),
+            });
+            const sessionOf = (result: typeof message) => {
+              const changed = result.storedEvents.find(
+                ({ event }) => event.type === "provider-thread.updated",
+              );
+              if (changed?.event.type !== "provider-thread.updated")
+                throw new Error("provider thread missing");
+              return changed.event.payload.providerSessionId;
+            };
+            const shared = Context.get(
+              yield* Layer.build(IdAllocator.layer),
+              IdAllocator.IdAllocatorV2,
+            ).derive.providerSession({ providerInstanceId: ProviderInstanceId.make("provider") });
+            assert.strictEqual(sessionOf(message), shared);
+            assert.strictEqual(sessionOf(other), shared);
+            assert.deepStrictEqual(
+              yield* (yield* SqlClient.SqlClient)`SELECT * FROM orchestration_v2_effect_outbox`,
+              [],
+            );
+            return { claim, message, shared };
+          }).pipe(Effect.provide(Layer.fresh(testLayer())));
+          const commit = Context.get(fixture.runtime, EventSink.EventSinkV2).commitNativeCommand;
+          if (!commit) throw new Error("native writer missing");
+          for (const [command, phase, result] of [
+            [fixture.derived.claimCommand, "claim", decisions.claim],
+            [fixture.derived.messageCommand, "message", decisions.message],
+          ] as const) {
+            const events = result.storedEvents.map((stored) => stored.event);
+            yield* commit({
+              command,
+              hint: { intentId: fixture.input.intentId, phase },
+              acceptedAt: events.at(-1)!.occurredAt,
+              events,
+              effects: [],
+            });
+          }
+          const rows = {
+            receipts:
+              yield* fixture.sql`SELECT * FROM orchestration_command_receipts ORDER BY command_id`,
+            proofs:
+              yield* fixture.sql`SELECT * FROM workflow_native_command_proofs ORDER BY command_id`,
+            events: yield* fixture.sql`SELECT * FROM orchestration_events ORDER BY sequence`,
+          };
+          assert.strictEqual(rows.proofs.length, 2);
+          return {
+            config: fixture.config,
+            derived: fixture.derived,
+            intentId: fixture.input.intentId,
+            rows,
+            shared: decisions.shared,
+          };
+        }).pipe(Effect.provide(testLayer(filename))),
+      );
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const runtime = yield* proofOrchestrator(true, Effect.void, undefined, saved.config);
+        const orchestrator = Context.get(runtime, Orchestrator.OrchestratorV2);
+        assert.isTrue(
+          (yield* orchestrator.dispatch(saved.derived.claimCommand, {
+            intentId: saved.intentId,
+            phase: "claim",
+          })).replayed,
+        );
+        const replay = yield* orchestrator.dispatch(saved.derived.messageCommand, {
+          intentId: saved.intentId,
+          phase: "message",
+        });
+        assert.isTrue(replay.replayed);
+        const changed = replay.storedEvents.find(
+          ({ event }) => event.type === "provider-thread.updated",
+        );
+        if (changed?.event.type !== "provider-thread.updated")
+          throw new Error("provider thread missing");
+        assert.strictEqual(changed.event.payload.providerSessionId, saved.shared);
+        assert.deepStrictEqual(
+          {
+            receipts: yield* sql`SELECT * FROM orchestration_command_receipts ORDER BY command_id`,
+            proofs: yield* sql`SELECT * FROM workflow_native_command_proofs ORDER BY command_id`,
+            events: yield* sql`SELECT * FROM orchestration_events ORDER BY sequence`,
+          },
+          saved.rows,
+        );
+      }).pipe(Effect.provide(testLayer(filename)));
+    }),
+);
+
+it.effect(
+  "native allocation preserves an empty imported provider thread while replacing its prior session",
+  () =>
+    Effect.gen(function* () {
+      const { derived } = yield* workflowDecision(true);
+      const runtime = yield* proofOrchestrator();
+      const orchestrator = Context.get(runtime, Orchestrator.OrchestratorV2);
+      const sink = Context.get(runtime, EventSink.EventSinkV2);
+      const allocator = Context.get(
+        yield* Layer.build(IdAllocator.layer),
+        IdAllocator.IdAllocatorV2,
+      );
+      const created = yield* orchestrator.dispatch(
+        decodeOrchestratorFixtureCommand({
+          ...existingThreadCommand(derived),
+          importedNativeThread: {
+            ref: { driver: "codex", nativeId: "retained-native-thread", strength: "strong" },
+          },
+        }),
+      );
+      const imported = created.storedEvents.find(
+        ({ event }) => event.type === "provider-thread.updated",
+      );
+      if (imported?.event.type !== "provider-thread.updated")
+        throw new Error("imported provider thread missing");
+      const shared = allocator.derive.providerSession({
+        providerInstanceId: ProviderInstanceId.make("provider"),
+      });
+      yield* sink.write({
+        events: [
+          {
+            ...imported.event,
+            id: yield* allocator.allocate.event({
+              threadId: derived.claimCommand.threadId,
+              commandId: CommandId.make("imported-session-reference"),
+            }),
+            payload: { ...imported.event.payload, providerSessionId: shared },
+          },
+        ],
+      });
+      yield* orchestrator.dispatch(derived.claimCommand, {
+        intentId: derived.reservation.intentId,
+        phase: "claim",
+      });
+      const result = yield* orchestrator.dispatch(derived.messageCommand, {
+        intentId: derived.reservation.intentId,
+        phase: "message",
+      });
+      const changed = result.storedEvents.find(
+        ({ event }) => event.type === "provider-thread.updated",
+      );
+      if (changed?.event.type !== "provider-thread.updated")
+        throw new Error("provider thread missing");
+      assert.strictEqual(changed.event.payload.id, imported.event.payload.id);
+      assert.deepStrictEqual(
+        changed.event.payload.nativeThreadRef,
+        imported.event.payload.nativeThreadRef,
+      );
+      assert.deepStrictEqual(
+        changed.event.payload.nativeMetadata,
+        imported.event.payload.nativeMetadata,
+      );
+      assert.isString(changed.event.payload.providerSessionId);
+      assert.notStrictEqual(changed.event.payload.providerSessionId, shared);
+    }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect.each(["assistant-message", "fork", "merge_back", "provider-switch"] as const)(
+  "native initial message refuses %s before planning a writer",
+  (mode) =>
+    Effect.gen(function* () {
+      const { derived } = yield* workflowDecision(true);
+      const runtime = yield* proofOrchestrator();
+      const orchestrator = Context.get(runtime, Orchestrator.OrchestratorV2);
+      const sink = Context.get(runtime, EventSink.EventSinkV2);
+      yield* orchestrator.dispatch(existingThreadCommand(derived));
+      yield* orchestrator.dispatch(derived.claimCommand, {
+        intentId: derived.reservation.intentId,
+        phase: "claim",
+      });
+      const threadId = derived.claimCommand.threadId;
+      const event = yield* decodeFixtureEvent({
+        id: `native-late-${mode}`,
+        threadId,
+        occurredAt: facts.now,
+        ...(mode === "assistant-message"
+          ? {
+              type: "message.updated",
+              payload: {
+                id: "late-assistant",
+                threadId,
+                runId: null,
+                nodeId: null,
+                role: "assistant",
+                text: "Imported history",
+                attachments: [],
+                streaming: false,
+                createdBy: "agent",
+                creationSource: "mcp",
+                createdAt: facts.now,
+                updatedAt: facts.now,
+              },
+            }
+          : mode === "provider-switch"
+            ? {
+                type: "provider-thread.updated",
+                driver: "codex",
+                providerInstanceId: "other",
+                payload: {
+                  id: "foreign-provider-thread",
+                  driver: "codex",
+                  providerInstanceId: "other",
+                  providerSessionId: "ordinary-old-session",
+                  appThreadId: threadId,
+                  ownerNodeId: null,
+                  nativeThreadRef: {
+                    driver: "codex",
+                    nativeId: "foreign-native",
+                    strength: "strong",
+                  },
+                  nativeConversationHeadRef: null,
+                  status: "not_loaded",
+                  firstRunOrdinal: null,
+                  lastRunOrdinal: null,
+                  handoffIds: [],
+                  forkedFrom: null,
+                  createdAt: facts.now,
+                  updatedAt: facts.now,
+                },
+              }
+            : {
+                type: "context-transfer.created",
+                providerInstanceId: "provider",
+                payload: {
+                  id: `late-${mode}`,
+                  type: mode,
+                  sourceThreadId: threadId,
+                  targetThreadId: threadId,
+                  sourcePoint: { threadId },
+                  basePoint: null,
+                  sourceProviderInstanceId: "provider",
+                  targetProviderInstanceId: "provider",
+                  targetRunId: null,
+                  status: "pending",
+                  resolution: null,
+                  createdBy: "agent",
+                  error: null,
+                  createdAt: facts.now,
+                  updatedAt: facts.now,
+                  consumedAt: null,
+                },
+              }),
+      });
+      yield* sink.write({ events: [event] });
+      const original = sink.commitNativeCommand;
+      if (!original) throw new Error("native writer missing");
+      let writes = 0;
+      using _writer = vi.spyOn(sink, "commitNativeCommand").mockImplementation((input) => {
+        writes++;
+        return original(input);
+      });
+      const before = yield* nativeCounts;
+      const error = yield* Effect.flip(
+        orchestrator.dispatch(derived.messageCommand, {
+          intentId: derived.reservation.intentId,
+          phase: "message",
+        }),
+      );
+      assert.instanceOf(error, Orchestrator.OrchestratorDispatchError);
+      assert.isString(error.cause);
+      assert.strictEqual(writes, 0);
+      assert.deepStrictEqual(yield* nativeCounts, before);
+      const sql = yield* SqlClient.SqlClient;
+      assert.deepStrictEqual(
+        yield* sql`SELECT * FROM orchestration_command_receipts WHERE command_id=${derived.messageCommand.commandId}`,
+        [],
+      );
+      assert.deepStrictEqual(
+        yield* sql`SELECT * FROM workflow_native_command_proofs WHERE phase='message'`,
+        [],
+      );
+    }).pipe(Effect.provide(testLayer())),
 );
