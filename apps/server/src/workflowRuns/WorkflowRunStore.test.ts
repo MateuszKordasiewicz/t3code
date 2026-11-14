@@ -14549,3 +14549,325 @@ it.effect.each(physicalAdmissionKinds)(
       assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_submission_transports`, []);
     }).pipe(Effect.provide(layerWithOutbox)),
 );
+
+it.effect.each(
+  (["workflow", "planning"] as const).flatMap((kind) =>
+    [false, true].map((rearm) => ({ kind, rearm })),
+  ),
+)(
+  "native preparation acquires exact $kind claim and preserves read-only history (rearm=$rearm)",
+  ({ kind, rearm }) =>
+    Effect.gen(function* () {
+      const fixture = yield* currentNativeExecutionFixture(kind, rearm);
+      const { store, sql } = fixture;
+      const claim = { ...fixture.operationSelection };
+      const pending = store.beginClaimedNativePreparation(claim);
+      claim.workerId = "changed";
+      const before = yield* nativeBindingState;
+      const subscription = yield* store.subscribeChanges;
+      const acquired = yield* pending;
+      assert.strictEqual(acquired.kind, "acquired");
+      if (acquired.kind !== "acquired") throw new Error("missing native job");
+      const job = acquired.job;
+      assert.strictEqual(job.identityVersion, 3);
+      assert.deepStrictEqual(job.input.nativeOwner, {
+        intentId: fixture.input.intentId,
+        owner: fixture.claimedOperation.owner,
+        executionClaim: fixture.operationSelection,
+      });
+      assert.strictEqual(
+        job.input.runId,
+        (yield* readCurrentNativeProjection(fixture)).runs[0]!.id,
+      );
+      assert.strictEqual(job.input.threadId, fixture.input.threadId);
+      assert.strictEqual(job.input.serverBootId, fixture.operationSelection.bootId);
+      assert.isTrue(Object.isFrozen(job.input.nativeOwner));
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 1);
+      assert.deepStrictEqual(yield* nativeBindingState, before);
+      const jobs = yield* preparationState;
+      const selected = preparationSelection(job);
+      for (const mutation of [
+        store.closePreparationCode(selected),
+        store.markPreparationProcessExposed(selected),
+        store.quiescePreparationJob(selected, "unknown"),
+        store.settleCodeOnlyPreparation(selected),
+      ])
+        assert.strictEqual((yield* Effect.result(mutation))._tag, "Failure");
+      assert.strictEqual(
+        (yield* Effect.result(store.beginOrdinaryPreparation(job.input)))._tag,
+        "Failure",
+      );
+      yield* fixture.sessions.revoke(fixture.authority.sessionId);
+      assert.deepStrictEqual(
+        yield* store.beginClaimedNativePreparation(fixture.operationSelection),
+        { kind: "existing", job },
+      );
+      assert.deepStrictEqual(yield* preparationState, jobs);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_submission_transports`, []);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(
+  (["workflow", "planning"] as const).flatMap((kind) =>
+    [
+      "plain",
+      "worker",
+      "generation",
+      "revoke",
+      "pause",
+      "deadline",
+      "starting",
+      "running",
+      "missing-storage",
+      "inherited",
+      "cas",
+    ].map((change) => ({ kind, change })),
+  ),
+)("fresh native preparation refuses $kind/$change before acquisition", ({ kind, change }) =>
+  Effect.gen(function* () {
+    const fixture = yield* currentNativeExecutionFixture(kind);
+    const { store, sql } = fixture;
+    let selected = store;
+    const input = { ...fixture.operationSelection };
+    if (change === "plain") selected = yield* Store.WorkflowRunStore;
+    else if (change === "worker") input.workerId = "foreign";
+    else if (change === "generation") input.expectedGeneration++;
+    else if (change === "revoke") yield* fixture.sessions.revoke(fixture.authority.sessionId);
+    else if (change === "pause") yield* nativeClaimControl(kind, store, "pause");
+    else if (change === "deadline")
+      yield* TestClock.setTime(DateTime.makeUnsafe("2027-01-01T00:00:00Z").epochMilliseconds);
+    else if (change === "starting" || change === "running")
+      yield* setCurrentNativeStage(fixture, change);
+    else if (change === "missing-storage")
+      yield* sql`ALTER TABLE orchestration_v2_preparation_jobs RENAME TO hidden_native_jobs`;
+    else if (change === "cas")
+      yield* sql`CREATE TRIGGER reject_native_job BEFORE INSERT ON orchestration_v2_preparation_jobs BEGIN SELECT RAISE(IGNORE); END`;
+    const before = yield* nativeBindingState;
+    const subscription = yield* store.subscribeChanges;
+    const action = selected.beginClaimedNativePreparation(input);
+    const result = yield* Effect.result(
+      change === "inherited" ? sql.withTransaction(action) : action,
+    );
+    assert.isTrue(
+      result._tag === "Failure" ||
+        (result.success.kind !== "acquired" && result.success.kind !== "existing"),
+    );
+    assert.deepStrictEqual(yield* nativeBindingState, before);
+    assert.deepStrictEqual(
+      yield* change === "missing-storage"
+        ? sql`SELECT * FROM hidden_native_jobs`
+        : preparationState,
+      [],
+    );
+    assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("native preparation rejects malformed claim selectors without evaluating getters", () =>
+  Effect.gen(function* () {
+    const fixture = yield* currentNativeExecutionFixture("workflow");
+    let reads = 0;
+    const getter = Object.defineProperty({ ...fixture.operationSelection }, "workerId", {
+      enumerable: true,
+      get() {
+        reads++;
+        return "bad";
+      },
+    });
+    for (const input of [
+      getter,
+      { ...fixture.operationSelection, extra: true },
+      { ...fixture.operationSelection, expectedGeneration: -1 },
+      { ...fixture.operationSelection, expectedFingerprint: "bad" },
+      { ...fixture.operationSelection, workerId: " " },
+    ])
+      assert.strictEqual(
+        (yield* Effect.result(fixture.store.beginClaimedNativePreparation(input)))._tag,
+        "Failure",
+      );
+    assert.strictEqual(reads, 0);
+    assert.deepStrictEqual(yield* preparationState, []);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "native preparation permits only one concurrent %s acquisition",
+  (kind) =>
+    Effect.gen(function* () {
+      const fixture = yield* currentNativeExecutionFixture(kind);
+      const subscription = yield* fixture.store.subscribeChanges;
+      const results = yield* Effect.all(
+        [
+          fixture.store.beginClaimedNativePreparation(fixture.operationSelection),
+          fixture.store.beginClaimedNativePreparation(fixture.operationSelection),
+        ],
+        { concurrency: "unbounded" },
+      );
+      assert.deepStrictEqual(results.map((result) => result.kind).sort(), ["acquired", "existing"]);
+      assert.strictEqual((yield* preparationState).length, 1);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 1);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect("native preparation retains a known current selection before run start", () =>
+  Effect.gen(function* () {
+    const fixture = yield* currentNativeExecutionFixture("workflow");
+    const projection = yield* readCurrentNativeProjection(fixture);
+    const provider = projection.providerThreads[0]!;
+    const run = projection.runs[0]!;
+    const node = projection.nodes[0]!;
+    if (provider.providerSessionId !== null) yield* seedPhysicalSession(provider.providerSessionId);
+    const now = yield* DateTime.now;
+    const sink = Context.get(fixture.runtime, EventSink.EventSinkV2);
+    yield* sink.write({
+      events: [
+        {
+          id: EventId.make("known-preparation-native"),
+          type: "provider-thread.updated",
+          threadId: run.threadId,
+          runId: run.id,
+          nodeId: node.id,
+          providerInstanceId: provider.providerInstanceId,
+          occurredAt: now,
+          payload: {
+            ...provider,
+            nativeThreadRef: {
+              driver: provider.driver,
+              nativeId: "known-before-preparation",
+              strength: "strong",
+            },
+            updatedAt: now,
+          },
+        },
+      ],
+    });
+    const acquired = yield* fixture.store.beginClaimedNativePreparation(fixture.operationSelection);
+    assert.strictEqual(acquired.kind, "acquired");
+    if (acquired.kind !== "acquired") throw new Error("missing native preparation");
+    assert.deepStrictEqual(acquired.job.input.nativeSelection, {
+      driver: provider.driver,
+      providerInstanceId: provider.providerInstanceId,
+      nativeId: "known-before-preparation",
+    });
+    assert.deepStrictEqual(acquired.job.input.request.current, {
+      driver: provider.driver,
+      providerInstanceId: provider.providerInstanceId,
+      providerThreadId: provider.id,
+      providerSessionId: provider.providerSessionId,
+      nativeThreadId: "known-before-preparation",
+    });
+    const ordinary = yield* Store.WorkflowRunStore;
+    assert.deepStrictEqual(
+      yield* ordinary.beginOrdinaryPreparation({
+        ...preparationInput("uncreated-alias"),
+        nativeSelection: acquired.job.input.nativeSelection ?? null,
+      }),
+      { kind: "denied", reason: "custody" },
+    );
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["owner", "claim", "material", "shadow", "version", "missing-native"] as const)(
+  "native preparation history rejects stored %s substitution",
+  (change) =>
+    Effect.gen(function* () {
+      const fixture = yield* currentNativeExecutionFixture("workflow");
+      const first = yield* fixture.store.beginClaimedNativePreparation(fixture.operationSelection);
+      if (first.kind !== "acquired" || !first.job.input.nativeOwner)
+        throw new Error("missing native job");
+      const { nativeSelection: _native, ...withoutNative } = first.job.input;
+      const patch =
+        change === "owner"
+          ? {
+              nativeOwner: {
+                ...first.job.input.nativeOwner,
+                owner: { kind: "workflow_run", workflowRunId: "foreign" },
+              },
+            }
+          : change === "claim"
+            ? {
+                nativeOwner: {
+                  ...first.job.input.nativeOwner,
+                  executionClaim: { ...fixture.operationSelection, workerId: "foreign" },
+                },
+              }
+            : change === "material"
+              ? { request: { ...first.job.input.request, materialHash: nextHash } }
+              : {};
+      const value = {
+        v: change === "version" ? 2 : 3,
+        ...(change === "missing-native" ? withoutNative : first.job.input),
+        ...patch,
+      };
+      yield* fixture.sql`DROP TRIGGER preparation_jobs_update_guard`;
+      if (change === "shadow")
+        yield* fixture.sql`UPDATE orchestration_v2_preparation_jobs SET server_boot_id='foreign'`;
+      else
+        yield* fixture.sql`UPDATE orchestration_v2_preparation_jobs SET request_identity_json=${stableStringify(value)},request_identity_hash=${WorkflowCanonicalHash.tagged("t3.preparation-job-identity.v3", value)}`;
+      const jobs = yield* preparationState;
+      const before = yield* nativeBindingState;
+      const subscription = yield* fixture.store.subscribeChanges;
+      const error = yield* Effect.flip(
+        fixture.store.beginClaimedNativePreparation(fixture.operationSelection),
+      );
+      assert.strictEqual(error.reason, "integrity");
+      assert.deepStrictEqual(yield* preparationState, jobs);
+      assert.deepStrictEqual(yield* nativeBindingState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "native preparation survives reopen as read-only %s history without authority",
+  (kind) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const directory = yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "native-preparation-reopen-")),
+          ),
+          (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
+        );
+        const filename = NodePath.join(directory, "state.sqlite");
+        const fileLayer = () =>
+          Layer.merge(Store.layer, EffectOutbox.layer).pipe(
+            Layer.provideMerge(NodeSqliteClient.layer({ filename })),
+          );
+        const retained = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const fixture = yield* currentNativeExecutionFixture(kind);
+            const result = yield* fixture.store.beginClaimedNativePreparation(
+              fixture.operationSelection,
+            );
+            assert.strictEqual(result.kind, "acquired");
+            if (result.kind !== "acquired") throw new Error("missing native preparation");
+            return {
+              claim: fixture.operationSelection,
+              job: result.job,
+              jobs: yield* preparationState,
+              state: yield* nativeBindingState,
+            };
+          }).pipe(Effect.provide(fileLayer())),
+        );
+        yield* Effect.gen(function* () {
+          const store = yield* Store.WorkflowRunStore;
+          const subscription = yield* store.subscribeChanges;
+          assert.deepStrictEqual(yield* store.beginClaimedNativePreparation(retained.claim), {
+            kind: "existing",
+            job: retained.job,
+          });
+          assert.deepStrictEqual(
+            yield* store.beginClaimedNativePreparation({
+              ...retained.claim,
+              expectedGeneration: retained.claim.expectedGeneration + 1,
+            }),
+            { kind: "denied", reason: "authority" },
+          );
+          assert.deepStrictEqual(yield* preparationState, retained.jobs);
+          assert.deepStrictEqual(yield* nativeBindingState, retained.state);
+          assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+        }).pipe(Effect.provide(fileLayer()));
+      }),
+    ),
+);

@@ -3037,6 +3037,34 @@ it.effect.each([
         workerId: operation.claim!.workerId,
       });
       assert.strictEqual(operation.status, "claimed");
+      const jobs = yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_jobs`;
+      assert.strictEqual(jobs.length, 1);
+      assert.strictEqual(result.preparation.job.identityVersion, 3);
+      assert.isTrue(Object.isFrozen(result.preparation));
+      assert.isTrue(Object.isFrozen(result.preparation.job));
+      assert.isTrue(Object.isFrozen(result.preparation.selection));
+      assert.deepStrictEqual(result.preparation.job.input.nativeOwner, {
+        intentId: fixture.input.intentId,
+        owner: operation.owner,
+        executionClaim: result.executionClaim,
+      });
+      assert.strictEqual(result.preparation.job.input.threadId, result.native.threadId);
+      assert.strictEqual(result.preparation.job.input.runId, result.native.runId);
+      assert.strictEqual(result.preparation.job.state, "active");
+      assert.isFalse(result.preparation.job.processExposed);
+      assert.strictEqual(result.preparation.job.codeClosedAt, null);
+      assert.deepStrictEqual(result.preparation.selection, {
+        jobId: result.preparation.job.input.jobId,
+        entryKey: result.preparation.job.input.entryKey,
+        requestIdentityHash: result.preparation.job.requestIdentityHash,
+        serverBootId: result.executionClaim.bootId,
+        expectedVersion: 0,
+      });
+      assert.strictEqual(
+        jobs[0]!.request_identity_hash,
+        result.preparation.job.requestIdentityHash,
+      );
+
       const intent = yield* fixture.sql.withTransaction(
         fixture.store.readNativeReservationInTransaction({ intentId: fixture.input.intentId }),
       );
@@ -3429,5 +3457,59 @@ it.effect.each(["workflow", "planning"] as const)(
       }
       assert.deepStrictEqual(yield* producerDatabaseSnapshot(fixture.sql), before);
       assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect.each(
+  (["workflow", "planning"] as const).flatMap((kind) =>
+    ["insert-ignore", "revoke-after-cas"].map((change) => ({ kind, change })),
+  ),
+)(
+  "native producer preserves committed $kind work for reconciliation after preparation $change",
+  ({ kind, change }) =>
+    Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture(kind, false, false, 2);
+      if (change === "insert-ignore")
+        yield* fixture.sql`CREATE TRIGGER refuse_preparation BEFORE INSERT ON orchestration_v2_preparation_jobs BEGIN SELECT RAISE(IGNORE); END`;
+      const store =
+        change === "revoke-after-cas"
+          ? Store.WorkflowRunStore.of({
+              ...fixture.store,
+              beginClaimedNativePreparation: (claim) =>
+                fixture.sessions
+                  .revoke(fixture.reference.sessionId)
+                  .pipe(
+                    Effect.orDie,
+                    Effect.andThen(fixture.store.beginClaimedNativePreparation(claim)),
+                  ),
+            })
+          : fixture.store;
+      const producer = yield* nativeLaunchProducer(fixture, fixture.authority.coordinator, store);
+      const failure = yield* Effect.flip(producer.claimReservedIntent(producerSelection(fixture)));
+      assert.strictEqual(failure.stage, "preparation");
+      assert.deepStrictEqual(yield* fixture.sql`SELECT status FROM workflow_operations`, [
+        { status: "claimed" },
+      ]);
+      assert.deepStrictEqual(yield* fixture.sql`SELECT state FROM workflow_native_launch_intents`, [
+        { state: "finalized" },
+      ]);
+      assert.strictEqual(
+        (yield* fixture.sql`SELECT * FROM workflow_native_command_proofs`).length,
+        2,
+      );
+      assert.deepStrictEqual(
+        yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_jobs`,
+        [],
+      );
+      assert.deepStrictEqual(yield* fixture.sql`SELECT * FROM orchestration_v2_effect_outbox`, []);
+      assert.deepStrictEqual(
+        yield* fixture.sql`SELECT * FROM orchestration_v2_submission_transports`,
+        [],
+      );
+      if (change === "insert-ignore") yield* fixture.sql`DROP TRIGGER refuse_preparation`;
+      const before = yield* producerDatabaseSnapshot(fixture.sql);
+      const retry = yield* Effect.flip(producer.claimReservedIntent(producerSelection(fixture)));
+      assert.strictEqual(retry.reason, "reconciliation_required");
+      assert.deepStrictEqual(yield* producerDatabaseSnapshot(fixture.sql), before);
     }).pipe(Effect.provide(testLayer())),
 );

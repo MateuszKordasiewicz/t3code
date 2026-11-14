@@ -8,6 +8,10 @@ const invalid = () => new Error("Invalid preparation job");
 const inputKeys =
   "entryKey,environmentId,jobId,kind,originatingLaunchJobId,parentSelection,projectId,request,runId,serverBootId,threadId";
 const nativeInputKeys = inputKeys.replace("kind,", "kind,nativeSelection,");
+const nativeOwnerInputKeys = nativeInputKeys.replace(
+  "nativeSelection,",
+  "nativeOwner,nativeSelection,",
+);
 const selectionKeys = "entryKey,expectedVersion,jobId,requestIdentityHash,serverBootId";
 function json(value: unknown): void {
   WorkflowCanonicalHash.assertCanonical(value);
@@ -73,6 +77,39 @@ export function ownSelection(value: unknown) {
     expectedVersion: version(raw.expectedVersion),
   });
 }
+export function ownNativeClaim(value: unknown) {
+  json(value);
+  const raw = object(value, "bootId,expectedFingerprint,expectedGeneration,operationId,workerId");
+  return Object.freeze({
+    operationId: id(raw.operationId),
+    expectedFingerprint: digest(raw.expectedFingerprint),
+    expectedGeneration: version(raw.expectedGeneration),
+    bootId: id(raw.bootId),
+    workerId: id(raw.workerId),
+  });
+}
+function ownNativeOwner(value: unknown) {
+  const raw = object(value, "executionClaim,intentId,owner");
+  const owner = object(raw.owner);
+  const selected =
+    owner.kind === "workflow_run"
+      ? {
+          kind: "workflow_run" as const,
+          workflowRunId: id(object(owner, "kind,workflowRunId").workflowRunId),
+        }
+      : owner.kind === "planning_session"
+        ? {
+            kind: "planning_session" as const,
+            planningSessionId: id(object(owner, "kind,planningSessionId").planningSessionId),
+          }
+        : undefined;
+  if (!selected) throw invalid();
+  return freeze({
+    intentId: id(raw.intentId),
+    owner: selected,
+    executionClaim: ownNativeClaim(raw.executionClaim),
+  });
+}
 export function ownInput(value: unknown) {
   json(value);
   const raw = object(value);
@@ -82,7 +119,26 @@ export function ownInput(value: unknown) {
           raw.nativeSelection === null ? null : ownNativeSelection(raw.nativeSelection),
       }
     : {};
-  object(raw, Object.hasOwn(raw, "nativeSelection") ? nativeInputKeys : inputKeys);
+  const native = Object.hasOwn(raw, "nativeOwner")
+    ? { nativeOwner: ownNativeOwner(raw.nativeOwner) }
+    : {};
+  object(
+    raw,
+    Object.hasOwn(raw, "nativeOwner")
+      ? nativeOwnerInputKeys
+      : Object.hasOwn(raw, "nativeSelection")
+        ? nativeInputKeys
+        : inputKeys,
+  );
+  if (
+    native.nativeOwner !== undefined &&
+    (raw.kind !== "launch" ||
+      raw.runId === null ||
+      raw.parentSelection !== null ||
+      raw.originatingLaunchJobId !== null ||
+      raw.serverBootId !== native.nativeOwner.executionClaim.bootId)
+  )
+    throw invalid();
   const kind = raw.kind;
   if (kind !== "launch" && kind !== "setup" && kind !== "title" && kind !== "release")
     throw invalid();
@@ -108,10 +164,15 @@ export function ownInput(value: unknown) {
     serverBootId: id(raw.serverBootId),
     request: structuredClone(object(raw.request)),
     ...selected,
+    ...native,
   });
 }
 export function identity(input: ReturnType<typeof ownInput>) {
-  const version = Object.hasOwn(input, "nativeSelection") ? 2 : 1;
+  const version = Object.hasOwn(input, "nativeOwner")
+    ? 3
+    : Object.hasOwn(input, "nativeSelection")
+      ? 2
+      : 1;
   const value = { v: version, ...input };
   return {
     version,
@@ -144,7 +205,7 @@ export function decodeRow(value: unknown) {
     "code_closed_at,created_at,entry_key,environment_id,format_version,job_id,kind,originating_launch_job_id,process_exposed,project_id,record_version,request_identity_hash,request_identity_json,run_id,server_boot_id,settled_at,settlement_hash,settlement_json,state,thread_id",
   );
   const stored = parse(raw.request_identity_json);
-  if (stored.v !== 1 && stored.v !== 2) throw invalid();
+  if (stored.v !== 1 && stored.v !== 2 && stored.v !== 3) throw invalid();
   const { v: _v, ...input } = stored;
   const owned = ownInput(input);
   const encoded = identity(owned);
@@ -214,6 +275,7 @@ export function decodeRow(value: unknown) {
     settledAt,
   });
 }
+export type NativeClaim = ReturnType<typeof ownNativeClaim>;
 export type Input = ReturnType<typeof ownInput>;
 export type NativeSelection = ReturnType<typeof ownNativeSelection>;
 export type Job = ReturnType<typeof decodeRow>;

@@ -8,6 +8,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import { WorkflowCanonicalHash } from "../workflowRuns/WorkflowCanonicalHash.ts";
 import * as Derivation from "../workflowRuns/WorkflowNativeLaunchDerivation.ts";
 import * as Store from "../workflowRuns/WorkflowRunStore.ts";
+import * as PreparationJob from "../preparation/PreparationJob.ts";
 import * as EventSink from "./EventSink.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 
@@ -25,6 +26,7 @@ export class WorkflowNativeLaunchError extends Schema.TaggedError<WorkflowNative
       "binding",
       "finalization",
       "operation",
+      "preparation",
     ]),
     reason: Schema.Literals([
       "invalid",
@@ -183,15 +185,29 @@ const makeOwned = Effect.fn("WorkflowNativeLaunchService.make")(function* (
         WorkflowCanonicalHash.tagged("owner", intent.claim.owner)
     )
       return yield* new WorkflowNativeLaunchError({ stage: "operation", reason: "integrity" });
+    const executionClaim = Object.freeze({
+      operationId: operation.id,
+      expectedFingerprint: operation.fingerprint,
+      expectedGeneration: operation.controlGeneration,
+      bootId: operation.claim.bootId,
+      workerId: operation.claim.workerId,
+    });
+    const preparation = yield* atStage(
+      "preparation",
+      store.beginClaimedNativePreparation(executionClaim),
+    );
+    if (preparation.kind !== "acquired")
+      return yield* new WorkflowNativeLaunchError({
+        stage: "preparation",
+        reason: "reconciliation_required",
+      });
     return Object.freeze({
       kind: "claimed" as const,
       native: Object.freeze({ threadId: selected.threadId, runId: bound.nativeRunId }),
-      executionClaim: Object.freeze({
-        operationId: operation.id,
-        expectedFingerprint: operation.fingerprint,
-        expectedGeneration: operation.controlGeneration,
-        bootId: operation.claim.bootId,
-        workerId: operation.claim.workerId,
+      executionClaim,
+      preparation: Object.freeze({
+        job: preparation.job,
+        selection: PreparationJob.selection(preparation.job),
       }),
     });
   });

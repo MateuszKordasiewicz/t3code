@@ -364,13 +364,18 @@ const makeStore = Effect.fnUntraced(function* (
             catch: integrity,
           });
           if (
-            job.identityVersion !== 2 ||
+            (job.identityVersion !== 2 && job.identityVersion !== 3) ||
             job.input.environmentId !== environmentId ||
             !sameCustodyValue(job.input.nativeSelection, native)
           )
             return yield* integrity();
           yield* readPreparationParent(job.input);
-          if (job.state !== "settled" || job.processExposed || job.settlement?.kind !== "code_only")
+          if (
+            job.identityVersion !== 2 ||
+            job.state !== "settled" ||
+            job.processExposed ||
+            job.settlement?.kind !== "code_only"
+          )
             held = true;
         }
         if (rows.length < 128) break;
@@ -935,6 +940,7 @@ const makeStore = Effect.fnUntraced(function* (
       const result = yield* inTransaction(
         Effect.gen(function* () {
           const encoded = PreparationJob.identity(input);
+          if (encoded.version === 3) return yield* integrity();
           const retained =
             yield* sql`SELECT * FROM orchestration_v2_preparation_jobs WHERE job_id=${input.jobId} OR entry_key=${input.entryKey}`;
           const jobs = yield* Effect.forEach(retained, (row) =>
@@ -6363,6 +6369,159 @@ const makeStore = Effect.fnUntraced(function* (
       isStoreError(error) ? error : new WorkflowRunStoreError({ reason: "persistence" }),
     ),
   );
+  const nativePreparationEntry = (claim: PreparationJob.NativeClaim) =>
+    `native-preparation:${WorkflowCanonicalHash.tagged("t3.native-preparation-entry.v1", claim)}`;
+  const nativePreparationInput = (
+    claim: PreparationJob.NativeClaim,
+    retained: NativeReservation,
+    current: {
+      driver: string;
+      providerInstanceId: string;
+      providerThreadId: string;
+      providerSessionId: string | null;
+      nativeThreadId: string | null;
+    },
+  ) => {
+    const imported = nativeFromLaunch(retained.material.launch);
+    if (
+      imported &&
+      (imported.driver !== current.driver ||
+        imported.providerInstanceId !== current.providerInstanceId ||
+        (current.nativeThreadId !== null && imported.nativeId !== current.nativeThreadId))
+    )
+      throw integrity();
+    return PreparationJob.ownInput({
+      jobId: nativePreparationEntry(claim),
+      entryKey: nativePreparationEntry(claim),
+      kind: "launch",
+      environmentId: retained.destination.environmentId,
+      projectId: retained.destination.projectId,
+      threadId: retained.threadId,
+      runId: retained.nativeRunId,
+      originatingLaunchJobId: null,
+      parentSelection: null,
+      serverBootId: claim.bootId,
+      nativeSelection:
+        current.nativeThreadId === null
+          ? imported
+          : {
+              driver: current.driver,
+              providerInstanceId: current.providerInstanceId,
+              nativeId: current.nativeThreadId,
+            },
+      nativeOwner: { intentId: retained.intentId, owner: retained.owner, executionClaim: claim },
+      request: {
+        phase: "native-preparation",
+        materialHash: retained.materialHash,
+        launchHash: retained.launchHash,
+        launch: retained.material.launch,
+        current,
+      },
+    });
+  };
+  const beginClaimedNativePreparation = Effect.fn("WorkflowRunStore.beginClaimedNativePreparation")(
+    function* (claim: PreparationJob.NativeClaim) {
+      if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+        return yield* integrity();
+      const result = yield* inTransaction(
+        Effect.gen(function* () {
+          const entry = nativePreparationEntry(claim);
+          const rows =
+            yield* sql`SELECT * FROM orchestration_v2_preparation_jobs WHERE job_id=${entry} OR entry_key=${entry}`;
+          if (rows.length) {
+            if (rows.length !== 1) return yield* integrity();
+            const job = yield* Effect.try({
+              try: () => PreparationJob.decodeRow(rows[0]),
+              catch: integrity,
+            });
+            const owner = job.input.nativeOwner;
+            if (
+              job.identityVersion !== 3 ||
+              !owner ||
+              !sameCustodyValue(owner.executionClaim, claim)
+            )
+              return yield* integrity();
+            const retained = yield* readNativeReservationInTransaction({
+              intentId: owner.intentId,
+            });
+            const observation = job.input.request.current;
+            if (
+              typeof observation !== "object" ||
+              observation === null ||
+              Array.isArray(observation)
+            )
+              return yield* integrity();
+            const current = observation as Record<string, unknown>;
+            const validId = (value: unknown): value is string =>
+              typeof value === "string" && value.trim().length > 0 && value.isWellFormed();
+            if (
+              Object.keys(current).sort().join() !==
+                "driver,nativeThreadId,providerInstanceId,providerSessionId,providerThreadId" ||
+              !validId(current.driver) ||
+              !validId(current.providerInstanceId) ||
+              !validId(current.providerThreadId) ||
+              (current.providerSessionId !== null && !validId(current.providerSessionId)) ||
+              (current.nativeThreadId !== null && !validId(current.nativeThreadId))
+            )
+              return yield* integrity();
+            const observationSnapshot = {
+              driver: current.driver,
+              providerInstanceId: current.providerInstanceId,
+              providerThreadId: current.providerThreadId,
+              providerSessionId: current.providerSessionId,
+              nativeThreadId: current.nativeThreadId,
+            };
+            const expected = yield* Effect.try({
+              try: () => nativePreparationInput(claim, retained, observationSnapshot),
+              catch: integrity,
+            });
+            if (
+              !sameCustodyValue(expected, job.input) ||
+              retained.operationId !== claim.operationId ||
+              retained.material.version !== 2
+            )
+              return yield* integrity();
+            return Object.freeze({ kind: "existing" as const, job });
+          }
+          const current = yield* verifyClaimedNativeOperationInTransaction(claim);
+          if (current.kind !== "current") return current;
+          if (current.stage !== "preparing") return nativeIntentDenied("state");
+          const retained = yield* readNativeReservationInTransaction({
+            intentId: current.intentId,
+          });
+          if (
+            retained.nativeRunId !== current.runId ||
+            retained.threadId !== current.threadId ||
+            retained.operationId !== claim.operationId
+          )
+            return yield* integrity();
+          const observation = {
+            driver: current.driver,
+            providerInstanceId: current.providerInstanceId,
+            providerThreadId: current.providerThreadId,
+            providerSessionId: current.providerSessionId,
+            nativeThreadId: current.nativeThreadId,
+          };
+          const input = yield* Effect.try({
+            try: () => nativePreparationInput(claim, retained, observation),
+            catch: integrity,
+          });
+          const encoded = PreparationJob.identity(input);
+          const createdAt = DateTime.formatIso(yield* DateTime.now);
+          const inserted =
+            yield* sql`INSERT INTO orchestration_v2_preparation_jobs ${sql.insert({ format_version: 1, job_id: input.jobId, entry_key: input.entryKey, kind: input.kind, environment_id: input.environmentId, project_id: input.projectId, thread_id: input.threadId, run_id: input.runId, originating_launch_job_id: null, server_boot_id: input.serverBootId, request_identity_json: encoded.text, request_identity_hash: encoded.hash, created_at: createdAt })} RETURNING *`;
+          if (inserted.length !== 1) return yield* integrity();
+          const job = yield* Effect.try({
+            try: () => PreparationJob.decodeRow(inserted[0]),
+            catch: integrity,
+          });
+          return Object.freeze({ kind: "acquired" as const, job });
+        }),
+      );
+      if (result.kind === "acquired") yield* notify;
+      return result;
+    },
+  );
   const claim = Effect.fn("WorkflowRunStore.claim")(function* (input: {
     readonly operationId: string;
     readonly expectedOwnerVersion: number;
@@ -6889,6 +7048,13 @@ const makeStore = Effect.fnUntraced(function* (
         )
           throw integrity();
         return claimNativeIntent(structuredClone(input));
+      } catch {
+        return Effect.fail(integrity());
+      }
+    },
+    beginClaimedNativePreparation: (claim: PreparationJob.NativeClaim) => {
+      try {
+        return beginClaimedNativePreparation(PreparationJob.ownNativeClaim(claim));
       } catch {
         return Effect.fail(integrity());
       }
