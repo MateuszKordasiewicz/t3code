@@ -434,6 +434,8 @@ const operationalWorkflowTables = [
   "orchestration_v2_submission_transports",
   "orchestration_v2_submission_attempts",
   "orchestration_v2_preparation_jobs",
+  "orchestration_v2_preparation_process_resources",
+  "test_preparation_process_child",
   "test_preparation_job_child",
 ] as const;
 const planContentTables = [
@@ -501,12 +503,63 @@ const seedOperationalWorkflow = Effect.fn("test.seedOperationalWorkflowForDevCop
     ["prep-unknown", "title", null, "unknown"],
     ["prep-settled", "release", null, "settled"],
   ] as const) {
-    yield* sql`INSERT INTO orchestration_v2_preparation_jobs(format_version,job_id,entry_key,kind,environment_id,project_id,thread_id,originating_launch_job_id,server_boot_id,request_identity_json,request_identity_hash,created_at) VALUES (1,${id},${id},${kind},'environment-kept','project-kept','stopped-thread',${parent},'seed-server-boot','{}',${hash},${at})`;
+    yield* sql`INSERT INTO orchestration_v2_preparation_jobs(format_version,job_id,entry_key,kind,environment_id,project_id,thread_id,originating_launch_job_id,server_boot_id,request_identity_json,request_identity_hash,created_at) VALUES (1,${id},${id},${kind},'environment-kept','project-kept','stopped-thread',${parent},'seed-server-boot',${JSON.stringify({ v: 2 })},${hash},${at})`;
     if (state === "settled")
       yield* sql`UPDATE orchestration_v2_preparation_jobs SET state='settled',record_version=1,code_closed_at=${at},settlement_json=${JSON.stringify({ v: 1, jobId: id, entryKey: id, priorVersion: 0, kind: "code_only" })},settlement_hash=${hash},settled_at=${at} WHERE job_id=${id}`;
     else if (state !== "active")
       yield* sql`UPDATE orchestration_v2_preparation_jobs SET state=${state},record_version=1 WHERE job_id=${id}`;
   }
+  yield* sql`UPDATE orchestration_v2_preparation_jobs SET process_exposed=1,record_version=1 WHERE job_id='prep-active'`;
+  for (const id of ["prep-unbound", "prep-bound", "prep-retired"]) {
+    const proposedUnit = `t3code-preparation-${id}.scope`;
+    const context = {
+      v: 1,
+      profile: "linux-node-no-stdin-v1",
+      jobSelection: {
+        jobId: "prep-active",
+        entryKey: "prep-active",
+        requestIdentityHash: hash,
+        serverBootId: "seed-server-boot",
+        expectedVersion: 1,
+      },
+      environmentId: "environment-kept",
+      projectId: "project-kept",
+      threadId: "stopped-thread",
+      runId: null,
+      executionClaim: null,
+      current: null,
+      host: {
+        hostBootId: "12345678-1234-4234-8234-123456789abc",
+        scopeNamespace: "app-t3code-agents-123456789abc.slice",
+      },
+      proposedUnit,
+      creationInputHash: hash,
+    };
+    yield* sql`INSERT INTO orchestration_v2_preparation_process_resources(format_version,resource_id,job_id,job_request_identity_hash,environment_id,project_id,thread_id,server_boot_id,host_boot_id,scope_namespace,proposed_unit,creation_input_hash,creation_context_json,creation_context_hash,created_at) VALUES (1,${id},'prep-active',${hash},'environment-kept','project-kept','stopped-thread','seed-server-boot',${context.host.hostBootId},${context.host.scopeNamespace},${proposedUnit},${hash},${JSON.stringify(context)},${hash},${at})`;
+    if (id !== "prep-unbound") {
+      const binding = {
+        unit: proposedUnit,
+        invocationId: "1".repeat(32),
+        controlGroup: `/fixture/${proposedUnit}`,
+        pid: 101,
+        pidStartTicks: "9007199254740993",
+      };
+      yield* sql`UPDATE orchestration_v2_preparation_process_resources SET record_version=1,creation_started_at=${at},child_pid=101,binding_json=${JSON.stringify(binding)},binding_hash=${hash},bound_at=${at} WHERE resource_id=${id}`;
+      if (id === "prep-retired") {
+        const settlement = {
+          v: 1,
+          resourceId: id,
+          contextHash: hash,
+          priorVersion: 1,
+          childExit: { pid: 101, exitCode: 0 },
+          scope: { binding, observation: "removed" },
+        };
+        yield* sql`UPDATE orchestration_v2_preparation_process_resources SET record_version=2,state='settled',settlement_json=${JSON.stringify(settlement)},settlement_hash=${hash},settled_at=${at} WHERE resource_id=${id}`;
+      }
+    }
+  }
+  yield* sql`CREATE TABLE test_preparation_process_child(id TEXT PRIMARY KEY,resource_id TEXT NOT NULL REFERENCES orchestration_v2_preparation_process_resources(resource_id))`;
+  yield* sql`INSERT INTO test_preparation_process_child VALUES ('process-descendant','prep-retired')`;
   yield* sql`CREATE TABLE test_preparation_job_child(id TEXT PRIMARY KEY,job_id TEXT NOT NULL REFERENCES orchestration_v2_preparation_jobs(job_id))`;
   yield* sql`INSERT INTO test_preparation_job_child VALUES ('copy-descendant','prep-active')`;
 });
@@ -522,7 +575,7 @@ const readWorkflowCopyState = Effect.fn("test.readWorkflowCopyState")(function* 
     (table) => sql`SELECT * FROM ${sql(table)}`,
   );
   const schema =
-    yield* sql`SELECT type,name,sql FROM sqlite_master WHERE tbl_name IN ('orchestration_v2_submission_transports','orchestration_v2_submission_attempts','orchestration_v2_preparation_jobs','workflow_native_reservation_material','test_preparation_job_child') OR name LIKE 'submission_%' OR name LIKE 'orchestration_v2_submission_%_guard' ORDER BY name`;
+    yield* sql`SELECT type,name,sql FROM sqlite_master WHERE tbl_name IN ('orchestration_v2_submission_transports','orchestration_v2_submission_attempts','orchestration_v2_preparation_jobs','orchestration_v2_preparation_process_resources','test_preparation_process_child','workflow_native_reservation_material','test_preparation_job_child') OR name LIKE 'submission_%' OR name LIKE 'orchestration_v2_submission_%_guard' ORDER BY name`;
   const history = yield* sql`SELECT * FROM effect_sql_migrations ORDER BY migration_id`;
   return { operational, content, schema, history };
 });
