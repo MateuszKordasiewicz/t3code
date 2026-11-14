@@ -896,3 +896,220 @@ export function reduceTaskValidation(
       return fail("unsupported");
   }
 }
+
+type ReviewType =
+  | "task.action-review-requested"
+  | "task.action-review-result-recorded"
+  | "task.action-review-invalidated"
+  | "task.action-review-cancelled"
+  | "task.action-review-continuation-released";
+type ReviewEvent = Extract<WorkTaskEvent, { readonly type: ReviewType }>;
+type ReviewOf<T extends ReviewType> = Extract<ReviewEvent, { readonly type: T }>;
+type ReviewRecorded<E extends ReviewEvent = ReviewEvent> = {
+  readonly event: E;
+  readonly context: WorkTaskPersistedEventContext;
+};
+type ReviewRecord = {
+  readonly request: ReviewRecorded<ReviewOf<"task.action-review-requested">>;
+  readonly decision?: ReviewRecorded<ReviewOf<"task.action-review-result-recorded">>;
+  readonly outcomes: Chunk.Chunk<ReviewRecorded>;
+  readonly release?: ReviewRecorded<ReviewOf<"task.action-review-continuation-released">>;
+  readonly status:
+    | "pending"
+    | "approved"
+    | "rejected"
+    | "changes_requested"
+    | "invalidated"
+    | "cancelled";
+};
+type ReviewState = {
+  readonly taskId: ReviewEvent["taskId"];
+  readonly reviews: HashMap.HashMap<string, ReviewRecord>;
+  readonly runtimeRequests: HashMap.HashMap<string, string>;
+  readonly continuations: HashMap.HashMap<string, string>;
+  readonly requestCommands: HashMap.HashMap<string, string>;
+  readonly events: HashMap.HashMap<string, ReviewRecorded>;
+  readonly sequences: HashMap.HashMap<number, ReviewRecorded>;
+  readonly lastSequence: number;
+};
+export class ReviewReplayConflict extends Schema.TaggedError<ReviewReplayConflict>()(
+  "ReviewReplayConflict",
+  {
+    code: Schema.Literals([
+      "envelope",
+      "task_identity",
+      "event_identity",
+      "sequence",
+      "request",
+      "binding",
+      "decision",
+      "release",
+      "phase",
+      "unsupported",
+    ]),
+    eventId: Schema.String,
+  },
+) {}
+const requestedReviewBinding = (review: ReviewOf<"task.action-review-requested">["review"]) => ({
+  taskId: review.taskId,
+  reviewId: review.reviewId,
+  reviewRevision: review.revision,
+  definitionRevision: review.definitionRevision,
+  actionPolicyRevision: review.actionPolicyRevision,
+  payloadIdentity: {
+    action: review.action,
+    target: review.target,
+    fingerprint: review.fingerprint,
+  },
+  ruleId: review.ruleId,
+  runtimeRequestId: review.runtimeRequestId,
+  providerSessionId: review.providerSessionId,
+  managerThreadId: review.managerThreadId,
+  managerGeneration: review.managerGeneration,
+  runId: review.runId,
+});
+
+/** Retains immutable review evidence; live human authorization and dispatch remain service guards. */
+export function reduceTaskReviews(
+  state: ReviewState | undefined,
+  recorded: ReviewRecorded,
+): ReviewState {
+  const { event, context } = recorded;
+  const fail = (code: ReviewReplayConflict["code"]): never => {
+    throw new ReviewReplayConflict({ code, eventId: event.id });
+  };
+  if (event.id !== context.eventId || event.occurredAt !== context.occurredAt)
+    return fail("envelope");
+  const previous: ReviewState = state ?? {
+    taskId: event.taskId,
+    reviews: HashMap.empty(),
+    runtimeRequests: HashMap.empty(),
+    continuations: HashMap.empty(),
+    requestCommands: HashMap.empty(),
+    events: HashMap.empty(),
+    sequences: HashMap.empty(),
+    lastSequence: -1,
+  };
+  if (event.taskId !== previous.taskId) return fail("task_identity");
+  const duplicate =
+    lookup(previous.events, event.id) ?? lookup(previous.sequences, context.sequence);
+  if (duplicate) {
+    if (NodeUtil.isDeepStrictEqual(duplicate, recorded)) return previous;
+    return fail(duplicate.event.id === event.id ? "event_identity" : "sequence");
+  }
+  if (context.sequence <= previous.lastSequence) return fail("sequence");
+  const next: ReviewState = {
+    ...previous,
+    events: HashMap.set(previous.events, event.id, recorded),
+    sequences: HashMap.set(previous.sequences, context.sequence, recorded),
+    lastSequence: context.sequence,
+  };
+  if (event.type === "task.action-review-requested") {
+    const review = event.review;
+    if (
+      !review.runtimeRequestId ||
+      context.commandId === null ||
+      review.createdSequence !== context.sequence ||
+      review.taskId !== event.taskId ||
+      review.state.type !== "pending" ||
+      HashMap.has(previous.reviews, review.reviewId) ||
+      HashMap.has(previous.runtimeRequests, review.runtimeRequestId) ||
+      HashMap.has(previous.requestCommands, context.commandId) ||
+      (review.continuationId !== undefined &&
+        HashMap.has(previous.continuations, review.continuationId))
+    )
+      return fail("request");
+    return {
+      ...next,
+      reviews: HashMap.set(previous.reviews, review.reviewId, {
+        request: { event, context },
+        outcomes: Chunk.empty(),
+        status: "pending",
+      }),
+      runtimeRequests: HashMap.set(
+        previous.runtimeRequests,
+        review.runtimeRequestId,
+        review.reviewId,
+      ),
+      requestCommands: HashMap.set(previous.requestCommands, context.commandId, review.reviewId),
+      continuations:
+        review.continuationId === undefined
+          ? previous.continuations
+          : HashMap.set(previous.continuations, review.continuationId, review.reviewId),
+    };
+  }
+  const reviewId = "binding" in event ? event.binding.reviewId : event.reviewId;
+  const known = lookup(previous.reviews, reviewId);
+  if (!known) return fail("request");
+  const binding = requestedReviewBinding(known.request.event.review);
+  if (event.type === "task.action-review-result-recorded") {
+    if (
+      event.reviewRevision !== binding.reviewRevision ||
+      event.definitionRevision !== binding.definitionRevision ||
+      event.actionPolicyRevision !== binding.actionPolicyRevision ||
+      event.managerThreadId !== binding.managerThreadId ||
+      event.managerGeneration !== binding.managerGeneration ||
+      event.runId !== binding.runId ||
+      !NodeUtil.isDeepStrictEqual(event.payloadIdentity, binding.payloadIdentity)
+    )
+      return fail("binding");
+    if (known.decision || !Chunk.isEmpty(known.outcomes)) return fail("decision");
+    const status =
+      event.decision === "approve"
+        ? "approved"
+        : event.decision === "reject"
+          ? "rejected"
+          : "changes_requested";
+    return {
+      ...next,
+      reviews: HashMap.set(previous.reviews, reviewId, {
+        ...known,
+        decision: { event, context },
+        status,
+      }),
+    };
+  }
+  if (!NodeUtil.isDeepStrictEqual(event.binding, binding)) return fail("binding");
+  switch (event.type) {
+    case "task.action-review-invalidated":
+    case "task.action-review-cancelled": {
+      if (
+        event.type === "task.action-review-cancelled" &&
+        context.commandId !== event.source.commandId
+      )
+        return fail("envelope");
+      return {
+        ...next,
+        reviews: HashMap.set(previous.reviews, reviewId, {
+          ...known,
+          outcomes: Chunk.append(known.outcomes, recorded),
+          status: event.type === "task.action-review-invalidated" ? "invalidated" : "cancelled",
+        }),
+      };
+    }
+    case "task.action-review-continuation-released": {
+      if (
+        !known.decision ||
+        known.release ||
+        !Chunk.isEmpty(known.outcomes) ||
+        known.decision.event.id !== event.decisionEventId ||
+        known.decision.event.decision !== event.decision
+      )
+        return fail("release");
+      const requested = known.request.event.review.continuationId;
+      const owner = lookup(previous.continuations, event.continuationId);
+      if (
+        (requested !== undefined && requested !== event.continuationId) ||
+        (owner !== undefined && owner !== reviewId)
+      )
+        return fail("release");
+      return {
+        ...next,
+        reviews: HashMap.set(previous.reviews, reviewId, { ...known, release: { event, context } }),
+        continuations: HashMap.set(previous.continuations, event.continuationId, reviewId),
+      };
+    }
+    default:
+      return fail("unsupported");
+  }
+}
