@@ -16318,3 +16318,31 @@ it.effect.each([false, true])(
       }).pipe(Effect.provide(Layer.fresh(fileLayer)), Effect.scoped);
     }),
 );
+
+it.effect("stored workspace history cannot reconstruct a native transport acquisition", () =>
+  Effect.gen(function* () {
+    const fixture = yield* currentNativeExecutionFixture("workflow");
+    const seeded = yield* seedWorkspaceRetirement("historical-transport", true);
+    const { sql, input, identity, evidence, at } = seeded;
+    yield* sql`UPDATE orchestration_v2_preparation_jobs SET state='settled',code_closed_at=${at},settlement_json=${stableStringify(evidence)},settlement_hash=${PreparationJob.settlementHash(identity.hash, at, evidence)},settled_at=${at},record_version=2 WHERE job_id=${input.jobId}`;
+    const job = PreparationJob.decodeRow(
+      (yield* sql`SELECT * FROM orchestration_v2_preparation_jobs WHERE job_id=${input.jobId}`)[0],
+    );
+    const before = yield* preparationState;
+    const ordinary = yield* Store.make();
+    for (const store of [fixture.store, ordinary])
+      for (const acquired of [job, structuredClone(job), { kind: "retired", job }]) {
+        const denied = yield* Effect.result(
+          store.consumeNativeCodexTransportOwner(acquired, {
+            command: "/fixture-bin/codex",
+            args: ["app-server"],
+            cwd: evidence.workspace.path,
+            env: {},
+          }),
+        );
+        assert.strictEqual(denied._tag, "Failure");
+      }
+    assert.deepStrictEqual(yield* preparationState, before);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_submission_transports`, []);
+  }).pipe(Effect.provide(layerWithOutbox)),
+);

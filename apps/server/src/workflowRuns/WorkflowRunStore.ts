@@ -27,6 +27,9 @@ import * as NodeCrypto from "node:crypto";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Scope from "effect/Scope";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as Exit from "effect/Exit";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as Context from "effect/Context";
@@ -51,6 +54,9 @@ import * as PreparationNode from "../preparation/PreparationNodeChild.ts";
 import {
   decodeSubmissionTransportData,
   decodeSubmissionAttemptResourceData,
+  encodeSubmissionTransportData,
+  encodeScopeBindingData,
+  encodeScopeSettlementData,
 } from "../orchestration-v2/ProviderSubmissionCodec.ts";
 import type { PlanningObservation } from "../developmentPlans/PlanningPassObservation.ts";
 import { DevelopmentPlanHash } from "../developmentPlans/DevelopmentPlanHash.ts";
@@ -126,6 +132,15 @@ const attemptFacts = <
 const encode = (value: unknown) => JSON.stringify(value);
 const parse = (value: string): unknown => JSON.parse(value);
 const decodePreparationWorkflowOwner = Schema.decodeEffect(WorkflowOperationV1.fields.owner);
+const decodeNativeTransportCurrent = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    driver: Schema.Literal("codex"),
+    providerInstanceId: Schema.NonEmptyString,
+    providerThreadId: Schema.NonEmptyString,
+    providerSessionId: Schema.NonEmptyString,
+    nativeThreadId: Schema.Null,
+  }),
+);
 const decodeWorkspaceThread = Schema.decodeEffect(
   Schema.fromJsonString(OrchestrationV2AppThreadJson),
 );
@@ -252,6 +267,13 @@ type PreparationActor = {
   job: PreparationJob.Job;
   readonly resources: Map<string, PreparationResource.Resource>;
 };
+type NativeTransportActor = {
+  readonly job: PreparationJob.Job;
+  readonly claim: PreparationJob.NativeClaim;
+  readonly scope: Scope.Scope;
+  readonly flags: { stopped: boolean; blocked: boolean };
+  row?: ReturnType<typeof decodeSubmissionTransportData>;
+};
 type NativeBindingRuntime = {
   readonly scope: Scope.Scope;
   readonly agentScope: typeof AgentScope.Service;
@@ -276,6 +298,15 @@ const makeStore = Effect.fnUntraced(function* (
   );
   const sql = yield* SqlClient.SqlClient;
   const preparationActors = new WeakSet<PreparationActor>();
+  const retiredWorkspaces = new WeakMap<
+    object,
+    {
+      readonly actor: PreparationActor;
+      readonly flags: { intakeSealed: boolean; stopping: boolean; blocked: boolean };
+    }
+  >();
+  const nativeTransports = new WeakSet<NativeTransportActor>();
+
   const preparationAcquisitions = new WeakMap<
     object,
     { readonly job: PreparationJob.Job; consumed: boolean }
@@ -568,6 +599,7 @@ const makeStore = Effect.fnUntraced(function* (
             providerThreadIds?: readonly string[];
           },
       actor?: PreparationActor,
+      transport?: NativeTransportActor,
     ) {
       const validatedThreads = new Map<
         string,
@@ -604,6 +636,7 @@ const makeStore = Effect.fnUntraced(function* (
       const work: Work[] = [];
       const queued = new Set<string>();
       const parents = new Map<string, Row>();
+      const exemptParents = new Set<string>();
       const attempts = new Set<string>();
       const sessionIdentities = new Map<string, { driver: string; instance: string }>();
       const queue = (kind: Kind, id: unknown) => {
@@ -678,7 +711,38 @@ const makeStore = Effect.fnUntraced(function* (
         });
         if (row.environment_id !== environmentId) return yield* integrity();
         const id = row.transport_id as string;
-        if (parents.has(id)) return parents.get(id)!.settlement_json === null;
+        if (parents.has(id))
+          return !exemptParents.has(id) && parents.get(id)!.settlement_json === null;
+        if (transport?.row?.transport_id === id) {
+          if (
+            !nativeTransports.has(transport) ||
+            transport.flags.stopped ||
+            transport.flags.blocked ||
+            transport.scope.state._tag === "Closed" ||
+            !sameCustodyValue(transport.row, row) ||
+            row.settlement_json !== null ||
+            !sameCustodyValue(parse(row.creation_context_json as string), {
+              v: 1,
+              environmentId: transport.job.input.environmentId,
+              projectId: transport.job.input.projectId,
+              openingThreadId: transport.job.input.threadId,
+              driver: "codex",
+              providerInstanceId: (transport.job.input.request.current as Record<string, unknown>)
+                .providerInstanceId,
+              providerSessionId: (transport.job.input.request.current as Record<string, unknown>)
+                .providerSessionId,
+              scopeNamespace: row.scope_namespace,
+              hostBootId: row.host_boot_id,
+              expectedClaim: transport.claim,
+            }) ||
+            (yield* sql`SELECT 1 FROM orchestration_v2_submission_attempts WHERE transport_id=${id} LIMIT 1`)
+              .length
+          )
+            return yield* integrity();
+          parents.set(id, row);
+          exemptParents.add(id);
+          return false;
+        }
         parents.set(id, row);
         if (row.settlement_json === null) return true;
         let cursor = "";
@@ -709,7 +773,7 @@ const makeStore = Effect.fnUntraced(function* (
           if (found.length !== 1 || !found[0]) return yield* integrity();
           held = yield* inspectParent(found[0]);
           parent = parents.get(id)!;
-        } else held = parent.settlement_json === null;
+        } else held = !exemptParents.has(id) && parent.settlement_json === null;
         yield* parseAttempt(raw, parent);
         return held;
       });
@@ -7143,6 +7207,7 @@ const makeStore = Effect.fnUntraced(function* (
             },
           );
           yield* notify;
+          retiredWorkspaces.set(result, { actor, flags });
           return result;
         }),
         checkOutsideWriter: outside,
@@ -7364,6 +7429,467 @@ const makeStore = Effect.fnUntraced(function* (
       );
     },
   );
+  const consumeNativeCodexTransportOwner = Effect.fn(
+    "WorkflowRunStore.consumeNativeCodexTransportOwner",
+  )(function* (
+    acquired: object,
+    command: {
+      readonly command: string;
+      readonly args: readonly string[];
+      readonly cwd: string;
+      readonly env: Readonly<Record<string, string>>;
+    },
+  ) {
+    const runtime = nativeBinding;
+    const acquisition = retiredWorkspaces.get(acquired);
+    if (!runtime || !acquisition || runtime.scope.state._tag === "Closed")
+      return yield* integrity();
+    if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+      return yield* integrity();
+    retiredWorkspaces.delete(acquired);
+    const job = acquisition.actor.job;
+    const claim = job.input.nativeOwner?.executionClaim;
+    if (
+      acquired !== job ||
+      !claim ||
+      job.state !== "settled" ||
+      !job.codeClosedAt ||
+      acquisition.flags.stopping ||
+      acquisition.flags.blocked
+    )
+      return yield* integrity();
+    const workspace = yield* Effect.try({
+      try: () =>
+        PreparationJob.ownWorkspaceSettlement(
+          job.settlement,
+          job.input,
+          job.recordVersion - 1,
+          job.codeClosedAt!,
+        ),
+      catch: integrity,
+    });
+    const current = yield* decodeNativeTransportCurrent(job.input.request.current, {
+      onExcessProperty: "error",
+    }).pipe(Effect.mapError(integrity));
+    if (
+      !runtime.path.isAbsolute(command.command) ||
+      command.cwd !== workspace.workspace.path ||
+      command.args[0] !== "app-server"
+    )
+      return yield* integrity();
+    const host = acquisition.actor.resources.values().next().value?.context.host;
+    if (!host) return yield* integrity();
+    return yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const physical = yield* Scope.make("sequential");
+        const cleanupScope = yield* Scope.make("sequential");
+        const flags = { stopped: false, blocked: false };
+        const actor: NativeTransportActor = { job, claim, scope: physical, flags };
+        nativeTransports.add(actor);
+        const mutex = yield* Semaphore.make(1);
+        const bodies = new Set<{
+          readonly fiber: Fiber.Fiber<unknown, unknown>;
+          readonly done: Deferred.Deferred<void>;
+        }>();
+        type Gate = Effect.Success<
+          ReturnType<typeof PreparationGate.prepareControlledCodexProcessGate>
+        >;
+        type Pending = Effect.Success<ReturnType<Gate["spawnHeld"]>>;
+        type Held = Effect.Success<ReturnType<Pending["awaitHeld"]>>;
+        let gate: Gate | undefined;
+        let pending: Pending | undefined;
+        let held: Held | undefined;
+        let constructor: Fiber.Fiber<unknown, unknown> | undefined;
+        let openAttempted = false;
+        let createAttempted = false;
+        let releaseAttempted = false;
+        let closeDone:
+          | Deferred.Deferred<
+              { readonly kind: "retired" | "held" | "closed"; readonly transportId: string },
+              PreparationOwner.PreparationProcessOwnerError
+            >
+          | undefined;
+        const id = NodeCrypto.randomUUID();
+        const outside = Effect.fn("WorkflowRunStore.transportOutsideWriter")(function* () {
+          if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+            return yield* integrity();
+        });
+        const body = Effect.fn("WorkflowRunStore.transportBody")(function* <A, E>(
+          work: Effect.Effect<A, E>,
+        ) {
+          yield* outside();
+          return yield* Effect.uninterruptibleMask((resume) =>
+            Effect.withFiber((fiber) =>
+              Effect.suspend(() => {
+                const invocation = { fiber, done: Deferred.makeUnsafe<void>() };
+                bodies.add(invocation);
+                return Effect.gen(function* () {
+                  const exit = yield* Effect.exit(
+                    resume(PreparationOwner.sanitize("creation", work)),
+                  );
+                  if (Exit.isFailure(exit)) flags.blocked = true;
+                  bodies.delete(invocation);
+                  Deferred.doneUnsafe(invocation.done, Exit.void);
+                  return yield* exit;
+                });
+              }),
+            ),
+          );
+        }, Effect.interruptible);
+        const checkOriginal = Effect.fn("WorkflowRunStore.checkTransportOriginal")(function* () {
+          if (
+            !nativeTransports.has(actor) ||
+            !preparationActors.has(acquisition.actor) ||
+            job.input.environmentId !== runtime.environmentId ||
+            claim.bootId !== runtime.coordinator.bootId ||
+            claim.workerId !== runtime.coordinator.workerId
+          )
+            return yield* integrity();
+          const actual = yield* readPreparationJob(job.input.jobId);
+          if (!sameCustodyValue(actual, job) || !(yield* preparationRetired(actual)))
+            return yield* stale();
+          yield* validateNativePreparationHistory(actual, claim);
+          if (actor.row) {
+            const rows =
+              yield* sql`SELECT * FROM orchestration_v2_submission_transports WHERE transport_id=${id}`;
+            if (rows.length !== 1) return yield* integrity();
+            const row = yield* Effect.try({
+              try: () => decodeSubmissionTransportData(rows[0]),
+              catch: integrity,
+            });
+            if (
+              !sameCustodyValue(row, actor.row) ||
+              (yield* sql`SELECT 1 FROM orchestration_v2_submission_attempts WHERE transport_id=${id} LIMIT 1`)
+                .length
+            )
+              return yield* integrity();
+          }
+        });
+        const checkCurrent = Effect.fn("WorkflowRunStore.checkTransportCurrent")(function* (
+          own: boolean,
+        ) {
+          yield* checkOriginal();
+          if (
+            flags.stopped ||
+            flags.blocked ||
+            physical.state._tag === "Closed" ||
+            runtime.scope.state._tag === "Closed" ||
+            acquisition.flags.stopping ||
+            acquisition.flags.blocked
+          )
+            return yield* stale();
+          const selected = yield* verifyClaimedNativeOperationInTransaction(claim);
+          if (
+            selected.kind !== "current" ||
+            selected.stage !== "preparing" ||
+            selected.threadId !== job.input.threadId ||
+            selected.runId !== job.input.runId ||
+            !sameCustodyValue(current, {
+              driver: selected.driver,
+              providerInstanceId: selected.providerInstanceId,
+              providerThreadId: selected.providerThreadId,
+              providerSessionId: selected.providerSessionId,
+              nativeThreadId: selected.nativeThreadId,
+            })
+          )
+            return yield* stale();
+          const rows = yield* sql<{
+            payload_json: string;
+          }>`SELECT payload_json FROM orchestration_v2_projection_threads WHERE thread_id=${job.input.threadId}`;
+          if (rows.length !== 1) return yield* integrity();
+          const thread = yield* decodeWorkspaceThread(rows[0]!.payload_json, {
+            onExcessProperty: "error",
+          }).pipe(Effect.mapError(integrity));
+          if (
+            thread.projectId !== job.input.projectId ||
+            thread.branch !== workspace.workspace.refName ||
+            thread.worktreePath !== workspace.workspace.path
+          )
+            return yield* stale();
+          if (
+            yield* walkResourceCustodyInTransaction(
+              {
+                purpose: "physical",
+                environmentId: runtime.environmentId,
+                threadId: job.input.threadId,
+                expectedOwner: yield* decodePreparationWorkflowOwner(
+                  job.input.nativeOwner!.owner,
+                ).pipe(Effect.mapError(integrity)),
+                nativeSelection: job.input.nativeSelection ?? null,
+              },
+              undefined,
+              own ? actor : undefined,
+            )
+          )
+            return yield* stale();
+        });
+        const writer = <A, E>(work: Effect.Effect<A, E>, accept: (value: A) => void) =>
+          outside().pipe(
+            Effect.andThen(
+              mutex.withPermit(
+                inTransaction(work).pipe(
+                  Effect.interruptible,
+                  Effect.tap((value) => Effect.sync(() => accept(value))),
+                ),
+              ),
+            ),
+            Effect.interruptible,
+          );
+        const close = Effect.fn("WorkflowRunStore.closeNativeCodexTransport")(function* () {
+          yield* outside();
+          return yield* Effect.uninterruptible(
+            Effect.withFiber((fiber) =>
+              Effect.suspend(() => {
+                if (
+                  (constructor?.id === fiber.id && constructor.pollUnsafe() === undefined) ||
+                  [...bodies].some(
+                    (invocation) =>
+                      invocation.fiber.id === fiber.id && !Deferred.isDoneUnsafe(invocation.done),
+                  )
+                )
+                  return Effect.fail(PreparationOwner.error("cleanup", "invalid"));
+                if (closeDone) return Deferred.await(closeDone);
+                const completion = Deferred.makeUnsafe<
+                  { readonly kind: "retired" | "held" | "closed"; readonly transportId: string },
+                  PreparationOwner.PreparationProcessOwnerError
+                >();
+                closeDone = completion;
+                flags.stopped = true;
+                const cleanup = Effect.gen(function* () {
+                  if (constructor && constructor.pollUnsafe() === undefined)
+                    constructor.interruptUnsafe();
+                  for (const invocation of bodies) invocation.fiber.interruptUnsafe();
+                  yield* Effect.forEach(bodies, (invocation) => Deferred.await(invocation.done), {
+                    concurrency: "unbounded",
+                    discard: true,
+                  });
+                  const constructed = constructor ? yield* Fiber.await(constructor) : undefined;
+                  const closed = yield* Effect.exit(Scope.close(physical, Exit.void));
+                  const stopped = pending
+                    ? yield* Effect.exit(pending.stopOwnedChild())
+                    : Exit.void;
+                  if (!actor.row) return { kind: "closed" as const, transportId: id };
+                  if (
+                    !constructed ||
+                    Exit.isFailure(constructed) ||
+                    Exit.isFailure(closed) ||
+                    Exit.isFailure(stopped) ||
+                    !pending ||
+                    !held ||
+                    actor.row.binding_json === null
+                  )
+                    return { kind: "held" as const, transportId: id };
+                  const terminal = yield* Effect.result(
+                    pending.awaitTerminal.pipe(Effect.timeoutOption("2 seconds")),
+                  );
+                  const observed = yield* Effect.result(pending.observeRetirement());
+                  if (
+                    terminal._tag === "Failure" ||
+                    Option.isNone(terminal.success) ||
+                    observed._tag === "Failure" ||
+                    !observed.success ||
+                    !sameCustodyValue(observed.success.binding, held.binding)
+                  )
+                    return { kind: "held" as const, transportId: id };
+                  const evidence = yield* Effect.try({
+                    try: () => encodeScopeSettlementData(observed.success, held!.binding),
+                    catch: integrity,
+                  });
+                  const settled = yield* Effect.exit(
+                    writer(
+                      Effect.gen(function* () {
+                        yield* checkOriginal();
+                        if (
+                          (yield* sql`SELECT 1 FROM orchestration_v2_submission_attempts WHERE transport_id=${id} LIMIT 1`)
+                            .length
+                        )
+                          return yield* integrity();
+                        const expected = actor.row!;
+                        const rows =
+                          yield* sql`UPDATE orchestration_v2_submission_transports SET settlement_json=${evidence.json},settlement_hash=${evidence.hash},settled_at=${DateTime.formatIso(yield* DateTime.now)} WHERE transport_id=${id} AND creation_context_hash=${expected.creation_context_hash} AND creation_input_hash=${expected.creation_input_hash} AND binding_json=${expected.binding_json} AND binding_hash=${expected.binding_hash} AND settlement_json IS NULL RETURNING *`;
+                        if (rows.length !== 1) return yield* stale();
+                        return yield* Effect.try({
+                          try: () => decodeSubmissionTransportData(rows[0]),
+                          catch: integrity,
+                        });
+                      }),
+                      (row) => {
+                        actor.row = row;
+                      },
+                    ),
+                  );
+                  if (Exit.isFailure(settled)) return { kind: "held" as const, transportId: id };
+                  const published = yield* Effect.exit(notify);
+                  return {
+                    kind: Exit.isSuccess(published) ? ("retired" as const) : ("held" as const),
+                    transportId: id,
+                  };
+                }).pipe(
+                  (work) => PreparationOwner.sanitize("cleanup", work),
+                  Effect.provideService(Scope.Scope, cleanupScope),
+                );
+                return cleanup.pipe(
+                  Effect.exit,
+                  Effect.tap((exit) => Effect.sync(() => Deferred.doneUnsafe(completion, exit))),
+                  Effect.forkIn(cleanupScope, { startImmediately: true }),
+                  Effect.andThen(Deferred.await(completion)),
+                );
+              }),
+            ),
+          );
+        });
+        yield* Scope.addFinalizer(
+          runtime.scope,
+          close().pipe(Effect.ignore, Effect.ensuring(Scope.close(cleanupScope, Exit.void))),
+        );
+        const prepared = yield* Effect.exit(
+          restore(
+            body(
+              Effect.gen(function* () {
+                yield* inTransaction(checkCurrent(false));
+                gate = yield* PreparationGate.prepareControlledCodexProcessGate({
+                  ...command,
+                  extendEnv: false,
+                  threadId: job.input.threadId,
+                }).pipe(
+                  Effect.provideService(AgentScope, runtime.agentScope),
+                  Effect.provideService(PreparationNode.PreparationNodeChild, runtime.nodeChild),
+                  Effect.provideService(Path.Path, runtime.path),
+                  Effect.provideService(HostProcess.Environment, runtime.hostEnvironment),
+                  Effect.provideService(HostProcess.WorkingDirectory, runtime.hostCwd),
+                  Effect.provideService(Scope.Scope, physical),
+                );
+                if (!sameCustodyValue(gate.hostIdentity, host)) return yield* integrity();
+              }),
+            ),
+          ),
+        );
+        if (Exit.isFailure(prepared)) {
+          yield* close().pipe(Effect.ignore);
+          return yield* Effect.failCause(prepared.cause);
+        }
+        const open = Effect.fn("WorkflowRunStore.openNativeCodexTransport")(function* () {
+          const fiber = yield* Effect.withFiber(Effect.succeed);
+          if (openAttempted || !gate || !constructor || constructor.id !== fiber.id)
+            return yield* integrity();
+          openAttempted = true;
+          const selectedGate = gate;
+          return yield* body(
+            Effect.gen(function* () {
+              yield* writer(
+                Effect.gen(function* () {
+                  yield* checkCurrent(false);
+                  const row = encodeSubmissionTransportData({
+                    transportId: id,
+                    proposedUnit: selectedGate.proposedUnit,
+                    creationInputHash: selectedGate.creationInputHash,
+                    createdAt: DateTime.formatIso(yield* DateTime.now),
+                    context: {
+                      v: 1,
+                      environmentId: runtime.environmentId,
+                      projectId: job.input.projectId,
+                      openingThreadId: job.input.threadId,
+                      driver: "codex",
+                      providerInstanceId: current.providerInstanceId,
+                      providerSessionId: current.providerSessionId,
+                      scopeNamespace: selectedGate.hostIdentity.scopeNamespace,
+                      hostBootId: selectedGate.hostIdentity.hostBootId,
+                      expectedClaim: claim,
+                    },
+                  });
+                  const rows =
+                    yield* sql`INSERT INTO orchestration_v2_submission_transports ${sql.insert(row)} RETURNING *`;
+                  if (rows.length !== 1) return yield* integrity();
+                  return yield* Effect.try({
+                    try: () => decodeSubmissionTransportData(rows[0]),
+                    catch: integrity,
+                  });
+                }),
+                (row) => {
+                  actor.row = row;
+                },
+              );
+              yield* notify;
+              yield* writer(
+                Effect.gen(function* () {
+                  yield* checkCurrent(true);
+                  if (createAttempted) return yield* integrity();
+                  createAttempted = true;
+                  pending = yield* selectedGate
+                    .spawnHeld()
+                    .pipe(Effect.provideService(Scope.Scope, physical));
+                }),
+                () => {},
+              );
+              if (!pending) return yield* integrity();
+              const selectedPending = pending;
+              held = yield* selectedPending
+                .awaitHeld()
+                .pipe(Effect.provideService(Scope.Scope, physical));
+              const selectedHeld = held;
+              yield* writer(
+                Effect.gen(function* () {
+                  yield* checkOriginal();
+                  if (actor.row?.binding_json !== null) return yield* stale();
+                  const binding = encodeScopeBindingData(selectedHeld.binding, actor.row);
+                  const rows =
+                    yield* sql`UPDATE orchestration_v2_submission_transports SET binding_json=${binding.json},binding_hash=${binding.hash},bound_at=${DateTime.formatIso(yield* DateTime.now)} WHERE transport_id=${id} AND binding_json IS NULL AND settlement_json IS NULL RETURNING *`;
+                  if (rows.length !== 1) return yield* stale();
+                  return yield* Effect.try({
+                    try: () => decodeSubmissionTransportData(rows[0]),
+                    catch: integrity,
+                  });
+                }),
+                (row) => {
+                  actor.row = row;
+                },
+              );
+              yield* notify;
+              let receipt: PreparationGate.PreparationGateLocalReceipt | undefined;
+              yield* writer(
+                Effect.gen(function* () {
+                  yield* checkCurrent(true);
+                  if (releaseAttempted) return yield* integrity();
+                  releaseAttempted = true;
+                  receipt = yield* selectedHeld.submitLocal();
+                }),
+                () => {},
+              );
+              if (!receipt) return yield* integrity();
+              const payload = yield* selectedHeld
+                .awaitExec(receipt)
+                .pipe(Effect.provideService(Scope.Scope, physical));
+              return Object.freeze({
+                ...payload,
+                pid: selectedPending.pid,
+                isRunning: selectedPending.isRunning,
+                exitCode: selectedPending.awaitExit,
+                stderr: selectedPending.stderr,
+              });
+            }),
+          );
+        }, Effect.interruptible);
+        return Object.freeze({
+          transportId: id,
+          executionClaim: claim,
+          current: Object.freeze(current),
+          scope: physical as Scope.Scope,
+          close,
+          open,
+          captureConstructor: Effect.fn("WorkflowRunStore.captureNativeCodexConstructor")(
+            function* () {
+              yield* outside();
+              const fiber = yield* Effect.withFiber(Effect.succeed);
+              if (constructor || flags.stopped || runtime.scope.state._tag === "Closed")
+                return yield* integrity();
+              constructor = fiber;
+            },
+          ),
+        });
+      }),
+    );
+  });
+
   const claim = Effect.fn("WorkflowRunStore.claim")(function* (input: {
     readonly operationId: string;
     readonly expectedOwnerVersion: number;
@@ -7895,6 +8421,35 @@ const makeStore = Effect.fnUntraced(function* (
       }
     },
     consumeNativePreparationOwner,
+    consumeNativeCodexTransportOwner: (
+      job: object,
+      input: {
+        readonly command: string;
+        readonly args: readonly string[];
+        readonly cwd: string;
+        readonly env: Readonly<Record<string, string>>;
+      },
+    ) => {
+      try {
+        WorkflowCanonicalHash.assertCanonical(input);
+        if (
+          Object.keys(input).sort().join() !== "args,command,cwd,env" ||
+          typeof input.command !== "string" ||
+          typeof input.cwd !== "string" ||
+          !Array.isArray(input.args) ||
+          input.args.some((arg) => typeof arg !== "string") ||
+          Object.values(input.env).some((value) => typeof value !== "string")
+        )
+          return Effect.fail(integrity());
+        const owned = structuredClone(input);
+        Object.freeze(owned.args);
+        Object.freeze(owned.env);
+        Object.freeze(owned);
+        return consumeNativeCodexTransportOwner(job, owned);
+      } catch {
+        return Effect.fail(integrity());
+      }
+    },
     beginClaimedNativePreparation: (claim: PreparationJob.NativeClaim) => {
       try {
         return beginClaimedNativePreparation(PreparationJob.ownNativeClaim(claim));

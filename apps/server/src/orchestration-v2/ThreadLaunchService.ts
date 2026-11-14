@@ -1607,7 +1607,13 @@ const makeNativeWorkspacePreparationOwned = Effect.fn(
   const path = yield* Path.Path;
   const serviceScope = yield* Effect.scope;
   const entryScope = yield* Scope.fork(serviceScope, "sequential");
-  type Entry = { fiber?: Fiber.Fiber<unknown, unknown>; owner?: PreparationOwner.Owner };
+  type Entry = {
+    fiber?: Fiber.Fiber<unknown, unknown>;
+    owner?: PreparationOwner.Owner;
+    executionClaim?: Effect.Success<
+      ReturnType<typeof producer.claimReservedIntent>
+    >["executionClaim"];
+  };
   const entries = new Set<Entry>();
   let closed = false;
   const stopEntry = Effect.fn("ThreadLaunchService.stopNativeWorkspaceEntry")(function* (
@@ -1643,6 +1649,7 @@ const makeNativeWorkspacePreparationOwned = Effect.fn(
           const selected = yield* claim;
           const owner = selected.preparation.owner;
           entry.owner = owner;
+          entry.executionClaim = selected.executionClaim;
           yield* owner.captureWorkspaceEntry();
           const job = selected.preparation.job;
           const decoded = yield* decodeNativeReservationLaunch(job.input.request.launch);
@@ -1744,7 +1751,8 @@ const makeNativeWorkspacePreparationOwned = Effect.fn(
                 if (entry.owner) yield* entry.owner.stop().pipe(Effect.ignore);
                 return yield* Effect.failCause(exit.cause);
               }
-              if (!entry.owner) return yield* nativeWorkspaceError("invalid");
+              if (!entry.owner || !entry.executionClaim)
+                return yield* nativeWorkspaceError("invalid");
               const retirement = yield* Effect.result(entry.owner.retireWorkspace());
               const preparation =
                 retirement._tag === "Success"
@@ -1755,6 +1763,7 @@ const makeNativeWorkspacePreparationOwned = Effect.fn(
                 kind: exit.value.kind,
                 runState: "preparing" as const,
                 native: exit.value.native,
+                executionClaim: entry.executionClaim,
                 worktree: exit.value.worktree,
                 preparation,
                 inventory,
