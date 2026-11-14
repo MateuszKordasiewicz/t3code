@@ -22,12 +22,15 @@ import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
 import * as Sink from "effect/Sink";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import { preparePreparationProcessGate } from "./PreparationProcessGate.ts";
+import * as Gate from "./PreparationProcessGate.ts";
 import * as NodeChild from "./PreparationNodeChild.ts";
+import { WorkflowCanonicalHash } from "../workflowRuns/WorkflowCanonicalHash.ts";
 
 vi.mock("node:crypto", { spy: true });
 
@@ -39,6 +42,11 @@ const fixtureHost = Object.freeze({
 const input = { command: "/usr/bin/fixture", args: ["original"], cwd: "/work" };
 const makeHarness = Effect.fn("test.makePreparationGateHarness")(function* (
   options: {
+    readonly codex?: boolean;
+    readonly unit?: string;
+    readonly keepOutput?: boolean;
+    readonly holdStderr?: boolean;
+    readonly payloadWrite?: Effect.Effect<void>;
     readonly ready?: "split" | "wrong-pid" | "oversize" | "eof" | "early-exec" | "withheld";
     readonly writer?: "withheld-ack" | "blocked" | "typed" | "defect";
     readonly passive?: boolean;
@@ -49,6 +57,9 @@ const makeHarness = Effect.fn("test.makePreparationGateHarness")(function* (
     readonly hostIdentity?: unknown;
   } = {},
 ) {
+  const payloadEntered = yield* Deferred.make<void>();
+  const stderrEntered = yield* Deferred.make<void>();
+  const images: NodeChild.PreparationNodeImage[] = [];
   const spawnWaitStarted = yield* Deferred.make<void>();
   const creationStarted = yield* Deferred.make<void>();
   const spawnEvent = yield* Deferred.make<void>();
@@ -72,7 +83,11 @@ const makeHarness = Effect.fn("test.makePreparationGateHarness")(function* (
   let nonce = "";
   let command: ChildProcess.StandardCommand | undefined;
   const binding = Object.freeze({
-    unit: "gate-fixture.scope",
+    unit:
+      options.unit ??
+      (options.codex
+        ? "t3code-codex-11111111-1111-4111-8111-111111111111.scope"
+        : "gate-fixture.scope"),
     invocationId: "1".repeat(32),
     controlGroup: "/gate-fixture.scope",
     pid: 999999991,
@@ -126,7 +141,7 @@ const makeHarness = Effect.fn("test.makePreparationGateHarness")(function* (
         output,
         Buffer.concat([encode(header), options.payload ?? encode("payload")]),
       );
-    yield* Queue.end(output);
+    if (!options.keepOutput) yield* Queue.end(output);
   });
   const createFake = (selected: ChildProcess.Command) =>
     Effect.gen(function* () {
@@ -166,6 +181,10 @@ const makeHarness = Effect.fn("test.makePreparationGateHarness")(function* (
         stdin: Sink.forEach((bytes: Uint8Array) =>
           Effect.gen(function* () {
             yield* Deferred.succeed(entered, undefined);
+            if (state.written > 0 && options.payloadWrite) {
+              yield* Deferred.succeed(payloadEntered, undefined);
+              yield* options.payloadWrite;
+            }
             if (options.writer === "blocked") yield* Deferred.await(allowWrite);
             state.written++;
             yield* Queue.offer(writes, new TextDecoder().decode(bytes));
@@ -190,7 +209,11 @@ const makeHarness = Effect.fn("test.makePreparationGateHarness")(function* (
             }),
           ),
         ),
-        stderr: Stream.empty,
+        stderr: options.holdStderr
+          ? Stream.fromEffect(
+              Deferred.succeed(stderrEntered, undefined).pipe(Effect.andThen(Effect.never)),
+            )
+          : Stream.empty,
         all: Stream.empty,
         getInputFd: () => Sink.drain,
         getOutputFd: () => Stream.empty,
@@ -210,6 +233,7 @@ const makeHarness = Effect.fn("test.makePreparationGateHarness")(function* (
   const nodeCreator: typeof NodeChild.PreparationNodeChild.Service = {
     prepare: (image) => {
       state.prepares++;
+      images.push(image);
       const selected = ChildProcess.make(image.executable, image.args, {
         cwd: image.cwd,
         env: image.environment,
@@ -256,7 +280,10 @@ const makeHarness = Effect.fn("test.makePreparationGateHarness")(function* (
   );
   return {
     state,
+    images,
     binding,
+    payloadEntered,
+    stderrEntered,
     creationStarted,
     spawnWaitStarted,
     spawnEvent,
@@ -807,4 +834,330 @@ it.effect("owns host identity and binds only its changed facts into a fixed-nonc
       assert.strictEqual(nonce.mock.calls.length, 3);
     }).pipe(Effect.provide(harness.layer));
   }).pipe(Effect.scoped),
+);
+
+it.effect.each(["split", "coalesced"] as const)(
+  "fixed Codex gate exposes the retained protocol pipe only after its original %s EXEC receipt",
+  (chunks) =>
+    Effect.gen(function* () {
+      assert.isFunction(Gate.prepareControlledCodexProcessGate);
+      const harness = yield* makeHarness({
+        codex: true,
+        ...(chunks === "split" ? { exec: "split" as const } : {}),
+        payload: Uint8Array.of(0, 255, ...encode("initial payload")),
+      });
+      yield* Effect.gen(function* () {
+        const prepared = yield* Gate.prepareControlledCodexProcessGate(input);
+        const pending = yield* prepared.spawnHeld();
+        const held = yield* pending.awaitHeld();
+        assert.deepStrictEqual(Object.keys(held).sort(), ["awaitExec", "binding", "submitLocal"]);
+        const receipt = yield* held.submitLocal();
+        assert.strictEqual(
+          (yield* Effect.result(held.awaitExec(Object.freeze({ ...receipt }))))._tag,
+          "Failure",
+        );
+        const pipe = yield* held.awaitExec(receipt);
+        assert.isTrue(Object.isFrozen(pipe));
+        assert.deepStrictEqual(Object.keys(pipe).sort(), ["stdin", "stdout"]);
+        assert.deepStrictEqual(
+          Buffer.concat(yield* Stream.runCollect(pipe.stdout)),
+          Buffer.from(Uint8Array.of(0, 255, ...encode("initial payload"))),
+        );
+        assert.strictEqual((yield* Effect.result(held.awaitExec(receipt)))._tag, "Failure");
+        yield* pending.stopOwnedChild();
+        const before = harness.state.written;
+        assert.strictEqual(
+          (yield* Effect.result(Stream.run(Stream.make(encode("late")), pipe.stdin)))._tag,
+          "Failure",
+        );
+        assert.strictEqual(harness.state.written, before);
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+
+it.effect.each([false, true])(
+  "Codex pipe stop joins owned blocked IO under outer mask=%s",
+  (masked) =>
+    Effect.gen(function* () {
+      const release = yield* Deferred.make<void>();
+      const unwinding = yield* Deferred.make<void>();
+      const ownerScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(ownerScope, Exit.void));
+      const harness = yield* makeHarness({
+        codex: true,
+        keepOutput: true,
+        holdStderr: true,
+        payloadWrite: Effect.never.pipe(
+          Effect.ensuring(
+            Deferred.succeed(unwinding, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          ),
+        ),
+      });
+      yield* Effect.gen(function* () {
+        const prepared = yield* Gate.prepareControlledCodexProcessGate(input).pipe(
+          Effect.provideService(Scope.Scope, ownerScope),
+        );
+        const pending = yield* prepared.spawnHeld();
+        const held = yield* pending.awaitHeld();
+        const receipt = yield* held.submitLocal();
+        const pipe = yield* held.awaitExec(receipt);
+        yield* Queue.takeAll(harness.readRequests);
+        const reading = yield* Stream.runCollect(pipe.stdout).pipe(
+          Effect.asVoid,
+          Effect.exit,
+          Effect.forkScoped,
+        );
+        yield* Queue.take(harness.readRequests);
+        const stderr = yield* Stream.runCollect(pending.stderr).pipe(
+          Effect.asVoid,
+          Effect.exit,
+          Effect.forkScoped,
+        );
+        yield* Deferred.await(harness.stderrEntered);
+        const writing = yield* Stream.run(Stream.make(encode("request\n")), pipe.stdin).pipe(
+          (work) => (masked ? Effect.uninterruptible(work) : work),
+          Effect.exit,
+          Effect.forkScoped,
+        );
+        yield* Deferred.await(harness.payloadEntered);
+        const stopping = yield* (
+          masked ? Scope.close(ownerScope, Exit.void) : pending.stopOwnedChild()
+        ).pipe(Effect.forkScoped);
+        yield* Deferred.await(unwinding);
+        yield* Effect.sync(() => {
+          assert.isUndefined(stopping.pollUnsafe());
+          assert.isUndefined(writing.pollUnsafe());
+        }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+        yield* Fiber.join(stopping);
+        for (const work of [writing, reading, stderr]) {
+          const outer = yield* Fiber.await(work);
+          assert.isTrue(Exit.isFailure(outer) || Exit.isFailure(outer.value));
+        }
+        assert.strictEqual(harness.state.written, 1);
+        assert.strictEqual(
+          (yield* Effect.result(Stream.run(Stream.make(encode("late\n")), pipe.stdin)))._tag,
+          "Failure",
+        );
+        assert.strictEqual((yield* Effect.result(Stream.runCollect(pipe.stdout)))._tag, "Failure");
+        assert.strictEqual(
+          (yield* Effect.result(Stream.runCollect(pending.stderr)))._tag,
+          "Failure",
+        );
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+
+it.effect.each(["bad", "oversize", "eof"] as const)(
+  "Codex pipe refuses the %s EXEC prefix without publishing stdin",
+  (exec) =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ codex: true, exec });
+      yield* Effect.gen(function* () {
+        const pending = yield* (yield* Gate.prepareControlledCodexProcessGate(input)).spawnHeld();
+        const held = yield* pending.awaitHeld();
+        assert.isFalse(Object.hasOwn(pending, "stdin"));
+        assert.isFalse(Object.hasOwn(held, "stdin"));
+        const receipt = yield* held.submitLocal();
+        assert.strictEqual((yield* Effect.result(held.awaitExec(receipt)))._tag, "Failure");
+        assert.strictEqual((yield* Effect.result(held.awaitExec(receipt)))._tag, "Failure");
+        assert.strictEqual(harness.state.written, 1);
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+
+it.live(
+  "Codex gate retains real Node stdin for separate protocol frames and stops its original child",
+  () =>
+    Effect.gen(function* () {
+      const directory = yield* Effect.acquireRelease(
+        Effect.sync(() => NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-codex-pipe-"))),
+        (path) => Effect.sync(() => NodeFS.rmSync(path, { recursive: true, force: true })),
+      );
+      const ownerScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(ownerScope, Exit.void));
+      const marker = NodePath.join(directory, "payload-started");
+      const unit = "t3code-codex-11111111-1111-4111-8111-111111111111.scope";
+      const scope: typeof AgentScope.Service = {
+        ...AgentScope.defaultValue(),
+        wrap: (request) => {
+          assert.strictEqual(request.name, "codex");
+          assert.isUndefined(request.shared);
+          return Effect.succeed({
+            command: request.command,
+            args: request.args,
+            unit,
+            hostIdentity: fixtureHost,
+            custody: {
+              bind: (pid) =>
+                Effect.succeed({
+                  unit,
+                  invocationId: "1".repeat(32),
+                  controlGroup: `/app.slice/${fixtureHost.scopeNamespace}/${unit}`,
+                  pid,
+                  pidStartTicks: "1",
+                }),
+              stopAndObserve: () => Effect.undefined,
+              observeRetirement: () => Effect.undefined,
+            },
+          });
+        },
+      };
+      yield* Effect.gen(function* () {
+        const prepared = yield* Gate.prepareControlledCodexProcessGate({
+          command: process.execPath,
+          cwd: directory,
+          env: { PATH: "/usr/bin:/bin" },
+          extendEnv: false,
+          args: [
+            "-e",
+            "require('node:fs').writeFileSync(process.argv[1],'started');process.stdout.write('BOOT\\n');let text='';process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>{text+=chunk;let end;while((end=text.indexOf('\\n'))!==-1){const line=text.slice(0,end);text=text.slice(end+1);process.stdout.write(JSON.stringify({echo:line})+'\\n');}});",
+            marker,
+          ],
+        }).pipe(Effect.provideService(Scope.Scope, ownerScope));
+        const pending = yield* prepared.spawnHeld();
+        const held = yield* pending.awaitHeld();
+        assert.isFalse(NodeFS.existsSync(marker));
+        assert.isTrue(yield* pending.isRunning);
+        const receipt = yield* held.submitLocal();
+        const pipe = yield* held.awaitExec(receipt);
+        const lines = yield* Queue.unbounded<string>();
+        const collector = yield* pipe.stdout.pipe(
+          Stream.decodeText(),
+          Stream.splitLines,
+          Stream.runForEach((line) => Queue.offer(lines, line)),
+          Effect.exit,
+          Effect.forkScoped,
+        );
+        assert.strictEqual(yield* Queue.take(lines), "BOOT");
+        assert.strictEqual(NodeFS.readFileSync(marker, "utf8"), "started");
+        for (const line of ["first frame", "second 🐕 frame", "third frame"]) {
+          yield* Stream.run(Stream.make(encode(line + "\n")), pipe.stdin);
+          assert.strictEqual(yield* Queue.take(lines), JSON.stringify({ echo: line }));
+        }
+        yield* Scope.close(ownerScope, Exit.void);
+        assert.deepStrictEqual(yield* pending.awaitTerminal, { code: null, signal: "SIGTERM" });
+        const collected = yield* Fiber.await(collector);
+        assert.isTrue(Exit.isFailure(collected) || Exit.isFailure(collected.value));
+        assert.strictEqual(
+          (yield* Effect.result(Stream.run(Stream.make(encode("late\n")), pipe.stdin)))._tag,
+          "Failure",
+        );
+        assert.isUndefined(yield* pending.observeRetirement());
+      }).pipe(Effect.provideService(AgentScope, scope));
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "fixed pipe profile preserves the exact legacy V3 image and has a distinct complete hash",
+  () =>
+    Effect.gen(function* () {
+      using _nonce = vi
+        .spyOn(NodeCrypto, "randomUUID")
+        .mockReturnValue("00000000-0000-4000-8000-000000000001");
+      const harness = yield* makeHarness({ codex: true });
+      yield* Effect.gen(function* () {
+        const legacy = yield* preparePreparationProcessGate(input);
+        const protocol = yield* Gate.prepareControlledCodexProcessGate(input);
+        const script = [
+          'printf \'READY:%s:%s\\n\' "$1" "$$"',
+          "IFS= read -r release || exit 121",
+          '[ "$release" = "RELEASE:$1" ] || exit 122',
+          "printf 'EXEC:%s\\n' \"$1\"",
+          "shift",
+          'exec "$@" </dev/null',
+        ].join("\n");
+        const old = harness.images[0]!;
+        assert.strictEqual(old.args[1], script);
+        assert.strictEqual(old.args[2], "t3-preparation-gate");
+        const preimage = {
+          v: 3,
+          hostIdentity: fixtureHost,
+          creator: "synchronous-node-v1",
+          platform: "linux",
+          runtime: { kind: "node", version: process.versions.node },
+          executable: old.executable,
+          proposedUnit: legacy.proposedUnit,
+          args: old.args,
+          cwd: old.cwd,
+          environment: Object.entries(old.environment).sort(([a], [b]) =>
+            a < b ? -1 : a > b ? 1 : 0,
+          ),
+          spawn: {
+            shell: false,
+            detached: true,
+            windowsHide: false,
+            stdio: ["pipe", "pipe", "pipe"],
+          },
+          input: {
+            sinkEndOnDone: false,
+            encoding: "utf-8",
+            payloadStdin: "/dev/null",
+            nonce: "00000000-0000-4000-8000-000000000001",
+          },
+          cleanup: {
+            originalHandleOnly: true,
+            termWaitMs: 1000,
+            killWaitMs: 1000,
+            outsideWriter: true,
+          },
+        };
+        assert.strictEqual(
+          legacy.creationInputHash,
+          WorkflowCanonicalHash.tagged("t3.preparation-creation-input.v3", preimage),
+        );
+        const next = harness.images[1]!;
+        assert.strictEqual(next.args[1], script.replace('exec "$@" </dev/null', 'exec "$@"'));
+        assert.strictEqual(next.args[2], "t3-codex-pipe-gate");
+        assert.strictEqual(
+          protocol.creationInputHash,
+          WorkflowCanonicalHash.tagged("t3.codex-pipe-creation-input.v1", {
+            ...preimage,
+            v: 1,
+            profile: "linux-node-codex-pipe-v1",
+            args: next.args,
+            input: { ...preimage.input, payloadStdin: "pipe" },
+          }),
+        );
+        assert.notStrictEqual(protocol.creationInputHash, legacy.creationInputHash);
+        assert.strictEqual(harness.state.spawns, 0);
+      }).pipe(Effect.provide(harness.layer));
+    }),
+);
+it.effect.each([
+  "gate-fixture.scope",
+  "t3code-codex-shared.scope",
+  "t3code-codex-00000000-0000-0000-0000-000000000000.scope",
+])("Codex gate refuses nonfresh unit %s before creator preparation", (unit) =>
+  Effect.gen(function* () {
+    const harness = yield* makeHarness({ unit });
+    assert.strictEqual(
+      (yield* Effect.result(
+        Gate.prepareControlledCodexProcessGate(input).pipe(Effect.provide(harness.layer)),
+      ))._tag,
+      "Failure",
+    );
+    assert.strictEqual(harness.state.prepares, 0);
+    assert.strictEqual(harness.state.spawns, 0);
+  }),
+);
+it.effect("Codex gate refuses supplied profiles and stdin before any scope operation", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHarness({ codex: true });
+    for (const supplied of [
+      { profile: "linux-node-codex-pipe-v1" },
+      { stdin: undefined },
+      { stdin: Sink.drain },
+    ]) {
+      assert.strictEqual(
+        (yield* Effect.result(
+          Gate.prepareControlledCodexProcessGate({ ...input, ...supplied }).pipe(
+            Effect.provide(harness.layer),
+          ),
+        ))._tag,
+        "Failure",
+      );
+    }
+    assert.strictEqual(harness.state.wraps, 0);
+    assert.strictEqual(harness.state.prepares, 0);
+  }),
 );

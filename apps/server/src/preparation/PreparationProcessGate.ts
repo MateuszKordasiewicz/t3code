@@ -5,10 +5,14 @@ import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Pull from "effect/Pull";
 import * as Schema from "effect/Schema";
+import * as Deferred from "effect/Deferred";
+import * as Scope from "effect/Scope";
+import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import * as NodeChild from "./PreparationNodeChild.ts";
 
@@ -142,7 +146,59 @@ export interface PreparationGateLocalReceipt {
 }
 
 const prepareOwned = Effect.fn("PreparationProcessGate.prepare")(
-  function* (input: ReturnType<typeof ownInput>) {
+  function* <Output>(
+    input: ReturnType<typeof ownInput>,
+    profile: "preparation" | "codex",
+    finishOutput: (
+      stdout: Stream.Stream<Uint8Array, PreparationProcessGateError>,
+      stdin: Sink.Sink<void, Uint8Array, never, PreparationProcessGateError>,
+    ) => Output,
+  ) {
+    const pipe = profile === "codex";
+    const ownerScope = yield* Effect.scope;
+    const stopped = Deferred.makeUnsafe<void>();
+    const closed = () =>
+      pipe && (ownerScope.state._tag === "Closed" || Deferred.isDoneUnsafe(stopped));
+    const signalClose = () => {
+      if (pipe) Deferred.doneUnsafe(stopped, Exit.void);
+    };
+    const activeIo = new Set<Deferred.Deferred<void>>();
+    // Per-pull guards reuse the gate's tracing boundary.
+    const guardWork = Effect.fnUntraced(function* <A, E, R>(
+      stage: Stage,
+      work: Effect.Effect<A, E, R>,
+    ) {
+      return yield* !pipe
+        ? work
+        : Effect.uninterruptibleMask((restore) =>
+            Effect.suspend(() => {
+              if (closed()) return Effect.fail(failure(stage, "unavailable"));
+              const done = Deferred.makeUnsafe<void>();
+              activeIo.add(done);
+              return restore(
+                Effect.raceFirst(
+                  work,
+                  Deferred.await(stopped).pipe(
+                    Effect.andThen(Effect.fail(failure(stage, "unavailable"))),
+                  ),
+                ),
+              ).pipe(
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    activeIo.delete(done);
+                    Deferred.doneUnsafe(done, Exit.void);
+                  }),
+                ),
+              );
+            }),
+          ).pipe(Effect.interruptible);
+    });
+    const joinIo = Effect.fn("PreparationProcessGate.joinIo")(() =>
+      Effect.forEach(activeIo, (done) => Deferred.await(done), {
+        concurrency: "unbounded",
+        discard: true,
+      }),
+    );
     const path = yield* Path.Path;
     const hostCwd = yield* HostProcess.WorkingDirectory;
     const hostEnvironment = yield* HostProcess.Environment;
@@ -178,8 +234,15 @@ const prepareOwned = Effect.fn("PreparationProcessGate.prepare")(
     const nonce = yield* Effect.sync(NodeCrypto.randomUUID);
     const launch = yield* scope.wrap({
       command: "/bin/sh",
-      args: ["-c", gateScript, "t3-preparation-gate", nonce, input.command, ...input.args],
-      name: "preparation",
+      args: [
+        "-c",
+        pipe ? gateScript.replace('exec "$@" </dev/null', 'exec "$@"') : gateScript,
+        pipe ? "t3-codex-pipe-gate" : "t3-preparation-gate",
+        nonce,
+        input.command,
+        ...input.args,
+      ],
+      name: pipe ? "codex" : "preparation",
       env: owned.env,
       ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
     });
@@ -207,6 +270,11 @@ const prepareOwned = Effect.fn("PreparationProcessGate.prepare")(
     const executable = launch.command;
     if (
       !unit ||
+      (pipe && unit === "t3code-codex-00000000-0000-0000-0000-000000000000.scope") ||
+      (pipe &&
+        !/^t3code-codex-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.scope$/.test(
+          unit,
+        )) ||
       !original ||
       typeof original.bind !== "function" ||
       typeof original.stopAndObserve !== "function" ||
@@ -235,35 +303,58 @@ const prepareOwned = Effect.fn("PreparationProcessGate.prepare")(
       environment: owned.env,
     });
     const preparedChild = yield* creator.prepare(image);
-    const creationInputHash = WorkflowCanonicalHash.tagged("t3.preparation-creation-input.v3", {
-      v: 3,
-      hostIdentity,
-      creator: "synchronous-node-v1",
-      platform: "linux",
-      runtime: { kind: "node", version: process.versions.node },
-      executable,
-      proposedUnit: unit,
-      args: finalArgs,
-      cwd: owned.cwd,
-      environment: Object.entries(owned.env).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
-      spawn: { shell: false, detached: true, windowsHide: false, stdio: ["pipe", "pipe", "pipe"] },
-      input: { sinkEndOnDone: false, encoding: "utf-8", payloadStdin: "/dev/null", nonce },
-      cleanup: {
-        originalHandleOnly: true,
-        termWaitMs: 1000,
-        killWaitMs: 1000,
-        outsideWriter: true,
-      },
+    let retained: Effect.Success<ReturnType<typeof preparedChild.createLocal>> | undefined;
+    const stopPipe = Effect.fn("PreparationProcessGate.stopPipe")(function* () {
+      signalClose();
+      if (retained) yield* sanitize("cleanup", retained.kill()).pipe(Effect.ensuring(joinIo()));
+      else yield* joinIo();
     });
+    if (pipe) yield* Scope.addFinalizer(ownerScope, stopPipe().pipe(Effect.ignore));
+    const creationInputHash = WorkflowCanonicalHash.tagged(
+      pipe ? "t3.codex-pipe-creation-input.v1" : "t3.preparation-creation-input.v3",
+      {
+        v: pipe ? 1 : 3,
+        ...(pipe ? { profile: "linux-node-codex-pipe-v1" } : {}),
+        hostIdentity,
+        creator: "synchronous-node-v1",
+        platform: "linux",
+        runtime: { kind: "node", version: process.versions.node },
+        executable,
+        proposedUnit: unit,
+        args: finalArgs,
+        cwd: owned.cwd,
+        environment: Object.entries(owned.env).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+        spawn: {
+          shell: false,
+          detached: true,
+          windowsHide: false,
+          stdio: ["pipe", "pipe", "pipe"],
+        },
+        input: {
+          sinkEndOnDone: false,
+          encoding: "utf-8",
+          payloadStdin: pipe ? "pipe" : "/dev/null",
+          nonce,
+        },
+        cleanup: {
+          originalHandleOnly: true,
+          termWaitMs: 1000,
+          killWaitMs: 1000,
+          outsideWriter: true,
+        },
+      },
+    );
     let spawned = false;
     return Object.freeze({
       creationInputHash,
       hostIdentity,
       proposedUnit: unit,
       spawnHeld: Effect.fn("PreparationProcessGate.spawnHeld")(function* () {
+        if (closed()) return yield* failure("spawn", "unavailable");
         if (spawned) return yield* failure("spawn", "used");
         spawned = true;
         const child = yield* sanitize("spawn", preparedChild.createLocal());
+        retained = child;
         const initializeOutput = Stream.toPull(child.stdout);
         let pull: Effect.Success<typeof initializeOutput> | undefined;
         let pending: ReadonlyArray<Uint8Array> = [];
@@ -303,10 +394,20 @@ const prepareOwned = Effect.fn("PreparationProcessGate.prepare")(
         let stderrConsumed = false;
         const stderr = Stream.unwrap(
           Effect.suspend(() => {
+            if (closed()) return Effect.fail(failure("output", "unavailable"));
             if (stderrConsumed) return Effect.fail(failure("output", "used"));
             stderrConsumed = true;
             return Effect.succeed(
-              child.stderr.pipe(Stream.mapError(() => failure("output", "unknown"))),
+              !pipe
+                ? child.stderr.pipe(Stream.mapError(() => failure("output", "unknown")))
+                : Stream.fromPull(
+                    Effect.gen(function* () {
+                      const pull = yield* Stream.toPull(
+                        child.stderr.pipe(Stream.mapError(() => failure("output", "unknown"))),
+                      );
+                      return guardWork("output", pull);
+                    }),
+                  ).pipe(Stream.scoped),
             );
           }),
         );
@@ -314,32 +415,37 @@ const prepareOwned = Effect.fn("PreparationProcessGate.prepare")(
         const awaitHeld = Effect.fn("PreparationProcessGate.awaitHeld")(function* () {
           if (waited) return yield* failure("ready", "used");
           waited = true;
-          const binding = yield* sanitize(
+          const binding = yield* guardWork(
             "ready",
-            Effect.gen(function* () {
-              yield* child.awaitSpawn;
-              pull = yield* initializeOutput;
-              const line = yield* readLine("ready");
-              if (
-                line !== "READY:" + nonce + ":" + String(child.pid) ||
-                pending.slice(head).some((chunk) => chunk.length > 0) ||
-                !(yield* child.isRunning)
-              )
-                return yield* failure("ready", "protocol");
-              const pinned = yield* custody.bind(child.pid);
-              if (
-                !pinned ||
-                pinned.pid !== child.pid ||
-                pinned.unit !== unit ||
-                !(yield* child.isRunning)
-              )
-                return yield* failure("ready", "unavailable");
-              return pinned;
-            }).pipe(
-              Effect.timeoutOption("15 seconds"),
-              Effect.interruptible,
-              Effect.flatMap((result) =>
-                Effect.fromOption(result).pipe(Effect.mapError(() => failure("ready", "timeout"))),
+            sanitize(
+              "ready",
+              Effect.gen(function* () {
+                yield* child.awaitSpawn;
+                pull = yield* initializeOutput;
+                const line = yield* readLine("ready");
+                if (
+                  line !== "READY:" + nonce + ":" + String(child.pid) ||
+                  pending.slice(head).some((chunk) => chunk.length > 0) ||
+                  !(yield* child.isRunning)
+                )
+                  return yield* failure("ready", "protocol");
+                const pinned = yield* custody.bind(child.pid);
+                if (
+                  !pinned ||
+                  pinned.pid !== child.pid ||
+                  pinned.unit !== unit ||
+                  !(yield* child.isRunning)
+                )
+                  return yield* failure("ready", "unavailable");
+                return pinned;
+              }).pipe(
+                Effect.timeoutOption("15 seconds"),
+                Effect.interruptible,
+                Effect.flatMap((result) =>
+                  Effect.fromOption(result).pipe(
+                    Effect.mapError(() => failure("ready", "timeout")),
+                  ),
+                ),
               ),
             ),
           );
@@ -354,13 +460,18 @@ const prepareOwned = Effect.fn("PreparationProcessGate.prepare")(
               submitted = true;
               const release = new TextEncoder().encode("RELEASE:" + nonce + "\n");
               if (release.length > 256) return yield* failure("submit", "invalid");
-              yield* sanitize(
+              yield* guardWork(
                 "submit",
-                Stream.run(Stream.make(release), child.stdin).pipe(
-                  Effect.timeoutOption("2 seconds"),
-                  Effect.interruptible,
-                  Effect.flatMap((result) =>
-                    Option.isSome(result) ? Effect.void : Effect.fail(failure("submit", "unknown")),
+                sanitize(
+                  "submit",
+                  Stream.run(Stream.make(release), child.stdin).pipe(
+                    Effect.timeoutOption("2 seconds"),
+                    Effect.interruptible,
+                    Effect.flatMap((result) =>
+                      Option.isSome(result)
+                        ? Effect.void
+                        : Effect.fail(failure("submit", "unknown")),
+                    ),
                   ),
                 ),
               );
@@ -373,20 +484,23 @@ const prepareOwned = Effect.fn("PreparationProcessGate.prepare")(
               if (!receipt || selected !== receipt) return yield* failure("exec", "invalid");
               if (execConsumed) return yield* failure("exec", "used");
               execConsumed = true;
-              const line = yield* sanitize(
+              const line = yield* guardWork(
                 "exec",
-                readLine("exec").pipe(
-                  Effect.timeoutOption("5 seconds"),
-                  Effect.interruptible,
-                  Effect.flatMap((result) =>
-                    Effect.fromOption(result).pipe(
-                      Effect.mapError(() => failure("exec", "timeout")),
+                sanitize(
+                  "exec",
+                  readLine("exec").pipe(
+                    Effect.timeoutOption("5 seconds"),
+                    Effect.interruptible,
+                    Effect.flatMap((result) =>
+                      Effect.fromOption(result).pipe(
+                        Effect.mapError(() => failure("exec", "timeout")),
+                      ),
                     ),
                   ),
                 ),
               );
               if (line !== "EXEC:" + nonce) return yield* failure("exec", "protocol");
-              return Stream.fromPull(
+              const stdout = Stream.fromPull(
                 Effect.suspend(() => {
                   if (outputConsumed) return Effect.fail(failure("output", "used"));
                   outputConsumed = true;
@@ -405,9 +519,33 @@ const prepareOwned = Effect.fn("PreparationProcessGate.prepare")(
                       ),
                     );
                   });
-                  return Effect.succeed(outputPull);
+                  return Effect.succeed(guardWork("output", outputPull));
                 }),
               );
+              const output = !pipe
+                ? stdout
+                : Stream.unwrap(
+                    Effect.suspend(() =>
+                      closed()
+                        ? Effect.fail(failure("output", "unavailable"))
+                        : Effect.succeed(
+                            stdout.pipe(
+                              Stream.interruptWhen(
+                                Deferred.await(stopped).pipe(
+                                  Effect.andThen(Effect.fail(failure("output", "unavailable"))),
+                                ),
+                              ),
+                            ),
+                          ),
+                    ),
+                  );
+              const stdin = Sink.forEach((bytes: Uint8Array) =>
+                guardWork(
+                  "output",
+                  sanitize("output", Stream.run(Stream.make(bytes), child.stdin)),
+                ),
+              );
+              return finishOutput(output, stdin);
             }),
           });
         });
@@ -418,8 +556,14 @@ const prepareOwned = Effect.fn("PreparationProcessGate.prepare")(
           awaitTerminal: sanitize("output", child.awaitTerminal),
           stderr,
           awaitHeld,
-          stopOwnedChild: () => sanitize("cleanup", child.kill()),
-          stopAndObserve: () => custody.stopAndObserve(),
+          stopOwnedChild: () => (pipe ? stopPipe() : sanitize("cleanup", child.kill())),
+          stopAndObserve: () =>
+            !pipe
+              ? custody.stopAndObserve()
+              : Effect.sync(signalClose).pipe(
+                  Effect.andThen(custody.stopAndObserve()),
+                  Effect.ensuring(joinIo()),
+                ),
           observeRetirement: () => custody.observeRetirement(),
         });
       }),
@@ -430,7 +574,17 @@ const prepareOwned = Effect.fn("PreparationProcessGate.prepare")(
 
 export function preparePreparationProcessGate(input: PreparationProcessGateInput) {
   try {
-    return prepareOwned(ownInput(input));
+    return prepareOwned(ownInput(input), "preparation", (stdout) => stdout);
+  } catch {
+    return Effect.fail(failure("input", "invalid"));
+  }
+}
+
+export function prepareControlledCodexProcessGate(input: PreparationProcessGateInput) {
+  try {
+    return prepareOwned(ownInput(input), "codex", (stdout, stdin) =>
+      Object.freeze({ stdin, stdout }),
+    );
   } catch {
     return Effect.fail(failure("input", "invalid"));
   }
