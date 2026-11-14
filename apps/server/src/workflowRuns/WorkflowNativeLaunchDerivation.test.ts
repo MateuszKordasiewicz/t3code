@@ -14,6 +14,15 @@ import * as PreparationResource from "../preparation/PreparationProcessResource.
 import * as PreparationJob from "../preparation/PreparationJob.ts";
 import * as ThreadLaunch from "../orchestration-v2/ThreadLaunchService.ts";
 import * as NativeTransport from "../orchestration-v2/WorkflowNativeCodexTransport.ts";
+import * as ProviderInstances from "../provider/ProviderInstanceRegistry.ts";
+import * as CodexInstallation from "../provider/CodexInstallation.ts";
+import * as RuntimePolicy from "../orchestration-v2/RuntimePolicy.ts";
+import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import * as Continuations from "@t3tools/provider-core/server/ProviderContinuationRequests";
+import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
+import type { ServerProvider, ServerProviderCompatibilityAdvisory } from "@t3tools/contracts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import { makeGitVcsDriverCore } from "../vcs/GitVcsDriverCore.ts";
 import * as Settings from "../serverSettings.ts";
@@ -4252,7 +4261,147 @@ it.effect.each([false, true])(
 
 const nativeTransportEntry = Effect.fn("test.nativeTransportEntry")(function* (
   fixture: Effect.Success<ReturnType<typeof controlledNativeFixture>>,
+  managedPolicy?: Parameters<typeof Settings.layerTest>[1],
 ) {
+  const providerId = ProviderInstanceId.make("provider");
+  const initialSettings = Context.get(
+    yield* Layer.build(
+      Layer.fresh(
+        Settings.layerTest(
+          {
+            providerInstances: {
+              [providerId]: {
+                driver: "codex",
+                enabled: true,
+                config: { setupMode: "existing", binaryPath: "codex" },
+              },
+            },
+          },
+          managedPolicy,
+        ),
+      ),
+    ),
+    Settings.ServerSettingsService,
+  );
+  const usage = yield* Queue.unbounded<unknown>();
+  const versions = yield* Queue.unbounded<string>();
+  const facts = {
+    settings: yield* initialSettings.getSettings,
+    instance: undefined as ProviderInstance | undefined,
+    supportedModes: ["approval-required", "full-access"] as ("approval-required" | "full-access")[],
+    beforeUsage: Effect.void as Effect.Effect<void>,
+    beforeSnapshot: Effect.void as Effect.Effect<void>,
+    beforePolicy: Effect.void as Effect.Effect<void>,
+    afterPolicy: Effect.void as Effect.Effect<void>,
+    beforeCompatibility: Effect.void as Effect.Effect<void>,
+    advisory: undefined as ServerProviderCompatibilityAdvisory | undefined,
+    usage,
+    versions,
+  };
+  const adapter = {
+    instanceId: providerId,
+    driver: ProviderDriverKind.make("codex"),
+    getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+    planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
+    openSession: () => Effect.die("native fixture must not use the registry Adapter open path"),
+  } as ProviderAdapter.ProviderAdapterV2["Service"];
+  facts.instance = {
+    instanceId: providerId,
+    driverKind: ProviderDriverKind.make("codex"),
+    enabled: true,
+    displayName: undefined,
+    continuationIdentity: {
+      driverKind: ProviderDriverKind.make("codex"),
+      continuationKey: "fixture",
+    },
+    textGeneration: {
+      generateTranscriptionPostProcessing: () => Effect.die("native text generation"),
+      generateCommitMessage: () => Effect.die("native text generation"),
+      generatePrContent: () => Effect.die("native text generation"),
+      generateBranchName: () => Effect.die("native text generation"),
+      generateThreadTitle: () => Effect.die("native text generation"),
+      generateReviewGuide: () => Effect.die("native text generation"),
+    },
+    orchestrationAdapter: adapter,
+    snapshot: {
+      getSnapshot: Effect.suspend(() =>
+        facts.beforeSnapshot.pipe(
+          Effect.andThen(
+            Effect.sync(
+              () =>
+                ({
+                  instanceId: providerId,
+                  driver: ProviderDriverKind.make("codex"),
+                  supportedRuntimeModes: facts.supportedModes,
+                  enabled: true,
+                  installed: true,
+                  version: "1",
+                  status: "ready",
+                  auth: { status: "authenticated" },
+                  checkedAt: "2026-11-14T00:00:00Z",
+                  models: [],
+                  slashCommands: [],
+                  skills: [],
+                }) satisfies ServerProvider,
+            ),
+          ),
+        ),
+      ),
+      applyUsageLimits: (update: unknown) =>
+        facts.beforeUsage.pipe(Effect.andThen(Queue.offer(usage, update)), Effect.asVoid),
+      refresh: Effect.die("native fixture must not refresh or probe a provider"),
+      resolveMaintenance: () => Effect.die("native fixture must not resolve maintenance"),
+      streamChanges: Stream.empty,
+    },
+  };
+  const registry = ProviderInstances.ProviderInstanceRegistry.of({
+    getInstance: (id) => Effect.sync(() => (id === providerId ? facts.instance : undefined)),
+    listInstances: Effect.sync(() => (facts.instance ? [facts.instance] : [])),
+    listUnavailable: Effect.succeed([]),
+    streamChanges: Stream.empty,
+    subscribeChanges: Effect.never,
+  });
+  const settings = Settings.ServerSettingsService.of({
+    ...initialSettings,
+    getSettings: Effect.sync(() => facts.settings),
+  });
+  const projects = Context.get(
+    yield* Layer.build(
+      Layer.fresh(
+        ProjectStore.layer.pipe(Layer.provide(Layer.succeed(SqlClient.SqlClient, fixture.sql))),
+      ),
+    ),
+    ProjectStore.ProjectStoreV2,
+  );
+  const policy = Context.get(
+    yield* Layer.build(
+      RuntimePolicy.layerFromProjectStore.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.succeed(ProjectStore.ProjectStoreV2, projects),
+            Layer.succeed(ProviderInstances.ProviderInstanceRegistry, registry),
+            Layer.succeed(Settings.ServerSettingsService, settings),
+          ),
+        ),
+      ),
+    ),
+    RuntimePolicy.RuntimePolicyV2,
+  );
+  const installation = CodexInstallation.CodexInstallation.of({
+    managedDirectory: "/unused-installation",
+    resolve: () => Effect.die("native fixture must not resolve an installation"),
+    acquire: () => Effect.die("native fixture must not acquire an installation"),
+    compatibility: (version) =>
+      facts.beforeCompatibility.pipe(
+        Effect.andThen(Queue.offer(versions, version)),
+        Effect.andThen(Effect.sync(() => facts.advisory)),
+      ),
+    start: Effect.die("native fixture must not start installation"),
+    cancel: () => Effect.die("native fixture must not cancel installation"),
+    state: Effect.die("native fixture must not read installation state"),
+    changes: Stream.empty,
+    remove: () => Effect.die("native fixture must not remove installation"),
+  });
   const core = yield* makeGitVcsDriverCore().pipe(
     Effect.provideService(ServerConfig, fixture.config),
     Effect.provideService(
@@ -4261,26 +4410,36 @@ const nativeTransportEntry = Effect.fn("test.nativeTransportEntry")(function* (
     ),
     Effect.provide(NodeServices.layer),
   );
-  return yield* NativeTransport.makeNativeCodexTransport(fixture.authority.coordinator).pipe(
+  const service = yield* NativeTransport.makeNativeCodexTransport(
+    fixture.authority.coordinator,
+  ).pipe(
     Effect.provideService(GitVcsDriver.GitVcsDriver, core),
     Effect.provide(fixture.runtime),
     Effect.provideService(SqlClient.SqlClient, fixture.sql),
     Effect.provideService(ServerConfig, fixture.config),
+    Effect.provideService(Settings.ServerSettingsService, settings),
+    Effect.provideService(ProviderInstances.ProviderInstanceRegistry, registry),
+    Effect.provideService(CodexInstallation.CodexInstallation, installation),
+    Effect.provideService(
+      RuntimePolicy.RuntimePolicyV2,
+      RuntimePolicy.RuntimePolicyV2.of({
+        resolve: (input) =>
+          facts.beforePolicy.pipe(
+            Effect.andThen(policy.resolve(input)),
+            Effect.tap(() => facts.afterPolicy),
+          ),
+      }),
+    ),
     Effect.provide(
       Layer.mergeAll(
-        Settings.layerTest({
-          providerInstances: {
-            [ProviderInstanceId.make("provider")]: {
-              driver: "codex",
-              enabled: true,
-              config: { setupMode: "existing", binaryPath: "codex" },
-            },
-          },
-        }),
         NodeServices.layer,
+        IdAllocator.layer,
+        McpProviderSessions.layer,
+        Continuations.layer,
       ),
     ),
   );
+  return { ...service, facts };
 });
 it.effect.each(["workflow", "planning"] as const)(
   "real native %s transport owns the original retired workspace and denies every SDK frame",
@@ -5772,6 +5931,477 @@ it.effect.each(["snapshot", "stop-unmasked", "stop-masked"] as const)(
         assert.strictEqual(child.payloads.length, mode === "snapshot" ? 1 : 0);
         if (mode === "snapshot")
           assert.strictEqual(JSON.parse(child.payloads[0]!).method, "initialize");
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "native %s constructs its real unpublished Adapter on the original client",
+  (kind) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        const fixture = yield* controlledNativeFixture(kind, false, false, 2, false, {
+          type: "worktree",
+          baseRef: "main",
+          branch: "native-feature",
+        });
+        const service = yield* nativeTransportEntry(fixture);
+        const transport = yield* service.createReservedTransport(producerSelection(fixture));
+        const bootstrap = yield* transport.bootstrap();
+        Object.assign(bootstrap.response, { userAgent: "public-mutation/999" });
+        assert.isFunction(transport.createAdapterRuntime);
+        const initializedAgain = yield* Effect.result(transport.bootstrap());
+        assert.strictEqual(initializedAgain._tag, "Failure");
+        assert.isTrue(Object.isFrozen(transport.client));
+        assert.isTrue(Object.isFrozen(transport.client.raw));
+        assert.strictEqual(
+          (yield* Effect.result(fixture.sql.withTransaction(transport.createAdapterRuntime())))
+            ._tag,
+          "Failure",
+        );
+        const result = yield* transport.createAdapterRuntime();
+        assert.strictEqual(result.kind, "adapter-runtime-created");
+        assert.strictEqual(result.transportId, transport.transportId);
+        assert.strictEqual(
+          result.runtime.providerSession.id,
+          (transport.preparation.job.input.request.current as Record<string, unknown>)
+            .providerSessionId,
+        );
+        assert.isTrue(Object.isFrozen(result.runtime));
+        assert.isTrue(Object.isFrozen(result.runtime.providerSession));
+        assert.isFalse("input" in result);
+        assert.strictEqual(yield* Queue.take(service.facts.versions), "1");
+        assert.strictEqual(
+          (yield* Effect.result(transport.client.request("account/read", {})))._tag,
+          "Failure",
+        );
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        const child = harness.children.get(image.args[3]!)!;
+        assert.strictEqual(child.payloads.length, 2);
+        yield* Queue.offer(
+          child.output,
+          new TextEncoder().encode(
+            JSON.stringify({
+              method: "account/rateLimits/updated",
+              params: {
+                rateLimits: {
+                  limitId: "codex",
+                  primary: { usedPercent: 20, resetsAt: 2000100000, windowDurationMins: 300 },
+                },
+              },
+            }) + "\n",
+          ),
+        );
+        assert.isObject(yield* Queue.take(service.facts.usage));
+        assert.strictEqual(
+          (yield* Effect.result(transport.createAdapterRuntime()))._tag,
+          "Failure",
+        );
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT * FROM orchestration_v2_projection_provider_sessions`,
+          [],
+        );
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT status FROM orchestration_v2_projection_runs`,
+          [{ status: "preparing" }],
+        );
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT * FROM orchestration_v2_submission_attempts`,
+          [],
+        );
+        assert.strictEqual((yield* transport.close()).kind, "retired");
+        assert.isFalse(child.running);
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(
+  (["before-process", "before-adapter", "during-compatibility"] as const).flatMap((stage) =>
+    (["missing", "replaced", "disabled", "auth", "config", "supported-modes"] as const).map(
+      (change) => ({ stage, change }),
+    ),
+  ),
+)("native Adapter refuses $change profile $stage", ({ stage, change }) =>
+  Effect.gen(function* () {
+    const harness = yield* nativeWorkspaceProcesses();
+    yield* Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture("workflow", false, false, 2, false, {
+        type: "worktree",
+        baseRef: "main",
+        branch: "native-feature",
+      });
+      const service = yield* nativeTransportEntry(fixture);
+      const mutate = Effect.sync(() => {
+        const instance = service.facts.instance!;
+        if (change === "missing") service.facts.instance = undefined;
+        else if (change === "replaced") service.facts.instance = { ...instance };
+        else if (change === "disabled") service.facts.instance = { ...instance, enabled: false };
+        else if (change === "auth")
+          service.facts.instance = {
+            ...instance,
+            auth: {
+              start: () => Effect.die("native auth must not start"),
+              complete: () => Effect.die("native auth must not complete"),
+              cancel: () => Effect.die("native auth must not cancel"),
+              logout: () => Effect.die("native auth must not logout"),
+              withAccess: () => Effect.die("native auth must not acquire"),
+              subscribe: () => Stream.die("native auth must not subscribe"),
+            },
+          };
+        else if (change === "supported-modes") service.facts.supportedModes = ["approval-required"];
+        else {
+          const id = instance.instanceId;
+          const selected = service.facts.settings.providerInstances[id]!;
+          service.facts.settings = {
+            ...service.facts.settings,
+            providerInstances: {
+              ...service.facts.settings.providerInstances,
+              [id]: { ...selected, config: { setupMode: "managed", binaryPath: "codex" } },
+            },
+          };
+        }
+      });
+      if (stage === "before-process") {
+        yield* mutate;
+        const result = yield* Effect.result(
+          service.createReservedTransport(producerSelection(fixture)),
+        );
+        // Replacement and capability snapshots are captured at this boundary.
+        assert.strictEqual(
+          result._tag,
+          change === "replaced" || change === "supported-modes" ? "Success" : "Failure",
+        );
+        if (result._tag === "Success") yield* result.success.close();
+        else
+          assert.strictEqual(
+            harness.requests.filter((image) => image.args[4] === "/fixture-bin/codex").length,
+            0,
+          );
+        return;
+      }
+      const transport = yield* service.createReservedTransport(producerSelection(fixture));
+      yield* transport.bootstrap();
+      if (stage === "before-adapter") yield* mutate;
+      else service.facts.beforeCompatibility = mutate;
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(transport.createAdapterRuntime())));
+      const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+      const child = harness.children.get(image.args[3]!)!;
+      assert.strictEqual(child.payloads.length, 2);
+      assert.isFalse(child.running);
+      assert.strictEqual((yield* transport.close()).kind, "held");
+      assert.strictEqual((yield* Effect.result(transport.createAdapterRuntime()))._tag, "Failure");
+      assert.deepStrictEqual(
+        yield* fixture.sql`SELECT * FROM orchestration_v2_projection_provider_sessions`,
+        [],
+      );
+    }).pipe(Effect.provide(harness.services));
+  }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each([
+  "revoke",
+  "pause",
+  "generation",
+  "workspace",
+  "mode",
+  "model",
+  "project",
+  "broken",
+  "ceiling",
+  "dead",
+  "lost-return",
+] as const)("native Adapter holds its original owner after %s during construction", (change) =>
+  Effect.gen(function* () {
+    const harness = yield* nativeWorkspaceProcesses();
+    yield* Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture("planning", false, false, 2, false, {
+        type: "worktree",
+        baseRef: "main",
+        branch: "native-feature",
+      });
+      const service = yield* nativeTransportEntry(
+        fixture,
+        change === "ceiling"
+          ? {
+              organization: "Fixture",
+              lockedSettings: [],
+              limits: { maxRuntimeMode: "approval-required" },
+            }
+          : undefined,
+      );
+      const transport = yield* service.createReservedTransport(producerSelection(fixture));
+      assert.strictEqual((yield* Effect.result(transport.createAdapterRuntime()))._tag, "Failure");
+      yield* transport.bootstrap();
+      const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+      const child = harness.children.get(image.args[3]!)!;
+      service.facts.beforeCompatibility = Effect.gen(function* () {
+        if (change === "revoke") yield* fixture.sessions.revoke(fixture.reference.sessionId);
+        else if (change === "pause") yield* controlNativeFixture(fixture, "pause");
+        else if (change === "generation") {
+          yield* fixture.sql`UPDATE workflow_planning_sessions SET control_generation=2,record_version=3,record_json=json_set(record_json,'$.controlGeneration',2,'$.recordVersion',3)`;
+          yield* fixture.sql`UPDATE workflow_operations SET generation=2,record_json=json_set(record_json,'$.controlGeneration',2,'$.claim.generation',2)`;
+        } else if (change === "workspace")
+          yield* fixture.sql`UPDATE orchestration_v2_projection_threads SET payload_json=json_set(payload_json,'$.worktreePath','/foreign')`;
+        else if (change === "mode")
+          yield* fixture.sql`UPDATE orchestration_v2_projection_threads SET payload_json=json_set(payload_json,'$.runtimeMode','approval-required')`;
+        else if (change === "model")
+          yield* fixture.sql`UPDATE orchestration_v2_projection_runs SET payload_json=json_set(payload_json,'$.modelSelection.model','foreign')`;
+        else if (change === "project")
+          yield* fixture.sql`UPDATE projection_projects SET deleted_at=${facts.now} WHERE project_id='project'`;
+        else if (change === "dead") {
+          child.running = false;
+          yield* Deferred.succeed(child.terminal, { code: 1, signal: null });
+          yield* Queue.end(child.output);
+        }
+      }).pipe(Effect.orDie);
+      if (change === "broken")
+        service.facts.advisory = {
+          status: "broken",
+          message: null,
+          recommendedVersion: "1.0.0",
+          recommendedRange: null,
+        };
+      const original = fixture.sql.withTransaction;
+      let lost = false;
+      using _writer = vi
+        .spyOn(fixture.sql, "withTransaction")
+        .mockImplementation(<A, E, R>(work: Effect.Effect<A, E, R>) =>
+          original(work).pipe(
+            Effect.flatMap((value) => {
+              if (
+                change !== "lost-return" ||
+                lost ||
+                !value ||
+                typeof value !== "object" ||
+                !("key" in value)
+              )
+                return Effect.succeed(value);
+              lost = true;
+              return Effect.interrupt;
+            }),
+          ),
+        );
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(transport.createAdapterRuntime())));
+      assert.strictEqual(lost, change === "lost-return");
+      assert.strictEqual(child.payloads.length, 2);
+      assert.isFalse(child.running);
+      assert.strictEqual((yield* transport.close()).kind, "held");
+      assert.strictEqual((yield* Effect.result(transport.createAdapterRuntime()))._tag, "Failure");
+      assert.deepStrictEqual(
+        yield* fixture.sql`SELECT * FROM orchestration_v2_projection_provider_sessions`,
+        [],
+      );
+      assert.deepStrictEqual(
+        yield* fixture.sql`SELECT * FROM orchestration_v2_submission_attempts`,
+        [],
+      );
+    }).pipe(Effect.provide(harness.services));
+  }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(
+  ([false, true] as const).flatMap((masked) =>
+    (["caller", "constructor", "store"] as const).flatMap((boundary) =>
+      (["policy", "compatibility", "sql"] as const).map((stage) => ({ masked, boundary, stage })),
+    ),
+  ),
+)(
+  "native Adapter joins $stage unwind at $boundary under mask=$masked",
+  ({ masked, boundary, stage }) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      const storeScope = yield* Scope.make();
+      const constructorScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(constructorScope, Exit.void));
+      yield* Effect.addFinalizer(() => Scope.close(storeScope, Exit.void));
+      const entered = yield* Deferred.make<void>();
+      const unwinding = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      yield* Effect.gen(function* () {
+        const fixture = yield* controlledNativeFixture("workflow", false, false, 2, false, {
+          type: "worktree",
+          baseRef: "main",
+          branch: "native-feature",
+        }).pipe(Effect.provideService(Scope.Scope, storeScope));
+        const service = yield* nativeTransportEntry(fixture).pipe(
+          Effect.provideService(Scope.Scope, constructorScope),
+        );
+        const transport = yield* service.createReservedTransport(producerSelection(fixture));
+        yield* transport.bootstrap();
+        const blocked = Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Effect.never),
+          Effect.ensuring(
+            Deferred.succeed(unwinding, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          ),
+        );
+        if (stage === "policy") service.facts.beforePolicy = blocked;
+        if (stage === "compatibility") service.facts.beforeCompatibility = blocked;
+        const original = fixture.sql.withTransaction;
+        let armed = stage === "sql";
+        using _writer = vi
+          .spyOn(fixture.sql, "withTransaction")
+          .mockImplementation(<A, E, R>(work: Effect.Effect<A, E, R>) => {
+            if (!armed) return original(work);
+            armed = false;
+            return original(blocked);
+          });
+        const constructing = yield* transport
+          .createAdapterRuntime()
+          .pipe(
+            (work) => (masked ? Effect.uninterruptible(work) : work),
+            Effect.exit,
+            Effect.forkScoped,
+          );
+        yield* Deferred.await(entered);
+        const stopping = yield* (
+          boundary === "caller"
+            ? Fiber.interrupt(constructing)
+            : Scope.close(boundary === "store" ? storeScope : constructorScope, Exit.void)
+        ).pipe(Effect.forkScoped);
+        yield* Deferred.await(unwinding);
+        yield* Effect.sync(() => {
+          assert.isUndefined(stopping.pollUnsafe());
+          assert.isUndefined(constructing.pollUnsafe());
+        }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+        yield* Fiber.join(stopping);
+        const exit = yield* Fiber.await(constructing);
+        assert.isTrue(
+          Exit.isFailure(exit)
+            ? Cause.hasInterrupts(exit.cause)
+            : Exit.isFailure(exit.value) && Cause.hasInterrupts(exit.value.cause),
+        );
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        const child = harness.children.get(image.args[3]!)!;
+        assert.strictEqual(child.payloads.length, 2);
+        assert.isFalse(child.running);
+        assert.strictEqual(
+          (yield* fixture.sql`SELECT settlement_json FROM orchestration_v2_submission_transports`)[0]!
+            .settlement_json,
+          null,
+        );
+        assert.strictEqual(
+          yield* fixture.sql.withTransaction(Effect.succeed("writer released")),
+          "writer released",
+        );
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(["policy", "compatibility", "final-profile", "final-current"] as const)(
+  "native Adapter times out its original %s without retry",
+  (stage) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      yield* Effect.gen(function* () {
+        const fixture = yield* controlledNativeFixture("planning", false, false, 2, false, {
+          type: "worktree",
+          baseRef: "main",
+          branch: "native-feature",
+        });
+        const service = yield* nativeTransportEntry(fixture);
+        const transport = yield* service.createReservedTransport(producerSelection(fixture));
+        yield* transport.bootstrap();
+        const blocked = Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+        );
+        if (stage === "policy") service.facts.beforePolicy = blocked;
+        else if (stage === "compatibility") service.facts.beforeCompatibility = blocked;
+        let policies = 0;
+        let writes = 0;
+        if (stage === "final-profile" || stage === "final-current")
+          service.facts.afterPolicy = Effect.sync(() => {
+            if (++policies === 2 && stage === "final-profile")
+              service.facts.beforeSnapshot = blocked;
+          });
+        const original = fixture.sql.withTransaction;
+        using _writer = vi
+          .spyOn(fixture.sql, "withTransaction")
+          .mockImplementation(<A, E, R>(work: Effect.Effect<A, E, R>) => {
+            if (stage === "final-current" && policies === 2 && ++writes === 2)
+              return original(blocked);
+            return original(work);
+          });
+        const constructing = yield* transport
+          .createAdapterRuntime()
+          .pipe(Effect.exit, Effect.forkScoped);
+        yield* Deferred.await(entered);
+        yield* TestClock.adjust("10 seconds");
+        yield* Deferred.succeed(release, undefined);
+        assert.isTrue(Exit.isFailure(yield* Fiber.join(constructing)));
+        assert.strictEqual((yield* transport.close()).kind, "held");
+        assert.strictEqual(
+          (yield* Effect.result(transport.createAdapterRuntime()))._tag,
+          "Failure",
+        );
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        const child = harness.children.get(image.args[3]!)!;
+        assert.strictEqual(child.payloads.length, 2);
+        assert.isFalse(child.running);
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "native %s runtime joins the actual Adapter notification handler before settlement",
+  (kind) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      const entered = yield* Deferred.make<void>();
+      const unwinding = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      yield* Effect.gen(function* () {
+        const fixture = yield* controlledNativeFixture(kind, false, false, 2, false, {
+          type: "worktree",
+          baseRef: "main",
+          branch: "native-feature",
+        });
+        const service = yield* nativeTransportEntry(fixture);
+        const transport = yield* service.createReservedTransport(producerSelection(fixture));
+        yield* transport.bootstrap();
+        yield* transport.createAdapterRuntime();
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        const child = harness.children.get(image.args[3]!)!;
+        service.facts.beforeUsage = Effect.gen(function* () {
+          const reentrant = yield* Effect.result(transport.close());
+          assert.strictEqual(reentrant._tag, "Failure");
+          yield* Deferred.succeed(entered, undefined);
+          return yield* Effect.never;
+        }).pipe(
+          Effect.ensuring(
+            Deferred.succeed(unwinding, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          ),
+        );
+        yield* Queue.offer(
+          child.output,
+          new TextEncoder().encode(
+            JSON.stringify({
+              method: "account/rateLimits/updated",
+              params: {
+                rateLimits: {
+                  limitId: "codex",
+                  primary: { usedPercent: 20, resetsAt: 2000100000, windowDurationMins: 300 },
+                },
+              },
+            }) + "\n",
+          ),
+        );
+        yield* Deferred.await(entered);
+        const closing = yield* transport.close().pipe(Effect.forkScoped);
+        yield* Deferred.await(unwinding);
+        yield* Effect.gen(function* () {
+          assert.isUndefined(closing.pollUnsafe());
+          assert.strictEqual(
+            (yield* fixture.sql`SELECT settlement_json FROM orchestration_v2_submission_transports`)[0]!
+              .settlement_json,
+            null,
+          );
+        }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+        assert.strictEqual((yield* Fiber.join(closing)).kind, "retired");
+        assert.isFalse(child.running);
+        assert.strictEqual(child.payloads.length, 2);
       }).pipe(Effect.provide(harness.services));
     }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
 );

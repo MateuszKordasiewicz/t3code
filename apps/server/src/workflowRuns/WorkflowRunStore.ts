@@ -7504,6 +7504,9 @@ const makeStore = Effect.fnUntraced(function* (
         let held: Held | undefined;
         let constructor: Fiber.Fiber<unknown, unknown> | undefined;
         let bootstrap: Fiber.Fiber<unknown, unknown> | undefined;
+        let adapterConstruction: Fiber.Fiber<unknown, unknown> | undefined;
+        let adapterInputKey: string | undefined;
+        let adapterAccepted = false;
         let bootstrapPhase: "new" | "initialize" | "confirmed" | "initialized" = "new";
         const initializeParams = buildCodexAdapterInitializeParams();
         const initializeJson = stableStringify(initializeParams);
@@ -7645,6 +7648,94 @@ const makeStore = Effect.fnUntraced(function* (
             ),
             Effect.interruptible,
           );
+        const readAdapterInput = Effect.fn("WorkflowRunStore.readNativeAdapterInput")(function* () {
+          yield* checkCurrent(true);
+          const threads = yield* sql<{
+            payload_json: string;
+          }>`SELECT payload_json FROM orchestration_v2_projection_threads WHERE thread_id=${job.input.threadId}`;
+          const runs = yield* sql<{
+            payload_json: string;
+          }>`SELECT payload_json FROM orchestration_v2_projection_runs WHERE run_id=${job.input.runId}`;
+          if (threads.length !== 1 || runs.length !== 1) return yield* integrity();
+          const thread = yield* decodeWorkspaceThread(threads[0]!.payload_json).pipe(
+            Effect.mapError(integrity),
+          );
+          const run = yield* decodeNativeFinalizationRun(runs[0]!.payload_json).pipe(
+            Effect.mapError(integrity),
+          );
+          const key = yield* Effect.try({
+            try: () =>
+              WorkflowCanonicalHash.tagged("t3.native-adapter-input.v1", {
+                threadId: thread.id,
+                projectId: thread.projectId,
+                branch: thread.branch,
+                cwd: thread.worktreePath,
+                runtimeMode: thread.runtimeMode,
+                interactionMode: thread.interactionMode,
+                runId: run.id,
+                modelSelection: run.modelSelection,
+                providerSessionId: current.providerSessionId,
+              }),
+            catch: integrity,
+          });
+          return { thread, modelSelection: run.modelSelection, key };
+        });
+        const captureAdapterConstruction = Effect.fn(
+          "WorkflowRunStore.captureNativeAdapterConstruction",
+        )(function* () {
+          yield* outside();
+          return yield* Effect.uninterruptibleMask((resume) =>
+            Effect.gen(function* () {
+              const fiber = yield* Effect.withFiber(Effect.succeed);
+              const initialized = bootstrap?.pollUnsafe();
+              if (
+                adapterConstruction ||
+                !initialized ||
+                Exit.isFailure(initialized) ||
+                bootstrapPhase !== "initialized" ||
+                flags.stopped ||
+                flags.blocked ||
+                runtime.scope.state._tag === "Closed"
+              )
+                return yield* integrity();
+              adapterConstruction = fiber;
+              const input = yield* resume(
+                body(
+                  writer(readAdapterInput(), (value) => {
+                    adapterInputKey = value.key;
+                  }),
+                ),
+              );
+              return Object.freeze({ thread: input.thread, modelSelection: input.modelSelection });
+            }),
+          );
+        }, Effect.interruptible);
+        const confirmAdapterConstruction = Effect.fn(
+          "WorkflowRunStore.confirmNativeAdapterConstruction",
+        )(function* () {
+          yield* outside();
+          const fiber = yield* Effect.withFiber(Effect.succeed);
+          const completed = adapterConstruction?.pollUnsafe();
+          if (
+            !adapterConstruction ||
+            !adapterInputKey ||
+            flags.stopped ||
+            flags.blocked ||
+            (adapterConstruction.id !== fiber.id && (!completed || Exit.isFailure(completed)))
+          )
+            return yield* integrity();
+          yield* body(
+            writer(
+              Effect.gen(function* () {
+                const input = yield* readAdapterInput();
+                if (input.key !== adapterInputKey) return yield* stale();
+              }),
+              () => {
+                if (completed && Exit.isSuccess(completed)) adapterAccepted = true;
+              },
+            ),
+          );
+        }, Effect.interruptible);
         const close = Effect.fn("WorkflowRunStore.closeNativeCodexTransport")(function* () {
           yield* outside();
           return yield* Effect.uninterruptible(
@@ -7653,6 +7744,8 @@ const makeStore = Effect.fnUntraced(function* (
                 if (
                   (constructor?.id === fiber.id && constructor.pollUnsafe() === undefined) ||
                   (bootstrap?.id === fiber.id && bootstrap.pollUnsafe() === undefined) ||
+                  (adapterConstruction?.id === fiber.id &&
+                    adapterConstruction.pollUnsafe() === undefined) ||
                   [...bodies].some(
                     (invocation) =>
                       invocation.fiber.id === fiber.id && !Deferred.isDoneUnsafe(invocation.done),
@@ -7671,6 +7764,8 @@ const makeStore = Effect.fnUntraced(function* (
                     constructor.interruptUnsafe();
                   if (bootstrap && bootstrap.pollUnsafe() === undefined)
                     bootstrap.interruptUnsafe();
+                  if (adapterConstruction && adapterConstruction.pollUnsafe() === undefined)
+                    adapterConstruction.interruptUnsafe();
                   for (const invocation of bodies) invocation.fiber.interruptUnsafe();
                   yield* Effect.forEach(bodies, (invocation) => Deferred.await(invocation.done), {
                     concurrency: "unbounded",
@@ -7678,6 +7773,9 @@ const makeStore = Effect.fnUntraced(function* (
                   });
                   const constructed = constructor ? yield* Fiber.await(constructor) : undefined;
                   const initialized = bootstrap ? yield* Fiber.await(bootstrap) : undefined;
+                  const adapted = adapterConstruction
+                    ? yield* Fiber.await(adapterConstruction)
+                    : undefined;
                   const closed = yield* Effect.exit(Scope.close(physical, Exit.void));
                   const stopped = pending
                     ? yield* Effect.exit(pending.stopOwnedChild())
@@ -7690,6 +7788,8 @@ const makeStore = Effect.fnUntraced(function* (
                       (!initialized ||
                         Exit.isFailure(initialized) ||
                         bootstrapPhase !== "initialized")) ||
+                    (adapterConstruction !== undefined &&
+                      (!adapted || Exit.isFailure(adapted) || !adapterAccepted)) ||
                     Exit.isFailure(closed) ||
                     Exit.isFailure(stopped) ||
                     !pending ||
@@ -7972,6 +8072,8 @@ const makeStore = Effect.fnUntraced(function* (
           scope: physical as Scope.Scope,
           close,
           open,
+          captureAdapterConstruction,
+          confirmAdapterConstruction,
           captureBootstrap: Effect.fn("WorkflowRunStore.captureNativeCodexBootstrap")(function* () {
             yield* outside();
             const fiber = yield* Effect.withFiber(Effect.succeed);
