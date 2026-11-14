@@ -1,3 +1,5 @@
+import * as PreparationOwner from "../preparation/PreparationProcessOwner.ts";
+import { SpawnExecutableResolution } from "@t3tools/shared/shell";
 // @effect-diagnostics nodeBuiltinImport:off - realpathSync.native resolves Windows 8.3 short names, which the Effect realPath does not.
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
@@ -6832,3 +6834,197 @@ describe("Windows long path configuration", () => {
     }
   });
 });
+
+const preparationCoreFixture = Effect.fn("test.preparationCoreFixture")(function* (
+  code = 0,
+  beforeExit: Effect.Effect<void> = Effect.void,
+) {
+  const storeScope = yield* Scope.make();
+  yield* Effect.addFinalizer(() => Scope.close(storeScope, Exit.void));
+  const inputs: PreparationOwner.CommandInput[] = [];
+  const records = new Map<object, { readonly id: string; closed: boolean }>();
+  const owner = yield* PreparationOwner.make(
+    { jobId: "job", threadId: "thread", runId: "run" },
+    storeScope,
+    {
+      checkOutsideWriter: () => Effect.void,
+      prepareCommand: (input, state) =>
+        Effect.gen(function* () {
+          inputs.push(input);
+          const ref = Object.freeze({});
+          const record = { id: String(inputs.length), closed: false };
+          records.set(ref, record);
+          yield* Scope.addFinalizer(
+            state.commandScope,
+            Effect.sync(() => {
+              record.closed = true;
+            }),
+          );
+          return ref;
+        }),
+      createCommand: (ref) =>
+        Effect.succeed({
+          resourceId: records.get(ref)!.id,
+          stderr: Stream.encodeText(Stream.make("diagnostic\n")),
+        }),
+      startCommand: () => Effect.succeed(Stream.encodeText(Stream.make("payload\n"))),
+      collectCommand: () => beforeExit.pipe(Effect.as(code)),
+      assessInventory: () =>
+        Effect.sync(() => ({
+          kind: "sealed",
+          jobId: "job",
+          inventory: [...records.values()].every((value) => value.closed) ? "all-retired" : "held",
+          resources: [...records.values()].map((value) => ({
+            resourceId: value.id,
+            state: value.closed ? ("settled" as const) : ("held" as const),
+          })),
+        })),
+    },
+    { intakeSealed: false, stopping: false, blocked: false },
+  );
+  const core = yield* makeGitVcsDriverCore().pipe(
+    Effect.provideService(SpawnExecutableResolution, (_command, _platform, env) =>
+      env.PATH === "/captured-bin" ? "/captured-bin/git" : undefined,
+    ),
+    Effect.provideService(
+      ChildProcessSpawner.ChildProcessSpawner,
+      ChildProcessSpawner.make(() => Effect.die("raw preparation spawn")),
+    ),
+  );
+  return { owner, inputs, core };
+});
+
+it.effect(
+  "selected preparation Core uses the actual constructed owner and existing concurrent collectors",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* preparationCoreFixture();
+      const lines: string[] = [];
+      const result = yield* fixture.core
+        .execute({
+          operation: "test.preparation",
+          cwd: "/workspace",
+          args: ["status"],
+          env: { PATH: "/captured-bin" },
+          maxOutputBytes: 4,
+          appendTruncationMarker: true,
+          progress: {
+            onStdoutLine: (line) =>
+              Effect.sync(() => {
+                lines.push(line);
+              }),
+          },
+        })
+        .pipe(
+          Effect.provideService(PreparationOwner.Current, fixture.owner),
+          Effect.provideService(SpawnExecutableResolution, () => "/foreign/git"),
+        );
+      assert.strictEqual(result.exitCode, 0);
+      assert.strictEqual(result.stdout, "payl");
+      assert.isTrue(result.stdoutTruncated);
+      assert.strictEqual(fixture.inputs.length, 1);
+      assert.strictEqual(fixture.inputs[0]!.command, "/captured-bin/git");
+      assert.deepStrictEqual(fixture.inputs[0]!.args, ["status"]);
+      assert.strictEqual(fixture.inputs[0]!.env?.PATH, "/captured-bin");
+      assert.strictEqual(fixture.inputs[0]!.extendEnv, false);
+      assert.isFalse(Object.hasOwn(fixture.inputs[0]!, "stdin"));
+      assert.deepStrictEqual(lines, ["payl"]);
+      assert.strictEqual((yield* fixture.owner.seal()).inventory, "all-retired");
+    }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("selected preparation Core preserves nonzero Git failure mapping", () =>
+  Effect.gen(function* () {
+    const fixture = yield* preparationCoreFixture(7);
+    const result = yield* Effect.result(
+      fixture.core
+        .execute({
+          operation: "test.preparation",
+          cwd: "/workspace",
+          args: ["status"],
+          env: { PATH: "/captured-bin" },
+        })
+        .pipe(Effect.provideService(PreparationOwner.Current, fixture.owner)),
+    );
+    assert.strictEqual(result._tag, "Failure");
+    if (result._tag === "Failure") assert.strictEqual(result.failure.exitCode, 7);
+    assert.strictEqual(fixture.inputs.length, 1);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect.each([
+  "stdin",
+  "stdin-undefined",
+  "trace",
+  "force-kill",
+  "executable",
+  "forged",
+  "fast-checkout",
+] as const)("selected preparation Core refuses %s before a command or branch mutation", (mode) =>
+  Effect.gen(function* () {
+    const fixture = yield* preparationCoreFixture();
+    const work =
+      mode === "fast-checkout"
+        ? fixture.core
+            .createWorktree(
+              { cwd: "/workspace", refName: "main", newRefName: "feature", path: null },
+              { fastCheckout: true, submodules: "none" },
+            )
+            .pipe(Effect.asVoid)
+        : fixture.core
+            .execute({
+              operation: "test.preparation",
+              cwd: "/workspace",
+              args: ["status"],
+              env: { PATH: mode === "executable" ? "/missing" : "/captured-bin" },
+              ...(mode === "stdin"
+                ? { stdin: "input" }
+                : mode === "stdin-undefined"
+                  ? { stdin: undefined }
+                  : {}),
+              ...(mode === "trace" ? { progress: { onHookStarted: () => Effect.void } } : {}),
+              ...(mode === "force-kill" ? { forceKillAfterMs: 1 } : {}),
+            } as GitVcsDriver.ExecuteGitInput)
+            .pipe(Effect.asVoid);
+    const result = yield* Effect.result(
+      work.pipe(
+        Effect.provideService(
+          PreparationOwner.Current,
+          mode === "forged" ? { ...fixture.owner } : fixture.owner,
+        ),
+      ),
+    );
+    assert.strictEqual(result._tag, "Failure");
+    assert.strictEqual(fixture.inputs.length, 0);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("selected preparation Core timeout joins command cleanup", () =>
+  Effect.gen(function* () {
+    const collecting = yield* Deferred.make<void>();
+    const fixture = yield* preparationCoreFixture(
+      0,
+      Deferred.succeed(collecting, undefined).pipe(Effect.andThen(Effect.never)),
+    );
+    const running = yield* fixture.core
+      .execute({
+        operation: "test.preparation",
+        cwd: "/workspace",
+        args: ["status"],
+        env: { PATH: "/captured-bin" },
+        timeoutMs: 1,
+      })
+      .pipe(
+        Effect.provideService(PreparationOwner.Current, fixture.owner),
+        Effect.result,
+        Effect.forkScoped,
+      );
+    yield* Deferred.await(collecting);
+    yield* TestClock.adjust("1 millis");
+    const result = yield* Fiber.join(running);
+    assert.strictEqual(result._tag, "Failure");
+    if (result._tag === "Failure")
+      assert.strictEqual(result.failure.detail, "Git command timed out.");
+    assert.strictEqual((yield* fixture.owner.seal()).inventory, "all-retired");
+  }).pipe(Effect.provide(layerTest)),
+);

@@ -36,7 +36,12 @@ import { dedupeRemoteBranchesWithLocalMatches } from "@t3tools/shared/git";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { compactTraceAttributes } from "@t3tools/shared/observability";
 import { decodeJsonResult } from "@t3tools/shared/schemaJson";
-import { resolveSpawnCommand, runsGitWithoutConsole } from "@t3tools/shared/shell";
+import {
+  resolveSpawnCommand,
+  runsGitWithoutConsole,
+  SpawnExecutableResolution,
+} from "@t3tools/shared/shell";
+import * as PreparationOwner from "../preparation/PreparationProcessOwner.ts";
 import { parseT3ProjectFile } from "@t3tools/shared/t3ProjectFile";
 import { resolveProjectFileBackedSetting } from "@t3tools/shared/projectSettings";
 import { gitCommandDuration, gitCommandsTotal, withMetrics } from "../observability/Metrics.ts";
@@ -55,6 +60,7 @@ import { makeIsServerInternalPath } from "../auth/serverInternalPaths.ts";
 import * as ServerConfig from "../config.ts";
 import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
 
+const isGitCommandError = Schema.is(GitCommandError);
 const DEFAULT_TIMEOUT_MS = 30_000;
 /** T3's record of the branch, named as on the host, that a branch was cut from. */
 const branchBaseConfigKey = (branch: string) => `branch.${branch}.t3-merge-base`;
@@ -842,7 +848,10 @@ const OUTPUT_LINE_SEPARATOR = /\r\n|\r|\n/;
 
 const collectOutput = Effect.fnUntraced(function* (
   input: Pick<GitVcsDriver.ExecuteGitInput, "operation" | "cwd" | "args">,
-  stream: Stream.Stream<Uint8Array, PlatformError.PlatformError>,
+  stream: Stream.Stream<
+    Uint8Array,
+    PlatformError.PlatformError | PreparationOwner.PreparationProcessOwnerError
+  >,
   maxOutputBytes: number,
   appendTruncationMarker: boolean,
   onLine: ((line: string) => Effect.Effect<void, never>) | undefined,
@@ -912,14 +921,15 @@ const collectOutput = Effect.fnUntraced(function* (
   });
 
   yield* Stream.runForEach(stream, processChunk).pipe(
-    Effect.catchTags({
-      PlatformError: (cause) =>
-        new GitCommandError({
-          ...gitCommandContext(input),
-          detail: "Failed to read Git process output.",
-          cause,
-        }),
-    }),
+    Effect.mapError((cause) =>
+      isGitCommandError(cause)
+        ? cause
+        : new GitCommandError({
+            ...gitCommandContext(input),
+            detail: "Failed to read Git process output.",
+            cause,
+          }),
+    ),
   );
 
   const remainder = truncated ? "" : decoder.decode();
@@ -950,12 +960,27 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   const isServerInternalPath = yield* makeIsServerInternalPath;
   const digest = yield* Digest.Digest;
   const hostPlatform = yield* HostProcess.Platform;
+  const executableResolution = yield* SpawnExecutableResolution;
   const serviceScope = yield* Effect.scope;
   const statusFetches = new Map<string, Fiber.Fiber<void, GitCommandError>>();
   const statusFetchProcesses = yield* Semaphore.make(4);
 
   const executeRaw: GitVcsDriver.GitVcsDriver["Service"]["execute"] = Effect.fnUntraced(
     function* (input) {
+      const owner = yield* PreparationOwner.Current;
+      if (
+        owner !== undefined &&
+        (!PreparationOwner.isOwner(owner) ||
+          hostPlatform !== "linux" ||
+          Object.hasOwn(input, "stdin") ||
+          input.forceKillAfterMs !== undefined ||
+          input.progress?.onHookStarted !== undefined ||
+          input.progress?.onHookFinished !== undefined)
+      )
+        return yield* new GitCommandError({
+          ...gitCommandContext(input),
+          detail: "Unsupported native preparation Git profile.",
+        });
       const commandInput = {
         ...input,
         args: [...input.args],
@@ -986,31 +1011,64 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         };
         const env = { ...baseEnv, ...explicitBareRepositoryEnv(baseEnv, hostPlatform) };
         const spawnEnv = { ...env, ...windowsLongPathConfigEnv(hostPlatform, env) };
-        const resolved = yield* resolveSpawnCommand("git", [], { env: spawnEnv });
+        const selectedExecutable = owner
+          ? executableResolution("git", "linux", spawnEnv)
+          : undefined;
+        if (owner && (!selectedExecutable || !path.isAbsolute(selectedExecutable)))
+          return yield* new GitCommandError({
+            ...gitCommandContext(commandInput),
+            detail: "Native preparation requires an absolute Git executable.",
+          });
+        const resolved = owner
+          ? { command: selectedExecutable!, shell: false }
+          : yield* resolveSpawnCommand("git", [], { env: spawnEnv });
         // cmd wrappers truncate multiline commits; leave git.cmd handling to Node lookup.
         const executable = resolved.shell ? "git" : resolved.command;
-        const child = yield* commandSpawner
-          .spawn(
-            ChildProcess.make(executable, commandInput.args, {
-              cwd: commandInput.cwd,
-              env: spawnEnv,
-              forceKillAfter: input.forceKillAfterMs,
-              ...(runsGitWithoutConsole(hostPlatform, executable, commandInput.args)
-                ? { detached: true, windowsHide: true }
-                : {}),
-            }),
-          )
-          .pipe(
-            Effect.mapError(
-              (cause) =>
-                new GitCommandError({
-                  ...gitCommandContext(commandInput),
-                  detail: "Failed to spawn Git process.",
-                  cause,
+        const child = owner
+          ? yield* owner
+              .start({
+                command: executable,
+                args: commandInput.args,
+                cwd: commandInput.cwd,
+                env: spawnEnv,
+                extendEnv: false,
+              })
+              .pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new GitCommandError({
+                      ...gitCommandContext(commandInput),
+                      detail: "Failed to start owned Git process.",
+                      cause,
+                    }),
+                ),
+              )
+          : yield* commandSpawner
+              .spawn(
+                ChildProcess.make(executable, commandInput.args, {
+                  cwd: commandInput.cwd,
+                  env: spawnEnv,
+                  forceKillAfter: input.forceKillAfterMs,
+                  ...(runsGitWithoutConsole(hostPlatform, executable, commandInput.args)
+                    ? { detached: true, windowsHide: true }
+                    : {}),
                 }),
-            ),
-          );
+              )
+              .pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new GitCommandError({
+                      ...gitCommandContext(commandInput),
+                      detail: "Failed to spawn Git process.",
+                      cause,
+                    }),
+                ),
+              );
 
+        const childExit: Effect.Effect<
+          number,
+          PlatformError.PlatformError | PreparationOwner.PreparationProcessOwnerError
+        > = child.exitCode;
         const [stdout, stderr, exitCode] = yield* Effect.all(
           [
             collectOutput(
@@ -1029,7 +1087,8 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
               input.progress?.onStderrLine,
               input.keepLineCallbacksAfterTruncation,
             ),
-            child.exitCode.pipe(
+            childExit.pipe(
+              Effect.map(ChildProcessSpawner.ExitCode),
               Effect.mapError(
                 (cause) =>
                   new GitCommandError({
@@ -1039,7 +1098,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
                   }),
               ),
             ),
-            input.stdin === undefined
+            input.stdin === undefined || !("stdin" in child)
               ? Effect.void
               : Stream.run(Stream.encodeText(Stream.make(input.stdin)), child.stdin).pipe(
                   Effect.mapError(
@@ -4250,6 +4309,19 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   const createWorktree: GitVcsDriver.GitVcsDriver["Service"]["createWorktree"] = Effect.fn(
     "createWorktree",
   )(function* (input, options) {
+    const owner = yield* PreparationOwner.Current;
+    if (
+      owner !== undefined &&
+      (!PreparationOwner.isOwner(owner) ||
+        options?.fastCheckout === true ||
+        options?.submodules !== "none")
+    )
+      return yield* new GitCommandError({
+        operation: "GitVcsDriver.createWorktree",
+        command: "git worktree add",
+        cwd: input.cwd,
+        detail: "Unsupported native preparation worktree profile.",
+      });
     yield* refuseOptionLikeRefName("GitVcsDriver.createWorktree", input.cwd, input.refName);
     yield* refuseOptionLikeRefName("GitVcsDriver.createWorktree", input.cwd, input.newRefName);
     const targetBranch = input.newRefName ?? input.refName;

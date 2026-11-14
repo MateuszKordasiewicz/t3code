@@ -1,3 +1,20 @@
+import * as FileSystem from "effect/FileSystem";
+import { ChildProcessSpawner } from "effect/process";
+import { AgentScope, type AgentScopeBinding } from "@t3tools/shared/AgentScope";
+import * as HostProcess from "@t3tools/shared/HostProcess";
+import { SpawnExecutableResolution } from "@t3tools/shared/shell";
+import * as Cause from "effect/Cause";
+import * as Exit from "effect/Exit";
+import * as Scope from "effect/Scope";
+import * as Queue from "effect/Queue";
+import * as Sink from "effect/Sink";
+import * as PreparationNode from "../preparation/PreparationNodeChild.ts";
+import * as PreparationResource from "../preparation/PreparationProcessResource.ts";
+import * as PreparationJob from "../preparation/PreparationJob.ts";
+import * as ThreadLaunch from "../orchestration-v2/ThreadLaunchService.ts";
+import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+import { makeGitVcsDriverCore } from "../vcs/GitVcsDriverCore.ts";
+import * as Settings from "../serverSettings.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
@@ -2482,6 +2499,7 @@ const controlledNativeFixture = Effect.fn("test.controlledNativeFixture")(functi
   claim = true,
   materialVersion: 1 | 2 = 2,
   generateTitle = false,
+  workspaceStrategy?: ThreadLaunch.ThreadLaunchWorkspaceStrategy,
 ) {
   assert.isFunction(EventSink.makeCapturedAuthorizedNativeEventInfrastructure);
   yield* TestClock.setTime(DateTime.makeUnsafe(facts.now).epochMilliseconds);
@@ -2535,6 +2553,7 @@ const controlledNativeFixture = Effect.fn("test.controlledNativeFixture")(functi
             ...basicInput().launch,
             reuseExistingThread: reuse,
             ...(generateTitle ? { generateTitle: true } : {}),
+            ...(workspaceStrategy ? { workspaceStrategy } : {}),
           },
         }
       : (() => {
@@ -2547,6 +2566,7 @@ const controlledNativeFixture = Effect.fn("test.controlledNativeFixture")(functi
               ...value.launch,
               reuseExistingThread: reuse,
               ...(generateTitle ? { generateTitle: true } : {}),
+              ...(workspaceStrategy ? { workspaceStrategy } : {}),
             },
           };
         })();
@@ -3516,4 +3536,430 @@ it.effect.each(
       assert.strictEqual(retry.reason, "reconciliation_required");
       assert.deepStrictEqual(yield* producerDatabaseSnapshot(fixture.sql), before);
     }).pipe(Effect.provide(testLayer())),
+);
+
+const nativeWorkspaceProcesses = Effect.fn("test.nativeWorkspaceProcesses")(function* (
+  beforeWrap: Effect.Effect<void> = Effect.void,
+) {
+  const requests: PreparationNode.PreparationNodeImage[] = [];
+  const host = {
+    hostBootId: "12345678-1234-4234-8234-123456789abc",
+    scopeNamespace: "app-t3code-agents-123456789abc.slice",
+  };
+  type Child = {
+    binding: AgentScopeBinding;
+    output: Queue.Queue<Uint8Array, Cause.Done>;
+    terminal: Deferred.Deferred<{ code: number | null; signal: NodeJS.Signals | null }>;
+    running: boolean;
+    nonce: string;
+  };
+  const children = new Map<string, Child>();
+  const bytes = (text: string) => new TextEncoder().encode(text);
+  let wraps = 0;
+  const wrapEntered = yield* Deferred.make<void>();
+  const scope: typeof AgentScope.Service = {
+    ...AgentScope.defaultValue(),
+    wrap: (input) =>
+      Effect.gen(function* () {
+        yield* Deferred.succeed(wrapEntered, undefined);
+        yield* beforeWrap;
+        const unit = `t3code-preparation-12345678-1234-4234-8234-${String(++wraps).padStart(12, "0")}.scope`;
+        const binding = {
+          unit,
+          invocationId: String(wraps).padStart(32, "a"),
+          controlGroup: `/user.slice/${host.scopeNamespace}/${unit}`,
+          pid: 6000 + wraps,
+          pidStartTicks: String(2000 + wraps),
+        };
+        const child: Child = {
+          binding,
+          output: yield* Queue.unbounded<Uint8Array, Cause.Done>(),
+          terminal: yield* Deferred.make<{ code: number | null; signal: NodeJS.Signals | null }>(),
+          running: false,
+          nonce: input.args[3]!,
+        };
+        children.set(child.nonce, child);
+        return {
+          command: input.command,
+          args: input.args,
+          unit,
+          hostIdentity: host,
+          custody: {
+            bind: () => Effect.succeed(binding),
+            observeRetirement: () =>
+              Effect.sync(() =>
+                child.running ? undefined : { binding, observation: "empty" as const },
+              ),
+            stopAndObserve: () =>
+              Effect.sync(() => {
+                child.running = false;
+                Deferred.doneUnsafe(
+                  child.terminal,
+                  Exit.succeed({ code: null, signal: "SIGTERM" }),
+                );
+                Queue.endUnsafe(child.output);
+                return { binding, observation: "empty" as const };
+              }),
+          },
+        };
+      }),
+  };
+  const node: typeof PreparationNode.PreparationNodeChild.Service = {
+    prepare: (image) =>
+      Effect.gen(function* () {
+        const child = children.get(image.args[3]!)!;
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            child.running = false;
+            Deferred.doneUnsafe(child.terminal, Exit.succeed({ code: null, signal: "SIGTERM" }));
+            Queue.endUnsafe(child.output);
+          }),
+        );
+        return {
+          createLocal: () =>
+            Effect.sync(() => {
+              requests.push(image);
+              child.running = true;
+              Queue.offerUnsafe(child.output, bytes(`READY:${child.nonce}:${child.binding.pid}\n`));
+              return {
+                pid: child.binding.pid,
+                awaitSpawn: Effect.void,
+                awaitTerminal: Deferred.await(child.terminal),
+                exitCode: Deferred.await(child.terminal).pipe(
+                  Effect.flatMap((value) =>
+                    value.code === null
+                      ? Effect.fail(
+                          new PreparationNode.PreparationNodeChildError({ reason: "unknown" }),
+                        )
+                      : Effect.succeed(value.code),
+                  ),
+                ),
+                isRunning: Effect.sync(() => child.running),
+                kill: () =>
+                  Effect.sync(() => {
+                    child.running = false;
+                    Deferred.doneUnsafe(
+                      child.terminal,
+                      Exit.succeed({ code: null, signal: "SIGTERM" }),
+                    );
+                    return undefined;
+                  }),
+                stdin: Sink.forEach((value: Uint8Array) =>
+                  Effect.sync(() => {
+                    assert.strictEqual(new TextDecoder().decode(value), `RELEASE:${child.nonce}\n`);
+                    const args = image.args.slice(5);
+                    const code = args.includes("config") ? 1 : 0;
+                    const output = args.includes("--git-common-dir")
+                      ? "/old/.git\n"
+                      : args.includes("--show-toplevel")
+                        ? "/old\n"
+                        : args.includes("symbolic-ref")
+                          ? "refs/heads/main\n"
+                          : args.includes("--symbolic-full-name")
+                            ? "refs/heads/main\n"
+                            : "";
+                    Queue.offerUnsafe(child.output, bytes(`EXEC:${child.nonce}\n${output}`));
+                    Queue.endUnsafe(child.output);
+                    child.running = false;
+                    Deferred.doneUnsafe(child.terminal, Exit.succeed({ code, signal: null }));
+                  }),
+                ),
+                stdout: Stream.fromQueue(child.output),
+                stderr: Stream.empty,
+              };
+            }),
+        };
+      }),
+  };
+  const services = Layer.mergeAll(
+    Layer.succeed(AgentScope, scope),
+    Layer.succeed(PreparationNode.PreparationNodeChild, node),
+    Layer.succeed(HostProcess.Environment, { PATH: "/fixture-bin", CAPTURED: "yes" }),
+    Layer.succeed(HostProcess.WorkingDirectory, "/captured"),
+    Layer.succeed(HostProcess.HomeDirectory, "/captured-home"),
+    Layer.succeed(HostProcess.Platform, "linux"),
+    Layer.succeed(SpawnExecutableResolution, (_command, _platform, env) =>
+      env.PATH === "/fixture-bin" ? "/fixture-bin/git" : undefined,
+    ),
+  );
+  return { requests, services, wrapEntered };
+});
+const nativeWorkspaceEntry = Effect.fn("test.nativeWorkspaceEntry")(function* (
+  fixture: Effect.Success<ReturnType<typeof controlledNativeFixture>>,
+  fileSystem?: FileSystem.FileSystem,
+  settings: Parameters<typeof Settings.layerTest>[0] = {},
+) {
+  const coreConstruction = makeGitVcsDriverCore().pipe(
+    Effect.provideService(ServerConfig, fixture.config),
+    Effect.provideService(
+      ChildProcessSpawner.ChildProcessSpawner,
+      ChildProcessSpawner.make(() => Effect.die("native raw spawn fallback")),
+    ),
+  );
+  const core = yield* (
+    fileSystem
+      ? coreConstruction.pipe(Effect.provideService(FileSystem.FileSystem, fileSystem))
+      : coreConstruction
+  ).pipe(Effect.provide(NodeServices.layer));
+  return yield* ThreadLaunch.makeNativeWorkspacePreparation(fixture.authority.coordinator).pipe(
+    Effect.provideService(GitVcsDriver.GitVcsDriver, core),
+    Effect.provide(fixture.runtime),
+    Effect.provideService(SqlClient.SqlClient, fixture.sql),
+    Effect.provideService(ServerConfig, fixture.config),
+    Effect.provide(Layer.mergeAll(Settings.layerTest(settings), NodeServices.layer)),
+  );
+});
+
+it.effect.each(["workflow", "planning"] as const)(
+  "native workspace entry connects real %s producer ownership to actual Core and retained resources",
+  (kind) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        const fixture = yield* controlledNativeFixture(kind, false, false, 2, false, {
+          type: "worktree",
+          baseRef: "main",
+          branch: "native-feature",
+        });
+        const entry = yield* nativeWorkspaceEntry(fixture);
+        const result = yield* entry.createReservedWorkspace(producerSelection(fixture)).pipe(
+          Effect.provideService(HostProcess.Environment, { PATH: "/foreign" }),
+          Effect.provideService(HostProcess.HomeDirectory, "/foreign"),
+          Effect.provideService(SpawnExecutableResolution, () => "/foreign/git"),
+        );
+        assert.strictEqual(result.kind, "worktree-created");
+        assert.strictEqual(result.state, "preparing-held");
+        assert.strictEqual(result.worktree.refName, "native-feature");
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT json_extract(payload_json,'$.branch') AS branch,json_extract(payload_json,'$.worktreePath') AS path FROM orchestration_v2_projection_threads WHERE thread_id=${result.native.threadId}`,
+          [{ branch: "native-feature", path: result.worktree.path }],
+        );
+        assert.strictEqual(result.inventory.inventory, "all-retired");
+        assert.isAbove(harness.requests.length, 3);
+        for (const image of harness.requests) {
+          assert.strictEqual(image.args[4], "/fixture-bin/git");
+          assert.strictEqual(image.environment.CAPTURED, "yes");
+        }
+        const resources =
+          yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_process_resources`;
+        assert.strictEqual(resources.length, harness.requests.length);
+        for (const row of resources)
+          assert.strictEqual(PreparationResource.decodeRow(row).state, "settled");
+        const job = PreparationJob.decodeRow(
+          (yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_jobs`)[0],
+        );
+        assert.strictEqual(job.state, "active");
+        assert.strictEqual(job.codeClosedAt, null);
+        assert.isTrue(job.processExposed);
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT status FROM orchestration_v2_projection_runs`,
+          [{ status: "preparing" }],
+        );
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT * FROM orchestration_v2_effect_outbox WHERE effect_type IN ('provider-turn.start','provider-turn.restart','provider-runtime.continue')`,
+          [],
+        );
+        assert.strictEqual(
+          (yield* Effect.result(entry.createReservedWorkspace(producerSelection(fixture))))._tag,
+          "Failure",
+        );
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(["root", "generated-branch", "from-origin", "revoked", "setup"] as const)(
+  "native workspace entry refuses %s before any owned Git creation",
+  (mode) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        const strategy: ThreadLaunch.ThreadLaunchWorkspaceStrategy =
+          mode === "root"
+            ? { type: "root" }
+            : mode === "generated-branch"
+              ? { type: "worktree", baseRef: "main" }
+              : {
+                  type: "worktree",
+                  baseRef: "main",
+                  branch: "native-feature",
+                  ...(mode === "from-origin" ? { startFromOrigin: true } : {}),
+                };
+        const fixture = yield* controlledNativeFixture(
+          "workflow",
+          false,
+          false,
+          2,
+          false,
+          strategy,
+        );
+        const entry = yield* nativeWorkspaceEntry(
+          fixture,
+          undefined,
+          mode === "setup"
+            ? {
+                defaultProjectScripts: [
+                  {
+                    id: "setup",
+                    name: "Setup",
+                    command: "echo setup",
+                    icon: "configure",
+                    runOnWorktreeCreate: true,
+                  },
+                ],
+              }
+            : {},
+        );
+        if (mode === "revoked") yield* fixture.sessions.revoke(fixture.reference.sessionId);
+        const result = yield* Effect.result(
+          entry.createReservedWorkspace(producerSelection(fixture)),
+        );
+        assert.strictEqual(result._tag, "Failure");
+        assert.strictEqual(harness.requests.length, 0);
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_process_resources`,
+          [],
+        );
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT * FROM orchestration_v2_effect_outbox WHERE effect_type IN ('provider-turn.start','provider-turn.restart','provider-runtime.continue')`,
+          [],
+        );
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(["revoke", "project"] as const)(
+  "native workspace entry rechecks %s changes after exposure and before A",
+  (change) =>
+    Effect.gen(function* () {
+      const release = yield* Deferred.make<void>();
+      const harness = yield* nativeWorkspaceProcesses(Deferred.await(release));
+      yield* Effect.gen(function* () {
+        const fixture = yield* controlledNativeFixture("planning", false, false, 2, false, {
+          type: "worktree",
+          baseRef: "main",
+          branch: "native-feature",
+        });
+        const entry = yield* nativeWorkspaceEntry(fixture);
+        const creating = yield* entry
+          .createReservedWorkspace(producerSelection(fixture))
+          .pipe(Effect.result, Effect.forkScoped);
+        yield* Deferred.await(harness.wrapEntered);
+        yield* Effect.gen(function* () {
+          if (change === "revoke") yield* fixture.sessions.revoke(fixture.reference.sessionId);
+          else
+            yield* fixture.sql`UPDATE projection_projects SET workspace_root='/changed' WHERE project_id='project'`;
+        }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+        assert.strictEqual((yield* Fiber.join(creating))._tag, "Failure");
+        assert.strictEqual(harness.requests.length, 0);
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_process_resources`,
+          [],
+        );
+        const job = PreparationJob.decodeRow(
+          (yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_jobs`)[0],
+        );
+        assert.isTrue(job.processExposed);
+        assert.strictEqual(job.codeClosedAt, null);
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect(
+  "Store scope teardown joins an actual native entry owned by a separate constructor scope",
+  () =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      const storeScope = yield* Scope.make();
+      const constructorScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(constructorScope, Exit.void));
+      yield* Effect.addFinalizer(() => Scope.close(storeScope, Exit.void));
+      const entered = yield* Deferred.make<void>();
+      const unwinding = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      yield* Effect.gen(function* () {
+        const fixture = yield* controlledNativeFixture("workflow", false, false, 2, false, {
+          type: "worktree",
+          baseRef: "main",
+          branch: "native-feature",
+        }).pipe(Effect.provideService(Scope.Scope, storeScope));
+        const actualFs = yield* FileSystem.FileSystem.pipe(Effect.provide(NodeServices.layer));
+        const fs: FileSystem.FileSystem = {
+          ...actualFs,
+          realPath: (path) =>
+            path === "/old"
+              ? Deferred.succeed(entered, undefined).pipe(
+                  Effect.andThen(Effect.never),
+                  Effect.ensuring(
+                    Deferred.succeed(unwinding, undefined).pipe(
+                      Effect.andThen(Deferred.await(release)),
+                    ),
+                  ),
+                )
+              : actualFs.realPath(path),
+        };
+        const entry = yield* nativeWorkspaceEntry(fixture, fs).pipe(
+          Effect.provideService(Scope.Scope, constructorScope),
+        );
+        const creating = yield* entry
+          .createReservedWorkspace(producerSelection(fixture))
+          .pipe(Effect.exit, Effect.forkScoped);
+        yield* Deferred.await(entered);
+        const closing = yield* Scope.close(storeScope, Exit.void).pipe(Effect.forkScoped);
+        yield* Deferred.await(unwinding);
+        yield* Effect.sync(() => {
+          assert.isUndefined(closing.pollUnsafe());
+          assert.isUndefined(creating.pollUnsafe());
+          assert.isAtLeast(harness.requests.length, 1);
+        }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+        yield* Fiber.join(closing);
+        const exit = yield* Fiber.join(creating);
+        assert.isTrue(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause));
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT * FROM orchestration_v2_effect_outbox WHERE effect_type IN ('provider-turn.start','provider-turn.restart','provider-runtime.continue')`,
+          [],
+        );
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(["caller", "constructor"] as const)(
+  "native workspace entry joins %s cancellation without detaching work",
+  (mode) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses(Effect.never);
+      const constructorScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(constructorScope, Exit.void));
+      yield* Effect.gen(function* () {
+        const fixture = yield* controlledNativeFixture("planning", false, false, 2, false, {
+          type: "worktree",
+          baseRef: "main",
+          branch: "native-feature",
+        });
+        const entry = yield* nativeWorkspaceEntry(fixture).pipe(
+          Effect.provideService(Scope.Scope, constructorScope),
+        );
+        const creating = yield* entry
+          .createReservedWorkspace(producerSelection(fixture))
+          .pipe(Effect.exit, Effect.forkScoped);
+        yield* Deferred.await(harness.wrapEntered);
+        if (mode === "caller") yield* Fiber.interrupt(creating);
+        else yield* Scope.close(constructorScope, Exit.void);
+        const outer = yield* Fiber.await(creating);
+        assert.isTrue(
+          Exit.isFailure(outer)
+            ? Cause.hasInterrupts(outer.cause)
+            : Exit.isFailure(outer.value) && Cause.hasInterrupts(outer.value.cause),
+        );
+        assert.strictEqual(harness.requests.length, 0);
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_process_resources`,
+          [],
+        );
+        const job = PreparationJob.decodeRow(
+          (yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_jobs`)[0],
+        );
+        assert.strictEqual(job.codeClosedAt, null);
+        assert.isTrue(job.processExposed);
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
 );

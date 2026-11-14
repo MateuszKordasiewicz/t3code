@@ -15,6 +15,7 @@ const fixture = Effect.fn("test.preparationControllerFixture")(function* (
     readonly beforeCreate?: Effect.Effect<void, Owner.PreparationProcessOwnerError>;
     readonly beforeStartup?: Effect.Effect<void, Owner.PreparationProcessOwnerError>;
     readonly beforeCleanup?: Effect.Effect<void>;
+    readonly output?: Stream.Stream<Uint8Array, Owner.PreparationProcessOwnerError>;
     readonly insideWriter?: { value: boolean };
     readonly closeCallerDuringPrepare?: boolean;
   } = {},
@@ -74,7 +75,7 @@ const fixture = Effect.fn("test.preparationControllerFixture")(function* (
         yield* options.beforeStartup ?? Effect.void;
         read(ref).started = true;
         calls.started++;
-        return Stream.make(bytes("payload"));
+        return options.output ?? Stream.make(bytes("payload"));
       }),
     collectCommand: () => Effect.succeed(0),
     assessInventory: () =>
@@ -100,7 +101,17 @@ const fixture = Effect.fn("test.preparationControllerFixture")(function* (
     port,
     flags,
   );
-  return { owner, flags, calls, inputs, createEntered, startupEntered, cleanupEntered, storeScope };
+  return {
+    owner,
+    flags,
+    calls,
+    inputs,
+    records,
+    createEntered,
+    startupEntered,
+    cleanupEntered,
+    storeScope,
+  };
 });
 const collect = Effect.fn("test.collectOwnedCommand")(function* (facade: {
   stdout: Stream.Stream<Uint8Array, Owner.PreparationProcessOwnerError>;
@@ -316,4 +327,98 @@ it.effect.each([false, true])(
       assert.strictEqual(test.calls.created, 0);
       yield* Scope.close(caller, Exit.void);
     }).pipe(Effect.scoped),
+);
+
+it.effect("forced stop closes a held pull and refuses every late facade subscription", () =>
+  Effect.gen(function* () {
+    const reading = yield* Deferred.make<void>();
+    const test = yield* fixture({
+      output: Stream.fromPull(
+        Effect.succeed(Deferred.succeed(reading, undefined).pipe(Effect.andThen(Effect.never))),
+      ),
+    });
+    const caller = yield* Scope.make();
+    yield* Effect.addFinalizer(() => Scope.close(caller, Exit.void));
+    const facade = yield* test.owner.start(input).pipe(Effect.provideService(Scope.Scope, caller));
+    const collecting = yield* Stream.runCollect(facade.stdout).pipe(
+      Effect.result,
+      Effect.forkScoped,
+    );
+    yield* Deferred.await(reading);
+    yield* test.owner.stop();
+    const lateExit = yield* Effect.result(facade.exitCode);
+    assert.strictEqual(lateExit._tag, "Failure");
+    if (lateExit._tag === "Failure") assert.strictEqual(lateExit.failure.reason, "closed");
+    const result = yield* Fiber.join(collecting);
+    assert.strictEqual(result._tag, "Failure");
+    if (result._tag === "Failure") assert.strictEqual(result.failure.reason, "closed");
+    for (const stream of [facade.stdout, facade.stderr]) {
+      const late = yield* Effect.result(Stream.runCollect(stream));
+      assert.strictEqual(late._tag, "Failure");
+      if (late._tag === "Failure") assert.strictEqual(late.failure.reason, "closed");
+    }
+  }).pipe(Effect.scoped),
+);
+
+it.effect("forced stop joins the actual captured workspace entry through its cleanup", () =>
+  Effect.gen(function* () {
+    const test = yield* fixture();
+    const captured = yield* Deferred.make<void>();
+    const unwinding = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const entry = yield* Effect.gen(function* () {
+      yield* test.owner.captureWorkspaceEntry();
+      yield* Deferred.succeed(captured, undefined);
+      return yield* Effect.never.pipe(
+        Effect.ensuring(
+          Deferred.succeed(unwinding, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.forkScoped);
+    yield* Deferred.await(captured);
+    const stopping = yield* test.owner.stop().pipe(Effect.forkScoped);
+    yield* Deferred.await(unwinding);
+    yield* Effect.sync(() => {
+      assert.isUndefined(stopping.pollUnsafe());
+      assert.isUndefined(entry.pollUnsafe());
+      assert.strictEqual(test.calls.assessed, 0);
+    }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+    const exit = yield* Fiber.await(entry);
+    assert.isTrue(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause));
+    assert.strictEqual((yield* Fiber.join(stopping)).inventory, "all-retired");
+  }).pipe(Effect.scoped),
+);
+
+it.effect("workspace entry refuses repeated capture and self stop or seal", () =>
+  Effect.gen(function* () {
+    const test = yield* fixture();
+    const entry = yield* Effect.gen(function* () {
+      yield* test.owner.captureWorkspaceEntry();
+      for (const operation of [
+        test.owner.captureWorkspaceEntry(),
+        test.owner.stop(),
+        test.owner.seal(),
+      ]) {
+        const result = yield* Effect.result(operation);
+        assert.strictEqual(result._tag, "Failure");
+        if (result._tag === "Failure") assert.strictEqual(result.failure.reason, "invalid");
+      }
+    }).pipe(Effect.scoped, Effect.forkScoped);
+    yield* Fiber.join(entry);
+    assert.strictEqual((yield* test.owner.seal()).inventory, "all-retired");
+  }).pipe(Effect.scoped),
+);
+
+it.effect("a startup defect stays exceptional when output is subscribed after startup failed", () =>
+  Effect.gen(function* () {
+    const test = yield* fixture({ beforeStartup: Effect.die("private startup diagnostic") });
+    const caller = yield* Scope.make();
+    yield* Effect.addFinalizer(() => Scope.close(caller, Exit.void));
+    const facade = yield* test.owner.start(input).pipe(Effect.provideService(Scope.Scope, caller));
+    const startup = yield* Effect.exit(Deferred.await([...test.records.values()][0]!.state.ready));
+    assert.isTrue(Exit.isFailure(startup) && startup.cause.reasons.some(Cause.isDieReason));
+    assert.isTrue(test.flags.blocked);
+    const exit = yield* Effect.exit(Stream.runCollect(facade.stdout));
+    assert.isTrue(Exit.isFailure(exit) && exit.cause.reasons.some(Cause.isDieReason));
+  }).pipe(Effect.scoped),
 );

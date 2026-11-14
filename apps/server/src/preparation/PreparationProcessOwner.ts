@@ -1,4 +1,5 @@
 import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -193,13 +194,20 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
     readonly state: CommandState;
     readonly done: Deferred.Deferred<void, PreparationProcessOwnerError>;
     closing: boolean;
+    readonly stopped: Deferred.Deferred<void>;
     startup?: Fiber.Fiber<void>;
   };
   const invocations = new Set<Invocation>();
   const commands = new Set<Slot>();
-  const closed = (slot: Slot) =>
+  let workspaceEntry: Fiber.Fiber<unknown, unknown> | undefined;
+  const signalClose = (slot: Slot) => {
+    slot.state.sealed = true;
+    Deferred.doneUnsafe(slot.stopped, Exit.void);
+    Deferred.doneUnsafe(slot.state.ready, Exit.fail(error("output", "closed")));
+  };
+  const closed = (slot: Slot, checkBlocked = true) =>
     flags.stopping ||
-    flags.blocked ||
+    (checkBlocked && flags.blocked) ||
     slot.state.sealed ||
     [storeScope, ownerScope, slot.state.callerScope, slot.state.commandScope].some(
       (scope) => scope.state._tag === "Closed",
@@ -211,8 +219,7 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
           Effect.suspend(() => {
             if (slot.closing) return Deferred.await(slot.done);
             slot.closing = true;
-            slot.state.sealed = true;
-            Deferred.doneUnsafe(slot.state.ready, Exit.fail(error("output", "closed")));
+            signalClose(slot);
             const cleanup = Effect.gen(function* () {
               if (!(yield* Deferred.isDone(slot.state.startDone)))
                 slot.state.startFiber.interruptUnsafe();
@@ -248,8 +255,8 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
       Effect.andThen(
         Effect.uninterruptible(
           Effect.withFiber((fiber) => {
-            flags.intakeSealed = true;
-            flags.stopping = true;
+            if (workspaceEntry?.id === fiber.id && workspaceEntry.pollUnsafe() === undefined)
+              return Effect.fail(error("cleanup", "invalid"));
             if (
               [...invocations].some(
                 (invocation) =>
@@ -257,6 +264,11 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
               )
             )
               return Effect.fail(error("cleanup", "invalid"));
+            flags.intakeSealed = true;
+            flags.stopping = true;
+            for (const slot of commands) signalClose(slot);
+            if (workspaceEntry && workspaceEntry.pollUnsafe() === undefined)
+              workspaceEntry.interruptUnsafe();
             if (stopDone) return Deferred.await(stopDone);
             const completion = Deferred.makeUnsafe<Inventory, PreparationProcessOwnerError>();
             stopDone = completion;
@@ -267,6 +279,7 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
                 concurrency: "unbounded",
                 discard: true,
               });
+              if (workspaceEntry) yield* Fiber.await(workspaceEntry);
               const exits = yield* Effect.forEach(
                 commands,
                 (slot) => Effect.exit(closeCommand(slot)),
@@ -303,6 +316,9 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
   const seal = Effect.fn("PreparationProcessOwner.seal")(function* () {
     flags.intakeSealed = true;
     yield* port.checkOutsideWriter("inventory");
+    const fiber = yield* Effect.withFiber(Effect.succeed);
+    if (workspaceEntry?.id === fiber.id && workspaceEntry.pollUnsafe() === undefined)
+      return yield* error("inventory", "invalid");
     const current = yield* Effect.serviceOption(Scope.Scope);
     if (
       Option.isSome(current) &&
@@ -319,6 +335,7 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
       concurrency: "unbounded",
       discard: true,
     });
+    if (workspaceEntry) yield* Fiber.await(workspaceEntry);
     yield* Effect.forEach(commands, (slot) => Deferred.await(slot.done), {
       concurrency: "unbounded",
       discard: true,
@@ -366,6 +383,7 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
             },
             done: Deferred.makeUnsafe<void, PreparationProcessOwnerError>(),
             closing: false,
+            stopped: Deferred.makeUnsafe<void>(),
           };
           slot = command;
           commands.add(command);
@@ -399,12 +417,28 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
               command.startup = yield* Effect.forkIn(startup, commandScope);
             }),
           );
+          const stopped = Deferred.await(command.stopped).pipe(
+            Effect.andThen(Effect.fail(error("output", "closed"))),
+          );
+          const output = (stream: Stream.Stream<Uint8Array, PreparationProcessOwnerError>) =>
+            Stream.unwrap(
+              Effect.suspend(() =>
+                closed(command, false)
+                  ? Effect.fail(error("output", "closed"))
+                  : Effect.succeed(stream.pipe(Stream.interruptWhen(stopped))),
+              ),
+            );
           return Object.freeze({
             resourceId: created.resourceId,
-            stdout: Stream.unwrap(Deferred.await(ready)),
-            stderr: created.stderr,
-            exitCode: Deferred.await(ready).pipe(
-              Effect.andThen(sanitize("output", port.collectCommand(ref))),
+            stdout: output(Stream.unwrap(Deferred.await(ready))),
+            stderr: output(created.stderr),
+            exitCode: Effect.suspend(() =>
+              closed(command, false)
+                ? Effect.fail(error("output", "closed"))
+                : Deferred.await(ready).pipe(
+                    Effect.andThen(sanitize("output", port.collectCommand(ref))),
+                    Effect.raceFirst(stopped),
+                  ),
             ),
           });
         }).pipe((work) => sanitize("creation", work), Effect.interruptible);
@@ -421,7 +455,31 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
       }),
     );
   }, Effect.interruptible);
-  return Object.freeze({
+  const captureWorkspaceEntry = Effect.fn("PreparationProcessOwner.captureWorkspaceEntry")(
+    function* () {
+      yield* port.checkOutsideWriter("admission");
+      const scope = yield* Effect.scope;
+      return yield* Effect.withFiber((fiber) =>
+        Effect.suspend(() => {
+          if (
+            workspaceEntry ||
+            flags.intakeSealed ||
+            flags.stopping ||
+            flags.blocked ||
+            scope === storeScope ||
+            scope === ownerScope ||
+            [scope, storeScope, ownerScope].some((current) => current.state._tag === "Closed")
+          )
+            return Effect.fail(error("admission", "invalid"));
+          workspaceEntry = fiber;
+          return Effect.void;
+        }),
+      );
+    },
+    Effect.interruptible,
+  );
+  const owner = Object.freeze({
+    captureWorkspaceEntry,
     jobId: identity.jobId,
     threadId: identity.threadId,
     runId: identity.runId,
@@ -435,5 +493,13 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
     seal,
     stop,
   });
+  constructedOwners.add(owner);
+  return owner;
 });
 export type Owner = Effect.Success<ReturnType<typeof make>>;
+const constructedOwners = new WeakSet<object>();
+export const isOwner = (value: unknown): value is Owner =>
+  typeof value === "object" && value !== null && constructedOwners.has(value);
+export const Current = Context.Reference<Owner | undefined>("t3/PreparationProcessOwner/Current", {
+  defaultValue: () => undefined,
+});
