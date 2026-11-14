@@ -14871,3 +14871,400 @@ it.effect.each(["workflow", "planning"] as const)(
       }),
     ),
 );
+
+it.effect.each(["workflow", "planning"] as const)(
+  "native preparation metadata preserves original %s cleanup after revocation",
+  (kind) =>
+    Effect.gen(function* () {
+      const fixture = yield* currentNativeExecutionFixture(kind);
+      const acquired = yield* fixture.store.beginClaimedNativePreparation(
+        fixture.operationSelection,
+      );
+      if (acquired.kind !== "acquired") throw new Error("missing native preparation");
+      assert.isFunction(fixture.store.markNativePreparationProcessExposed);
+      const control = {
+        selection: preparationSelection(acquired.job),
+        executionClaim: fixture.operationSelection,
+      };
+      const subscription = yield* fixture.store.subscribeChanges;
+      let job = yield* fixture.store.markNativePreparationProcessExposed(control);
+      assert.isTrue(job.processExposed);
+      assert.strictEqual(job.recordVersion, 1);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 1);
+      yield* fixture.sessions.revoke(fixture.authority.sessionId);
+      job = yield* fixture.store.quiesceNativePreparationJob(
+        { ...control, selection: preparationSelection(job) },
+        "unknown",
+      );
+      assert.strictEqual(job.state, "unknown");
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 1);
+      job = yield* fixture.store.closeNativePreparationCode({
+        ...control,
+        selection: preparationSelection(job),
+      });
+      assert.strictEqual(job.recordVersion, 3);
+      assert.isNotNull(job.codeClosedAt);
+      assert.strictEqual(job.settlement, null);
+      assert.strictEqual(job.requestIdentityHash, acquired.job.requestIdentityHash);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 1);
+      assert.deepStrictEqual(
+        yield* fixture.store.beginClaimedNativePreparation(fixture.operationSelection),
+        { kind: "existing", job },
+      );
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+      assert.strictEqual(
+        (yield* Effect.result(fixture.store.settleCodeOnlyPreparation(preparationSelection(job))))
+          ._tag,
+        "Failure",
+      );
+      assert.deepStrictEqual(
+        yield* fixture.sql`SELECT * FROM orchestration_v2_submission_transports`,
+        [],
+      );
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(
+  (["workflow", "planning"] as const).flatMap((kind) =>
+    ["pause", "stop", "deadline", "generation-change"].map((change) => ({ kind, change })),
+  ),
+)("native metadata cleanup retains original $kind owner after $change", ({ kind, change }) =>
+  Effect.gen(function* () {
+    const fixture = yield* currentNativeExecutionFixture(kind);
+    const acquired = yield* fixture.store.beginClaimedNativePreparation(fixture.operationSelection);
+    if (acquired.kind !== "acquired") throw new Error("missing native job");
+    const control = {
+      selection: preparationSelection(acquired.job),
+      executionClaim: fixture.operationSelection,
+    };
+    if (change === "deadline")
+      yield* TestClock.setTime(DateTime.makeUnsafe("2027-01-01T00:00:00Z").epochMilliseconds);
+    else if (change === "generation-change") {
+      if (kind === "workflow")
+        yield* fixture.sql`UPDATE workflow_runs SET control_generation=2,record_version=3,record_json=json_set(record_json,'$.controlGeneration',2,'$.recordVersion',3)`;
+      else
+        yield* fixture.sql`UPDATE workflow_planning_sessions SET control_generation=2,record_version=3,record_json=json_set(record_json,'$.controlGeneration',2,'$.recordVersion',3)`;
+      yield* fixture.sql`UPDATE workflow_operations SET generation=2,record_json=json_set(record_json,'$.controlGeneration',2,'$.claim.generation',2)`;
+    } else yield* nativeClaimControl(kind, fixture.store, change === "stop" ? "stop" : "pause");
+    const before = yield* preparationState;
+    const subscription = yield* fixture.store.subscribeChanges;
+    assert.strictEqual(
+      (yield* Effect.result(fixture.store.markNativePreparationProcessExposed(control)))._tag,
+      "Failure",
+    );
+    assert.deepStrictEqual(yield* preparationState, before);
+    assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    let job = yield* fixture.store.quiesceNativePreparationJob(control);
+    assert.strictEqual(job.state, "quiescing");
+    job = yield* fixture.store.closeNativePreparationCode({
+      ...control,
+      selection: preparationSelection(job),
+    });
+    assert.isNotNull(job.codeClosedAt);
+    assert.isFalse(job.processExposed);
+    assert.strictEqual(job.settlement, null);
+    assert.deepStrictEqual(job.input.nativeOwner?.executionClaim, fixture.operationSelection);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["plain", "boot", "worker", "environment"] as const)(
+  "native metadata controls refuse %s construction even for revoked cleanup",
+  (change) =>
+    Effect.gen(function* () {
+      const fixture = yield* currentNativeExecutionFixture("workflow");
+      const acquired = yield* fixture.store.beginClaimedNativePreparation(
+        fixture.operationSelection,
+      );
+      if (acquired.kind !== "acquired") throw new Error("missing native job");
+      const selected =
+        change === "plain"
+          ? yield* Store.WorkflowRunStore
+          : yield* Store.makeCapturedNativeWorkflowRunStore(
+              fixture.sql,
+              fixture.config,
+              fixture.path,
+              change === "environment"
+                ? { getEnvironmentId: Effect.succeed(EnvironmentId.make("foreign-environment")) }
+                : fixture.identity,
+              fixture.policy,
+              {
+                ...fixture.coordinator,
+                ...(change === "boot"
+                  ? { bootId: "foreign" }
+                  : change === "worker"
+                    ? { workerId: "foreign" }
+                    : {}),
+              },
+            );
+      yield* fixture.sessions.revoke(fixture.authority.sessionId);
+      const control = {
+        selection: preparationSelection(acquired.job),
+        executionClaim: fixture.operationSelection,
+      };
+      const before = yield* preparationState;
+      const subscription = yield* selected.subscribeChanges;
+      for (const action of [
+        selected.markNativePreparationProcessExposed(control),
+        selected.quiesceNativePreparationJob(control),
+        selected.closeNativePreparationCode(control),
+      ])
+        assert.strictEqual((yield* Effect.result(action))._tag, "Failure");
+      assert.deepStrictEqual(yield* preparationState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["native-null-to-known", "native-known-to-other", "session"] as const)(
+  "native exposure refuses frozen observation change %s even while claim remains current",
+  (change) =>
+    Effect.gen(function* () {
+      const fixture = yield* currentNativeExecutionFixture("workflow");
+      const projection = yield* readCurrentNativeProjection(fixture);
+      const provider = projection.providerThreads[0]!;
+      const run = projection.runs[0]!;
+      const node = projection.nodes[0]!;
+      if (provider.providerSessionId !== null)
+        yield* seedPhysicalSession(provider.providerSessionId);
+      const now = yield* DateTime.now;
+      const sink = Context.get(fixture.runtime, EventSink.EventSinkV2);
+      const update = (
+        id: string,
+        nativeId: string | null,
+        providerSessionId: typeof provider.providerSessionId,
+      ) =>
+        sink.write({
+          events: [
+            {
+              id: EventId.make(id),
+              type: "provider-thread.updated",
+              threadId: run.threadId,
+              runId: run.id,
+              nodeId: node.id,
+              providerInstanceId: provider.providerInstanceId,
+              occurredAt: now,
+              payload: {
+                ...provider,
+                providerSessionId,
+                nativeThreadRef:
+                  nativeId === null
+                    ? null
+                    : { driver: provider.driver, nativeId, strength: "strong" },
+                updatedAt: now,
+              },
+            },
+          ],
+        });
+      if (change === "native-known-to-other")
+        yield* update("metadata-initial-native", "initial-native", provider.providerSessionId);
+      const acquired = yield* fixture.store.beginClaimedNativePreparation(
+        fixture.operationSelection,
+      );
+      if (acquired.kind !== "acquired") throw new Error("missing native job");
+      if (change === "session") {
+        yield* seedPhysicalSession("replacement-session");
+        yield* update("metadata-next-session", null, ProviderSessionId.make("replacement-session"));
+      } else yield* update("metadata-next-native", "changed-native", provider.providerSessionId);
+      assert.strictEqual(
+        (yield* fixture.sql.withTransaction(
+          fixture.store.verifyClaimedNativeOperationInTransaction(fixture.operationSelection),
+        )).kind,
+        "current",
+      );
+      const before = yield* preparationState;
+      const subscription = yield* fixture.store.subscribeChanges;
+      assert.strictEqual(
+        (yield* Effect.result(
+          fixture.store.markNativePreparationProcessExposed({
+            selection: preparationSelection(acquired.job),
+            executionClaim: fixture.operationSelection,
+          }),
+        ))._tag,
+        "Failure",
+      );
+      assert.deepStrictEqual(yield* preparationState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect("native metadata controls own input and reject getters or extra fields before IO", () =>
+  Effect.gen(function* () {
+    const fixture = yield* currentNativeExecutionFixture("workflow");
+    const acquired = yield* fixture.store.beginClaimedNativePreparation(fixture.operationSelection);
+    if (acquired.kind !== "acquired") throw new Error("missing native job");
+    const control = {
+      selection: preparationSelection(acquired.job),
+      executionClaim: { ...fixture.operationSelection },
+    };
+    let reads = 0;
+    const getter = Object.defineProperty({ ...control }, "selection", {
+      enumerable: true,
+      get() {
+        reads++;
+        return control.selection;
+      },
+    });
+    const before = yield* preparationState;
+    for (const input of [
+      getter,
+      { ...control, extra: true },
+      { ...control, selection: { ...control.selection, extra: true } },
+      { ...control, executionClaim: { ...control.executionClaim, extra: true } },
+      { ...control, selection: { ...control.selection, expectedVersion: -1 } },
+      { ...control, executionClaim: { ...control.executionClaim, bootId: "foreign" } },
+    ])
+      assert.strictEqual(
+        (yield* Effect.result(fixture.store.quiesceNativePreparationJob(input)))._tag,
+        "Failure",
+      );
+    assert.strictEqual(reads, 0);
+    assert.strictEqual(
+      (yield* Effect.result(
+        fixture.store.quiesceNativePreparationJob(
+          control,
+          "active" as Parameters<typeof fixture.store.quiesceNativePreparationJob>[1],
+        ),
+      ))._tag,
+      "Failure",
+    );
+    assert.strictEqual(
+      (yield* Effect.result(
+        fixture.sql.withTransaction(fixture.store.closeNativePreparationCode(control)),
+      ))._tag,
+      "Failure",
+    );
+    assert.deepStrictEqual(yield* preparationState, before);
+    const pending = fixture.store.quiesceNativePreparationJob(control);
+    control.selection.expectedVersion = 99;
+    control.executionClaim.workerId = "mutated";
+    const job = yield* pending;
+    assert.strictEqual(job.state, "quiescing");
+    assert.strictEqual(job.recordVersion, 1);
+    assert.strictEqual(
+      (yield* Effect.result(
+        fixture.store.closeNativePreparationCode({
+          selection: preparationSelection(acquired.job),
+          executionClaim: fixture.operationSelection,
+        }),
+      ))._tag,
+      "Failure",
+    );
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["ignore", "abort", "overflow"] as const)(
+  "native metadata refuses %s without writes or notification",
+  (change) =>
+    Effect.gen(function* () {
+      const fixture = yield* currentNativeExecutionFixture("workflow");
+      const acquired = yield* fixture.store.beginClaimedNativePreparation(
+        fixture.operationSelection,
+      );
+      if (acquired.kind !== "acquired") throw new Error("missing native job");
+      if (change === "overflow") {
+        yield* fixture.sql`DROP TRIGGER preparation_jobs_update_guard`;
+        yield* fixture.sql`UPDATE orchestration_v2_preparation_jobs SET record_version=${Number.MAX_SAFE_INTEGER}`;
+      } else if (change === "ignore")
+        yield* fixture.sql`CREATE TRIGGER refuse_native_metadata BEFORE UPDATE ON orchestration_v2_preparation_jobs BEGIN SELECT RAISE(IGNORE); END`;
+      else
+        yield* fixture.sql`CREATE TRIGGER refuse_native_metadata AFTER UPDATE ON orchestration_v2_preparation_jobs BEGIN SELECT RAISE(ABORT,'metadata rollback'); END`;
+      const control = {
+        selection: {
+          ...preparationSelection(acquired.job),
+          expectedVersion: change === "overflow" ? Number.MAX_SAFE_INTEGER : 0,
+        },
+        executionClaim: fixture.operationSelection,
+      };
+      const before = yield* preparationState;
+      const subscription = yield* fixture.store.subscribeChanges;
+      for (const action of [
+        fixture.store.markNativePreparationProcessExposed(control),
+        fixture.store.quiesceNativePreparationJob(control),
+        fixture.store.closeNativePreparationCode(control),
+      ])
+        assert.strictEqual((yield* Effect.result(action))._tag, "Failure");
+      assert.deepStrictEqual(yield* preparationState, before);
+      assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 0);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect("concurrent native metadata controls consume one exact job version", () =>
+  Effect.gen(function* () {
+    const fixture = yield* currentNativeExecutionFixture("workflow");
+    const acquired = yield* fixture.store.beginClaimedNativePreparation(fixture.operationSelection);
+    if (acquired.kind !== "acquired") throw new Error("missing native job");
+    const control = {
+      selection: preparationSelection(acquired.job),
+      executionClaim: fixture.operationSelection,
+    };
+    const subscription = yield* fixture.store.subscribeChanges;
+    const results = yield* Effect.all(
+      [
+        Effect.result(fixture.store.quiesceNativePreparationJob(control)),
+        Effect.result(fixture.store.closeNativePreparationCode(control)),
+      ],
+      { concurrency: "unbounded" },
+    );
+    assert.strictEqual(results.filter((result) => result._tag === "Success").length, 1);
+    assert.strictEqual(results.filter((result) => result._tag === "Failure").length, 1);
+    assert.strictEqual((yield* preparationState)[0]!.record_version, 1);
+    assert.strictEqual((yield* PubSub.takeUpTo(subscription, 10)).length, 1);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("native cleanup retains the environment captured once at construction", () =>
+  Effect.gen(function* () {
+    const fixture = yield* currentNativeExecutionFixture("workflow");
+    const acquired = yield* fixture.store.beginClaimedNativePreparation(fixture.operationSelection);
+    if (acquired.kind !== "acquired") throw new Error("missing native job");
+    let reads = 0;
+    let environmentId = "environment";
+    const selected = yield* Store.makeCapturedNativeWorkflowRunStore(
+      fixture.sql,
+      fixture.config,
+      fixture.path,
+      {
+        getEnvironmentId: Effect.sync(() => {
+          reads++;
+          return EnvironmentId.make(environmentId);
+        }),
+      },
+      fixture.policy,
+      fixture.coordinator,
+    );
+    assert.strictEqual(reads, 1);
+    environmentId = "foreign";
+    yield* fixture.sessions.revoke(fixture.authority.sessionId);
+    const job = yield* selected.quiesceNativePreparationJob(
+      { selection: preparationSelection(acquired.job), executionClaim: fixture.operationSelection },
+      "unknown",
+    );
+    assert.strictEqual(job.state, "unknown");
+    assert.strictEqual(job.input.environmentId, "environment");
+    assert.strictEqual(reads, 1);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "native metadata retains actual rearmed %s claim without adopting a generation",
+  (kind) =>
+    Effect.gen(function* () {
+      const fixture = yield* currentNativeExecutionFixture(kind, true);
+      const acquired = yield* fixture.store.beginClaimedNativePreparation(
+        fixture.operationSelection,
+      );
+      if (acquired.kind !== "acquired") throw new Error("missing native job");
+      assert.strictEqual(fixture.operationSelection.expectedGeneration, 2);
+      let job = yield* fixture.store.markNativePreparationProcessExposed({
+        selection: preparationSelection(acquired.job),
+        executionClaim: fixture.operationSelection,
+      });
+      yield* fixture.sessions.revoke(fixture.authority.sessionId);
+      job = yield* fixture.store.closeNativePreparationCode({
+        selection: preparationSelection(job),
+        executionClaim: fixture.operationSelection,
+      });
+      assert.isNotNull(job.codeClosedAt);
+      assert.deepStrictEqual(job.input.nativeOwner?.executionClaim, fixture.operationSelection);
+      assert.strictEqual(job.settlement, null);
+    }).pipe(Effect.provide(layer)),
+);

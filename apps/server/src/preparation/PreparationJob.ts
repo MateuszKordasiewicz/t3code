@@ -88,6 +88,14 @@ export function ownNativeClaim(value: unknown) {
     workerId: id(raw.workerId),
   });
 }
+export function ownNativeControl(value: unknown) {
+  json(value);
+  const raw = object(value, "executionClaim,selection");
+  const selection = ownSelection(raw.selection);
+  const executionClaim = ownNativeClaim(raw.executionClaim);
+  if (selection.serverBootId !== executionClaim.bootId) throw invalid();
+  return Object.freeze({ selection, executionClaim });
+}
 function ownNativeOwner(value: unknown) {
   const raw = object(value, "executionClaim,intentId,owner");
   const owner = object(raw.owner);
@@ -275,6 +283,7 @@ export function decodeRow(value: unknown) {
     settledAt,
   });
 }
+export type NativeControl = ReturnType<typeof ownNativeControl>;
 export type NativeClaim = ReturnType<typeof ownNativeClaim>;
 export type Input = ReturnType<typeof ownInput>;
 export type NativeSelection = ReturnType<typeof ownNativeSelection>;

@@ -221,6 +221,7 @@ type CurrentAuthority = Effect.Success<
 >;
 type NativeCoordinator = { readonly bootId: string; readonly workerId: string };
 type NativeBindingRuntime = {
+  readonly environmentId: string;
   readonly protocol: Effect.Success<ReturnType<typeof NativeProtocol.makeNativeCommandProtocol>>;
   readonly coordinator: NativeCoordinator;
 };
@@ -1001,6 +1002,7 @@ const makeStore = Effect.fnUntraced(function* (
   const mutatePreparation = Effect.fn("WorkflowRunStore.mutatePreparation")(function* (
     selected: PreparationJob.Selection,
     action: "close" | "quiescing" | "unknown" | "settle" | "expose",
+    nativeClaim?: PreparationJob.NativeClaim,
   ) {
     if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
       return yield* integrity();
@@ -1013,13 +1015,49 @@ const makeStore = Effect.fnUntraced(function* (
           try: () => PreparationJob.decodeRow(rows[0]),
           catch: integrity,
         });
-        if (job.identityVersion !== 2) return yield* integrity();
+        if (nativeClaim === undefined) {
+          if (job.identityVersion !== 2) return yield* integrity();
+        } else {
+          const owner = job.input.nativeOwner;
+          if (
+            job.identityVersion !== 3 ||
+            !owner ||
+            action === "settle" ||
+            !nativeBinding ||
+            job.input.environmentId !== nativeBinding.environmentId ||
+            nativeClaim.bootId !== nativeBinding.coordinator.bootId ||
+            nativeClaim.workerId !== nativeBinding.coordinator.workerId ||
+            !sameCustodyValue(owner.executionClaim, nativeClaim)
+          )
+            return yield* integrity();
+        }
         if (
           !preparationMatches(job, selected) ||
           job.state === "settled" ||
           job.recordVersion === Number.MAX_SAFE_INTEGER
         )
           return yield* stale();
+        if (nativeClaim !== undefined) {
+          const retained = yield* validateNativePreparationHistory(job, nativeClaim);
+          if (action === "expose") {
+            const current = yield* verifyClaimedNativeOperationInTransaction(nativeClaim);
+            if (current.kind !== "current" || current.stage !== "preparing") return yield* stale();
+            const observation = {
+              driver: current.driver,
+              providerInstanceId: current.providerInstanceId,
+              providerThreadId: current.providerThreadId,
+              providerSessionId: current.providerSessionId,
+              nativeThreadId: current.nativeThreadId,
+            };
+            if (
+              current.intentId !== retained.intentId ||
+              current.threadId !== job.input.threadId ||
+              current.runId !== job.input.runId ||
+              !sameCustodyValue(observation, job.input.request.current)
+            )
+              return yield* stale();
+          }
+        }
         yield* readPreparationParent(job.input);
         const now = DateTime.formatIso(yield* DateTime.now);
         let patch: Record<string, string | number>;
@@ -1071,6 +1109,17 @@ const makeStore = Effect.fnUntraced(function* (
   ) => {
     try {
       return mutatePreparation(PreparationJob.ownSelection(selected), action);
+    } catch {
+      return Effect.fail(integrity());
+    }
+  };
+  const ownNativePreparationMutation = (
+    input: PreparationJob.NativeControl,
+    action: "close" | "quiescing" | "unknown" | "expose",
+  ) => {
+    try {
+      const control = PreparationJob.ownNativeControl(input);
+      return mutatePreparation(control.selection, action, control.executionClaim);
     } catch {
       return Effect.fail(integrity());
     }
@@ -6419,6 +6468,50 @@ const makeStore = Effect.fnUntraced(function* (
       },
     });
   };
+  const validateNativePreparationHistory = Effect.fn(
+    "WorkflowRunStore.validateNativePreparationHistory",
+  )(function* (job: PreparationJob.Job, claim: PreparationJob.NativeClaim) {
+    const owner = job.input.nativeOwner;
+    if (job.identityVersion !== 3 || !owner || !sameCustodyValue(owner.executionClaim, claim))
+      return yield* integrity();
+    const retained = yield* readNativeReservationInTransaction({
+      intentId: owner.intentId,
+    });
+    const observation = job.input.request.current;
+    if (typeof observation !== "object" || observation === null || Array.isArray(observation))
+      return yield* integrity();
+    const current = observation as Record<string, unknown>;
+    const validId = (value: unknown): value is string =>
+      typeof value === "string" && value.trim().length > 0 && value.isWellFormed();
+    if (
+      Object.keys(current).sort().join() !==
+        "driver,nativeThreadId,providerInstanceId,providerSessionId,providerThreadId" ||
+      !validId(current.driver) ||
+      !validId(current.providerInstanceId) ||
+      !validId(current.providerThreadId) ||
+      (current.providerSessionId !== null && !validId(current.providerSessionId)) ||
+      (current.nativeThreadId !== null && !validId(current.nativeThreadId))
+    )
+      return yield* integrity();
+    const observationSnapshot = {
+      driver: current.driver,
+      providerInstanceId: current.providerInstanceId,
+      providerThreadId: current.providerThreadId,
+      providerSessionId: current.providerSessionId,
+      nativeThreadId: current.nativeThreadId,
+    };
+    const expected = yield* Effect.try({
+      try: () => nativePreparationInput(claim, retained, observationSnapshot),
+      catch: integrity,
+    });
+    if (
+      !sameCustodyValue(expected, job.input) ||
+      retained.operationId !== claim.operationId ||
+      retained.material.version !== 2
+    )
+      return yield* integrity();
+    return retained;
+  });
   const beginClaimedNativePreparation = Effect.fn("WorkflowRunStore.beginClaimedNativePreparation")(
     function* (claim: PreparationJob.NativeClaim) {
       if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
@@ -6434,53 +6527,7 @@ const makeStore = Effect.fnUntraced(function* (
               try: () => PreparationJob.decodeRow(rows[0]),
               catch: integrity,
             });
-            const owner = job.input.nativeOwner;
-            if (
-              job.identityVersion !== 3 ||
-              !owner ||
-              !sameCustodyValue(owner.executionClaim, claim)
-            )
-              return yield* integrity();
-            const retained = yield* readNativeReservationInTransaction({
-              intentId: owner.intentId,
-            });
-            const observation = job.input.request.current;
-            if (
-              typeof observation !== "object" ||
-              observation === null ||
-              Array.isArray(observation)
-            )
-              return yield* integrity();
-            const current = observation as Record<string, unknown>;
-            const validId = (value: unknown): value is string =>
-              typeof value === "string" && value.trim().length > 0 && value.isWellFormed();
-            if (
-              Object.keys(current).sort().join() !==
-                "driver,nativeThreadId,providerInstanceId,providerSessionId,providerThreadId" ||
-              !validId(current.driver) ||
-              !validId(current.providerInstanceId) ||
-              !validId(current.providerThreadId) ||
-              (current.providerSessionId !== null && !validId(current.providerSessionId)) ||
-              (current.nativeThreadId !== null && !validId(current.nativeThreadId))
-            )
-              return yield* integrity();
-            const observationSnapshot = {
-              driver: current.driver,
-              providerInstanceId: current.providerInstanceId,
-              providerThreadId: current.providerThreadId,
-              providerSessionId: current.providerSessionId,
-              nativeThreadId: current.nativeThreadId,
-            };
-            const expected = yield* Effect.try({
-              try: () => nativePreparationInput(claim, retained, observationSnapshot),
-              catch: integrity,
-            });
-            if (
-              !sameCustodyValue(expected, job.input) ||
-              retained.operationId !== claim.operationId ||
-              retained.material.version !== 2
-            )
-              return yield* integrity();
+            yield* validateNativePreparationHistory(job, claim);
             return Object.freeze({ kind: "existing" as const, job });
           }
           const current = yield* verifyClaimedNativeOperationInTransaction(claim);
@@ -7066,6 +7113,17 @@ const makeStore = Effect.fnUntraced(function* (
         return Effect.fail(integrity());
       }
     },
+    markNativePreparationProcessExposed: (input: PreparationJob.NativeControl) =>
+      ownNativePreparationMutation(input, "expose"),
+    closeNativePreparationCode: (input: PreparationJob.NativeControl) =>
+      ownNativePreparationMutation(input, "close"),
+    quiesceNativePreparationJob: (
+      input: PreparationJob.NativeControl,
+      disposition: "quiescing" | "unknown" = "quiescing",
+    ) =>
+      disposition === "quiescing" || disposition === "unknown"
+        ? ownNativePreparationMutation(input, disposition)
+        : Effect.fail(integrity()),
     markPreparationProcessExposed: (selected: PreparationJob.Selection) =>
       ownPreparationMutation(selected, "expose"),
     closePreparationCode: (selected: PreparationJob.Selection) =>
@@ -7142,13 +7200,14 @@ const makeNativeStore = Effect.fn("WorkflowRunStore.makeCapturedNative")(functio
   policy: ManagedPolicy["Service"],
   coordinator: NativeCoordinator,
 ) {
+  const environmentId = yield* identity.getEnvironmentId;
   const authority = yield* ExecutionAuthority.makeCapturedWorkflowExecutionAuthority(
     sql,
-    identity,
+    { getEnvironmentId: Effect.succeed(environmentId) },
     policy,
   );
   const protocol = yield* NativeProtocol.makeNativeCommandProtocol(sql, config, path);
-  return yield* makeStore(Effect.void, authority, { protocol, coordinator }).pipe(
+  return yield* makeStore(Effect.void, authority, { protocol, coordinator, environmentId }).pipe(
     Effect.provideService(SqlClient.SqlClient, sql),
   );
 });
