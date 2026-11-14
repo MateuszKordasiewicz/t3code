@@ -1,5 +1,9 @@
 import {
   CommandId,
+  EventId,
+  ProviderSessionId,
+  OrchestrationV2ProviderSessionJson,
+  type OrchestrationV2ProviderSession,
   OrchestrationV2AppThreadJson,
   type OrchestrationV2Run,
   OrchestrationV2DomainEvent,
@@ -15,6 +19,9 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as ProviderCommitBatch from "./ProviderCommitBatch.ts";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Native attachment attempts retain one cryptographic event identity.
+import * as NodeCrypto from "node:crypto";
+import * as Deferred from "effect/Deferred";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -92,6 +99,21 @@ const CurrentProviderBatch = Context.Reference<ProviderBatchPublication | undefi
 );
 
 export interface EventSinkV2Shape {
+  readonly prepareNativeSession?: (
+    store: object,
+    owner: object,
+  ) => Effect.Effect<void, EventSinkV2Error>;
+  readonly attachNativeSession?: (
+    store: object,
+    owner: object,
+  ) => Effect.Effect<OrchestrationV2ProviderSession, EventSinkV2Error>;
+  readonly retireNativeSession?: (
+    store: object,
+    owner: object,
+    reason: "idle_timeout" | "runtime_error" | "manual_shutdown" | "server_shutdown",
+    detail?: string,
+  ) => Effect.Effect<"retired" | "held", EventSinkV2Error>;
+
   /** Items that are not provider snapshots, such as a consumer's own control items, never batch. */
   readonly consumeProviderEvents: <A extends { readonly type: string }, E, R, E2, R2>(
     source: Stream.Stream<A, E, R>,
@@ -300,6 +322,14 @@ const decodeNativeTarget = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2AppThreadJson),
 );
 
+const decodeNativeSession = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(OrchestrationV2ProviderSessionJson),
+);
+const encodeNativeSessionMetadata = (providerInstanceId: string) =>
+  JSON.stringify({ providerInstanceId });
+const encodeNativeSession = Schema.encodeEffect(
+  Schema.fromJsonString(OrchestrationV2ProviderSessionJson),
+);
 const makeSink = Effect.fn("orchestrationV2.EventSink.make")(function* (
   nativeVerifier?: NativeVerifier,
   nativeAuthority?: CapturedNativeAuthority,
@@ -1255,8 +1285,253 @@ const makeSink = Effect.fn("orchestrationV2.EventSink.make")(function* (
     }),
   );
 
+  type Attachment = {
+    readonly store: object;
+    readonly source: WorkflowRunStore.NativeManagerOwnerSource;
+    readonly eventId: EventId;
+    attempted: boolean;
+    json?: string;
+    attachedAt?: string;
+    sequence?: number;
+    retirement?: Deferred.Deferred<"retired" | "held", EventSinkV2Error>;
+  };
+  const attachments = new WeakMap<object, Attachment>();
+  const nativeSessionError = (cause?: unknown) => new EventSinkWriteError({ eventCount: 1, cause });
+  const originalSessionSource = Effect.fn("EventSink.originalNativeSessionSource")(function* (
+    store: object,
+    owner: object,
+  ) {
+    if (!nativeAuthority || store !== nativeAuthority.store) return yield* nativeSessionError();
+    return yield* WorkflowRunStore.readNativeManagerOwner(store, owner, sql).pipe(
+      Effect.mapError(nativeSessionError),
+    );
+  });
+  const originalAttachment = Effect.fn("EventSink.originalNativeAttachment")(function* (
+    store: object,
+    owner: object,
+  ) {
+    const source = yield* originalSessionSource(store, owner);
+    const record = attachments.get(owner);
+    if (!record || record.store !== store || record.source !== source)
+      return yield* nativeSessionError();
+    return record;
+  });
+  const prepareNativeSession = Effect.fn("EventSink.prepareNativeSession")(function* (
+    store: object,
+    owner: object,
+  ) {
+    yield* requireNativeBoundary();
+    const source = yield* originalSessionSource(store, owner);
+    if (attachments.has(owner) || source.scope.state._tag === "Closed")
+      return yield* nativeSessionError();
+    attachments.set(owner, {
+      store,
+      source,
+      eventId: EventId.make(`event:native-session:${NodeCrypto.randomUUID()}`),
+      attempted: false,
+    });
+  }, Effect.mapError(nativeSessionError));
+  const attachNativeSession = Effect.fn("EventSink.attachNativeSession")(function* (
+    store: object,
+    owner: object,
+  ) {
+    yield* requireNativeBoundary();
+    const record = yield* originalAttachment(store, owner);
+    if (record.attempted || record.retirement) return yield* nativeSessionError();
+    record.attempted = true;
+    const constructed = yield* record.source.readConstruction();
+    const session = constructed.runtime.providerSession;
+    if (
+      session.id !== record.source.current.providerSessionId ||
+      session.providerInstanceId !== record.source.current.providerInstanceId ||
+      session.driver !== record.source.current.driver ||
+      session.status !== "ready" ||
+      session.model !== constructed.input.modelSelection.model ||
+      session.cwd !== constructed.input.thread.worktreePath
+    )
+      return yield* nativeSessionError();
+    const attachedSession = yield* decodeNativeSession(yield* encodeNativeSession(session));
+    record.json = yield* encodeNativeSession(attachedSession);
+    const event: OrchestrationV2DomainEvent = {
+      id: record.eventId,
+      type: "provider-session.attached",
+      threadId: ThreadId.make(record.source.threadId),
+      providerInstanceId: session.providerInstanceId,
+      occurredAt: yield* DateTime.now,
+      payload: attachedSession,
+    };
+    record.attachedAt = DateTime.formatIso(event.occurredAt);
+    yield* withProviderBatch(
+      Effect.gen(function* () {
+        yield* record.source.checkPublicationInTransaction();
+        if (
+          (yield* sql`SELECT 1 FROM orchestration_v2_projection_provider_sessions WHERE provider_session_id=${session.id}`)
+            .length ||
+          (yield* sql`SELECT 1 FROM orchestration_v2_projection_provider_session_bindings WHERE provider_session_id=${session.id}`)
+            .length
+        )
+          return yield* nativeSessionError();
+        const written = yield* writeEffect({ events: [event], effects: [] });
+        if (written.length !== 1 || written[0]!.event.id !== record.eventId)
+          return yield* nativeSessionError();
+        record.sequence = written[0]!.sequence;
+      }),
+    );
+    return session;
+  }, Effect.mapError(nativeSessionError));
+  const retireNativeSession = Effect.fn("EventSink.retireNativeSession")(function* (
+    store: object,
+    owner: object,
+    reason: "idle_timeout" | "runtime_error" | "manual_shutdown" | "server_shutdown",
+    detail?: string,
+  ) {
+    yield* requireNativeBoundary();
+    const record = yield* originalAttachment(store, owner);
+    return yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        if (record.retirement) return yield* Deferred.await(record.retirement);
+        const done = Deferred.makeUnsafe<"retired" | "held", EventSinkV2Error>();
+        record.retirement = done;
+        const work = Effect.gen(function* () {
+          const original = yield* record.source.readRetirement();
+          const session =
+            record.json === undefined ? undefined : yield* decodeNativeSession(record.json);
+          return yield* withProviderBatch(
+            Effect.gen(function* () {
+              const sid = ProviderSessionId.make(record.source.current.providerSessionId);
+              const rows = yield* sql<{
+                thread_id: string;
+                provider: string;
+                driver: string;
+                provider_instance_id: string;
+                status: string;
+                updated_at: string;
+                payload_json: string;
+              }>`SELECT thread_id,provider,driver,provider_instance_id,status,updated_at,payload_json FROM orchestration_v2_projection_provider_sessions WHERE provider_session_id=${sid}`;
+              const bindings = yield* sql<{
+                thread_id: string;
+              }>`SELECT thread_id FROM orchestration_v2_projection_provider_session_bindings WHERE provider_session_id=${sid} ORDER BY thread_id`;
+              const events = yield* sql<{
+                sequence: number;
+                event_type: string;
+                aggregate_kind: string;
+                stream_id: string;
+                occurred_at: string;
+                metadata_json: string;
+                payload_json: string;
+              }>`SELECT sequence,event_type,aggregate_kind,stream_id,occurred_at,metadata_json,payload_json FROM orchestration_events WHERE event_id=${record.eventId}`;
+              if (events.length === 0) {
+                if (rows.length || bindings.length) return yield* nativeSessionError();
+                return original.disposition.kind === "held"
+                  ? ("held" as const)
+                  : ("retired" as const);
+              }
+              if (
+                !record.attempted ||
+                !session ||
+                !record.json ||
+                events.length !== 1 ||
+                events[0]!.event_type !== "provider-session.attached" ||
+                events[0]!.aggregate_kind !== "thread" ||
+                events[0]!.stream_id !== record.source.threadId ||
+                events[0]!.occurred_at !== record.attachedAt ||
+                events[0]!.metadata_json !==
+                  encodeNativeSessionMetadata(session.providerInstanceId) ||
+                events[0]!.payload_json !== record.json ||
+                rows.length !== 1 ||
+                rows[0]!.thread_id !== record.source.threadId ||
+                rows[0]!.provider !== session.providerInstanceId ||
+                rows[0]!.driver !== session.driver ||
+                rows[0]!.provider_instance_id !== session.providerInstanceId ||
+                rows[0]!.status !== session.status ||
+                rows[0]!.updated_at !== DateTime.formatIso(session.updatedAt) ||
+                rows[0]!.payload_json !== record.json ||
+                bindings.length !== 1 ||
+                bindings[0]!.thread_id !== record.source.threadId
+              )
+                return yield* nativeSessionError();
+              const expected = original.transport;
+              if (!expected) return yield* nativeSessionError();
+              const physical = yield* sql<{
+                creation_context_hash: string;
+                creation_input_hash: string;
+                binding_json: string | null;
+                binding_hash: string | null;
+                settlement_json: string | null;
+                settlement_hash: string | null;
+              }>`SELECT creation_context_hash,creation_input_hash,binding_json,binding_hash,settlement_json,settlement_hash FROM orchestration_v2_submission_transports WHERE transport_id=${record.source.transportId}`;
+              const row = physical[0];
+              if (
+                physical.length !== 1 ||
+                !row ||
+                row.creation_context_hash !== expected.creation_context_hash ||
+                row.creation_input_hash !== expected.creation_input_hash ||
+                row.binding_json !== expected.binding_json ||
+                row.binding_hash !== expected.binding_hash ||
+                (original.disposition.kind === "retired" &&
+                  (row.settlement_json !== expected.settlement_json ||
+                    row.settlement_hash !== expected.settlement_hash ||
+                    row.settlement_json === null))
+              )
+                return yield* nativeSessionError();
+              const tail = yield* sql<{
+                event_id: string;
+              }>`SELECT event_id FROM orchestration_events WHERE sequence >= ${events[0]!.sequence} AND event_type IN ('provider-session.attached','provider-session.updated','provider-session.detached') AND (json_extract(payload_json,'$.id')=${sid} OR json_extract(payload_json,'$.providerSessionId')=${sid}) ORDER BY sequence DESC LIMIT 1`;
+              if (tail.length !== 1 || tail[0]!.event_id !== record.eventId)
+                return yield* nativeSessionError();
+              const retired = original.disposition.kind !== "held";
+              const now = yield* DateTime.now;
+              const payload = {
+                ...session,
+                status:
+                  !retired || reason === "runtime_error"
+                    ? ("error" as const)
+                    : ("stopped" as const),
+                lastError: !retired
+                  ? "Native cleanup is unconfirmed."
+                  : reason === "runtime_error"
+                    ? (detail ?? "Native provider session failed.")
+                    : null,
+                updatedAt: now,
+              };
+              yield* writeEffect({
+                events: [
+                  {
+                    id: EventId.make(`event:native-session:${NodeCrypto.randomUUID()}`),
+                    type: "provider-session.updated",
+                    threadId: ThreadId.make(record.source.threadId),
+                    providerInstanceId: payload.providerInstanceId,
+                    occurredAt: now,
+                    payload,
+                  },
+                  {
+                    id: EventId.make(`event:native-session:${NodeCrypto.randomUUID()}`),
+                    type: "provider-session.detached",
+                    threadId: ThreadId.make(record.source.threadId),
+                    providerInstanceId: payload.providerInstanceId,
+                    occurredAt: now,
+                    payload: { providerSessionId: sid, detachedAt: now },
+                  },
+                ],
+                effects: [],
+              });
+              return retired ? ("retired" as const) : ("held" as const);
+            }),
+          );
+        }).pipe(Effect.mapError(nativeSessionError));
+        const result = yield* Effect.exit(restore(work));
+        Deferred.doneUnsafe(done, result);
+        return yield* result;
+      }),
+    );
+  }, Effect.mapError(nativeSessionError));
+  const nativeSessionMethods = nativeAuthority
+    ? { prepareNativeSession, attachNativeSession, retireNativeSession }
+    : {};
+
   return EventSinkV2.of({
     ...nativeMethods,
+    ...nativeSessionMethods,
     consumeProviderEvents: coordinator.consume,
     withProviderBatch,
     write: (input) =>

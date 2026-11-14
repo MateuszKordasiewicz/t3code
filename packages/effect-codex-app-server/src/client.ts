@@ -361,6 +361,7 @@ export class CodexAppServerControlledClient extends Context.Service<
   CodexAppServerControlledClient,
   Omit<CodexAppServerClient["Service"], "raw" | "request" | "notify"> & {
     readonly quiesceOutput: CodexProtocol.CodexAppServerControlledProtocol["quiesceOutput"];
+    readonly assertCanQuiesceOutput: CodexProtocol.CodexAppServerControlledProtocol["assertCanQuiesceOutput"];
     readonly ownedProcess: {
       readonly pid: ChildProcessSpawner.ChildProcessHandle["pid"];
       readonly isRunning: ChildProcessSpawner.ChildProcessHandle["isRunning"];
@@ -543,16 +544,18 @@ const makeControlledProcessProtocol = Effect.fn(
           inHandler(handler(method, params)),
         ),
     };
+    const assertCanQuiesceOutput = Effect.gen(function* () {
+      if ((yield* CurrentControlledHandlers).has(marker))
+        return yield* new CodexError.CodexAppServerFrameSubmissionError({
+          outcome: "not_submitted",
+          reason: "reentrant",
+        });
+      yield* transport.assertCanQuiesceOutput;
+    });
     return Object.freeze({
       ...handlers,
-      quiesceOutput: Effect.gen(function* () {
-        if ((yield* CurrentControlledHandlers).has(marker))
-          return yield* new CodexError.CodexAppServerFrameSubmissionError({
-            outcome: "not_submitted",
-            reason: "reentrant",
-          });
-        return yield* transport.quiesceOutput;
-      }),
+      assertCanQuiesceOutput,
+      quiesceOutput: assertCanQuiesceOutput.pipe(Effect.andThen(transport.quiesceOutput)),
       awaitTermination: Deferred.await(state.termination),
       raw: {
         notifications: transport.incomingNotifications,

@@ -44,9 +44,13 @@ import * as Result from "effect/Result";
 import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import type * as SqlError from "effect/sql/SqlError";
 import * as Path from "effect/Path";
 import { stableStringify } from "@t3tools/shared/relaySigning";
 import type { ServerConfig } from "../config.ts";
+import type { ModelSelection, OrchestrationV2AppThread } from "@t3tools/contracts";
+import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import type * as CodexClient from "effect-codex-app-server/client";
 import { buildCodexAdapterInitializeParams } from "../provider/CodexProvider.ts";
 import * as NativeProtocol from "./WorkflowNativeCommandProtocol.ts";
 import * as PreparationJob from "../preparation/PreparationJob.ts";
@@ -288,6 +292,69 @@ type NativeBindingRuntime = {
   readonly protocol: Effect.Success<ReturnType<typeof NativeProtocol.makeNativeCommandProtocol>>;
   readonly coordinator: NativeCoordinator;
 };
+export type NativeManagerConstruction = {
+  readonly runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime;
+  readonly policy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
+  readonly input: {
+    readonly thread: OrchestrationV2AppThread;
+    readonly modelSelection: ModelSelection;
+  };
+};
+export type NativeManagerDisposition = {
+  readonly kind: "retired" | "held" | "closed";
+  readonly transportId: string;
+};
+export type NativeManagerSourceError =
+  | WorkflowRunStoreError
+  | PreparationOwner.PreparationProcessOwnerError
+  | SqlError.SqlError;
+export interface NativeManagerOwnerSource {
+  readonly sql: SqlClient.SqlClient;
+  readonly transportId: string;
+  readonly threadId: string;
+  readonly runId: string | null;
+  readonly current: {
+    readonly driver: string;
+    readonly providerInstanceId: string;
+    readonly providerThreadId: string;
+    readonly providerSessionId: string;
+    readonly nativeThreadId: string | null;
+  };
+  readonly scope: Scope.Scope;
+  readonly checkReservation: () => Effect.Effect<void, NativeManagerSourceError>;
+  readonly capturePublication: () => Effect.Effect<void, NativeManagerSourceError>;
+  readonly checkPublicationInTransaction: () => Effect.Effect<void, NativeManagerSourceError>;
+  readonly confirmPublication: () => Effect.Effect<void, NativeManagerSourceError>;
+  readonly readConstruction: () => Effect.Effect<
+    NativeManagerConstruction,
+    NativeManagerSourceError
+  >;
+  readonly readClient: () => Effect.Effect<
+    typeof CodexClient.CodexAppServerControlledClient.Service | undefined,
+    NativeManagerSourceError
+  >;
+  readonly close: () => Effect.Effect<NativeManagerDisposition, NativeManagerSourceError>;
+  readonly readRetirement: () => Effect.Effect<
+    {
+      readonly disposition: NativeManagerDisposition;
+      readonly transport?: ReturnType<typeof decodeSubmissionTransportData>;
+    },
+    NativeManagerSourceError
+  >;
+}
+const nativeManagerSources = new WeakMap<
+  object,
+  { readonly sql: SqlClient.SqlClient; readonly owners: WeakMap<object, NativeManagerOwnerSource> }
+>();
+export const readNativeManagerOwner = Effect.fn("WorkflowRunStore.readNativeManagerOwner")(
+  function* (store: object, owner: object, sql: SqlClient.SqlClient) {
+    const registered = nativeManagerSources.get(store);
+    const source = registered?.owners.get(owner);
+    if (!source || registered?.sql !== sql || source.sql !== sql) return yield* integrity();
+    return source;
+  },
+);
+
 // Public constructors own the construction span; this helper is shared by their two capability sets.
 const makeStore = Effect.fnUntraced(function* (
   beforePublish: Effect.Effect<void> = Effect.void,
@@ -309,6 +376,7 @@ const makeStore = Effect.fnUntraced(function* (
     }
   >();
   const nativeTransports = new WeakSet<NativeTransportActor>();
+  const managerOwners = new WeakMap<object, NativeManagerOwnerSource>();
 
   const preparationAcquisitions = new WeakMap<
     object,
@@ -7499,7 +7567,6 @@ const makeStore = Effect.fnUntraced(function* (
         >;
         type Pending = Effect.Success<ReturnType<Gate["spawnHeld"]>>;
         type Held = Effect.Success<ReturnType<Pending["awaitHeld"]>>;
-        let gate: Gate | undefined;
         let pending: Pending | undefined;
         let held: Held | undefined;
         let constructor: Fiber.Fiber<unknown, unknown> | undefined;
@@ -7507,6 +7574,8 @@ const makeStore = Effect.fnUntraced(function* (
         let adapterConstruction: Fiber.Fiber<unknown, unknown> | undefined;
         let adapterInputKey: string | undefined;
         let adapterAccepted = false;
+        let publication: Fiber.Fiber<unknown, unknown> | undefined;
+        let publicationAccepted = false;
         let bootstrapPhase: "new" | "initialize" | "confirmed" | "initialized" = "new";
         const initializeParams = buildCodexAdapterInitializeParams();
         const initializeJson = stableStringify(initializeParams);
@@ -7736,6 +7805,88 @@ const makeStore = Effect.fnUntraced(function* (
             ),
           );
         }, Effect.interruptible);
+        const readConstruction = Effect.fn("WorkflowRunStore.readOriginalNativeAdapter")(
+          function* () {
+            const completed = adapterConstruction?.pollUnsafe();
+            if (!adapterAccepted || !completed || Exit.isFailure(completed))
+              return yield* integrity();
+            const value = completed.value;
+            if (
+              typeof value !== "object" ||
+              value === null ||
+              !("kind" in value) ||
+              value.kind !== "adapter-runtime-created" ||
+              !("runtime" in value) ||
+              !("input" in value) ||
+              !("policy" in value)
+            )
+              return yield* integrity();
+            return value as NativeManagerConstruction;
+          },
+        );
+        const capturePublication = Effect.fn("WorkflowRunStore.captureNativeManagerPublication")(
+          function* () {
+            yield* outside();
+            if (
+              publication ||
+              flags.stopped ||
+              flags.blocked ||
+              runtime.scope.state._tag === "Closed"
+            )
+              return yield* integrity();
+            yield* readConstruction();
+            publication = yield* Effect.withFiber(Effect.succeed);
+            yield* body(
+              writer(
+                Effect.gen(function* () {
+                  const input = yield* readAdapterInput();
+                  if (input.key !== adapterInputKey) return yield* stale();
+                }),
+                () => {},
+              ),
+            );
+          },
+          Effect.interruptible,
+        );
+        const checkPublicationInTransaction = Effect.fn(
+          "WorkflowRunStore.checkNativeManagerPublicationInTransaction",
+        )(function* () {
+          const fiber = yield* Effect.withFiber(Effect.succeed);
+          if (
+            Option.isNone(yield* Effect.serviceOption(sql.transactionService)) ||
+            publication?.id !== fiber.id ||
+            publicationAccepted
+          )
+            return yield* integrity();
+          const input = yield* readAdapterInput();
+          if (input.key !== adapterInputKey) return yield* stale();
+        });
+        const confirmPublication = Effect.fn("WorkflowRunStore.confirmNativeManagerPublication")(
+          function* () {
+            yield* outside();
+            const completed = publication?.pollUnsafe();
+            if (
+              !completed ||
+              Exit.isFailure(completed) ||
+              publicationAccepted ||
+              flags.stopped ||
+              flags.blocked
+            )
+              return yield* integrity();
+            yield* body(
+              writer(
+                Effect.gen(function* () {
+                  const input = yield* readAdapterInput();
+                  if (input.key !== adapterInputKey) return yield* stale();
+                }),
+                () => {
+                  publicationAccepted = true;
+                },
+              ),
+            );
+          },
+          Effect.interruptible,
+        );
         const close = Effect.fn("WorkflowRunStore.closeNativeCodexTransport")(function* () {
           yield* outside();
           return yield* Effect.uninterruptible(
@@ -7744,6 +7895,7 @@ const makeStore = Effect.fnUntraced(function* (
                 if (
                   (constructor?.id === fiber.id && constructor.pollUnsafe() === undefined) ||
                   (bootstrap?.id === fiber.id && bootstrap.pollUnsafe() === undefined) ||
+                  (publication?.id === fiber.id && publication.pollUnsafe() === undefined) ||
                   (adapterConstruction?.id === fiber.id &&
                     adapterConstruction.pollUnsafe() === undefined) ||
                   [...bodies].some(
@@ -7764,6 +7916,8 @@ const makeStore = Effect.fnUntraced(function* (
                     constructor.interruptUnsafe();
                   if (bootstrap && bootstrap.pollUnsafe() === undefined)
                     bootstrap.interruptUnsafe();
+                  if (publication && publication.pollUnsafe() === undefined)
+                    publication.interruptUnsafe();
                   if (adapterConstruction && adapterConstruction.pollUnsafe() === undefined)
                     adapterConstruction.interruptUnsafe();
                   for (const invocation of bodies) invocation.fiber.interruptUnsafe();
@@ -7773,6 +7927,9 @@ const makeStore = Effect.fnUntraced(function* (
                   });
                   const constructed = constructor ? yield* Fiber.await(constructor) : undefined;
                   const initialized = bootstrap ? yield* Fiber.await(bootstrap) : undefined;
+                  const publishedRuntime = publication
+                    ? yield* Fiber.await(publication)
+                    : undefined;
                   const adapted = adapterConstruction
                     ? yield* Fiber.await(adapterConstruction)
                     : undefined;
@@ -7790,6 +7947,10 @@ const makeStore = Effect.fnUntraced(function* (
                         bootstrapPhase !== "initialized")) ||
                     (adapterConstruction !== undefined &&
                       (!adapted || Exit.isFailure(adapted) || !adapterAccepted)) ||
+                    (publication !== undefined &&
+                      (!publishedRuntime ||
+                        Exit.isFailure(publishedRuntime) ||
+                        !publicationAccepted)) ||
                     Exit.isFailure(closed) ||
                     Exit.isFailure(stopped) ||
                     !pending ||
@@ -7860,40 +8021,32 @@ const makeStore = Effect.fnUntraced(function* (
           runtime.scope,
           close().pipe(Effect.ignore, Effect.ensuring(Scope.close(cleanupScope, Exit.void))),
         );
-        const prepared = yield* Effect.exit(
-          restore(
-            body(
-              Effect.gen(function* () {
-                yield* inTransaction(checkCurrent(false));
-                gate = yield* PreparationGate.prepareControlledCodexProcessGate({
-                  ...command,
-                  extendEnv: false,
-                  threadId: job.input.threadId,
-                }).pipe(
-                  Effect.provideService(AgentScope, runtime.agentScope),
-                  Effect.provideService(PreparationNode.PreparationNodeChild, runtime.nodeChild),
-                  Effect.provideService(Path.Path, runtime.path),
-                  Effect.provideService(HostProcess.Environment, runtime.hostEnvironment),
-                  Effect.provideService(HostProcess.WorkingDirectory, runtime.hostCwd),
-                  Effect.provideService(Scope.Scope, physical),
-                );
-                if (!sameCustodyValue(gate.hostIdentity, host)) return yield* integrity();
-              }),
-            ),
-          ),
-        );
+        const prepared = yield* Effect.exit(restore(body(inTransaction(checkCurrent(false)))));
         if (Exit.isFailure(prepared)) {
           yield* close().pipe(Effect.ignore);
           return yield* Effect.failCause(prepared.cause);
         }
         const open = Effect.fn("WorkflowRunStore.openNativeCodexTransport")(function* () {
           const fiber = yield* Effect.withFiber(Effect.succeed);
-          if (openAttempted || !gate || !constructor || constructor.id !== fiber.id)
+          if (openAttempted || !constructor || constructor.id !== fiber.id)
             return yield* integrity();
           openAttempted = true;
-          const selectedGate = gate;
           return yield* body(
             Effect.gen(function* () {
+              yield* inTransaction(checkCurrent(false));
+              const selectedGate = yield* PreparationGate.prepareControlledCodexProcessGate({
+                ...command,
+                extendEnv: false,
+                threadId: job.input.threadId,
+              }).pipe(
+                Effect.provideService(AgentScope, runtime.agentScope),
+                Effect.provideService(PreparationNode.PreparationNodeChild, runtime.nodeChild),
+                Effect.provideService(Path.Path, runtime.path),
+                Effect.provideService(HostProcess.Environment, runtime.hostEnvironment),
+                Effect.provideService(HostProcess.WorkingDirectory, runtime.hostCwd),
+                Effect.provideService(Scope.Scope, physical),
+              );
+              if (!sameCustodyValue(selectedGate.hostIdentity, host)) return yield* integrity();
               yield* writer(
                 Effect.gen(function* () {
                   yield* checkCurrent(false);
@@ -8065,7 +8218,7 @@ const makeStore = Effect.fnUntraced(function* (
             }),
           );
         }, Effect.interruptible);
-        return Object.freeze({
+        const facade = Object.freeze({
           transportId: id,
           executionClaim: claim,
           current: Object.freeze(current),
@@ -8123,6 +8276,63 @@ const makeStore = Effect.fnUntraced(function* (
             },
           ),
         });
+        managerOwners.set(
+          facade,
+          Object.freeze({
+            sql,
+            transportId: id,
+            threadId: job.input.threadId,
+            runId: job.input.runId,
+            current: facade.current,
+            scope: physical,
+            capturePublication,
+            checkPublicationInTransaction,
+            confirmPublication,
+            readConstruction,
+            close,
+            checkReservation: Effect.fn("WorkflowRunStore.checkNativeManagerReservation")(
+              function* () {
+                yield* outside();
+                const fiber = yield* Effect.withFiber(Effect.succeed);
+                if (
+                  constructor?.id !== fiber.id ||
+                  constructor.pollUnsafe() !== undefined ||
+                  actor.row ||
+                  flags.stopped ||
+                  flags.blocked ||
+                  physical.state._tag === "Closed" ||
+                  runtime.scope.state._tag === "Closed"
+                )
+                  return yield* integrity();
+              },
+            ),
+            readClient: Effect.fn("WorkflowRunStore.readOriginalNativeClient")(function* () {
+              const completed = constructor?.pollUnsafe();
+              if (!completed || Exit.isFailure(completed)) return undefined;
+              const value = completed.value;
+              if (
+                typeof value !== "object" ||
+                value === null ||
+                !("kind" in value) ||
+                value.kind !== "transport-created" ||
+                !("client" in value)
+              )
+                return yield* integrity();
+              return value.client as typeof CodexClient.CodexAppServerControlledClient.Service;
+            }),
+            readRetirement: Effect.fn("WorkflowRunStore.readOriginalNativeRetirement")(
+              function* () {
+                if (!closeDone || !Deferred.isDoneUnsafe(closeDone)) return yield* integrity();
+                const disposition = yield* Deferred.await(closeDone);
+                return Object.freeze({
+                  disposition,
+                  ...(actor.row ? { transport: actor.row } : {}),
+                });
+              },
+            ),
+          }),
+        );
+        return facade;
       }),
     );
   });
@@ -8522,7 +8732,7 @@ const makeStore = Effect.fnUntraced(function* (
       return result;
     },
   );
-  return {
+  const service = {
     createRun,
     beginPlanning,
     admitPlanningPass,
@@ -8755,6 +8965,8 @@ const makeStore = Effect.fnUntraced(function* (
     readRecovery,
     compareAndApplyRecovery,
   };
+  nativeManagerSources.set(service, { sql, owners: managerOwners });
+  return service;
 });
 
 export const make = Effect.fn("WorkflowRunStore.make")(function* (

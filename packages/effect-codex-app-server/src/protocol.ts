@@ -166,8 +166,8 @@ const makeProtocolEngine = Effect.fn("makeCodexAppServerPatchedProtocol")(functi
   options: CodexAppServerPatchedProtocolOptions,
   controlled?: CodexAppServerControlledProtocolOptions<E>,
 ): Effect.fn.Return<
-  Omit<CodexAppServerControlledProtocol, "quiesceOutput"> &
-    Partial<Pick<CodexAppServerControlledProtocol, "quiesceOutput">>,
+  Omit<CodexAppServerControlledProtocol, "quiesceOutput" | "assertCanQuiesceOutput"> &
+    Partial<Pick<CodexAppServerControlledProtocol, "quiesceOutput" | "assertCanQuiesceOutput">>,
   never,
   Scope.Scope
 > {
@@ -585,7 +585,12 @@ const makeProtocolEngine = Effect.fn("makeCodexAppServerPatchedProtocol")(functi
     incomingNotifications: Stream.fromQueue(incomingNotifications),
     incomingRequests: Stream.fromQueue(incomingRequests),
     request: controlledRuntime ? controlledRuntime.requestSnapshot : request,
-    ...(controlledRuntime ? { quiesceOutput: controlledRuntime.quiesceOutput } : {}),
+    ...(controlledRuntime
+      ? {
+          quiesceOutput: controlledRuntime.quiesceOutput,
+          assertCanQuiesceOutput: controlledRuntime.assertCanQuiesceOutput,
+        }
+      : {}),
     notify,
     respond,
     respondError,
@@ -832,6 +837,7 @@ export const submitControlledCodexAppServerFrame = <E>(options: ControlledFrameO
 };
 
 export interface CodexAppServerControlledProtocol extends CodexAppServerPatchedProtocol {
+  readonly assertCanQuiesceOutput: Effect.Effect<void, CodexError.CodexAppServerError>;
   readonly quiesceOutput: Effect.Effect<void, CodexError.CodexAppServerError>;
   readonly request: (
     method: string,
@@ -1153,13 +1159,16 @@ const makeControlledRuntime = Effect.fn("CodexAppServerProtocol.makeControlledRu
     yield* Queue.end(outgoing);
     yield* Deferred.succeed(lifecycleStart, undefined);
   }, Effect.uninterruptible);
+  const assertCanQuiesceOutput = Effect.gen(function* () {
+    if ((yield* CurrentControlledCallbacks).has(marker))
+      return yield* new CodexError.CodexAppServerFrameSubmissionError({
+        outcome: "not_submitted",
+        reason: "reentrant",
+      });
+  });
   const quiesceOutput = Effect.uninterruptibleMask((restore) =>
     Effect.gen(function* () {
-      if ((yield* CurrentControlledCallbacks).has(marker))
-        return yield* new CodexError.CodexAppServerFrameSubmissionError({
-          outcome: "not_submitted",
-          reason: "reentrant",
-        });
+      yield* assertCanQuiesceOutput;
       yield* stopOutput();
       return yield* restore(Deferred.await(quiesceDone).pipe(Effect.flatten));
     }),
@@ -1423,7 +1432,7 @@ const makeControlledRuntime = Effect.fn("CodexAppServerProtocol.makeControlledRu
       ? Effect.fail(owned.failure)
       : requestOwned(owned.success, selection);
   };
-  return { terminate, sendSnapshot, requestSnapshot, quiesceOutput };
+  return { terminate, sendSnapshot, requestSnapshot, quiesceOutput, assertCanQuiesceOutput };
 }, Effect.uninterruptible);
 
 export const makeCodexAppServerPatchedProtocol = (
@@ -1450,8 +1459,12 @@ export const makeControlledCodexAppServerProtocol = <E>(
     );
   return makeProtocolEngine(owned, owned).pipe(
     Effect.flatMap((protocol) =>
-      protocol.quiesceOutput
-        ? Effect.succeed({ ...protocol, quiesceOutput: protocol.quiesceOutput })
+      protocol.quiesceOutput && protocol.assertCanQuiesceOutput
+        ? Effect.succeed({
+            ...protocol,
+            quiesceOutput: protocol.quiesceOutput,
+            assertCanQuiesceOutput: protocol.assertCanQuiesceOutput,
+          })
         : Effect.die("Missing controlled output lifecycle"),
     ),
   );

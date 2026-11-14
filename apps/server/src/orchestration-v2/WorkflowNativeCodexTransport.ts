@@ -31,6 +31,8 @@ import { codexAppServerEnvironment } from "../provider/CodexProvider.ts";
 import { codexAppServerArgs, resolveCodexLaunchArgs } from "../provider/codexLaunchArgs.ts";
 import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
 import * as Workspace from "./ThreadLaunchService.ts";
+import * as Manager from "./ProviderSessionManager.ts";
+import * as EventSink from "./EventSink.ts";
 import * as ProviderInstances from "../provider/ProviderInstanceRegistry.ts";
 import * as CodexInstallation from "../provider/CodexInstallation.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
@@ -66,6 +68,9 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
 ) {
   const sql = yield* SqlClient.SqlClient;
   const store = yield* Store.WorkflowRunStore;
+  const manager = yield* Manager.ProviderSessionManagerV2;
+  const eventSink = yield* EventSink.EventSinkV2;
+  yield* Manager.assertNativeManagerReceiver(manager, eventSink);
   const workspace = yield* Workspace.makeNativeWorkspacePreparation(coordinator);
   const settings = yield* Settings.ServerSettingsService;
   const instances = yield* ProviderInstances.ProviderInstanceRegistry;
@@ -88,6 +93,9 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
     fiber?: Fiber.Fiber<unknown, unknown>;
     bootstrapFiber?: Fiber.Fiber<unknown, unknown>;
     adapterFiber?: Fiber.Fiber<unknown, unknown>;
+    managerAttempted?: boolean;
+    client?: typeof CodexClient.CodexAppServerControlledClient.Service;
+    terminated?: Fiber.Fiber<unknown, unknown>;
     runtime?: ProviderAdapter.ProviderAdapterV2SessionRuntime;
     construction?: {
       input: Effect.Success<ReturnType<Owner["captureAdapterConstruction"]>>;
@@ -104,7 +112,15 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
     if (entry.adapterFiber && entry.adapterFiber.pollUnsafe() === undefined)
       entry.adapterFiber.interruptUnsafe();
     const result = entry.owner
-      ? yield* entry.owner.close()
+      ? entry.managerAttempted
+        ? yield* Manager.closeNativeManagerRuntime(manager, entry.owner).pipe(
+            Effect.catch((error) =>
+              error.reason === "unregistered"
+                ? entry.owner!.close()
+                : Effect.succeed({ kind: "held" as const, transportId: entry.owner!.transportId }),
+            ),
+          )
+        : yield* entry.owner.close()
       : { kind: "closed" as const, transportId: "" };
     if (entry.fiber) yield* Fiber.await(entry.fiber);
     if (entry.bootstrapFiber) yield* Fiber.await(entry.bootstrapFiber);
@@ -181,6 +197,7 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
           if (closed || serviceScope.state._tag === "Closed" || platform !== "linux")
             return yield* failure("closed");
           const entry: Entry = {};
+          const control = yield* Effect.withFiber(Effect.succeed);
           entries.add(entry);
           const body = Effect.gen(function* () {
             const prepared = yield* preparation;
@@ -209,6 +226,32 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
             if (stableStringify(owner.executionClaim) !== stableStringify(prepared.executionClaim))
               return yield* failure("stale");
             yield* owner.captureConstructor();
+            entry.managerAttempted = true;
+            yield* Manager.reserveNativeManagerRuntime(manager, {
+              store,
+              owner,
+              sql,
+              sink: eventSink,
+              control,
+              onCleanup: () => {
+                entries.delete(entry);
+              },
+              checkProfile: Effect.fn("WorkflowNativeCodexTransport.checkPublicationProfile")(
+                function* () {
+                  yield* checkProfile();
+                  if (
+                    closed ||
+                    serviceScope.state._tag === "Closed" ||
+                    !entry.client ||
+                    !entry.runtime ||
+                    !entry.terminated ||
+                    !(yield* entry.client.ownedProcess.isRunning) ||
+                    entry.terminated.pollUnsafe() !== undefined
+                  )
+                    return yield* failure("closed");
+                },
+              ),
+            });
             const io = yield* owner.open();
             let bootstrapSelection: string | undefined;
             let bootstrapMethod: "initialize" | "initialized" | undefined;
@@ -262,6 +305,8 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
                 }),
               }),
             );
+            entry.client = retained;
+            entry.terminated = terminated;
             const bootstrap = Effect.fn("WorkflowNativeCodexTransport.bootstrap")(
               function* () {
                 if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
@@ -491,6 +536,23 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
               bootstrap,
               client: retained,
               createAdapterRuntime,
+              publishRuntime: Effect.fn("WorkflowNativeCodexTransport.publishRuntime")(
+                function* () {
+                  if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+                    return yield* failure("boundary");
+                  if (closed || serviceScope.state._tag === "Closed" || !entry.runtime)
+                    return yield* failure("closed");
+                  const runtime = yield* Manager.publishNativeManagerRuntime(manager, owner);
+                  return Object.freeze({
+                    kind: "runtime-published" as const,
+                    transportId: owner.transportId,
+                    runtime,
+                    runState: "preparing" as const,
+                  });
+                },
+                Effect.mapError(() => failure("failed")),
+                Effect.interruptible,
+              ),
               close: Effect.fn("WorkflowNativeCodexTransport.close")(function* () {
                 if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
                   return yield* failure("boundary");

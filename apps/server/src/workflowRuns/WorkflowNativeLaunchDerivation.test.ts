@@ -14,6 +14,11 @@ import * as PreparationResource from "../preparation/PreparationProcessResource.
 import * as PreparationJob from "../preparation/PreparationJob.ts";
 import * as ThreadLaunch from "../orchestration-v2/ThreadLaunchService.ts";
 import * as NativeTransport from "../orchestration-v2/WorkflowNativeCodexTransport.ts";
+import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionManager.ts";
+import * as CommandOutputHub from "../orchestration-v2/CommandOutputHub.ts";
+import * as ProviderEventIngestor from "../orchestration-v2/ProviderEventIngestor.ts";
+import * as McpSessionRegistryTestkit from "../mcp/McpSessionRegistry.testkit.ts";
+
 import * as ProviderInstances from "../provider/ProviderInstanceRegistry.ts";
 import * as CodexInstallation from "../provider/CodexInstallation.ts";
 import * as RuntimePolicy from "../orchestration-v2/RuntimePolicy.ts";
@@ -35,10 +40,12 @@ import * as NodePathService from "@effect/platform-node/NodePath";
 import { assert, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  EventId,
   MessageId,
   OrchestrationV2Command,
   ProviderInstanceId,
   ProviderDriverKind,
+  ProviderSessionId,
   CommandId,
   ThreadId,
   RunId,
@@ -2159,21 +2166,18 @@ const proofOrchestrator = Effect.fn("test.proofOrchestrator")(function* (
     planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
     openSession: () => Effect.die("Native proof fixture must never open a provider session"),
   } as ProviderAdapter.ProviderAdapterV2["Service"];
+  const registry = ProviderAdapterRegistry.layerFromAdapters([adapter]);
   return yield* Layer.build(
     Layer.fresh(
-      ProviderReplayHarness.layerWithRegistry(
-        { name: "native-command-proofs" },
-        ProviderAdapterRegistry.layerFromAdapters([adapter]),
-        {
-          databaseLayer: Layer.succeed(SqlClient.SqlClient, sql),
-          nativeCommandProofs,
-          ...(serverConfig === undefined ? {} : { serverConfig }),
-          ...(nativeWorkflowAuthority === undefined ? {} : { nativeWorkflowAuthority }),
-          runEffectWorker: false,
-          runContinuationWorker: false,
-          recoverOnStartup: false,
-        },
-      ),
+      ProviderReplayHarness.layerWithRegistry({ name: "native-command-proofs" }, registry, {
+        databaseLayer: Layer.succeed(SqlClient.SqlClient, sql),
+        nativeCommandProofs,
+        ...(serverConfig === undefined ? {} : { serverConfig }),
+        ...(nativeWorkflowAuthority === undefined ? {} : { nativeWorkflowAuthority }),
+        runEffectWorker: false,
+        runContinuationWorker: false,
+        recoverOnStartup: false,
+      }).pipe(Layer.provideMerge(registry)),
     ),
   );
 });
@@ -4803,6 +4807,21 @@ it.effect(
         command.args.push("foreign");
         command.env.OWNED = "mutated";
         const owner = yield* acquiring;
+        const managerSource = yield* Store.readNativeManagerOwner(
+          fixture.store,
+          owner,
+          fixture.sql,
+        );
+        for (const [store, facade, client] of [
+          [{ ...fixture.store }, owner, fixture.sql],
+          [fixture.store, { ...owner }, fixture.sql],
+          [ordinary, owner, fixture.sql],
+          [fixture.store, owner, Object.assign(fixture.sql.bind(undefined), fixture.sql)],
+        ] as const)
+          assert.isTrue(
+            Exit.isFailure(yield* Effect.exit(Store.readNativeManagerOwner(store, facade, client))),
+          );
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(managerSource.readConstruction())));
         assert.strictEqual(
           (yield* Effect.result(fixture.store.consumeNativeCodexTransportOwner(job, command)))._tag,
           "Failure",
@@ -5781,6 +5800,11 @@ it.effect.each(
           Exit.isFailure(exit)
             ? Cause.hasInterrupts(exit.cause)
             : Exit.isFailure(exit.value) && Cause.hasInterrupts(exit.value.cause),
+          Exit.isFailure(exit)
+            ? Cause.pretty(exit.cause)
+            : Exit.isFailure(exit.value)
+              ? Cause.pretty(exit.value.cause)
+              : "unexpected success",
         );
         const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
         const child = harness.children.get(image.args[3]!)!;
@@ -6854,4 +6878,949 @@ it.effect.each(["assistant-message", "fork", "merge_back", "provider-switch"] as
         [],
       );
     }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "native %s publishes its original runtime into the real Manager and joins release",
+  (kind) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        const fixture = yield* controlledNativeFixture(kind, false, false, 2, false, {
+          type: "worktree",
+          baseRef: "main",
+          branch: "native-manager-owned",
+        });
+        const manager = Context.get(
+          fixture.runtime,
+          ProviderSessionManager.ProviderSessionManagerV2,
+        );
+        const service = yield* nativeTransportEntry(fixture);
+        const transport = yield* service.createReservedTransport(producerSelection(fixture));
+        yield* transport.client.assertCanQuiesceOutput;
+        yield* transport.bootstrap();
+        const constructed = yield* transport.createAdapterRuntime();
+        const sessionId = constructed.runtime.providerSessionId;
+        assert.isFalse(yield* manager.isLive(sessionId));
+        assert.isFunction(transport.publishRuntime);
+        const published = yield* transport.publishRuntime();
+        assert.strictEqual(published.kind, "runtime-published");
+        assert.strictEqual(published.transportId, transport.transportId);
+        assert.strictEqual(published.runtime.providerSessionId, sessionId);
+        const live = yield* manager.get(sessionId);
+        assert.isTrue(Option.isSome(live));
+        if (Option.isSome(live)) assert.strictEqual(live.value, published.runtime);
+        assert.notStrictEqual(published.runtime, constructed.runtime);
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT status FROM orchestration_v2_projection_provider_sessions WHERE provider_session_id=${sessionId}`,
+          [{ status: "ready" }],
+        );
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT thread_id FROM orchestration_v2_projection_provider_session_bindings WHERE provider_session_id=${sessionId}`,
+          [{ thread_id: fixture.input.threadId }],
+        );
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT event_type FROM orchestration_events WHERE event_type='provider-session.attached'`,
+          [{ event_type: "provider-session.attached" }],
+        );
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT status FROM orchestration_v2_projection_runs`,
+          [{ status: "preparing" }],
+        );
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT * FROM orchestration_v2_submission_attempts`,
+          [],
+        );
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        const child = harness.children.get(image.args[3]!)!;
+        assert.strictEqual(child.payloads.length, 2);
+        yield* manager.close(sessionId);
+        assert.isFalse(child.running);
+        assert.isFalse(yield* manager.isLive(sessionId));
+        assert.isTrue(Option.isNone(yield* manager.get(sessionId)));
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT status FROM orchestration_v2_projection_provider_sessions WHERE provider_session_id=${sessionId}`,
+          [{ status: "stopped" }],
+        );
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT * FROM orchestration_v2_projection_provider_session_bindings WHERE provider_session_id=${sessionId}`,
+          [],
+        );
+        assert.strictEqual((yield* transport.close()).kind, "retired");
+        assert.strictEqual(child.payloads.length, 2);
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+const nativeManagerOrdinaryAdapter = Effect.fn("test.nativeManagerOrdinaryAdapter")(function* (
+  fixture: Effect.Success<ReturnType<typeof controlledNativeFixture>>,
+) {
+  const adapter = yield* Context.get(
+    fixture.runtime,
+    ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+  ).get(ProviderInstanceId.make("provider"));
+  const state = {
+    beforeOpen: Effect.void as Effect.Effect<void>,
+    beforeClose: Effect.void as Effect.Effect<void>,
+    closed: 0,
+  };
+  const spy = vi.spyOn(adapter, "openSession").mockImplementation((input) =>
+    Effect.gen(function* () {
+      yield* Effect.addFinalizer(() =>
+        state.beforeClose.pipe(
+          Effect.andThen(
+            Effect.sync(() => {
+              state.closed++;
+            }),
+          ),
+        ),
+      );
+      yield* state.beforeOpen;
+      const now = yield* DateTime.now;
+      const unused = () => Effect.die("unused ordinary fixture method");
+      return {
+        instanceId: ProviderInstanceId.make("provider"),
+        driver: ProviderDriverKind.make("codex"),
+        providerSessionId: input.providerSessionId,
+        providerSession: {
+          id: input.providerSessionId,
+          driver: ProviderDriverKind.make("codex"),
+          providerInstanceId: ProviderInstanceId.make("provider"),
+          status: "ready" as const,
+          cwd: "/ordinary",
+          model: "model",
+          capabilities: CodexProviderCapabilitiesV2,
+          createdAt: now,
+          updatedAt: now,
+          lastError: null,
+        },
+        events: Stream.never,
+        ensureThread: unused,
+        resumeThread: unused,
+        startTurn: unused,
+        steerTurn: unused,
+        interruptTurn: unused,
+        respondToRuntimeRequest: unused,
+        readThreadSnapshot: unused,
+        rollbackThread: unused,
+        forkThread: unused,
+      } satisfies ProviderAdapter.ProviderAdapterV2SessionRuntime;
+    }),
+  );
+  return { state, spy };
+});
+const ordinaryNativeManagerInput = (threadId: ThreadId, providerSessionId: ProviderSessionId) => ({
+  threadId,
+  providerSessionId,
+  modelSelection: { instanceId: ProviderInstanceId.make("provider"), model: "model" },
+  runtimePolicy: {
+    cwd: null,
+    runtimeMode: "full-access" as const,
+    interactionMode: "default" as const,
+  },
+});
+
+it.effect.each([
+  "same-session",
+  "same-thread",
+  "detached-thread",
+  "pending-open",
+  "close-debt",
+] as const)("native Manager refuses ordinary custody at %s without evicting its runtime", (mode) =>
+  Effect.gen(function* () {
+    let codexWraps = 0;
+    const harness = yield* nativeWorkspaceProcesses(
+      Effect.void,
+      Effect.sync(() => {
+        codexWraps++;
+      }),
+    );
+    const testScope = yield* Effect.scope;
+    yield* Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture("workflow", false, false, 2, false, {
+        type: "worktree",
+        baseRef: "main",
+        branch: "native-manager-custody",
+      });
+      const manager = Context.get(fixture.runtime, ProviderSessionManager.ProviderSessionManagerV2);
+      const ordinary = yield* nativeManagerOrdinaryAdapter(fixture);
+      using _adapter = ordinary.spy;
+      const sid = ProviderSessionId.make("ordinary-manager-custody");
+      const tid =
+        mode === "same-session" || mode === "detached-thread"
+          ? ThreadId.make("other-thread")
+          : ThreadId.make(fixture.input.threadId);
+      if (tid !== fixture.input.threadId)
+        yield* fixture.orchestrator.dispatch(
+          decodeOrchestratorFixtureCommand({
+            type: "thread.create",
+            commandId: "ordinary-other-thread",
+            threadId: tid,
+            projectId: fixture.input.projectId,
+            title: "Other",
+            modelSelection: fixture.input.launch.modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: "main",
+            worktreePath: null,
+            createdBy: "agent",
+            creationSource: "mcp",
+          }),
+        );
+      const allocator = Context.get(
+        yield* Layer.build(IdAllocator.layer),
+        IdAllocator.IdAllocatorV2,
+      );
+      using _id = vi
+        .spyOn(allocator.allocate, "providerSession")
+        .mockImplementation(() =>
+          Effect.succeed(
+            mode === "same-session" ? sid : ProviderSessionId.make("new-native-session"),
+          ),
+        );
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const closed = yield* Deferred.make<void>();
+      if (mode === "pending-open")
+        ordinary.state.beforeOpen = Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+        );
+      if (mode === "close-debt")
+        ordinary.state.beforeClose = Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+          Effect.andThen(Deferred.succeed(closed, undefined)),
+        );
+      let opening:
+        | Fiber.Fiber<
+            ProviderAdapter.ProviderAdapterV2SessionRuntime,
+            ProviderSessionManager.ProviderSessionManagerV2Error
+          >
+        | undefined;
+      let reached = 0;
+      let consumed = 0;
+      const originalConsume = fixture.store.consumeNativeCodexTransportOwner;
+      using _consume = vi
+        .spyOn(fixture.store, "consumeNativeCodexTransportOwner")
+        .mockImplementation((job, command) =>
+          Effect.gen(function* () {
+            reached++;
+            const retired = PreparationJob.decodeRow(
+              (yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_jobs`)[0],
+            );
+            assert.strictEqual(retired.input.threadId, fixture.input.threadId);
+            assert.strictEqual(
+              (yield* fixture.sql`SELECT state FROM orchestration_v2_preparation_jobs`)[0]!.state,
+              "settled",
+            );
+            opening = yield* manager
+              .open(ordinaryNativeManagerInput(tid, sid))
+              .pipe(Effect.forkIn(testScope));
+            if (mode === "pending-open") yield* Deferred.await(entered);
+            else yield* Fiber.join(opening);
+            if (mode === "detached-thread") {
+              yield* manager.open(
+                ordinaryNativeManagerInput(ThreadId.make(fixture.input.threadId), sid),
+              );
+              yield* manager.detach({
+                providerSessionId: sid,
+                threadId: ThreadId.make(fixture.input.threadId),
+              });
+            }
+            if (mode === "close-debt") {
+              const closing = yield* manager.close(sid).pipe(Effect.forkIn(testScope));
+              yield* Deferred.await(entered);
+              yield* TestClock.adjust("30 seconds");
+              yield* Fiber.join(closing);
+              assert.strictEqual(ordinary.state.closed, 0);
+            }
+          }).pipe(
+            Effect.orDie,
+            Effect.andThen(originalConsume(job, command)),
+            Effect.tap(() =>
+              Effect.sync(() => {
+                consumed++;
+              }),
+            ),
+          ),
+        );
+      const service = yield* nativeTransportEntry(fixture);
+      const denied = yield* service
+        .createReservedTransport(producerSelection(fixture))
+        .pipe(Effect.exit, Effect.ensuring(Deferred.succeed(release, undefined)));
+      assert.strictEqual(reached, 1);
+      assert.strictEqual(consumed, 1);
+      assert.isTrue(Exit.isFailure(denied));
+      assert.strictEqual(codexWraps, 0);
+      assert.strictEqual(
+        harness.requests.filter((image) => image.args[4] === "/fixture-bin/codex").length,
+        0,
+      );
+      if (mode === "pending-open" && opening) yield* Fiber.join(opening);
+      if (mode === "close-debt") {
+        yield* Deferred.await(closed);
+        assert.strictEqual(ordinary.state.closed, 1);
+      } else {
+        assert.isTrue(yield* manager.isLive(sid));
+        assert.strictEqual(ordinary.state.closed, 0);
+        yield* manager.close(sid);
+        assert.strictEqual(ordinary.state.closed, 1);
+      }
+    }).pipe(Effect.provide(harness.services));
+  }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(["manager", "sink", "store"] as const)(
+  "native Manager rejects a copied %s service before Codex birth",
+  (mode) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        const fixture = yield* controlledNativeFixture("workflow", false, false, 2, false, {
+          type: "worktree",
+          baseRef: "main",
+          branch: "native-cloned-service",
+        });
+        const altered =
+          mode === "manager"
+            ? Context.add(fixture.runtime, ProviderSessionManager.ProviderSessionManagerV2, {
+                ...Context.get(fixture.runtime, ProviderSessionManager.ProviderSessionManagerV2),
+              })
+            : mode === "sink"
+              ? Context.add(fixture.runtime, EventSink.EventSinkV2, {
+                  ...Context.get(fixture.runtime, EventSink.EventSinkV2),
+                })
+              : Context.add(fixture.runtime, Store.WorkflowRunStore, { ...fixture.store });
+        const attempted = yield* Effect.gen(function* () {
+          const service = yield* nativeTransportEntry({ ...fixture, runtime: altered });
+          return yield* service.createReservedTransport(producerSelection(fixture));
+        }).pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(attempted));
+        assert.strictEqual(
+          harness.requests.filter((image) => image.args[4] === "/fixture-bin/codex").length,
+          0,
+        );
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each([
+  "close-instance",
+  "detach",
+  "release",
+  "release-unless-busy",
+  "shutdown",
+  "transport",
+] as const)("native Manager joins original cleanup through %s", (mode) =>
+  Effect.gen(function* () {
+    const harness = yield* nativeWorkspaceProcesses();
+    yield* Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture("planning", false, false, 2, false, {
+        type: "worktree",
+        baseRef: "main",
+        branch: "native-manager-release",
+      });
+      const manager = Context.get(fixture.runtime, ProviderSessionManager.ProviderSessionManagerV2);
+      const service = yield* nativeTransportEntry(fixture);
+      const transport = yield* service.createReservedTransport(producerSelection(fixture));
+      yield* transport.bootstrap();
+      yield* transport.createAdapterRuntime();
+      const published = yield* transport.publishRuntime();
+      const sid = published.runtime.providerSessionId;
+      if (mode === "close-instance")
+        yield* manager.closeInstance(ProviderInstanceId.make("provider"));
+      else if (mode === "detach")
+        yield* manager.detach({
+          providerSessionId: sid,
+          threadId: ThreadId.make(fixture.input.threadId),
+        });
+      else if (mode === "release")
+        yield* manager.release({ providerSessionId: sid, reason: "manual_shutdown" });
+      else if (mode === "release-unless-busy")
+        assert.isTrue(
+          yield* manager.releaseUnlessBusy({
+            providerSessionId: sid,
+            reason: "manual_shutdown",
+            ownProviderThreadIds: [],
+          }),
+        );
+      else if (mode === "shutdown") yield* manager.shutdown;
+      else assert.strictEqual((yield* transport.close()).kind, "retired");
+      assert.isFalse(yield* manager.isLive(sid));
+      assert.isFalse(yield* transport.client.ownedProcess.isRunning);
+      assert.deepStrictEqual(
+        yield* fixture.sql`SELECT status FROM orchestration_v2_projection_provider_sessions WHERE provider_session_id=${sid}`,
+        [{ status: "stopped" }],
+      );
+      assert.deepStrictEqual(
+        yield* fixture.sql`SELECT * FROM orchestration_v2_projection_provider_session_bindings WHERE provider_session_id=${sid}`,
+        [],
+      );
+      assert.strictEqual((yield* transport.close()).kind, "retired");
+    }).pipe(Effect.provide(harness.services));
+  }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each([
+  "lost-attachment-return",
+  "projection-replaced",
+  "attachment-aba",
+  "grant-revoked",
+  "grant-after-attachment",
+  "profile-after-attachment",
+  "input-after-attachment",
+  "nested-mutation",
+  "callback-close",
+  "callback-shutdown",
+  "callback-close-instance",
+  "foreign-thread",
+  "sdk-death",
+] as const)("native Manager preserves original ownership at %s", (mode) =>
+  Effect.gen(function* () {
+    const harness = yield* nativeWorkspaceProcesses();
+    yield* Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture("workflow", false, false, 2, false, {
+        type: "worktree",
+        baseRef: "main",
+        branch: "native-manager-boundary",
+      });
+      const manager = Context.get(fixture.runtime, ProviderSessionManager.ProviderSessionManagerV2);
+      const sink = Context.get(fixture.runtime, EventSink.EventSinkV2);
+      const service = yield* nativeTransportEntry(fixture);
+      const transport = yield* service.createReservedTransport(producerSelection(fixture));
+      yield* transport.bootstrap();
+      const raw = yield* transport.createAdapterRuntime();
+      const sid = raw.runtime.providerSessionId;
+      if (mode === "grant-revoked") yield* fixture.sessions.revoke(fixture.reference.sessionId);
+      const originalAttach = sink.attachNativeSession!;
+      using _write = vi.spyOn(sink, "attachNativeSession").mockImplementation((store, owner) =>
+        originalAttach(store, owner).pipe(
+          Effect.tap(
+            Effect.gen(function* () {
+              if (mode === "grant-after-attachment")
+                yield* fixture.sessions.revoke(fixture.reference.sessionId);
+              else if (mode === "input-after-attachment")
+                yield* fixture.sql`UPDATE orchestration_v2_projection_threads SET payload_json=json_set(payload_json,'$.worktreePath','/foreign')`;
+              else if (mode === "profile-after-attachment") {
+                const id = ProviderInstanceId.make("provider");
+                service.facts.settings = {
+                  ...service.facts.settings,
+                  providerInstances: {
+                    ...service.facts.settings.providerInstances,
+                    [id]: { ...service.facts.settings.providerInstances[id]!, enabled: false },
+                  },
+                };
+              }
+            }).pipe(
+              Effect.mapError(
+                (cause) => new EventSink.EventSinkWriteError({ eventCount: 1, cause }),
+              ),
+            ),
+          ),
+          Effect.andThen(
+            mode === "lost-attachment-return"
+              ? Effect.fail(new EventSink.EventSinkWriteError({ eventCount: 1 }))
+              : Effect.succeed(raw.runtime.providerSession),
+          ),
+        ),
+      );
+      if (
+        mode === "grant-revoked" ||
+        mode === "lost-attachment-return" ||
+        mode === "grant-after-attachment" ||
+        mode === "profile-after-attachment" ||
+        mode === "input-after-attachment"
+      ) {
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(transport.publishRuntime())));
+        assert.isFalse(yield* manager.isLive(sid));
+        assert.isFalse(yield* transport.client.ownedProcess.isRunning);
+        if (mode !== "grant-revoked") {
+          assert.deepStrictEqual(
+            yield* fixture.sql`SELECT status FROM orchestration_v2_projection_provider_sessions WHERE provider_session_id=${sid}`,
+            [{ status: "error" }],
+          );
+          assert.deepStrictEqual(
+            yield* fixture.sql`SELECT * FROM orchestration_v2_projection_provider_session_bindings WHERE provider_session_id=${sid}`,
+            [],
+          );
+        }
+        return;
+      }
+      const published = yield* transport.publishRuntime();
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(transport.publishRuntime())));
+      if (mode === "projection-replaced") {
+        yield* fixture.sql`UPDATE orchestration_v2_projection_provider_sessions SET driver='foreign' WHERE provider_session_id=${sid}`;
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(manager.close(sid))));
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT driver,status FROM orchestration_v2_projection_provider_sessions WHERE provider_session_id=${sid}`,
+          [{ driver: "foreign", status: "ready" }],
+        );
+        return;
+      }
+      if (mode === "attachment-aba") {
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("foreign-native-update"),
+              type: "provider-session.updated",
+              threadId: ThreadId.make(fixture.input.threadId),
+              occurredAt: yield* DateTime.now,
+              payload: published.runtime.providerSession,
+            },
+          ],
+        });
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(manager.close(sid))));
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT status FROM orchestration_v2_projection_provider_sessions WHERE provider_session_id=${sid}`,
+          [{ status: "ready" }],
+        );
+        return;
+      }
+      if (mode === "nested-mutation") {
+        const caps = published.runtime.providerSession.capabilities.tools;
+        const original = caps.supportsMcpTools;
+        Object.assign(caps, { supportsMcpTools: !original });
+        yield* manager
+          .close(sid)
+          .pipe(
+            Effect.ensuring(Effect.sync(() => Object.assign(caps, { supportsMcpTools: original }))),
+          );
+        const row = (yield* fixture.sql<{
+          payload_json: string;
+        }>`SELECT payload_json FROM orchestration_v2_projection_provider_sessions WHERE provider_session_id=${sid}`)[0]!;
+        assert.strictEqual(
+          JSON.parse(row.payload_json).capabilities.tools.supportsMcpTools,
+          original,
+        );
+        return;
+      }
+      if (
+        mode === "callback-close" ||
+        mode === "callback-shutdown" ||
+        mode === "callback-close-instance"
+      ) {
+        const attempts =
+          yield* Queue.unbounded<
+            Exit.Exit<void, ProviderSessionManager.ProviderSessionManagerV2Error>
+          >();
+        yield* transport.client.handleUnknownServerRequest(() =>
+          (mode === "callback-shutdown"
+            ? manager.shutdown
+            : mode === "callback-close-instance"
+              ? manager.closeInstance(ProviderInstanceId.make("provider"))
+              : manager.close(sid)
+          ).pipe(
+            Effect.exit,
+            Effect.flatMap((exit) => Queue.offer(attempts, exit)),
+            Effect.as({ ok: true }),
+          ),
+        );
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        const child = harness.children.get(image.args[3]!)!;
+        yield* Queue.offer(
+          child.output,
+          new TextEncoder().encode(
+            JSON.stringify({ id: "manager-close", method: "fixture/close", params: {} }) + "\n",
+          ),
+        );
+        const attempted = yield* Queue.take(attempts);
+        assert.strictEqual(Exit.isSuccess(attempted), mode === "callback-shutdown");
+        assert.isTrue(yield* manager.isLive(sid));
+        assert.isTrue(child.running);
+      }
+      if (mode === "foreign-thread") {
+        const projections = Context.get(
+          yield* Layer.build(
+            ProjectionStore.layer.pipe(
+              Layer.provide(Layer.succeed(SqlClient.SqlClient, fixture.sql)),
+            ),
+          ),
+          ProjectionStore.ProjectionStoreV2,
+        );
+        const records = yield* projections.getThreadRecords(ThreadId.make(fixture.input.threadId), [
+          "providerThreads",
+        ]);
+        const providerThread = records.providerThreads[0]!;
+        const foreign = ThreadId.make("foreign-thread");
+        const modelSelection = { instanceId: ProviderInstanceId.make("provider"), model: "model" };
+        const runtimePolicy = {
+          cwd: "/foreign",
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
+        };
+        for (const action of [
+          published.runtime.ensureThread({ threadId: foreign, modelSelection, runtimePolicy }),
+          published.runtime.resumeThread({
+            providerThread: { ...providerThread, appThreadId: null },
+          }),
+          published.runtime.resumeThread({ providerThread, threadId: foreign }),
+          published.runtime.forkThread({
+            sourceProviderThread: providerThread,
+            targetThreadId: foreign,
+            modelSelection,
+            runtimePolicy,
+          }),
+        ]) {
+          const error = yield* Effect.flip(action);
+          assert.strictEqual(error._tag, "ProviderAdapterProtocolError");
+        }
+      }
+      if (mode === "sdk-death") {
+        const subscription = yield* published.runtime.subscribeEvents!;
+        const ended = yield* subscription.events.pipe(
+          Stream.runDrain,
+          Effect.exit,
+          Effect.forkScoped,
+        );
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        const child = harness.children.get(image.args[3]!)!;
+        child.running = false;
+        yield* Deferred.succeed(child.terminal, { code: 1, signal: null });
+        yield* Queue.end(child.output);
+        assert.isTrue(Exit.isFailure(yield* Fiber.join(ended)));
+      }
+      yield* manager.close(sid);
+      assert.isFalse(yield* manager.isLive(sid));
+      assert.isFalse(yield* transport.client.ownedProcess.isRunning);
+      assert.deepStrictEqual(
+        yield* fixture.sql`SELECT status FROM orchestration_v2_projection_runs`,
+        [{ status: "preparing" }],
+      );
+      assert.deepStrictEqual(
+        yield* fixture.sql`SELECT * FROM orchestration_v2_submission_attempts`,
+        [],
+      );
+    }).pipe(Effect.provide(harness.services));
+  }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(
+  ([false, true] as const).flatMap((masked) =>
+    (["caller", "factory", "store", "manager", "deadline"] as const).map((boundary) => ({
+      masked,
+      boundary,
+    })),
+  ),
+)(
+  "native Manager joins blocked publication at $boundary under mask=$masked",
+  ({ masked, boundary }) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      const storeScope = yield* Scope.make();
+      const factoryScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(factoryScope, Exit.void));
+      yield* Effect.addFinalizer(() => Scope.close(storeScope, Exit.void));
+      const entered = yield* Deferred.make<void>();
+      const unwinding = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      yield* Effect.gen(function* () {
+        const fixture = yield* controlledNativeFixture("workflow", false, false, 2, false, {
+          type: "worktree",
+          baseRef: "main",
+          branch: "native-manager-publish-unwind",
+        }).pipe(Effect.provideService(Scope.Scope, storeScope));
+        const manager = Context.get(
+          fixture.runtime,
+          ProviderSessionManager.ProviderSessionManagerV2,
+        );
+        const sink = Context.get(fixture.runtime, EventSink.EventSinkV2);
+        const service = yield* nativeTransportEntry(fixture).pipe(
+          Effect.provideService(Scope.Scope, factoryScope),
+        );
+        const prepared = yield* Queue.unbounded<ProviderSessionId>();
+        const originalWriter = fixture.sql.withTransaction;
+        const originalAttach = sink.attachNativeSession!;
+        let armed = false;
+        using _writer = vi
+          .spyOn(fixture.sql, "withTransaction")
+          .mockImplementation(<A, E, R>(work: Effect.Effect<A, E, R>) => {
+            if (!armed) return originalWriter(work);
+            armed = false;
+            return originalWriter(
+              Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Effect.never),
+                Effect.ensuring(
+                  Deferred.succeed(unwinding, undefined).pipe(
+                    Effect.andThen(Deferred.await(release)),
+                  ),
+                ),
+                Effect.interruptible,
+              ),
+            );
+          });
+        using _attach = vi.spyOn(sink, "attachNativeSession").mockImplementation((store, owner) =>
+          Effect.suspend(() => {
+            armed = true;
+            return originalAttach(store, owner);
+          }),
+        );
+        const working = yield* Effect.gen(function* () {
+          const transport = yield* service.createReservedTransport(producerSelection(fixture));
+          yield* transport.bootstrap();
+          const constructed = yield* transport.createAdapterRuntime();
+          yield* Queue.offer(prepared, constructed.runtime.providerSessionId);
+          return yield* transport.publishRuntime();
+        }).pipe(
+          (work) => (masked ? Effect.uninterruptible(work) : work),
+          Effect.exit,
+          Effect.forkScoped,
+        );
+        const sid = yield* Queue.take(prepared);
+        yield* Deferred.await(entered);
+        assert.isFalse(yield* manager.isLive(sid));
+        const stopping = yield* (
+          boundary === "caller"
+            ? Fiber.interrupt(working)
+            : boundary === "factory"
+              ? Scope.close(factoryScope, Exit.void)
+              : boundary === "store"
+                ? Scope.close(storeScope, Exit.void)
+                : boundary === "manager"
+                  ? manager.shutdown
+                  : TestClock.adjust("10 seconds")
+        ).pipe(Effect.forkScoped);
+        yield* Deferred.await(unwinding);
+        yield* Effect.sync(() => {
+          assert.isUndefined(working.pollUnsafe());
+          if (boundary !== "deadline") assert.isUndefined(stopping.pollUnsafe());
+        }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+        yield* Fiber.join(stopping);
+        const result = yield* Fiber.await(working);
+        assert.isTrue(Exit.isFailure(result) || Exit.isFailure(result.value));
+        assert.isFalse(yield* manager.isLive(sid));
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT * FROM orchestration_v2_projection_provider_sessions`,
+          [],
+        );
+        assert.deepStrictEqual(
+          yield* fixture.sql`SELECT * FROM orchestration_v2_submission_attempts`,
+          [],
+        );
+        const image = harness.requests.find((image) => image.args[4] === "/fixture-bin/codex")!;
+        const child = harness.children.get(image.args[3]!)!;
+        assert.isFalse(child.running);
+        assert.strictEqual(child.payloads.length, 2);
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect.each(["configured", "retained-config", "idle-release"] as const)(
+  "native Manager enforces original MCP and idle profile at %s",
+  (mode) =>
+    Effect.gen(function* () {
+      const harness = yield* nativeWorkspaceProcesses();
+      yield* Effect.gen(function* () {
+        const fixture = yield* controlledNativeFixture("workflow", false, false, 2, false, {
+          type: "worktree",
+          baseRef: "main",
+          branch: "native-manager-profile",
+        });
+        const mcp = Context.get(
+          yield* Layer.build(Layer.fresh(McpProviderSessions.layer)),
+          McpProviderSessions.McpProviderSessions,
+        );
+        const selected = {
+          environmentId: EnvironmentId.make("environment"),
+          threadId: ThreadId.make(fixture.input.threadId),
+          providerSessionId: "retained",
+          providerInstanceId: ProviderInstanceId.make("provider"),
+          endpoint: "http://unused",
+          authorizationHeader: "fixture",
+          browserToolsAvailable: false,
+        };
+        if (mode === "retained-config") yield* mcp.set(selected);
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          IdAllocator.layer,
+          McpSessionRegistryTestkit.layer,
+          Layer.succeed(McpProviderSessions.McpProviderSessions, mcp),
+          Layer.succeed(EventSink.EventSinkV2, Context.get(fixture.runtime, EventSink.EventSinkV2)),
+          Layer.succeed(
+            ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+            Context.get(fixture.runtime, ProviderAdapterRegistry.ProviderAdapterRegistryV2),
+          ),
+          ProjectionStore.layer.pipe(
+            Layer.provide(Layer.succeed(SqlClient.SqlClient, fixture.sql)),
+          ),
+          Layer.succeed(CommandOutputHub.CommandOutputHub, {
+            append: () => Effect.die("native output not qualified"),
+            finish: () => Effect.die("native output not qualified"),
+            subscribe: () => Stream.die("native output not qualified"),
+          }),
+          Layer.succeed(ProviderEventIngestor.ProviderEventIngestorV2, {
+            normalize: () => Effect.die("native events not qualified"),
+            ingestNormalized: () => Effect.die("native events not qualified"),
+          }),
+        );
+        const manager = Context.get(
+          yield* Layer.build(
+            Layer.fresh(
+              ProviderSessionManager.layerWithOptions({
+                configureMcp: mode === "configured",
+                idleTimeoutMs: 1,
+              }).pipe(Layer.provide(dependencies)),
+            ),
+          ),
+          ProviderSessionManager.ProviderSessionManagerV2,
+        );
+        const result = yield* Effect.gen(function* () {
+          const service = yield* nativeTransportEntry({
+            ...fixture,
+            runtime: Context.add(
+              fixture.runtime,
+              ProviderSessionManager.ProviderSessionManagerV2,
+              manager,
+            ),
+          });
+          const transport = yield* service.createReservedTransport(producerSelection(fixture));
+          if (mode !== "idle-release") return yield* Effect.die("MCP profile was accepted");
+          yield* transport.bootstrap();
+          yield* transport.createAdapterRuntime();
+          const published = yield* transport.publishRuntime();
+          const subscription = yield* published.runtime.subscribeEvents!;
+          const ended = yield* subscription.events.pipe(
+            Stream.runDrain,
+            Effect.exit,
+            Effect.forkScoped,
+          );
+          yield* TestClock.adjust(1);
+          assert.isTrue(Exit.isFailure(yield* Fiber.join(ended)));
+          yield* manager.close(published.runtime.providerSessionId);
+          assert.isFalse(yield* manager.isLive(published.runtime.providerSessionId));
+          assert.strictEqual((yield* transport.close()).kind, "retired");
+        }).pipe(Effect.exit);
+        if (mode === "idle-release")
+          assert.isTrue(
+            Exit.isSuccess(result),
+            Exit.isFailure(result) ? Cause.pretty(result.cause) : "success",
+          );
+        else {
+          assert.isTrue(Exit.isFailure(result));
+          assert.strictEqual(
+            harness.requests.filter((image) => image.args[4] === "/fixture-bin/codex").length,
+            0,
+          );
+          assert.deepStrictEqual(
+            yield* mcp.read(selected.threadId),
+            mode === "retained-config" ? selected : undefined,
+          );
+        }
+      }).pipe(Effect.provide(harness.services));
+    }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect("native Manager rechecks its profile after the observed final acceptance writer", () =>
+  Effect.gen(function* () {
+    const harness = yield* nativeWorkspaceProcesses();
+    yield* Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture("workflow", false, false, 2, false, {
+        type: "worktree",
+        baseRef: "main",
+        branch: "native-manager-final-profile",
+      });
+      const manager = Context.get(fixture.runtime, ProviderSessionManager.ProviderSessionManagerV2);
+      const sink = Context.get(fixture.runtime, EventSink.EventSinkV2);
+      const service = yield* nativeTransportEntry(fixture);
+      const transport = yield* service.createReservedTransport(producerSelection(fixture));
+      yield* transport.bootstrap();
+      const raw = yield* transport.createAdapterRuntime();
+      let armed = false;
+      let intercepted = false;
+      const originalAttach = sink.attachNativeSession!;
+      const originalWriter = fixture.sql.withTransaction;
+      using _attach = vi.spyOn(sink, "attachNativeSession").mockImplementation((store, owner) =>
+        originalAttach(store, owner).pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              armed = true;
+            }),
+          ),
+        ),
+      );
+      using _writer = vi
+        .spyOn(fixture.sql, "withTransaction")
+        .mockImplementation(<A, E, R>(work: Effect.Effect<A, E, R>) => {
+          if (!armed) return originalWriter(work);
+          armed = false;
+          return originalWriter(work).pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                intercepted = true;
+                const id = ProviderInstanceId.make("provider");
+                service.facts.settings = {
+                  ...service.facts.settings,
+                  providerInstances: {
+                    ...service.facts.settings.providerInstances,
+                    [id]: { ...service.facts.settings.providerInstances[id]!, enabled: false },
+                  },
+                };
+              }),
+            ),
+          );
+        });
+      const result = yield* Effect.exit(transport.publishRuntime());
+      assert.isTrue(intercepted);
+      assert.isTrue(Exit.isFailure(result));
+      assert.isFalse(yield* manager.isLive(raw.runtime.providerSessionId));
+      assert.isFalse(yield* transport.client.ownedProcess.isRunning);
+      assert.deepStrictEqual(
+        yield* fixture.sql`SELECT status FROM orchestration_v2_projection_provider_sessions`,
+        [{ status: "error" }],
+      );
+    }).pipe(Effect.provide(harness.services));
+  }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+it.effect("native Manager owns attachment payload before its SQL writer waits", () =>
+  Effect.gen(function* () {
+    const harness = yield* nativeWorkspaceProcesses();
+    yield* Effect.gen(function* () {
+      const fixture = yield* controlledNativeFixture("workflow", false, false, 2, false, {
+        type: "worktree",
+        baseRef: "main",
+        branch: "native-manager-payload",
+      });
+      const manager = Context.get(fixture.runtime, ProviderSessionManager.ProviderSessionManagerV2);
+      const sink = Context.get(fixture.runtime, EventSink.EventSinkV2);
+      const service = yield* nativeTransportEntry(fixture);
+      const transport = yield* service.createReservedTransport(producerSelection(fixture));
+      yield* transport.bootstrap();
+      const raw = yield* transport.createAdapterRuntime();
+      const caps = raw.runtime.providerSession.capabilities.tools;
+      const original = caps.supportsMcpTools;
+      let armed = false;
+      let intercepted = false;
+      const originalAttach = sink.attachNativeSession!;
+      const originalWriter = fixture.sql.withTransaction;
+      using _attach = vi.spyOn(sink, "attachNativeSession").mockImplementation((store, owner) =>
+        Effect.suspend(() => {
+          armed = true;
+          return originalAttach(store, owner);
+        }),
+      );
+      using _writer = vi
+        .spyOn(fixture.sql, "withTransaction")
+        .mockImplementation(<A, E, R>(work: Effect.Effect<A, E, R>) => {
+          if (!armed) return originalWriter(work);
+          armed = false;
+          return Effect.sync(() => {
+            intercepted = true;
+            Object.assign(caps, { supportsMcpTools: !original });
+          }).pipe(Effect.andThen(originalWriter(work)));
+        });
+      yield* Effect.gen(function* () {
+        const published = yield* transport.publishRuntime();
+        assert.isTrue(intercepted);
+        const row = (yield* fixture.sql<{
+          payload_json: string;
+        }>`SELECT payload_json FROM orchestration_v2_projection_provider_sessions WHERE provider_session_id=${published.runtime.providerSessionId}`)[0]!;
+        assert.strictEqual(
+          JSON.parse(row.payload_json).capabilities.tools.supportsMcpTools,
+          original,
+        );
+        yield* manager.close(published.runtime.providerSessionId);
+      }).pipe(
+        Effect.ensuring(Effect.sync(() => Object.assign(caps, { supportsMcpTools: original }))),
+      );
+    }).pipe(Effect.provide(harness.services));
+  }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
 );
