@@ -21,6 +21,13 @@ import {
   OrchestrationV2ExecutionNodeJson,
   OrchestrationV2CheckpointScopeJson,
 } from "@t3tools/contracts";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Resource identities use Node's cryptographic UUID source.
+import * as NodeCrypto from "node:crypto";
+import { AgentScope } from "@t3tools/shared/AgentScope";
+import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
+import * as Stream from "effect/Stream";
 import * as Context from "effect/Context";
 import * as Digest from "effect/crypto/Digest";
 import * as DateTime from "effect/DateTime";
@@ -31,11 +38,15 @@ import * as Result from "effect/Result";
 import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
-import type * as Path from "effect/Path";
+import * as Path from "effect/Path";
 import { stableStringify } from "@t3tools/shared/relaySigning";
 import type { ServerConfig } from "../config.ts";
 import * as NativeProtocol from "./WorkflowNativeCommandProtocol.ts";
 import * as PreparationJob from "../preparation/PreparationJob.ts";
+import * as PreparationResource from "../preparation/PreparationProcessResource.ts";
+import * as PreparationOwner from "../preparation/PreparationProcessOwner.ts";
+import * as PreparationGate from "../preparation/PreparationProcessGate.ts";
+import * as PreparationNode from "../preparation/PreparationNodeChild.ts";
 import {
   decodeSubmissionTransportData,
   decodeSubmissionAttemptResourceData,
@@ -113,6 +124,7 @@ const attemptFacts = <
 };
 const encode = (value: unknown) => JSON.stringify(value);
 const parse = (value: string): unknown => JSON.parse(value);
+const decodePreparationWorkflowOwner = Schema.decodeEffect(WorkflowOperationV1.fields.owner);
 const decodeNativeFinalizationRun = Schema.decodeEffect(
   Schema.fromJsonString(OrchestrationV2RunJson),
 );
@@ -220,7 +232,17 @@ type CurrentAuthority = Effect.Success<
   ReturnType<typeof ExecutionAuthority.makeCapturedWorkflowExecutionAuthority>
 >;
 type NativeCoordinator = { readonly bootId: string; readonly workerId: string };
+type PreparationActor = {
+  job: PreparationJob.Job;
+  readonly resources: Map<string, PreparationResource.Resource>;
+};
 type NativeBindingRuntime = {
+  readonly scope: Scope.Scope;
+  readonly agentScope: typeof AgentScope.Service;
+  readonly nodeChild: typeof PreparationNode.PreparationNodeChild.Service;
+  readonly path: Path.Path;
+  readonly hostEnvironment: NodeJS.ProcessEnv;
+  readonly hostCwd: string;
   readonly environmentId: string;
   readonly protocol: Effect.Success<ReturnType<typeof NativeProtocol.makeNativeCommandProtocol>>;
   readonly coordinator: NativeCoordinator;
@@ -237,6 +259,36 @@ const makeStore = Effect.fnUntraced(function* (
     Effect.asVoid,
   );
   const sql = yield* SqlClient.SqlClient;
+  const preparationActors = new WeakSet<PreparationActor>();
+  const preparationAcquisitions = new WeakMap<
+    object,
+    { readonly job: PreparationJob.Job; consumed: boolean }
+  >();
+  const validateActorInventory = Effect.fn("WorkflowRunStore.validateActorInventory")(function* (
+    actor: PreparationActor,
+  ) {
+    if (!preparationActors.has(actor)) return yield* integrity();
+    const selected = yield* readPreparationJob(actor.job.input.jobId);
+    if (!preparationMatches(selected, PreparationJob.selection(actor.job))) return yield* stale();
+    let cursor = "";
+    let count = 0;
+    for (;;) {
+      const rows =
+        yield* sql`SELECT * FROM orchestration_v2_preparation_process_resources WHERE job_id=${actor.job.input.jobId} AND resource_id>${cursor} ORDER BY resource_id LIMIT 128`;
+      for (const row of rows) {
+        const resource = yield* Effect.try({
+          try: () => PreparationResource.decodeRow(row),
+          catch: integrity,
+        });
+        const original = actor.resources.get(resource.resourceId);
+        if (!original || !sameCustodyValue(original, resource)) return yield* stale();
+        cursor = resource.resourceId;
+        count++;
+      }
+      if (rows.length < 128) break;
+    }
+    if (count !== actor.resources.size) return yield* integrity();
+  });
   const checkWorkflowAuthority = Effect.fn("WorkflowRunStore.checkNativeAuthority")(function* (
     material: Material,
     operation: WorkflowOperationV1,
@@ -319,6 +371,7 @@ const makeStore = Effect.fnUntraced(function* (
   const readPreparationCustody = Effect.fn("WorkflowRunStore.readPreparationCustody")(function* (
     environmentId: string,
     threadId: string,
+    actor?: PreparationActor,
   ) {
     let cursor = "";
     let held = false;
@@ -331,6 +384,10 @@ const makeStore = Effect.fnUntraced(function* (
           catch: integrity,
         });
         yield* readPreparationParent(job.input);
+        if (actor && job.input.jobId === actor.job.input.jobId) {
+          yield* validateActorInventory(actor);
+          continue;
+        }
         if (
           job.identityVersion !== 2 ||
           job.state !== "settled" ||
@@ -353,7 +410,11 @@ const makeStore = Effect.fnUntraced(function* (
           nativeId: launch.importedNativeThread.ref.nativeId,
         };
   const readNativePreparationCustody = Effect.fn("WorkflowRunStore.readNativePreparationCustody")(
-    function* (environmentId: string, native: PreparationJob.NativeSelection) {
+    function* (
+      environmentId: string,
+      native: PreparationJob.NativeSelection,
+      actor?: PreparationActor,
+    ) {
       let cursor = "";
       let held = false;
       for (;;) {
@@ -371,6 +432,10 @@ const makeStore = Effect.fnUntraced(function* (
           )
             return yield* integrity();
           yield* readPreparationParent(job.input);
+          if (actor && job.input.jobId === actor.job.input.jobId) {
+            yield* validateActorInventory(actor);
+            continue;
+          }
           if (
             job.identityVersion !== 2 ||
             job.state !== "settled" ||
@@ -404,6 +469,7 @@ const makeStore = Effect.fnUntraced(function* (
             providerSessionIds: readonly string[];
             providerThreadIds?: readonly string[];
           },
+      actor?: PreparationActor,
     ) {
       const validatedThreads = new Map<
         string,
@@ -631,7 +697,7 @@ const makeStore = Effect.fnUntraced(function* (
         const selected = work[index]!;
         if (selected.kind === "thread") {
           if (input.purpose === "physical") {
-            if (yield* readPreparationCustody(environmentId, selected.id)) return true;
+            if (yield* readPreparationCustody(environmentId, selected.id, actor)) return true;
             if (yield* transportHistory("opening_thread_id", selected.id)) return true;
             if (yield* attemptHistory({ field: "thread_id", id: selected.id })) return true;
           }
@@ -840,7 +906,7 @@ const makeStore = Effect.fnUntraced(function* (
             nativeId: selected.native.id,
           };
           if (input.purpose === "physical") {
-            if (yield* readNativePreparationCustody(environmentId, native)) return true;
+            if (yield* readNativePreparationCustody(environmentId, native, actor)) return true;
             if (yield* attemptHistory(selected.native)) return true;
           }
           if (environmentId !== "") {
@@ -6565,8 +6631,494 @@ const makeStore = Effect.fnUntraced(function* (
           return Object.freeze({ kind: "acquired" as const, job });
         }),
       );
-      if (result.kind === "acquired") yield* notify;
-      return result;
+      if (result.kind !== "acquired") return result;
+      yield* notify;
+      return yield* Effect.sync(() => {
+        preparationAcquisitions.set(result, { job: result.job, consumed: false });
+        return result;
+      });
+    },
+  );
+  const consumeNativePreparationOwner = Effect.fn("WorkflowRunStore.consumeNativePreparationOwner")(
+    function* (acquired: object) {
+      const runtime = nativeBinding;
+      const acquisition = preparationAcquisitions.get(acquired);
+      if (!runtime || !acquisition || acquisition.consumed || runtime.scope.state._tag === "Closed")
+        return yield* integrity();
+      if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+        return yield* integrity();
+      acquisition.consumed = true;
+      const claim = acquisition.job.input.nativeOwner?.executionClaim;
+      if (!claim) return yield* integrity();
+      const actor: PreparationActor = { job: acquisition.job, resources: new Map() };
+      preparationActors.add(actor);
+      const flags = { intakeSealed: false, stopping: false, blocked: false };
+      const mutex = yield* Semaphore.make(1);
+      type Gate = Effect.Success<ReturnType<typeof PreparationGate.preparePreparationProcessGate>>;
+      type Pending = Effect.Success<ReturnType<Gate["spawnHeld"]>>;
+      type Held = Effect.Success<ReturnType<Pending["awaitHeld"]>>;
+      type CommandRecord = {
+        readonly id: string;
+        readonly state: PreparationOwner.CommandState;
+        readonly gate: Gate;
+        resource?: PreparationResource.Resource;
+        pending?: Pending;
+        held?: Held;
+        receipt?: PreparationGate.PreparationGateLocalReceipt;
+        createAttempted: boolean;
+        releaseAttempted: boolean;
+      };
+      const commands = new Map<object, CommandRecord>();
+      const outside = Effect.fn("WorkflowRunStore.preparationOutsideWriter")(function* (
+        stage: PreparationOwner.PreparationProcessOwnerError["stage"],
+      ) {
+        if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+          return yield* PreparationOwner.error(stage, "invalid");
+      });
+      const checkJob = Effect.fn("WorkflowRunStore.checkPreparationActor")(function* () {
+        const job = yield* readPreparationJob(actor.job.input.jobId);
+        if (
+          !preparationMatches(job, PreparationJob.selection(actor.job)) ||
+          job.identityVersion !== 3 ||
+          job.input.environmentId !== runtime.environmentId ||
+          claim.bootId !== runtime.coordinator.bootId ||
+          claim.workerId !== runtime.coordinator.workerId
+        )
+          return yield* stale();
+        yield* validateNativePreparationHistory(job, claim);
+        return job;
+      });
+      const checkNewWork = Effect.fn("WorkflowRunStore.checkPreparationWork")(function* (
+        state?: PreparationOwner.CommandState,
+      ) {
+        const job = yield* checkJob();
+        if (
+          flags.stopping ||
+          flags.blocked ||
+          runtime.scope.state._tag === "Closed" ||
+          job.state !== "active" ||
+          job.codeClosedAt !== null ||
+          (state &&
+            (state.sealed ||
+              [state.callerScope, state.commandScope, state.ownerScope, state.storeScope].some(
+                (scope) => scope.state._tag === "Closed",
+              )))
+        )
+          return yield* stale();
+        const current = yield* verifyClaimedNativeOperationInTransaction(claim);
+        if (current.kind !== "current" || current.stage !== "preparing") return yield* stale();
+        const observation = {
+          driver: current.driver,
+          providerInstanceId: current.providerInstanceId,
+          providerThreadId: current.providerThreadId,
+          providerSessionId: current.providerSessionId,
+          nativeThreadId: current.nativeThreadId,
+        };
+        if (
+          !sameCustodyValue(observation, job.input.request.current) ||
+          current.threadId !== job.input.threadId ||
+          current.runId !== job.input.runId
+        )
+          return yield* stale();
+        const owner = job.input.nativeOwner;
+        if (
+          !owner ||
+          (yield* walkResourceCustodyInTransaction(
+            {
+              purpose: "physical",
+              environmentId: runtime.environmentId,
+              threadId: job.input.threadId,
+              expectedOwner: yield* decodePreparationWorkflowOwner(owner.owner).pipe(
+                Effect.mapError(integrity),
+              ),
+              nativeSelection: job.input.nativeSelection ?? null,
+            },
+            actor,
+          ))
+        )
+          return yield* stale();
+        return job;
+      });
+      // Selection changes follow observed commit returns while the same-owner mutex is still held.
+      const writer = <A, E>(
+        stage: PreparationOwner.PreparationProcessOwnerError["stage"],
+        body: Effect.Effect<A, E>,
+        accept: (value: A) => void,
+      ) =>
+        outside(stage).pipe(
+          Effect.andThen(
+            mutex
+              .withPermit(
+                inTransaction(body).pipe(
+                  Effect.interruptible,
+                  Effect.tap((value) => Effect.sync(() => accept(value))),
+                ),
+              )
+              .pipe(Effect.interruptible),
+          ),
+          (work) => PreparationOwner.sanitize(stage, work),
+          Effect.onError(() =>
+            Effect.sync(() => {
+              flags.blocked = true;
+              flags.intakeSealed = true;
+            }),
+          ),
+        );
+      const acceptResource = (record: CommandRecord, value: PreparationResource.Resource) => {
+        record.resource = value;
+        actor.resources.set(record.id, value);
+      };
+      const checkResource = Effect.fn("WorkflowRunStore.checkPreparationResource")(function* (
+        record: CommandRecord,
+      ) {
+        yield* checkJob();
+        const expected = record.resource;
+        if (!expected) return yield* integrity();
+        const rows =
+          yield* sql`SELECT * FROM orchestration_v2_preparation_process_resources WHERE resource_id=${record.id}`;
+        if (rows.length !== 1) return yield* stale();
+        const resource = yield* Effect.try({
+          try: () => PreparationResource.decodeRow(rows[0]),
+          catch: integrity,
+        });
+        if (
+          !sameCustodyValue(resource, expected) ||
+          resource.recordVersion === Number.MAX_SAFE_INTEGER
+        )
+          return yield* stale();
+        return resource;
+      });
+      const updateResource = Effect.fn("WorkflowRunStore.updatePreparationResource")(function* (
+        record: CommandRecord,
+        patch: Readonly<Record<string, string | number | null>>,
+      ) {
+        const resource = yield* checkResource(record);
+        const rows =
+          yield* sql`UPDATE orchestration_v2_preparation_process_resources SET ${sql.update({ ...patch, record_version: resource.recordVersion + 1 })} WHERE resource_id=${record.id} AND creation_context_hash=${resource.contextHash} AND record_version=${resource.recordVersion} RETURNING *`;
+        if (rows.length !== 1) return yield* stale();
+        return yield* Effect.try({
+          try: () => PreparationResource.decodeRow(rows[0]),
+          catch: integrity,
+        });
+      });
+      const recordBinding = Effect.fn("WorkflowRunStore.recordPreparationBinding")(function* (
+        record: CommandRecord,
+        evidence: unknown,
+      ) {
+        const resource = record.resource;
+        const pending = record.pending;
+        if (!resource || !pending) return yield* integrity();
+        const binding = yield* Effect.try({
+          try: () => PreparationResource.ownBinding(evidence, resource.context),
+          catch: integrity,
+        });
+        if (binding.pid !== pending.pid) return yield* integrity();
+        if (resource.binding !== null) {
+          if (!sameCustodyValue(binding, resource.binding)) return yield* integrity();
+          return;
+        }
+        const encoded = PreparationResource.encodeBinding(record.id, resource.context, binding);
+        yield* writer(
+          "binding",
+          Effect.gen(function* () {
+            const now = DateTime.formatIso(yield* DateTime.now);
+            return yield* updateResource(record, {
+              creation_started_at: resource.creationStartedAt ?? now,
+              child_pid: pending.pid,
+              binding_json: encoded.text,
+              binding_hash: encoded.hash,
+              bound_at: now,
+            });
+          }),
+          (value) => acceptResource(record, value),
+        );
+      });
+      const cleanup = Effect.fn("WorkflowRunStore.cleanupPreparationCommand")(function* (
+        record: CommandRecord,
+      ) {
+        yield* outside("cleanup");
+        const pending = record.pending;
+        if (!pending) return;
+        // Physical stop precedes terminal waiting and all optional persistence work.
+        const observed = yield* Effect.result(pending.observeRetirement());
+        let scope = observed._tag === "Success" ? observed.success : undefined;
+        const running = yield* Effect.result(pending.isRunning);
+        if (!scope || running._tag === "Failure" || running.success) {
+          yield* pending.stopOwnedChild().pipe(Effect.ignore);
+          const stopped = yield* Effect.result(pending.stopAndObserve());
+          scope = stopped._tag === "Success" ? stopped.success : undefined;
+        }
+        const terminal = yield* pending.awaitTerminal.pipe(
+          Effect.timeoutOption("2 seconds"),
+          Effect.interruptible,
+          Effect.result,
+        );
+        if (
+          !scope ||
+          terminal._tag !== "Success" ||
+          Option.isNone(terminal.success) ||
+          !record.resource
+        )
+          return;
+        const binding = record.held?.binding ?? scope.binding;
+        if (!sameCustodyValue(binding, scope.binding)) return;
+        yield* recordBinding(record, binding).pipe(Effect.ignore);
+        const resource = record.resource;
+        if (!resource?.binding || resource.state === "settled") return;
+        const result = terminal.success.value;
+        const encoded = yield* Effect.try({
+          try: () =>
+            PreparationResource.encodeSettlement(
+              record.id,
+              resource.context,
+              resource.binding!,
+              resource.recordVersion,
+              {
+                v: 1,
+                resourceId: record.id,
+                contextHash: resource.contextHash,
+                priorVersion: resource.recordVersion,
+                childExit: { pid: pending.pid, exitCode: result.code, signal: result.signal },
+                scope,
+              },
+            ),
+          catch: integrity,
+        });
+        yield* writer(
+          "cleanup",
+          updateResource(record, {
+            state: "settled",
+            settlement_json: encoded.text,
+            settlement_hash: encoded.hash,
+            settled_at: DateTime.formatIso(yield* DateTime.now),
+          }),
+          (value) => acceptResource(record, value),
+        ).pipe(Effect.ignore);
+      }, Effect.interruptible);
+      const readCommand = (ref: object) => {
+        const record = commands.get(ref);
+        return record
+          ? Effect.succeed(record)
+          : Effect.fail(PreparationOwner.error("input", "invalid"));
+      };
+      const port: PreparationOwner.CommandPort = {
+        checkOutsideWriter: outside,
+        prepareCommand: Effect.fn("WorkflowRunStore.prepareOwnedCommand")(function* (input, state) {
+          yield* writer(
+            "admission",
+            Effect.gen(function* () {
+              const job = yield* checkNewWork(state);
+              if (job.processExposed) return job;
+              const rows =
+                yield* sql`UPDATE orchestration_v2_preparation_jobs SET process_exposed=1,record_version=${job.recordVersion + 1} WHERE job_id=${job.input.jobId} AND record_version=${job.recordVersion} RETURNING *`;
+              if (rows.length !== 1) return yield* stale();
+              return yield* Effect.try({
+                try: () => PreparationJob.decodeRow(rows[0]),
+                catch: integrity,
+              });
+            }),
+            (job) => {
+              actor.job = job;
+            },
+          );
+          const gate = yield* PreparationOwner.sanitize(
+            "admission",
+            PreparationGate.preparePreparationProcessGate({
+              ...input,
+              threadId: actor.job.input.threadId,
+            }).pipe(
+              Effect.provideService(AgentScope, runtime.agentScope),
+              Effect.provideService(PreparationNode.PreparationNodeChild, runtime.nodeChild),
+              Effect.provideService(Path.Path, runtime.path),
+              Effect.provideService(HostProcess.Environment, runtime.hostEnvironment),
+              Effect.provideService(HostProcess.WorkingDirectory, runtime.hostCwd),
+              Effect.provideService(Scope.Scope, state.commandScope),
+            ),
+          );
+          const record: CommandRecord = {
+            id: NodeCrypto.randomUUID(),
+            state,
+            gate,
+            createAttempted: false,
+            releaseAttempted: false,
+          };
+          const ref = Object.freeze({});
+          commands.set(ref, record);
+          yield* Scope.addFinalizer(state.commandScope, cleanup(record).pipe(Effect.ignore));
+          yield* writer(
+            "admission",
+            Effect.gen(function* () {
+              const job = yield* checkNewWork(state);
+              const context = PreparationResource.ownContext({
+                v: 1,
+                profile: "linux-node-no-stdin-v1",
+                jobSelection: PreparationJob.selection(job),
+                environmentId: job.input.environmentId,
+                projectId: job.input.projectId,
+                threadId: job.input.threadId,
+                runId: job.input.runId,
+                executionClaim: claim,
+                current: job.input.request.current,
+                host: gate.hostIdentity,
+                proposedUnit: gate.proposedUnit,
+                creationInputHash: gate.creationInputHash,
+              });
+              const encoded = PreparationResource.encodeContext(context);
+              const rows =
+                yield* sql`INSERT INTO orchestration_v2_preparation_process_resources ${sql.insert({
+                  format_version: 1,
+                  resource_id: record.id,
+                  job_id: job.input.jobId,
+                  job_request_identity_hash: job.requestIdentityHash,
+                  environment_id: job.input.environmentId,
+                  project_id: job.input.projectId,
+                  thread_id: job.input.threadId,
+                  run_id: job.input.runId,
+                  server_boot_id: job.input.serverBootId,
+                  host_boot_id: gate.hostIdentity.hostBootId,
+                  scope_namespace: gate.hostIdentity.scopeNamespace,
+                  proposed_unit: gate.proposedUnit,
+                  creation_input_hash: gate.creationInputHash,
+                  creation_context_json: encoded.text,
+                  creation_context_hash: encoded.hash,
+                  created_at: DateTime.formatIso(yield* DateTime.now),
+                })} RETURNING *`;
+              if (rows.length !== 1) return yield* integrity();
+              return yield* Effect.try({
+                try: () => PreparationResource.decodeRow(rows[0]),
+                catch: integrity,
+              });
+            }),
+            (resource) => acceptResource(record, resource),
+          );
+          return ref;
+        }),
+        createCommand: Effect.fn("WorkflowRunStore.createOwnedCommand")(function* (ref) {
+          const record = yield* readCommand(ref);
+          yield* writer(
+            "creation",
+            Effect.gen(function* () {
+              yield* checkNewWork(record.state);
+              yield* checkResource(record);
+              if (record.createAttempted) return yield* integrity();
+              yield* Effect.uninterruptible(
+                Effect.gen(function* () {
+                  if (
+                    flags.stopping ||
+                    flags.blocked ||
+                    record.state.sealed ||
+                    [
+                      record.state.callerScope,
+                      record.state.commandScope,
+                      record.state.ownerScope,
+                      record.state.storeScope,
+                    ].some((scope) => scope.state._tag === "Closed")
+                  )
+                    return yield* stale();
+                  record.createAttempted = true;
+                  record.pending = yield* PreparationOwner.sanitize(
+                    "creation",
+                    record.gate
+                      .spawnHeld()
+                      .pipe(Effect.provideService(Scope.Scope, record.state.commandScope)),
+                  );
+                }),
+              );
+              if (!record.pending) return yield* integrity();
+              return yield* updateResource(record, {
+                creation_started_at: DateTime.formatIso(yield* DateTime.now),
+                child_pid: record.pending.pid,
+              });
+            }),
+            (value) => acceptResource(record, value),
+          );
+          if (!record.pending) return yield* PreparationOwner.error("creation", "unknown");
+          return {
+            resourceId: record.id,
+            stderr: record.pending.stderr.pipe(
+              Stream.mapError(() => PreparationOwner.error("output", "unknown")),
+            ),
+          };
+        }),
+        startCommand: Effect.fn("WorkflowRunStore.startOwnedCommand")(function* (ref) {
+          const record = yield* readCommand(ref);
+          if (!record.pending) return yield* PreparationOwner.error("ready", "unknown");
+          record.held = yield* PreparationOwner.sanitize(
+            "ready",
+            record.pending
+              .awaitHeld()
+              .pipe(Effect.provideService(Scope.Scope, record.state.commandScope)),
+          );
+          yield* PreparationOwner.sanitize("binding", recordBinding(record, record.held.binding));
+          const held = record.held;
+          yield* writer(
+            "release",
+            Effect.gen(function* () {
+              yield* checkNewWork(record.state);
+              const resource = yield* checkResource(record);
+              if (
+                record.releaseAttempted ||
+                !resource.binding ||
+                !sameCustodyValue(resource.binding, held.binding)
+              )
+                return yield* integrity();
+              record.releaseAttempted = true;
+              const receipt = yield* PreparationOwner.sanitize("release", held.submitLocal());
+              record.receipt = receipt;
+              return yield* updateResource(record, {
+                release_started_at: DateTime.formatIso(yield* DateTime.now),
+              });
+            }),
+            (value) => acceptResource(record, value),
+          );
+          const receipt = record.receipt;
+          if (!receipt) return yield* PreparationOwner.error("release", "unknown");
+          return (yield* PreparationOwner.sanitize("output", held.awaitExec(receipt))).pipe(
+            Stream.mapError(() => PreparationOwner.error("output", "unknown")),
+          );
+        }),
+        collectCommand: Effect.fn("WorkflowRunStore.collectOwnedCommand")(function* (ref) {
+          const record = yield* readCommand(ref);
+          if (!record.pending) return yield* PreparationOwner.error("output", "unknown");
+          return yield* PreparationOwner.sanitize("output", record.pending.awaitExit);
+        }),
+        assessInventory: Effect.fn("WorkflowRunStore.assessPreparationInventory")(function* () {
+          yield* outside("inventory");
+          const checked = yield* Effect.result(
+            mutex
+              .withPermit(inTransaction(validateActorInventory(actor)))
+              .pipe(Effect.interruptible),
+          );
+          const complete = checked._tag === "Success" && commands.size === actor.resources.size;
+          const resources = [...actor.resources.values()].map((resource) => ({
+            resourceId: resource.resourceId,
+            state:
+              complete && resource.state === "settled" ? ("settled" as const) : ("held" as const),
+          }));
+          return {
+            kind: "sealed" as const,
+            jobId: actor.job.input.jobId,
+            inventory:
+              complete &&
+              !flags.blocked &&
+              resources.every((resource) => resource.state === "settled")
+                ? ("all-retired" as const)
+                : ("held" as const),
+            resources,
+          };
+        }),
+      };
+      yield* writer("admission", checkNewWork(), () => {});
+      return yield* PreparationOwner.make(
+        {
+          jobId: actor.job.input.jobId,
+          threadId: actor.job.input.threadId,
+          runId: actor.job.input.runId!,
+        },
+        runtime.scope,
+        port,
+        flags,
+      );
     },
   );
   const claim = Effect.fn("WorkflowRunStore.claim")(function* (input: {
@@ -7099,6 +7651,7 @@ const makeStore = Effect.fnUntraced(function* (
         return Effect.fail(integrity());
       }
     },
+    consumeNativePreparationOwner,
     beginClaimedNativePreparation: (claim: PreparationJob.NativeClaim) => {
       try {
         return beginClaimedNativePreparation(PreparationJob.ownNativeClaim(claim));
@@ -7207,9 +7760,22 @@ const makeNativeStore = Effect.fn("WorkflowRunStore.makeCapturedNative")(functio
     policy,
   );
   const protocol = yield* NativeProtocol.makeNativeCommandProtocol(sql, config, path);
-  return yield* makeStore(Effect.void, authority, { protocol, coordinator, environmentId }).pipe(
-    Effect.provideService(SqlClient.SqlClient, sql),
-  );
+  const scope = yield* Effect.scope;
+  const agentScope = yield* AgentScope;
+  const nodeChild = yield* PreparationNode.PreparationNodeChild;
+  const hostEnvironment = yield* HostProcess.Environment;
+  const hostCwd = yield* HostProcess.WorkingDirectory;
+  return yield* makeStore(Effect.void, authority, {
+    protocol,
+    coordinator,
+    environmentId,
+    scope,
+    agentScope: Object.freeze({ ...agentScope }),
+    nodeChild: Object.freeze({ prepare: nodeChild.prepare }),
+    path,
+    hostEnvironment: Object.freeze({ ...hostEnvironment }),
+    hostCwd,
+  }).pipe(Effect.provideService(SqlClient.SqlClient, sql));
 });
 
 export function makeCapturedNativeWorkflowRunStore(

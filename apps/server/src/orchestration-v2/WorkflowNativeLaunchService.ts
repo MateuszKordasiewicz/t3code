@@ -201,11 +201,13 @@ const makeOwned = Effect.fn("WorkflowNativeLaunchService.make")(function* (
         stage: "preparation",
         reason: "reconciliation_required",
       });
+    const owner = yield* atStage("preparation", store.consumeNativePreparationOwner(preparation));
     return Object.freeze({
       kind: "claimed" as const,
       native: Object.freeze({ threadId: selected.threadId, runId: bound.nativeRunId }),
       executionClaim,
       preparation: Object.freeze({
+        owner,
         job: preparation.job,
         selection: PreparationJob.selection(preparation.job),
       }),

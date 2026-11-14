@@ -1,3 +1,13 @@
+import { vi } from "vite-plus/test";
+import { AgentScope, type AgentScopeBinding } from "@t3tools/shared/AgentScope";
+import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as Scope from "effect/Scope";
+import * as Fiber from "effect/Fiber";
+import * as Cause from "effect/Cause";
+import * as PreparationNode from "../preparation/PreparationNodeChild.ts";
+import * as PreparationOwner from "../preparation/PreparationProcessOwner.ts";
+import * as PreparationResource from "../preparation/PreparationProcessResource.ts";
+import * as PreparationJob from "../preparation/PreparationJob.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
@@ -15267,4 +15277,682 @@ it.effect.each(["workflow", "planning"] as const)(
       assert.deepStrictEqual(job.input.nativeOwner?.executionClaim, fixture.operationSelection);
       assert.strictEqual(job.settlement, null);
     }).pipe(Effect.provide(layer)),
+);
+
+vi.mock("effect/PubSub", { spy: true });
+
+const preparationProcessFixture = Effect.fn("test.preparationProcessFixture")(function* (
+  options: {
+    readonly holdRelease?: boolean;
+    readonly holdReady?: boolean;
+    readonly keepRunning?: boolean;
+    readonly noTerminal?: boolean;
+  } = {},
+) {
+  const entered = yield* Deferred.make<void>();
+  const release = yield* Deferred.make<void>();
+  const created = yield* Queue.unbounded<void>();
+  const calls = {
+    wraps: 0,
+    prepares: 0,
+    creates: 0,
+    releases: 0,
+    kills: 0,
+    stops: 0,
+    finalizers: 0,
+  };
+  const images: PreparationNode.PreparationNodeImage[] = [];
+  const host = {
+    hostBootId: "12345678-1234-4234-8234-123456789abc",
+    scopeNamespace: "app-t3code-agents-123456789abc.slice",
+  };
+  type Child = {
+    readonly binding: AgentScopeBinding;
+    readonly output: Queue.Queue<Uint8Array, Cause.Done>;
+    readonly terminal: Deferred.Deferred<{
+      readonly code: number | null;
+      readonly signal: NodeJS.Signals | null;
+    }>;
+    running: boolean;
+  };
+  const children = new Map<string, Child>();
+  const bytes = (value: string) => new TextEncoder().encode(value);
+  const stop = (child: Child) =>
+    Effect.sync(() => {
+      child.running = false;
+      if (!options.noTerminal)
+        Deferred.doneUnsafe(child.terminal, Exit.succeed({ code: null, signal: "SIGTERM" }));
+      Queue.endUnsafe(child.output);
+    });
+  const agentScope: typeof AgentScope.Service = {
+    ...AgentScope.defaultValue(),
+    wrap: (request) =>
+      Effect.gen(function* () {
+        calls.wraps++;
+        const unit = `t3code-preparation-12345678-1234-4234-8234-${String(calls.wraps).padStart(12, "0")}.scope`;
+        const binding = {
+          unit,
+          invocationId: String(calls.wraps).padStart(32, "a"),
+          controlGroup: `/user.slice/${host.scopeNamespace}/${unit}`,
+          pid: 4000 + calls.wraps,
+          pidStartTicks: String(100 + calls.wraps),
+        };
+        const child = {
+          binding,
+          output: yield* Queue.unbounded<Uint8Array, Cause.Done>(),
+          terminal: yield* Deferred.make<{
+            readonly code: number | null;
+            readonly signal: NodeJS.Signals | null;
+          }>(),
+          running: false,
+        };
+        children.set(request.args[3]!, child);
+        return {
+          command: request.command,
+          args: request.args,
+          unit,
+          hostIdentity: host,
+          custody: {
+            bind: () => Effect.succeed(binding),
+            observeRetirement: () =>
+              Effect.sync(() =>
+                child.running ? undefined : { binding, observation: "empty" as const },
+              ),
+            stopAndObserve: () =>
+              stop(child).pipe(
+                Effect.andThen(
+                  Effect.sync(() => {
+                    calls.stops++;
+                    return { binding, observation: "empty" as const };
+                  }),
+                ),
+              ),
+          },
+        };
+      }),
+  };
+  const nodeChild: typeof PreparationNode.PreparationNodeChild.Service = {
+    prepare: (image) =>
+      Effect.gen(function* () {
+        calls.prepares++;
+        images.push(image);
+        const nonce = image.args[3]!;
+        const child = children.get(nonce)!;
+        yield* Effect.addFinalizer(() =>
+          stop(child).pipe(
+            Effect.andThen(
+              Effect.sync(() => {
+                calls.finalizers++;
+              }),
+            ),
+          ),
+        );
+        return {
+          createLocal: () =>
+            Effect.sync(() => {
+              calls.creates++;
+              child.running = true;
+              if (!options.holdReady)
+                Queue.offerUnsafe(child.output, bytes(`READY:${nonce}:${child.binding.pid}\n`));
+              Queue.offerUnsafe(created, undefined);
+              return {
+                pid: child.binding.pid,
+                awaitSpawn: Effect.void,
+                awaitTerminal: Deferred.await(child.terminal),
+                exitCode: Deferred.await(child.terminal).pipe(
+                  Effect.flatMap((result) =>
+                    result.code === null
+                      ? Effect.fail(
+                          new PreparationNode.PreparationNodeChildError({ reason: "unknown" }),
+                        )
+                      : Effect.succeed(result.code),
+                  ),
+                ),
+                isRunning: Effect.sync(() => child.running),
+                kill: () =>
+                  Effect.sync(() => {
+                    calls.kills++;
+                  }).pipe(Effect.andThen(stop(child)), Effect.as(undefined)),
+                stdin: Sink.forEach((data: Uint8Array) =>
+                  Effect.gen(function* () {
+                    assert.strictEqual(new TextDecoder().decode(data), `RELEASE:${nonce}\n`);
+                    yield* Deferred.succeed(entered, undefined);
+                    if (options.holdRelease) yield* Deferred.await(release);
+                    calls.releases++;
+                    yield* Queue.offer(child.output, bytes(`EXEC:${nonce}\npayload`));
+                    if (!options.keepRunning) {
+                      child.running = false;
+                      Deferred.doneUnsafe(child.terminal, Exit.succeed({ code: 0, signal: null }));
+                      Queue.endUnsafe(child.output);
+                    }
+                  }),
+                ),
+                stdout: Stream.fromQueue(child.output),
+                stderr: Stream.make(bytes("early stderr")),
+              };
+            }),
+        };
+      }),
+  };
+  const services = Layer.mergeAll(
+    Layer.succeed(AgentScope, agentScope),
+    Layer.succeed(PreparationNode.PreparationNodeChild, nodeChild),
+    Layer.succeed(HostProcess.WorkingDirectory, "/captured"),
+    Layer.succeed(HostProcess.Environment, { PATH: "/usr/bin:/bin", CAPTURED: "yes" }),
+  );
+  return { calls, images, services, entered, release, created, children };
+});
+const preparationCommand = { command: "/usr/bin/git", args: ["status"] };
+const collectPreparationCommand = Effect.fn("test.collectPreparationCommand")(function* (facade: {
+  stdout: Stream.Stream<Uint8Array, PreparationOwner.PreparationProcessOwnerError>;
+  stderr: Stream.Stream<Uint8Array, PreparationOwner.PreparationProcessOwnerError>;
+  exitCode: Effect.Effect<number, PreparationOwner.PreparationProcessOwnerError>;
+}) {
+  const [stdout, stderr, code] = yield* Effect.all(
+    [Stream.runCollect(facade.stdout), Stream.runCollect(facade.stderr), facade.exitCode],
+    { concurrency: "unbounded" },
+  );
+  return {
+    stdout: new TextDecoder().decode(Buffer.concat(stdout)),
+    stderr: new TextDecoder().decode(Buffer.concat(stderr)),
+    code,
+  };
+});
+
+it.effect.each(["workflow", "planning"] as const)(
+  "connected preparation owner consumes fresh %s identity and owns concurrent commands",
+  (kind) =>
+    Effect.gen(function* () {
+      const harness = yield* preparationProcessFixture();
+      const fixture = yield* currentNativeExecutionFixture(kind).pipe(
+        Effect.provide(harness.services),
+      );
+      const acquired = yield* fixture.store.beginClaimedNativePreparation(
+        fixture.operationSelection,
+      );
+      assert.strictEqual(acquired.kind, "acquired");
+      if (acquired.kind !== "acquired") throw new Error("missing acquisition");
+      assert.strictEqual(
+        (yield* Effect.result(fixture.store.consumeNativePreparationOwner({ ...acquired })))._tag,
+        "Failure",
+      );
+      const ordinary = yield* Store.make();
+      assert.strictEqual(
+        (yield* Effect.result(ordinary.consumeNativePreparationOwner(acquired)))._tag,
+        "Failure",
+      );
+      const owner = yield* fixture.store
+        .consumeNativePreparationOwner(acquired)
+        .pipe(Effect.scoped);
+      assert.strictEqual(
+        (yield* Effect.result(fixture.store.consumeNativePreparationOwner(acquired)))._tag,
+        "Failure",
+      );
+      const existing = yield* fixture.store.beginClaimedNativePreparation(
+        fixture.operationSelection,
+      );
+      assert.strictEqual(
+        (yield* Effect.result(fixture.store.consumeNativePreparationOwner(existing)))._tag,
+        "Failure",
+      );
+      const caller = yield* Scope.make();
+      const facades = yield* Effect.all(
+        [owner.start(preparationCommand), owner.start(preparationCommand)],
+        { concurrency: "unbounded" },
+      ).pipe(
+        Effect.provideService(Scope.Scope, caller),
+        Effect.provideService(AgentScope, AgentScope.defaultValue()),
+        Effect.provideService(PreparationNode.PreparationNodeChild, {
+          prepare: () => Effect.die("foreign node creator"),
+        }),
+        Effect.provideService(HostProcess.WorkingDirectory, "/foreign"),
+        Effect.provideService(HostProcess.Environment, { FOREIGN: "yes" }),
+      );
+      assert.notStrictEqual(facades[0].resourceId, facades[1].resourceId);
+      assert.deepStrictEqual(
+        yield* Effect.all(facades.map(collectPreparationCommand), { concurrency: "unbounded" }),
+        [
+          { stdout: "payload", stderr: "early stderr", code: 0 },
+          { stdout: "payload", stderr: "early stderr", code: 0 },
+        ],
+      );
+      yield* Scope.close(caller, Exit.void);
+      assert.strictEqual((yield* owner.seal()).inventory, "all-retired");
+      assert.strictEqual(harness.calls.creates, 2);
+      assert.strictEqual(harness.calls.releases, 2);
+      assert.strictEqual(harness.calls.finalizers, 2);
+      assert.strictEqual(harness.images[0]!.cwd, "/captured");
+      assert.strictEqual(harness.images[0]!.environment.CAPTURED, "yes");
+      const resources =
+        yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_process_resources ORDER BY resource_id`;
+      assert.strictEqual(resources.length, 2);
+      for (const row of resources)
+        assert.strictEqual(PreparationResource.decodeRow(row).state, "settled");
+      const job = PreparationJob.decodeRow(
+        (yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_jobs`)[0],
+      );
+      assert.isTrue(job.processExposed);
+      assert.strictEqual(job.codeClosedAt, null);
+      assert.strictEqual(job.state, "active");
+      const next = yield* fixture.store.beginOrdinaryPreparation(
+        preparationInput(fixture.input.threadId, "foreign-after-owner"),
+      );
+      assert.strictEqual(next.kind, "denied");
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([false, true])(
+  "connected preparation stop interrupts a queued SQL writer under mask %s",
+  (masked) =>
+    Effect.gen(function* () {
+      const harness = yield* preparationProcessFixture();
+      const fixture = yield* currentNativeExecutionFixture("workflow").pipe(
+        Effect.provide(harness.services),
+      );
+      const acquired = yield* fixture.store.beginClaimedNativePreparation(
+        fixture.operationSelection,
+      );
+      const owner = yield* fixture.store.consumeNativePreparationOwner(acquired);
+      const locked = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const holder = yield* fixture.sql
+        .withTransaction(
+          Deferred.succeed(locked, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        )
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(locked);
+      const work = owner.start(preparationCommand).pipe(Effect.scoped);
+      const starting = yield* (masked ? Effect.uninterruptible(work) : work).pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      const stopping = yield* owner.stop().pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined));
+      const exit = yield* Fiber.await(starting);
+      assert.isTrue(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause));
+      assert.strictEqual(harness.calls.creates, 0);
+      assert.isUndefined(stopping.pollUnsafe());
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(holder);
+      assert.strictEqual((yield* Fiber.join(stopping)).inventory, "held");
+      assert.strictEqual(harness.calls.creates, 0);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "connected preparation joins cancelled %s release before signal cleanup",
+  (kind) =>
+    Effect.gen(function* () {
+      const harness = yield* preparationProcessFixture({ holdRelease: true });
+      const fixture = yield* currentNativeExecutionFixture(kind).pipe(
+        Effect.provide(harness.services),
+      );
+      const acquired = yield* fixture.store.beginClaimedNativePreparation(
+        fixture.operationSelection,
+      );
+      const owner = yield* fixture.store.consumeNativePreparationOwner(acquired);
+      const caller = yield* Scope.make();
+      const facade = yield* owner
+        .start(preparationCommand)
+        .pipe(Effect.provideService(Scope.Scope, caller));
+      assert.strictEqual(
+        new TextDecoder().decode(Buffer.concat(yield* Stream.runCollect(facade.stderr))),
+        "early stderr",
+      );
+      yield* Deferred.await(harness.entered);
+      assert.strictEqual(harness.calls.releases, 0);
+      const inventory = yield* owner.stop();
+      assert.strictEqual(inventory.inventory, "held");
+      assert.strictEqual(harness.calls.kills, 1);
+      assert.strictEqual(harness.calls.stops, 1);
+      assert.strictEqual(harness.calls.finalizers, 1);
+      const resource = PreparationResource.decodeRow(
+        (yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_process_resources`)[0],
+      );
+      assert.strictEqual(resource.releaseStartedAt, null);
+      assert.strictEqual(resource.state, "settled");
+      assert.deepStrictEqual(resource.settlement?.childExit, {
+        pid: 4001,
+        exitCode: null,
+        signal: "SIGTERM",
+      });
+      yield* Deferred.succeed(harness.release, undefined);
+      assert.strictEqual(harness.calls.releases, 0);
+      assert.strictEqual(
+        (yield* Effect.result(
+          owner.start(preparationCommand).pipe(Effect.provideService(Scope.Scope, caller)),
+        ))._tag,
+        "Failure",
+      );
+      yield* Scope.close(caller, Exit.void);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "connected preparation retains A after %s creation writer rollback",
+  (kind) =>
+    Effect.gen(function* () {
+      const harness = yield* preparationProcessFixture();
+      const fixture = yield* currentNativeExecutionFixture(kind).pipe(
+        Effect.provide(harness.services),
+      );
+      const acquired = yield* fixture.store.beginClaimedNativePreparation(
+        fixture.operationSelection,
+      );
+      const owner = yield* fixture.store.consumeNativePreparationOwner(acquired);
+      yield* fixture.sql`CREATE TRIGGER refuse_created_resource AFTER UPDATE ON orchestration_v2_preparation_process_resources WHEN NEW.creation_started_at IS NOT NULL BEGIN SELECT RAISE(ABORT,'creation rollback'); END`;
+      const result = yield* Effect.result(owner.start(preparationCommand).pipe(Effect.scoped));
+      assert.strictEqual(result._tag, "Failure");
+      assert.strictEqual(harness.calls.creates, 1);
+      assert.strictEqual(harness.calls.releases, 0);
+      assert.strictEqual(harness.calls.kills, 1);
+      const resources =
+        yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_process_resources`;
+      assert.strictEqual(resources.length, 1);
+      const resource = PreparationResource.decodeRow(resources[0]);
+      assert.strictEqual(resource.recordVersion, 0);
+      assert.strictEqual(resource.childPid, null);
+      assert.strictEqual(resource.state, "active");
+      yield* fixture.sql`DROP TRIGGER refuse_created_resource`;
+      assert.strictEqual((yield* owner.stop()).inventory, "held");
+      assert.strictEqual(
+        (yield* fixture.sql`SELECT record_version FROM orchestration_v2_preparation_process_resources`)[0]!
+          .record_version,
+        0,
+      );
+      assert.strictEqual(harness.calls.creates, 1);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["workflow", "planning"] as const)(
+  "connected preparation cleans original %s resource after revocation",
+  (kind) =>
+    Effect.gen(function* () {
+      const harness = yield* preparationProcessFixture({ keepRunning: true });
+      const fixture = yield* currentNativeExecutionFixture(kind).pipe(
+        Effect.provide(harness.services),
+      );
+      const acquired = yield* fixture.store.beginClaimedNativePreparation(
+        fixture.operationSelection,
+      );
+      const owner = yield* fixture.store.consumeNativePreparationOwner(acquired);
+      const caller = yield* Scope.make();
+      const facade = yield* owner
+        .start(preparationCommand)
+        .pipe(Effect.provideService(Scope.Scope, caller));
+      yield* Deferred.await(harness.entered);
+      // The exit collector reaches the actual terminal only after forced stop.
+      const collecting = yield* facade.exitCode.pipe(Effect.result, Effect.forkScoped);
+      yield* fixture.sessions.revoke(fixture.authority.sessionId);
+      yield* owner.stop();
+      assert.strictEqual((yield* Fiber.join(collecting))._tag, "Failure");
+      const resource = PreparationResource.decodeRow(
+        (yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_process_resources`)[0],
+      );
+      assert.strictEqual(resource.state, "settled");
+      assert.strictEqual(resource.settlement?.childExit.signal, "SIGTERM");
+      const before = harness.calls.creates;
+      assert.strictEqual(
+        (yield* Effect.result(
+          owner.start(preparationCommand).pipe(Effect.provideService(Scope.Scope, caller)),
+        ))._tag,
+        "Failure",
+      );
+      assert.strictEqual(harness.calls.creates, before);
+      yield* Scope.close(caller, Exit.void);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["revoked", "stale", "foreign-job", "foreign-resource"] as const)(
+  "connected preparation refuses %s authority or inventory without refreshing selectors",
+  (mode) =>
+    Effect.gen(function* () {
+      const harness = yield* preparationProcessFixture();
+      const fixture = yield* currentNativeExecutionFixture("workflow").pipe(
+        Effect.provide(harness.services),
+      );
+      const acquired = yield* fixture.store.beginClaimedNativePreparation(
+        fixture.operationSelection,
+      );
+      if (acquired.kind !== "acquired") throw new Error("missing acquisition");
+      if (mode === "revoked") {
+        yield* fixture.sessions.revoke(fixture.authority.sessionId);
+        assert.strictEqual(
+          (yield* Effect.result(fixture.store.consumeNativePreparationOwner(acquired)))._tag,
+          "Failure",
+        );
+        assert.strictEqual(
+          (yield* Effect.result(fixture.store.consumeNativePreparationOwner(acquired)))._tag,
+          "Failure",
+        );
+        assert.strictEqual(harness.calls.prepares, 0);
+        return;
+      }
+      const owner = yield* fixture.store.consumeNativePreparationOwner(acquired);
+      if (mode === "stale") {
+        yield* fixture.store.markNativePreparationProcessExposed({
+          selection: PreparationJob.selection(acquired.job),
+          executionClaim: fixture.operationSelection,
+        });
+      } else if (mode === "foreign-job") {
+        yield* fixture.sql`INSERT INTO orchestration_v2_preparation_jobs ${fixture.sql.insert(preparationRow(fixture.input.threadId, "foreign-owned-job"))}`;
+      } else {
+        const caller = yield* Scope.make();
+        const facade = yield* owner
+          .start(preparationCommand)
+          .pipe(Effect.provideService(Scope.Scope, caller));
+        yield* collectPreparationCommand(facade);
+        yield* Scope.close(caller, Exit.void);
+        const original =
+          (yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_process_resources`)[0]!;
+        yield* fixture.sql`DROP TRIGGER preparation_process_resources_update_guard`;
+        yield* fixture.sql`UPDATE orchestration_v2_preparation_process_resources SET record_version=${Number(original.record_version) + 1}`;
+      }
+      const before = harness.calls.creates;
+      assert.strictEqual(
+        (yield* Effect.result(owner.start(preparationCommand).pipe(Effect.scoped)))._tag,
+        "Failure",
+      );
+      assert.strictEqual(harness.calls.creates, before);
+      assert.strictEqual((yield* owner.stop()).inventory, "held");
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect(
+  "connected preparation cannot reconstruct an owner after interrupted admission notification",
+  () =>
+    Effect.gen(function* () {
+      let armed = false;
+      const actual = yield* Effect.promise(() =>
+        vi.importActual<typeof import("effect/PubSub")>("effect/PubSub"),
+      );
+      const original = actual.publish;
+      using _notification = vi
+        .spyOn(PubSub, "publish")
+        .mockImplementation((pubsub, value) =>
+          Effect.suspend(() => (armed ? Effect.interrupt : original(pubsub, value))),
+        );
+      const fixture = yield* currentNativeExecutionFixture("workflow");
+      armed = true;
+      const exit = yield* Effect.exit(
+        fixture.store.beginClaimedNativePreparation(fixture.operationSelection),
+      );
+      armed = false;
+      assert.isTrue(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause));
+      const job = PreparationJob.decodeRow(
+        (yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_jobs`)[0],
+      );
+      assert.strictEqual(
+        (yield* Effect.result(
+          fixture.store.consumeNativePreparationOwner({ kind: "acquired", job }),
+        ))._tag,
+        "Failure",
+      );
+      const existing = yield* fixture.store.beginClaimedNativePreparation(
+        fixture.operationSelection,
+      );
+      assert.strictEqual(existing.kind, "existing");
+      assert.strictEqual(
+        (yield* Effect.result(fixture.store.consumeNativePreparationOwner(existing)))._tag,
+        "Failure",
+      );
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect("connected preparation bounds terminal waiting after stopping the original child", () =>
+  Effect.gen(function* () {
+    const harness = yield* preparationProcessFixture({ holdReady: true, noTerminal: true });
+    const fixture = yield* currentNativeExecutionFixture("workflow").pipe(
+      Effect.provide(harness.services),
+    );
+    const acquired = yield* fixture.store.beginClaimedNativePreparation(fixture.operationSelection);
+    const owner = yield* fixture.store.consumeNativePreparationOwner(acquired);
+    const caller = yield* Scope.make();
+    yield* owner.start(preparationCommand).pipe(Effect.provideService(Scope.Scope, caller));
+    yield* Queue.take(harness.created);
+    const stopping = yield* owner.stop().pipe(Effect.forkScoped({ startImmediately: true }));
+    yield* TestClock.adjust("2 seconds");
+    assert.strictEqual((yield* Fiber.join(stopping)).inventory, "held");
+    assert.strictEqual(harness.calls.kills, 1);
+    assert.strictEqual(harness.calls.stops, 1);
+    const row =
+      (yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_process_resources`)[0]!;
+    assert.strictEqual(row.settlement_json, null);
+    assert.strictEqual(row.settled_at, null);
+    yield* Scope.close(caller, Exit.void);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(["creation", "release"] as const)(
+  "connected preparation holds an erased %s commit return without upgrading or retrying",
+  (phase) =>
+    Effect.gen(function* () {
+      const harness = yield* preparationProcessFixture();
+      const fixture = yield* currentNativeExecutionFixture("workflow").pipe(
+        Effect.provide(harness.services),
+      );
+      const acquired = yield* fixture.store.beginClaimedNativePreparation(
+        fixture.operationSelection,
+      );
+      const owner = yield* fixture.store.consumeNativePreparationOwner(acquired);
+      const caller = yield* Scope.make();
+      let commits = 0;
+      const original = fixture.sql.withTransaction;
+      using _transactions = vi
+        .spyOn(fixture.sql, "withTransaction")
+        .mockImplementation(<A, E, R>(work: Effect.Effect<A, E, R>) =>
+          original(work).pipe(
+            Effect.filterOrElse(
+              () => ++commits !== (phase === "creation" ? 3 : 5),
+              () => Effect.interrupt,
+            ),
+          ),
+        );
+      if (phase === "creation") {
+        const exit = yield* Effect.exit(
+          owner.start(preparationCommand).pipe(Effect.provideService(Scope.Scope, caller)),
+        );
+        assert.isTrue(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause));
+      } else {
+        const facade = yield* owner
+          .start(preparationCommand)
+          .pipe(Effect.provideService(Scope.Scope, caller));
+        const exit = yield* Effect.exit(Stream.runCollect(facade.stdout));
+        assert.isTrue(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause));
+        yield* Scope.close(caller, Exit.void);
+      }
+      assert.strictEqual((yield* owner.stop()).inventory, "held");
+      const resource = PreparationResource.decodeRow(
+        (yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_process_resources`)[0],
+      );
+      assert.strictEqual(resource.recordVersion, phase === "creation" ? 1 : 3);
+      assert.strictEqual(resource.state, "active");
+      assert.strictEqual(resource.settlement, null);
+      assert.strictEqual(harness.calls.creates, 1);
+      assert.strictEqual(harness.calls.releases, phase === "creation" ? 0 : 1);
+      assert.strictEqual(
+        (yield* Effect.result(
+          owner.start(preparationCommand).pipe(Effect.provideService(Scope.Scope, caller)),
+        ))._tag,
+        "Failure",
+      );
+      yield* Scope.close(caller, Exit.void);
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each(
+  (["workflow", "planning"] as const).flatMap((kind) =>
+    ["revoke", "release"].map((first) => ({ kind, first })),
+  ),
+)(
+  "connected preparation preserves independent $kind $first-first commit order",
+  ({ kind, first }) =>
+    Effect.gen(function* () {
+      const directory = yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "preparation-owner-order-")),
+        ),
+        (value) => Effect.sync(() => NodeFS.rmSync(value, { recursive: true, force: true })),
+      );
+      const filename = NodePath.join(directory, "state.sqlite");
+      yield* Effect.gen(function* () {
+        const harness = yield* preparationProcessFixture({ keepRunning: true });
+        const fixture = yield* currentNativeExecutionFixture(kind).pipe(
+          Effect.provide(harness.services),
+        );
+        yield* fixture.sql`PRAGMA journal_mode=WAL`;
+        const sqlB = Context.get(
+          yield* Layer.build(Layer.fresh(NodeSqliteClient.layer({ filename }))),
+          SqlClient.SqlClient,
+        );
+        const sessionsB = yield* AuthSessions.make.pipe(
+          Effect.provideService(SqlClient.SqlClient, sqlB),
+        );
+        const acquired = yield* fixture.store.beginClaimedNativePreparation(
+          fixture.operationSelection,
+        );
+        const owner = yield* fixture.store.consumeNativePreparationOwner(acquired);
+        const caller = yield* Scope.make();
+        const revoke = sessionsB.revoke({
+          sessionId: fixture.authority.sessionId,
+          revokedAt: yield* DateTime.now,
+        });
+        if (first === "revoke") {
+          yield* revoke;
+          assert.strictEqual(
+            (yield* Effect.result(
+              owner.start(preparationCommand).pipe(Effect.provideService(Scope.Scope, caller)),
+            ))._tag,
+            "Failure",
+          );
+          assert.strictEqual(harness.calls.creates, 0);
+          assert.strictEqual(
+            (yield* sqlB`SELECT * FROM orchestration_v2_preparation_process_resources`).length,
+            0,
+          );
+        } else {
+          const facade = yield* owner
+            .start(preparationCommand)
+            .pipe(Effect.provideService(Scope.Scope, caller));
+          const payload = yield* Stream.runHead(facade.stdout);
+          assert.isTrue(Option.isSome(payload));
+          assert.strictEqual(new TextDecoder().decode(Option.getOrThrow(payload)), "payload");
+          const visible = PreparationResource.decodeRow(
+            (yield* sqlB`SELECT * FROM orchestration_v2_preparation_process_resources`)[0],
+          );
+          assert.isNotNull(visible.releaseStartedAt);
+          yield* revoke;
+          yield* owner.stop();
+          const retired = PreparationResource.decodeRow(
+            (yield* sqlB`SELECT * FROM orchestration_v2_preparation_process_resources`)[0],
+          );
+          assert.strictEqual(retired.state, "settled");
+          assert.strictEqual(retired.settlement?.childExit.signal, "SIGTERM");
+          assert.strictEqual(harness.calls.creates, 1);
+          assert.strictEqual(harness.calls.releases, 1);
+        }
+        yield* Scope.close(caller, Exit.void);
+      }).pipe(
+        Effect.provide(Store.layer.pipe(Layer.provideMerge(NodeSqliteClient.layer({ filename })))),
+      );
+    }),
 );

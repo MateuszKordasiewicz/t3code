@@ -3041,6 +3041,10 @@ it.effect.each([
       assert.strictEqual(jobs.length, 1);
       assert.strictEqual(result.preparation.job.identityVersion, 3);
       assert.isTrue(Object.isFrozen(result.preparation));
+      assert.isTrue(Object.isFrozen(result.preparation.owner));
+      assert.strictEqual(result.preparation.owner.jobId, result.preparation.job.input.jobId);
+      assert.strictEqual(result.preparation.owner.threadId, result.native.threadId);
+      assert.strictEqual(result.preparation.owner.runId, result.native.runId);
       assert.isTrue(Object.isFrozen(result.preparation.job));
       assert.isTrue(Object.isFrozen(result.preparation.selection));
       assert.deepStrictEqual(result.preparation.job.input.nativeOwner, {
