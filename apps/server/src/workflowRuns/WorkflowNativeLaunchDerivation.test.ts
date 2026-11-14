@@ -18,6 +18,9 @@ import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionMana
 import * as CommandOutputHub from "../orchestration-v2/CommandOutputHub.ts";
 import * as ProviderEventIngestor from "../orchestration-v2/ProviderEventIngestor.ts";
 import * as McpSessionRegistryTestkit from "../mcp/McpSessionRegistry.testkit.ts";
+import * as McpRegistry from "../mcp/McpSessionRegistry.ts";
+import { HttpServer } from "effect/http";
+import * as NetAddress from "effect/net/NetAddress";
 
 import * as ProviderInstances from "../provider/ProviderInstanceRegistry.ts";
 import * as CodexInstallation from "../provider/CodexInstallation.ts";
@@ -3060,6 +3063,23 @@ it.effect.each(["workflow", "planning"] as const)(
 
 const decodeProducedOperation = Schema.decodeEffect(Schema.fromJsonString(WorkflowOperationV1));
 
+const isolatedNativeMcpRegistry = Effect.fn("test.isolatedNativeMcpRegistry")(function* () {
+  return yield* McpRegistry.__testing.make().pipe(
+    Effect.provideService(
+      HttpServer.HttpServer,
+      HttpServer.HttpServer.of({
+        address: NetAddress.inetAddressFromIpStringUnsafe("127.0.0.1", 43123),
+        serve: (() => Effect.void) as HttpServer.HttpServer["Service"]["serve"],
+      }),
+    ),
+    Effect.provideService(ServerEnvironment.ServerEnvironment, {
+      getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
+      getDescriptor: Effect.die("native MCP fixture has no descriptor consumer"),
+    }),
+    Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+  );
+});
+
 const nativeLaunchProducer = Effect.fn("test.nativeLaunchProducer")(function* (
   fixture: Effect.Success<ReturnType<typeof controlledNativeFixture>>,
   coordinator = fixture.authority.coordinator,
@@ -3138,6 +3158,61 @@ it.effect.each([
       assert.strictEqual(result.preparation.job.state, "active");
       assert.isFalse(result.preparation.job.processExposed);
       assert.strictEqual(result.preparation.job.codeClosedAt, null);
+      if (!reuse) {
+        const mcpThreadId = ThreadId.make(result.native.threadId);
+        const source = yield* Store.readNativeManagerPreparationOwner(
+          fixture.store,
+          result.preparation.owner,
+          fixture.sql,
+        );
+        assert.isFunction(source.issueMcp);
+        const registry = yield* isolatedNativeMcpRegistry();
+        const mcp = Context.get(
+          yield* Layer.build(Layer.fresh(McpProviderSessions.layer)),
+          McpProviderSessions.McpProviderSessions,
+        );
+        const originalIssue = registry.issue;
+        let issues = 0;
+        using _issue = vi.spyOn(registry, "issue").mockImplementation((request) =>
+          Effect.gen(function* () {
+            assert.isTrue(
+              Option.isSome(yield* Effect.serviceOption(fixture.sql.transactionService)),
+            );
+            issues++;
+            return yield* originalIssue(request);
+          }),
+        );
+        const capabilities = new Set(["preview"] as const);
+        const request = {
+          threadId: mcpThreadId,
+          providerInstanceId: ProviderInstanceId.make("provider"),
+          browserToolsAvailable: true,
+          capabilities,
+        };
+        const issuing = source.issueMcp(registry, mcp, request);
+        capabilities.clear();
+        const issued = yield* issuing;
+        const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+        const scope = yield* registry.resolve(token);
+        if (!scope) throw new Error("original credential missing");
+        assert.strictEqual(scope.thread.threadId, mcpThreadId);
+        assert.strictEqual(scope.thread.providerSessionId, issued.config.providerSessionId);
+        assert.notStrictEqual(scope.thread.providerSessionId, source.current.providerSessionId);
+        assert.deepStrictEqual([...scope.capabilities].sort(), [
+          "orchestration",
+          "preview",
+          "pull-requests",
+          "worktree",
+        ]);
+        assert.isTrue(
+          yield* McpProviderSessions.replaceIfCurrent(mcp, mcpThreadId, undefined, issued.config),
+        );
+        assert.strictEqual((yield* source.close()).kind, "closed");
+        assert.isUndefined(yield* registry.resolve(token));
+        assert.isUndefined(yield* mcp.read(mcpThreadId));
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(source.issueMcp(registry, mcp, request))));
+        assert.strictEqual(issues, 1);
+      }
       assert.deepStrictEqual(result.preparation.selection, {
         jobId: result.preparation.job.input.jobId,
         entryKey: result.preparation.job.input.entryKey,
@@ -8418,4 +8493,299 @@ it.effect.each(
         assert.isTrue(Exit.isFailure(consumedAgain));
       }).pipe(Effect.provide(harness.services));
     }).pipe(Effect.provide(Layer.mergeAll(testLayer(), Digest.layerWebCrypto))),
+);
+
+const originalMcpSourceFixture = Effect.fn("test.originalMcpSourceFixture")(function* () {
+  const tracker = yield* AgentScope;
+  const fixture = yield* controlledNativeFixture("workflow", false, false, 2).pipe(
+    Effect.provideService(AgentScope, tracker),
+  );
+  const producer = yield* nativeLaunchProducer(fixture);
+  const produced = yield* producer.claimReservedIntent(producerSelection(fixture));
+  const source = yield* Store.readNativeManagerPreparationOwner(
+    fixture.store,
+    produced.preparation.owner,
+    fixture.sql,
+  );
+  const registry = yield* isolatedNativeMcpRegistry();
+  const mcp = Context.get(
+    yield* Layer.build(Layer.fresh(McpProviderSessions.layer)),
+    McpProviderSessions.McpProviderSessions,
+  );
+  const request: McpRegistry.McpCredentialRequest = {
+    threadId: ThreadId.make(produced.native.threadId),
+    providerInstanceId: ProviderInstanceId.make("provider"),
+    browserToolsAvailable: true,
+    capabilities: new Set(["preview"]),
+  };
+  return { fixture, source, registry, mcp, request, tracker };
+});
+
+it.effect.each([
+  "revoked",
+  "wrong-thread",
+  "wrong-instance",
+  "copied-map",
+  "closed",
+  "copied-tracker",
+] as const)("original MCP issuance refuses %s before Registry issuance", (mode) =>
+  Effect.gen(function* () {
+    const { fixture, source, registry, mcp, request, tracker } = yield* originalMcpSourceFixture();
+    yield* source.assertAgentScope(tracker);
+    assert.strictEqual(source.environmentId, "environment");
+    let issues = 0;
+    const original = registry.issue;
+    using _issue = vi.spyOn(registry, "issue").mockImplementation((input) => {
+      issues++;
+      return original(input);
+    });
+    if (mode === "revoked") yield* fixture.sessions.revoke(fixture.reference.sessionId);
+    if (mode === "closed") yield* source.close();
+    const result = yield* Effect.exit(
+      mode === "copied-tracker"
+        ? source.assertAgentScope({ ...tracker })
+        : source.issueMcp(registry, mode === "copied-map" ? { ...mcp } : mcp, {
+            ...request,
+            ...(mode === "wrong-thread" ? { threadId: ThreadId.make("foreign") } : {}),
+            ...(mode === "wrong-instance"
+              ? { providerInstanceId: ProviderInstanceId.make("foreign") }
+              : {}),
+          }),
+    );
+    assert.isTrue(Exit.isFailure(result));
+    assert.strictEqual(issues, 0);
+    assert.isUndefined(yield* mcp.read(request.threadId));
+    assert.deepStrictEqual(
+      yield* fixture.sql`SELECT * FROM orchestration_v2_preparation_process_resources`,
+      [],
+    );
+    assert.deepStrictEqual(
+      yield* fixture.sql`SELECT * FROM orchestration_v2_submission_transports`,
+      [],
+    );
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect.each([
+  "normal",
+  "replacement",
+  "wrapper-mutation",
+  "frozen-config",
+  "lost-return",
+  "commit-loss",
+  "revoke-failure",
+] as const)("original MCP receipt cleanup preserves its exact custody after %s", (mode) =>
+  Effect.gen(function* () {
+    const { fixture, source, registry, mcp, request } = yield* originalMcpSourceFixture();
+    const originalIssue = registry.issue;
+    const originalWriter = fixture.sql.withTransaction;
+    const originalRevoke = registry.revokeProviderSession;
+    let observed: McpRegistry.McpIssuedCredential | undefined;
+    using _issue = vi.spyOn(registry, "issue").mockImplementation((input) =>
+      originalIssue(input).pipe(
+        Effect.tap((value) =>
+          Effect.sync(() => {
+            observed = value;
+          }),
+        ),
+      ),
+    );
+    let armed = mode === "commit-loss";
+    using _writer = vi
+      .spyOn(fixture.sql, "withTransaction")
+      .mockImplementation(<A, E, R>(work: Effect.Effect<A, E, R>) => {
+        if (!armed) return originalWriter(work);
+        armed = false;
+        return originalWriter(work).pipe(Effect.andThen(Effect.interrupt));
+      });
+    const result = yield* Effect.exit(
+      source
+        .issueMcp(registry, mcp, request)
+        .pipe(Effect.tap(() => (mode === "lost-return" ? Effect.interrupt : Effect.void))),
+    );
+    assert.strictEqual(Exit.isFailure(result), mode === "lost-return" || mode === "commit-loss");
+    if (!observed) throw new Error("original issuance result missing");
+    const issued = observed;
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+    if (mode === "commit-loss") assert.isUndefined(yield* registry.resolve(token));
+    else if (mode !== "lost-return") yield* mcp.set(issued.config);
+    const winner =
+      mode === "replacement" || mode === "wrapper-mutation" || mode === "frozen-config"
+        ? yield* originalIssue(request)
+        : undefined;
+    if (winner) yield* mcp.set(winner.config);
+    if (mode === "wrapper-mutation" && winner) Object.assign(issued, { config: winner.config });
+    if (mode === "frozen-config" && winner)
+      assert.throws(() => Object.assign(issued.config, winner.config), TypeError);
+    let revokes = 0;
+    using _revoke = vi.spyOn(registry, "revokeProviderSession").mockImplementation((id) => {
+      revokes++;
+      return mode === "revoke-failure"
+        ? Effect.die("fixture revocation failure")
+        : originalRevoke(id);
+    });
+    const closed = yield* source.close();
+    assert.strictEqual(
+      closed.kind,
+      mode === "commit-loss" || mode === "revoke-failure" ? "held" : "closed",
+    );
+    assert.strictEqual((yield* source.close()).kind, closed.kind);
+    assert.strictEqual(revokes, mode === "commit-loss" ? 0 : 1);
+    assert.isTrue((yield* mcp.read(request.threadId)) === winner?.config);
+    assert.strictEqual((yield* registry.resolve(token)) !== undefined, mode === "revoke-failure");
+    if (winner) {
+      assert.isTrue((yield* mcp.read(request.threadId)) === winner.config);
+      assert.isDefined(
+        yield* registry.resolve(winner.config.authorizationHeader.replace(/^Bearer\s+/, "")),
+      );
+    }
+    yield* originalRevoke(issued.config.providerSessionId);
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect.each(
+  ([false, true] as const).flatMap((masked) =>
+    (["before", "after"] as const).flatMap((phase) =>
+      (["caller", "source", "store"] as const).map((boundary) => ({ masked, phase, boundary })),
+    ),
+  ),
+)(
+  "original MCP issuance joins $phase issue during $boundary under mask=$masked",
+  ({ masked, phase, boundary }) =>
+    Effect.gen(function* () {
+      const storeScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(storeScope, Exit.void));
+      const { source, registry, mcp, request } = yield* originalMcpSourceFixture().pipe(
+        Effect.provideService(Scope.Scope, storeScope),
+      );
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const original = registry.issue;
+      let observed: McpRegistry.McpIssuedCredential | undefined;
+      let issues = 0;
+      using _issue = vi.spyOn(registry, "issue").mockImplementation((input) =>
+        Effect.gen(function* () {
+          issues++;
+          if (phase === "after") observed = yield* original(input);
+          yield* Deferred.succeed(entered, undefined);
+          yield* Deferred.await(release);
+          return observed ?? (observed = yield* original(input));
+        }),
+      );
+      const issuing = yield* source
+        .issueMcp(registry, mcp, request)
+        .pipe(
+          (work) => (masked ? Effect.uninterruptible(work) : work),
+          Effect.exit,
+          Effect.forkScoped,
+        );
+      yield* Deferred.await(entered);
+      const stopping = yield* (
+        boundary === "caller"
+          ? Fiber.interrupt(issuing)
+          : boundary === "source"
+            ? source.close()
+            : Scope.close(storeScope, Exit.void)
+      ).pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Effect.sync(() => {
+        assert.isUndefined(stopping.pollUnsafe());
+        assert.isUndefined(issuing.pollUnsafe());
+      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+      yield* Fiber.join(stopping);
+      const result = yield* Fiber.await(issuing);
+      assert.isTrue(Exit.isFailure(result) || Exit.isFailure(result.value));
+      if (!observed) throw new Error("original local issuance did not settle");
+      assert.isUndefined(
+        yield* registry.resolve(observed.config.authorizationHeader.replace(/^Bearer\s+/, "")),
+      );
+      assert.isTrue((yield* mcp.read(request.threadId)) === undefined);
+      assert.strictEqual((yield* source.close()).kind, "held");
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(source.issueMcp(registry, mcp, request))));
+      assert.strictEqual(issues, 1);
+    }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect.each(["revoke", "issue"] as const)(
+  "original MCP writer orders independent grant commit with %s first",
+  (first) =>
+    Effect.gen(function* () {
+      const directory = yield* Effect.acquireRelease(
+        Effect.sync(() => NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "native-mcp-grant-"))),
+        (value) => Effect.sync(() => NodeFS.rmSync(value, { recursive: true, force: true })),
+      );
+      const filename = NodePath.join(directory, "state.sqlite");
+      yield* Effect.gen(function* () {
+        const { fixture, source, registry, mcp, request } = yield* originalMcpSourceFixture();
+        using competitor = new NodeSqlite.DatabaseSync(filename);
+        const revoke = () =>
+          competitor
+            .prepare("UPDATE auth_sessions SET revoked_at=? WHERE session_id=?")
+            .run(facts.now, fixture.reference.sessionId);
+        const original = registry.issue;
+        let probes = 0;
+        using _issue = vi.spyOn(registry, "issue").mockImplementation((input) =>
+          Effect.gen(function* () {
+            probes++;
+            assert.throws(() => competitor.exec("BEGIN IMMEDIATE"), /locked/);
+            return yield* original(input);
+          }),
+        );
+        if (first === "revoke") revoke();
+        const result = yield* Effect.exit(source.issueMcp(registry, mcp, request));
+        assert.strictEqual(Exit.isSuccess(result), first === "issue");
+        assert.strictEqual(probes, first === "issue" ? 1 : 0);
+        if (Exit.isSuccess(result)) {
+          competitor.exec("BEGIN IMMEDIATE");
+          revoke();
+          competitor.exec("COMMIT");
+          assert.isTrue(Exit.isFailure(yield* Effect.exit(source.checkReservation())));
+          yield* source.close();
+          assert.isUndefined(
+            yield* registry.resolve(
+              result.value.config.authorizationHeader.replace(/^Bearer\s+/, ""),
+            ),
+          );
+        }
+      }).pipe(Effect.provide(testLayer(filename)));
+    }),
+);
+
+it.effect.each(
+  (["issue", "revoke"] as const).flatMap((phase) =>
+    ([false, true] as const).map((descendant) => ({ phase, descendant })),
+  ),
+)(
+  "original MCP $phase callback refuses source cleanup under descendant=$descendant",
+  ({ phase, descendant }) =>
+    Effect.gen(function* () {
+      const { source, registry, mcp, request } = yield* originalMcpSourceFixture();
+      const originalIssue = registry.issue;
+      const originalRevoke = registry.revokeProviderSession;
+      let callbacks = 0;
+      const callback = Effect.gen(function* () {
+        callbacks++;
+        const work = source.close();
+        const result = yield* Effect.exit(
+          descendant ? work.pipe(Effect.forkChild, Effect.flatMap(Fiber.join)) : work,
+        );
+        assert.isTrue(Exit.isFailure(result));
+      });
+      using _issue = vi
+        .spyOn(registry, "issue")
+        .mockImplementation((input) =>
+          (phase === "issue" ? callback : Effect.void).pipe(Effect.andThen(originalIssue(input))),
+        );
+      using _revoke = vi
+        .spyOn(registry, "revokeProviderSession")
+        .mockImplementation((id) =>
+          (phase === "revoke" ? callback : Effect.void).pipe(Effect.andThen(originalRevoke(id))),
+        );
+      const issued = yield* source.issueMcp(registry, mcp, request);
+      yield* source.checkReservation();
+      assert.strictEqual((yield* source.close()).kind, "closed");
+      assert.strictEqual(callbacks, 1);
+      assert.isUndefined(
+        yield* registry.resolve(issued.config.authorizationHeader.replace(/^Bearer\s+/, "")),
+      );
+    }).pipe(Effect.provide(testLayer())),
 );

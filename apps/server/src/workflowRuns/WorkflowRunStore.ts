@@ -1,5 +1,6 @@
 import {
   EnvironmentId,
+  ThreadId,
   ProjectId,
   PlanningSessionV1,
   PlanningPassV1,
@@ -51,6 +52,8 @@ import type { ServerConfig } from "../config.ts";
 import type { ModelSelection, OrchestrationV2AppThread } from "@t3tools/contracts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import type * as CodexClient from "effect-codex-app-server/client";
+import type * as McpRegistry from "../mcp/McpSessionRegistry.ts";
+import * as McpSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import { buildCodexAdapterInitializeParams } from "../provider/CodexProvider.ts";
 import * as NativeProtocol from "./WorkflowNativeCommandProtocol.ts";
 import * as PreparationJob from "../preparation/PreparationJob.ts";
@@ -270,6 +273,16 @@ type CurrentAuthority = Effect.Success<
   ReturnType<typeof ExecutionAuthority.makeCapturedWorkflowExecutionAuthority>
 >;
 type NativeCoordinator = { readonly bootId: string; readonly workerId: string };
+type NativeMcpIssuance = {
+  readonly fiber: Fiber.Fiber<unknown, unknown>;
+  readonly done: Deferred.Deferred<Exit.Exit<void, unknown>>;
+  receipt?: {
+    readonly registry: McpRegistry.McpSessionRegistryShape;
+    readonly sessions: typeof McpSessions.McpProviderSessions.Service;
+    readonly config: McpRegistry.McpIssuedCredential["config"];
+    readonly credentialId: string;
+  };
+};
 type PreparationActor = {
   job: PreparationJob.Job;
   readonly resources: Map<string, PreparationResource.Resource>;
@@ -279,6 +292,7 @@ type PreparationActor = {
     readonly done: Deferred.Deferred<Exit.Exit<void, unknown>>;
   };
   readonly consumed: Deferred.Deferred<Exit.Exit<void, unknown>>;
+  mcpIssuance?: NativeMcpIssuance;
   native?: {
     readonly close: () => Effect.Effect<NativeManagerDisposition, NativeManagerSourceError>;
     readonly assertCanStop: () => Effect.Effect<void, NativeManagerSourceError>;
@@ -295,6 +309,7 @@ type NativeTransportActor = {
 type NativeBindingRuntime = {
   readonly scope: Scope.Scope;
   readonly agentScope: typeof AgentScope.Service;
+  readonly originalAgentScope: typeof AgentScope.Service;
   readonly nodeChild: typeof PreparationNode.PreparationNodeChild.Service;
   readonly path: Path.Path;
   readonly hostEnvironment: NodeJS.ProcessEnv;
@@ -320,6 +335,15 @@ export type NativeManagerSourceError =
   | PreparationOwner.PreparationProcessOwnerError
   | SqlError.SqlError;
 export interface NativeManagerPreparationSource {
+  readonly environmentId: string;
+  readonly assertAgentScope: (
+    scope: typeof AgentScope.Service,
+  ) => Effect.Effect<void, NativeManagerSourceError>;
+  readonly issueMcp: (
+    registry: McpRegistry.McpSessionRegistryShape,
+    sessions: typeof McpSessions.McpProviderSessions.Service,
+    request: McpRegistry.McpCredentialRequest,
+  ) => Effect.Effect<McpRegistry.McpIssuedCredential, NativeManagerSourceError>;
   readonly sql: SqlClient.SqlClient;
   readonly owner: PreparationOwner.Owner;
   readonly threadId: string;
@@ -7559,6 +7583,142 @@ const makeStore = Effect.fnUntraced(function* (
       const current = yield* decodeNativeTransportCurrent(actor.job.input.request.current).pipe(
         Effect.mapError(integrity),
       );
+      let mcpCleanupDone: Deferred.Deferred<boolean> | undefined;
+      const closeMcp = Effect.fn("WorkflowRunStore.closeOriginalPreparationMcp")(function* () {
+        return yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            const receipt = actor.mcpIssuance?.receipt;
+            if (!receipt) return true;
+            if (mcpCleanupDone) return yield* Deferred.await(mcpCleanupDone);
+            const done = Deferred.makeUnsafe<boolean>();
+            mcpCleanupDone = done;
+            const result = yield* Effect.exit(
+              PreparationOwner.withOperation(
+                owner,
+                Effect.gen(function* () {
+                  const revoked = yield* Effect.exit(
+                    receipt.registry.revokeProviderSession(receipt.credentialId),
+                  );
+                  const cleared = yield* Effect.exit(
+                    McpSessions.replaceIfCurrent(
+                      receipt.sessions,
+                      ThreadId.make(actor.job.input.threadId),
+                      receipt.config,
+                      undefined,
+                    ),
+                  );
+                  return Exit.isSuccess(revoked) && Exit.isSuccess(cleared);
+                }),
+              ),
+            );
+            const closed = Exit.isSuccess(result) && result.value;
+            Deferred.doneUnsafe(done, Exit.succeed(closed));
+            return closed;
+          }),
+        );
+      });
+      const issueMcpBody = Effect.fn("WorkflowRunStore.issueOriginalPreparationMcp")(function* (
+        registry: McpRegistry.McpSessionRegistryShape,
+        sessions: typeof McpSessions.McpProviderSessions.Service,
+        request: McpRegistry.McpCredentialRequest,
+      ) {
+        yield* outside("admission");
+        if (
+          !McpSessions.isService(sessions) ||
+          request.threadId !== actor.job.input.threadId ||
+          request.providerInstanceId !== current.providerInstanceId
+        )
+          return yield* integrity();
+        return yield* Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const fiber = yield* Effect.withFiber(Effect.succeed);
+            const invocation = yield* Effect.sync(() => {
+              if (
+                actor.mcpIssuance ||
+                actor.native ||
+                flags.intakeSealed ||
+                flags.stopping ||
+                flags.blocked ||
+                runtime.scope.state._tag === "Closed"
+              )
+                return undefined;
+              const value: NativeMcpIssuance = {
+                fiber,
+                done: Deferred.makeUnsafe<Exit.Exit<void, unknown>>(),
+              };
+              actor.mcpIssuance = value;
+              return value;
+            });
+            if (!invocation) return yield* integrity();
+            const result = yield* Effect.exit(
+              restore(
+                PreparationOwner.withOperation(
+                  owner,
+                  writer(
+                    "admission",
+                    Effect.gen(function* () {
+                      const job = yield* checkNewWork();
+                      if (job.processExposed || actor.resources.size || commands.size)
+                        return yield* integrity();
+                      return yield* Effect.uninterruptible(
+                        registry.issue(request).pipe(
+                          Effect.tap((credential) =>
+                            Effect.sync(() => {
+                              const config = credential.config;
+                              invocation.receipt = {
+                                registry,
+                                sessions,
+                                config,
+                                credentialId: config.providerSessionId,
+                              };
+                              Object.freeze(config);
+                            }),
+                          ),
+                          Effect.flatMap((credential) => {
+                            const config = credential.config;
+                            if (
+                              config.environmentId !== runtime.environmentId ||
+                              config.threadId !== request.threadId ||
+                              config.providerInstanceId !== request.providerInstanceId ||
+                              !config.providerSessionId.trim() ||
+                              !config.authorizationHeader.startsWith("Bearer ")
+                            )
+                              return integrity();
+                            return Effect.succeed(credential);
+                          }),
+                        ),
+                      );
+                    }),
+                    () => {},
+                  ),
+                ),
+              ),
+            );
+            Deferred.doneUnsafe(invocation.done, Exit.succeed(Exit.map(result, () => undefined)));
+            if (Exit.isFailure(result)) yield* closeMcp();
+            return yield* result;
+          }),
+        );
+      }, Effect.interruptible);
+      const issueMcp: NativeManagerPreparationSource["issueMcp"] = (
+        registry,
+        sessions,
+        request,
+      ) => {
+        const owned = Result.try({
+          try: () =>
+            Object.freeze({
+              ...request,
+              ...(request.capabilities === undefined
+                ? {}
+                : { capabilities: new Set(request.capabilities) }),
+            }),
+          catch: integrity,
+        });
+        return Effect.fromResult(owned).pipe(
+          Effect.flatMap((value) => issueMcpBody(registry, sessions, value)),
+        );
+      };
       const assertCanStop = Effect.fn("WorkflowRunStore.assertPreparationManagerStop")(
         function* () {
           yield* PreparationOwner.assertCanStop(owner);
@@ -7569,12 +7729,80 @@ const makeStore = Effect.fnUntraced(function* (
             actor.consumption.fiber.id === fiber.id
           )
             return yield* integrity();
+          if (
+            actor.mcpIssuance &&
+            !Deferred.isDoneUnsafe(actor.mcpIssuance.done) &&
+            actor.mcpIssuance.fiber.id === fiber.id
+          )
+            return yield* integrity();
           if (actor.native) yield* actor.native.assertCanStop();
+        },
+      );
+      let sourceCloseDone:
+        | Deferred.Deferred<NativeManagerDisposition, NativeManagerSourceError>
+        | undefined;
+      const closeSource = Effect.fn("WorkflowRunStore.closePreparationManagerReservation")(
+        function* () {
+          yield* assertCanStop();
+          return yield* Effect.uninterruptible(
+            Effect.gen(function* () {
+              if (sourceCloseDone) return yield* Deferred.await(sourceCloseDone);
+              const done = Deferred.makeUnsafe<
+                NativeManagerDisposition,
+                NativeManagerSourceError
+              >();
+              sourceCloseDone = done;
+              flags.intakeSealed = true;
+              flags.stopping = true;
+              const issuance = actor.mcpIssuance;
+              const consumption = actor.consumption;
+              if (issuance && !Deferred.isDoneUnsafe(issuance.done))
+                issuance.fiber.interruptUnsafe();
+              if (consumption && !Deferred.isDoneUnsafe(consumption.done))
+                consumption.fiber.interruptUnsafe();
+              const result = yield* Effect.exit(
+                Effect.gen(function* () {
+                  const issued = issuance ? yield* Deferred.await(issuance.done) : undefined;
+                  const consumed = consumption
+                    ? yield* Deferred.await(consumption.done)
+                    : undefined;
+                  const nativeExit = yield* Effect.exit(
+                    actor.native
+                      ? actor.native.close()
+                      : Effect.succeed({ kind: "closed" as const, transportId: "" }),
+                  );
+                  const inventory = yield* Effect.exit(owner.stop());
+                  const credential = yield* closeMcp();
+                  const native = Exit.isSuccess(nativeExit) ? nativeExit.value : undefined;
+                  if (
+                    Exit.isFailure(nativeExit) ||
+                    Exit.isFailure(inventory) ||
+                    inventory.value.inventory !== "all-retired" ||
+                    (issued && Exit.isFailure(issued)) ||
+                    (consumed && Exit.isFailure(consumed)) ||
+                    !credential ||
+                    native?.kind === "held"
+                  )
+                    return { kind: "held" as const, transportId: native?.transportId ?? "" };
+                  return native!;
+                }),
+              );
+              Deferred.doneUnsafe(done, result);
+              return yield* result;
+            }),
+          );
         },
       );
       managerPreparations.set(
         owner,
         Object.freeze({
+          environmentId: runtime.environmentId,
+          assertAgentScope: Effect.fn("WorkflowRunStore.assertOriginalPreparationTracker")(
+            function* (selected) {
+              if (selected !== runtime.originalAgentScope) return yield* integrity();
+            },
+          ),
+          issueMcp,
           sql,
           owner,
           current: Object.freeze(current),
@@ -7599,37 +7827,10 @@ const makeStore = Effect.fnUntraced(function* (
             Effect.sync(() => actor.native?.source),
           ),
           awaitConsumption: Deferred.await(actor.consumed),
-          close: Effect.fn("WorkflowRunStore.closePreparationManagerReservation")(function* () {
-            yield* assertCanStop();
-            return yield* Effect.uninterruptible(
-              Effect.gen(function* () {
-                flags.intakeSealed = true;
-                flags.stopping = true;
-                const consumption = actor.consumption;
-                if (consumption && !Deferred.isDoneUnsafe(consumption.done))
-                  consumption.fiber.interruptUnsafe();
-                const consumed = consumption ? yield* Deferred.await(consumption.done) : undefined;
-                const nativeExit = yield* Effect.exit(
-                  actor.native
-                    ? actor.native.close()
-                    : Effect.succeed({ kind: "closed" as const, transportId: "" }),
-                );
-                const inventory = yield* Effect.exit(owner.stop());
-                const native = Exit.isSuccess(nativeExit) ? nativeExit.value : undefined;
-                if (
-                  Exit.isFailure(nativeExit) ||
-                  Exit.isFailure(inventory) ||
-                  inventory.value.inventory !== "all-retired" ||
-                  (consumed && Exit.isFailure(consumed)) ||
-                  native?.kind === "held"
-                )
-                  return { kind: "held" as const, transportId: native?.transportId ?? "" };
-                return native!;
-              }),
-            );
-          }),
+          close: closeSource,
         }),
       );
+      yield* Scope.addFinalizer(runtime.scope, closeSource().pipe(Effect.ignore));
       return owner;
     },
   );
@@ -8519,6 +8720,7 @@ const makeStore = Effect.fnUntraced(function* (
             acquisition.flags.stopping ||
             acquisition.flags.blocked ||
             actor.consumption ||
+            (actor.mcpIssuance && !Deferred.isDoneUnsafe(actor.mcpIssuance.done)) ||
             retiredWorkspaces.get(acquired) !== acquisition
           )
             return undefined;
@@ -9228,6 +9430,7 @@ const makeNativeStore = Effect.fn("WorkflowRunStore.makeCapturedNative")(functio
     environmentId,
     scope,
     agentScope: Object.freeze({ ...agentScope }),
+    originalAgentScope: agentScope,
     nodeChild: Object.freeze({ prepare: nodeChild.prepare }),
     path,
     hostEnvironment: Object.freeze({ ...hostEnvironment }),
