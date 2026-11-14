@@ -318,6 +318,20 @@ type CapturedNativeAuthority = {
   readonly store: WorkflowRunStore.WorkflowRunStore["Service"];
   readonly coordinator: NativeWorkflowAuthority["coordinator"];
 };
+const nativeSinkSources = new WeakMap<
+  object,
+  { readonly store: object; readonly sql: SqlClient.SqlClient }
+>();
+export const assertNativePreparationSource = Effect.fn("EventSink.assertNativePreparationSource")(
+  function* (sink: object, store: object, owner: object, sql: SqlClient.SqlClient) {
+    const source = nativeSinkSources.get(sink);
+    if (!source || source.store !== store || source.sql !== sql)
+      return yield* new EventSinkWriteError({ eventCount: 0 });
+    yield* WorkflowRunStore.readNativeManagerPreparationOwner(store, owner, sql).pipe(
+      Effect.mapError((cause) => new EventSinkWriteError({ eventCount: 0, cause })),
+    );
+  },
+);
 const decodeNativeTarget = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2AppThreadJson),
 );
@@ -1529,7 +1543,7 @@ const makeSink = Effect.fn("orchestrationV2.EventSink.make")(function* (
     ? { prepareNativeSession, attachNativeSession, retireNativeSession }
     : {};
 
-  return EventSinkV2.of({
+  const service = EventSinkV2.of({
     ...nativeMethods,
     ...nativeSessionMethods,
     consumeProviderEvents: coordinator.consume,
@@ -1649,6 +1663,8 @@ const makeSink = Effect.fn("orchestrationV2.EventSink.make")(function* (
         ),
       ),
   } satisfies EventSinkV2Shape);
+  if (nativeAuthority) nativeSinkSources.set(service, { store: nativeAuthority.store, sql });
+  return service;
 });
 
 const layerBase: Layer.Layer<

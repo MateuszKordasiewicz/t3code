@@ -26,6 +26,7 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { stableStringify } from "@t3tools/shared/relaySigning";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import * as Store from "../workflowRuns/WorkflowRunStore.ts";
+import * as PreparationOwner from "../preparation/PreparationProcessOwner.ts";
 import * as Settings from "../serverSettings.ts";
 import { codexAppServerEnvironment } from "../provider/CodexProvider.ts";
 import { codexAppServerArgs, resolveCodexLaunchArgs } from "../provider/codexLaunchArgs.ts";
@@ -102,25 +103,68 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
       policy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
     };
     owner?: Owner;
+    preparationOwner?: PreparationOwner.Owner;
+    preparationFiber?: Fiber.Fiber<
+      Effect.Success<ReturnType<typeof workspace.createReservedWorkspace>>,
+      Effect.Error<ReturnType<typeof workspace.createReservedWorkspace>>
+    >;
   };
   const entries = new Set<Entry>();
   let closed = false;
   const stop = Effect.fn("WorkflowNativeCodexTransport.stopEntry")(function* (entry: Entry) {
+    if (entry.preparationOwner) yield* PreparationOwner.assertCanStop(entry.preparationOwner);
     if (entry.fiber && entry.fiber.pollUnsafe() === undefined) entry.fiber.interruptUnsafe();
     if (entry.bootstrapFiber && entry.bootstrapFiber.pollUnsafe() === undefined)
       entry.bootstrapFiber.interruptUnsafe();
     if (entry.adapterFiber && entry.adapterFiber.pollUnsafe() === undefined)
       entry.adapterFiber.interruptUnsafe();
-    const result = entry.owner
-      ? entry.managerAttempted
-        ? yield* Manager.closeNativeManagerRuntime(manager, entry.owner).pipe(
-            Effect.catch((error) =>
-              error.reason === "unregistered"
-                ? entry.owner!.close()
-                : Effect.succeed({ kind: "held" as const, transportId: entry.owner!.transportId }),
-            ),
-          )
-        : yield* entry.owner.close()
+    if (entry.preparationFiber && entry.preparationFiber.pollUnsafe() === undefined)
+      entry.preparationFiber.interruptUnsafe();
+    const prepared = entry.preparationFiber
+      ? yield* Fiber.await(entry.preparationFiber)
+      : undefined;
+    if (
+      !entry.preparationOwner &&
+      prepared &&
+      Exit.isSuccess(prepared) &&
+      prepared.value.preparation.kind === "retired"
+    )
+      entry.preparationOwner = yield* Store.readNativeManagerWorkspaceOwner(
+        store,
+        prepared.value.preparation.job,
+        sql,
+      );
+    const selected = entry.owner ?? entry.preparationOwner;
+    const result = selected
+      ? yield* Manager.closeNativeManagerRuntime(manager, selected).pipe(
+          Effect.catchIf(
+            (error) =>
+              error.reason === "unregistered" &&
+              entry.preparationOwner !== undefined &&
+              selected !== entry.preparationOwner,
+            () => Manager.closeNativeManagerRuntime(manager, entry.preparationOwner!),
+          ),
+          Effect.catch((error) =>
+            error.reason === "unregistered"
+              ? entry.preparationOwner
+                ? entry.preparationOwner.stop().pipe(
+                    Effect.map((inventory) => ({
+                      kind:
+                        inventory.inventory === "all-retired"
+                          ? ("closed" as const)
+                          : ("held" as const),
+                      transportId: entry.owner?.transportId ?? "",
+                    })),
+                  )
+                : entry.owner
+                  ? entry.owner.close()
+                  : Effect.succeed({ kind: "closed" as const, transportId: "" })
+              : Effect.succeed({
+                  kind: "held" as const,
+                  transportId: entry.owner?.transportId ?? "",
+                }),
+          ),
+        )
       : { kind: "closed" as const, transportId: "" };
     if (entry.fiber) yield* Fiber.await(entry.fiber);
     if (entry.bootstrapFiber) yield* Fiber.await(entry.bootstrapFiber);
@@ -200,9 +244,21 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
           const control = yield* Effect.withFiber(Effect.succeed);
           entries.add(entry);
           const body = Effect.gen(function* () {
-            const prepared = yield* preparation;
+            const preparationFiber = yield* preparation.pipe(Effect.forkIn(childScope));
+            entry.preparationFiber = preparationFiber;
+            const preparationResult = yield* Fiber.await(preparationFiber);
+            if (Exit.isFailure(preparationResult))
+              return yield* Effect.failCause(preparationResult.cause);
+            const prepared = preparationResult.value;
             if (prepared.preparation.kind !== "retired") return yield* failure("stale");
             const job = prepared.preparation.job;
+            const retiredPreparation = prepared.preparation;
+            const originalPreparationOwner = yield* Store.readNativeManagerWorkspaceOwner(
+              store,
+              job,
+              sql,
+            );
+            entry.preparationOwner = originalPreparationOwner;
             const current = job.input.request.current as Record<string, unknown>;
             if (current.driver !== "codex" || typeof current.providerInstanceId !== "string")
               return yield* failure("profile");
@@ -222,359 +278,385 @@ export const makeNativeCodexTransport = Effect.fn("WorkflowNativeCodexTransport.
               cwd: prepared.worktree.path,
               env,
             });
-            entry.owner = owner;
-            if (stableStringify(owner.executionClaim) !== stableStringify(prepared.executionClaim))
-              return yield* failure("stale");
-            yield* owner.captureConstructor();
-            entry.managerAttempted = true;
-            yield* Manager.reserveNativeManagerRuntime(manager, {
-              store,
-              owner,
-              sql,
-              sink: eventSink,
-              control,
-              onCleanup: () => {
-                entries.delete(entry);
-              },
-              checkProfile: Effect.fn("WorkflowNativeCodexTransport.checkPublicationProfile")(
-                function* () {
-                  yield* checkProfile();
-                  if (
-                    closed ||
-                    serviceScope.state._tag === "Closed" ||
-                    !entry.client ||
-                    !entry.runtime ||
-                    !entry.terminated ||
-                    !(yield* entry.client.ownedProcess.isRunning) ||
-                    entry.terminated.pollUnsafe() !== undefined
-                  )
-                    return yield* failure("closed");
-                },
-              ),
-            });
-            const io = yield* owner.open();
-            let bootstrapSelection: string | undefined;
-            let bootstrapMethod: "initialize" | "initialized" | undefined;
-            let bootstrapAttempted = false;
-            let adapterAttempted = false;
-            let initializeResponse: CodexSchema.V1InitializeResponse | undefined;
-            let observer:
-              | CodexClient.CodexAppServerControlledClientOptions<CodexErrors.CodexAppServerFrameSubmissionError>["onOutcome"]
-              | undefined;
-            const client = yield* CodexClient.makeControlledProcessProtocolClient(
-              {
-                pid: ChildProcessSpawner.ProcessId(io.pid),
-                stdin: io.stdin.pipe(Sink.mapError(() => unavailable("stdin"))),
-                stdout: io.stdout.pipe(Stream.mapError(() => unavailable("stdout"))),
-                stderr: io.stderr.pipe(Stream.mapError(() => unavailable("stderr"))),
-                exitCode: io.exitCode.pipe(
-                  Effect.map(ChildProcessSpawner.ExitCode),
-                  Effect.mapError(() => unavailable("exit")),
-                ),
-              },
-              {
-                wrapper: (frame, submit) =>
-                  bootstrapSelection !== undefined &&
-                  frame.selection === bootstrapSelection &&
-                  frame.method === bootstrapMethod
-                    ? submit()
-                    : Effect.fail(
-                        new CodexErrors.CodexAppServerFrameSubmissionError({
-                          outcome: "not_submitted",
-                          reason: "wrapper",
-                        }),
-                      ),
-                onOutcome: (outcome) => (observer ? observer(outcome) : Effect.void),
-              },
-            ).pipe(Effect.provideService(Scope.Scope, owner.scope));
-            const terminated = yield* client.awaitTermination.pipe(
-              Effect.exit,
-              Effect.forkIn(owner.scope),
-            );
-            const retained = Object.freeze(
-              CodexClient.CodexAppServerControlledClient.of({
-                ...client,
-                raw: Object.freeze({ ...client.raw }),
-                ownedProcess: Object.freeze({
-                  pid: ChildProcessSpawner.ProcessId(io.pid),
-                  isRunning: io.isRunning.pipe(Effect.mapError(() => unavailable("isRunning"))),
-                  awaitExit: io.exitCode.pipe(
-                    Effect.map(ChildProcessSpawner.ExitCode),
-                    Effect.mapError(() => unavailable("exit")),
-                  ),
-                }),
-              }),
-            );
-            entry.client = retained;
-            entry.terminated = terminated;
-            const bootstrap = Effect.fn("WorkflowNativeCodexTransport.bootstrap")(
-              function* () {
-                if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
-                  return yield* failure("boundary");
-                return yield* Effect.uninterruptibleMask((resume) =>
-                  Effect.gen(function* () {
-                    if (bootstrapAttempted || closed || serviceScope.state._tag === "Closed")
-                      return yield* failure("closed");
-                    bootstrapAttempted = true;
-                    const scope = yield* Scope.make("sequential");
-                    yield* Scope.addFinalizer(serviceScope, Scope.close(scope, Exit.void));
-                    const work = Effect.gen(function* () {
-                      const profile = yield* owner.captureBootstrap();
-                      bootstrapSelection = profile.selection;
-                      bootstrapMethod = "initialize";
-                      const response = yield* client
-                        .request("initialize", profile.params, profile.selection)
-                        .pipe(Effect.timeout("10 seconds"));
-                      yield* owner.confirmInitialize();
-                      bootstrapMethod = "initialized";
-                      yield* client.notify("initialized", undefined, profile.selection);
-                      return Object.freeze({
-                        kind: "protocol-initialized" as const,
-                        transportId: owner.transportId,
-                        response,
-                      });
-                    }).pipe(
-                      Effect.interruptible,
-                      Effect.ensuring(
-                        Effect.sync(() => {
-                          bootstrapSelection = undefined;
-                          bootstrapMethod = undefined;
-                        }),
-                      ),
-                    );
-                    const fiber = yield* work.pipe(Effect.forkIn(scope));
-                    entry.bootstrapFiber = fiber;
-                    const result = yield* resume(Fiber.await(fiber)).pipe(
-                      Effect.onInterrupt(() => stop(entry).pipe(Effect.ignore)),
-                    );
-                    if (Exit.isFailure(result)) {
-                      yield* stop(entry).pipe(Effect.ignore);
-                      entries.delete(entry);
-                      return yield* Effect.failCause(result.cause);
-                    }
-                    initializeResponse = Object.freeze({ ...result.value.response });
-                    return result.value;
-                  }),
-                );
-              },
-              Effect.mapError(() => failure("failed")),
-              Effect.interruptible,
-            );
-            const createAdapterRuntime = Effect.fn(
-              "WorkflowNativeCodexTransport.createAdapterRuntime",
-            )(
-              function* () {
-                if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
-                  return yield* failure("boundary");
-                return yield* Effect.uninterruptibleMask((resume) =>
-                  Effect.gen(function* () {
-                    if (
-                      adapterAttempted ||
-                      !initializeResponse ||
-                      closed ||
-                      serviceScope.state._tag === "Closed"
-                    )
-                      return yield* failure("closed");
-                    adapterAttempted = true;
-                    const response = initializeResponse;
-                    const scope = yield* Scope.make("sequential");
-                    yield* Scope.addFinalizer(serviceScope, Scope.close(scope, Exit.void));
-                    const work = Effect.gen(function* () {
-                      const input = yield* owner.captureAdapterConstruction();
-                      yield* checkProfile();
-                      if (
-                        !(yield* retained.ownedProcess.isRunning) ||
-                        terminated.pollUnsafe() !== undefined
-                      )
-                        return yield* failure("closed");
-                      const runtimePolicy = yield* policy.resolve(input);
-                      if (runtimePolicy.cwd !== prepared.worktree.path)
-                        return yield* failure("profile");
-                      yield* owner.confirmAdapterConstruction();
-                      yield* checkProfile();
-                      const expected = {
-                        instanceId,
-                        threadId: input.thread.id,
-                        providerSessionId: ProviderSessionId.make(owner.current.providerSessionId),
-                        runtimePolicy,
-                        settings: config,
-                        environment: env,
-                      };
-                      let acquired = false;
-                      const clientFactory: CodexAdapter.CodexAppServerClientFactoryShape = {
-                        open: () => Effect.die("Native adoption cannot open another client"),
-                        adoptInitializedControlled: Effect.fn(
-                          "WorkflowNativeCodexTransport.adoptInitializedControlled",
-                        )(
-                          function* (
-                            actual: Parameters<
-                              NonNullable<
-                                CodexAdapter.CodexAppServerClientFactoryShape["adoptInitializedControlled"]
-                              >
-                            >[0],
-                          ) {
-                            if (
-                              acquired ||
-                              observer !== undefined ||
-                              stableStringify({
-                                instanceId: actual.instanceId,
-                                threadId: actual.threadId,
-                                providerSessionId: actual.providerSessionId,
-                                runtimePolicy: actual.runtimePolicy,
-                                settings: actual.settings,
-                                environment: actual.environment,
-                              }) !== stableStringify(expected)
-                            )
-                              return yield* failure("stale");
-                            acquired = true;
-                            yield* owner.confirmAdapterConstruction();
-                            yield* checkProfile();
-                            observer = actual.onOutcome;
-                            return { client: retained, initializeResponse: response };
-                          },
-                          (work, actual) =>
-                            work.pipe(
-                              Effect.mapError(
-                                (cause) =>
-                                  new ProviderAdapter.ProviderAdapterOpenSessionError({
-                                    driver: ProviderDriverKind.make("codex"),
-                                    providerSessionId: actual.providerSessionId,
-                                    cause,
-                                  }),
-                              ),
-                            ),
-                        ),
-                      };
-                      const adapter = yield* CodexAdapter.makeCodexAdapterV2({
-                        instanceId,
-                        settings: config,
-                        environment: env,
-                        clientFactory,
-                        digest,
-                        fileSystem,
-                        idAllocator,
-                        serverConfig,
-                        onUsageLimits: profile.instance.snapshot.applyUsageLimits,
-                        compatibility: installation.compatibility,
-                        continuationRequests,
-                      }).pipe(
-                        Effect.provideService(McpProviderSessions.McpProviderSessions, mcpSessions),
-                        Effect.provideService(Scope.Scope, owner.scope),
-                      );
-                      const runtime = yield* adapter
-                        .openSession({
-                          threadId: input.thread.id,
-                          providerSessionId: expected.providerSessionId,
-                          modelSelection: input.modelSelection,
-                          runtimePolicy,
-                        })
-                        .pipe(Effect.provideService(Scope.Scope, owner.scope));
-                      yield* checkProfile();
-                      const freshPolicy = yield* policy.resolve(input);
-                      if (stableStringify(freshPolicy) !== stableStringify(runtimePolicy))
-                        return yield* failure("profile");
-                      if (
-                        !(yield* retained.ownedProcess.isRunning) ||
-                        terminated.pollUnsafe() !== undefined
-                      )
-                        return yield* failure("closed");
-                      yield* owner.confirmAdapterConstruction();
-                      Object.freeze(runtime.providerSession);
-                      return Object.freeze({
-                        kind: "adapter-runtime-created" as const,
-                        transportId: owner.transportId,
-                        runtime: Object.freeze(runtime),
-                        policy: runtimePolicy,
-                        runState: "preparing" as const,
-                        input,
-                      });
-                    }).pipe(Effect.interruptible);
-                    const fiber = yield* work.pipe(
-                      Effect.forkIn(scope, { startImmediately: true }),
-                    );
-                    entry.adapterFiber = fiber;
-                    const result = yield* Effect.exit(
-                      resume(
-                        Effect.gen(function* () {
-                          const constructed = yield* Fiber.await(fiber);
-                          if (Exit.isFailure(constructed))
-                            return yield* Effect.failCause(constructed.cause);
-                          yield* checkProfile();
-                          yield* owner.confirmAdapterConstruction();
-                          return constructed.value;
-                        }).pipe(Effect.timeout("10 seconds")),
-                      ),
-                    );
-                    if (Exit.isFailure(result)) {
-                      yield* stop(entry).pipe(Effect.ignore);
-                      entries.delete(entry);
-                      return yield* Effect.failCause(result.cause);
-                    }
-                    entry.runtime = result.value.runtime;
-                    entry.construction = { input: result.value.input, policy: result.value.policy };
-                    return Object.freeze({
-                      kind: result.value.kind,
-                      transportId: result.value.transportId,
-                      runtime: result.value.runtime,
-                      runState: result.value.runState,
-                    });
-                  }),
-                );
-              },
-              Effect.mapError((error) =>
-                isNativeTransportError(error) ? error : failure("failed"),
-              ),
-              Effect.interruptible,
-            );
-            return Object.freeze({
-              kind: "transport-created" as const,
-              runState: "preparing" as const,
-              native: prepared.native,
-              executionClaim: prepared.executionClaim,
-              preparation: prepared.preparation,
-              transportId: owner.transportId,
-              bootstrap,
-              client: retained,
-              createAdapterRuntime,
-              publishRuntime: Effect.fn("WorkflowNativeCodexTransport.publishRuntime")(
-                function* () {
-                  if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
-                    return yield* failure("boundary");
-                  if (closed || serviceScope.state._tag === "Closed" || !entry.runtime)
-                    return yield* failure("closed");
-                  const runtime = yield* Manager.publishNativeManagerRuntime(manager, owner);
-                  return Object.freeze({
-                    kind: "runtime-published" as const,
-                    transportId: owner.transportId,
-                    runtime,
-                    runState: "preparing" as const,
-                  });
-                },
-                Effect.mapError(() => failure("failed")),
-                Effect.interruptible,
-              ),
-              close: Effect.fn("WorkflowNativeCodexTransport.close")(function* () {
-                if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
-                  return yield* failure("boundary");
-                return yield* Effect.uninterruptibleMask((resume) =>
-                  Effect.gen(function* () {
-                    const quiet = yield* Effect.exit(resume(client.quiesceOutput));
-                    if (Exit.isFailure(quiet)) {
-                      const error = Cause.findErrorOption(quiet.cause);
-                      if (
-                        Option.isSome(error) &&
-                        isFrameSubmissionError(error.value) &&
-                        error.value.reason === "reentrant"
-                      )
-                        return yield* Effect.failCause(quiet.cause);
-                    }
-                    const result = yield* stop(entry);
+            return yield* PreparationOwner.withOperation(
+              originalPreparationOwner,
+              Effect.gen(function* () {
+                entry.owner = owner;
+                if (
+                  stableStringify(owner.executionClaim) !== stableStringify(prepared.executionClaim)
+                )
+                  return yield* failure("stale");
+                yield* owner.captureConstructor();
+                entry.managerAttempted = true;
+                yield* Manager.reserveNativeManagerRuntime(manager, {
+                  store,
+                  owner,
+                  sql,
+                  sink: eventSink,
+                  control,
+                  onCleanup: () => {
                     entries.delete(entry);
-                    return result;
+                  },
+                  checkProfile: Effect.fn("WorkflowNativeCodexTransport.checkPublicationProfile")(
+                    function* () {
+                      yield* checkProfile();
+                      if (
+                        closed ||
+                        serviceScope.state._tag === "Closed" ||
+                        !entry.client ||
+                        !entry.runtime ||
+                        !entry.terminated ||
+                        !(yield* entry.client.ownedProcess.isRunning) ||
+                        entry.terminated.pollUnsafe() !== undefined
+                      )
+                        return yield* failure("closed");
+                    },
+                  ),
+                });
+                const io = yield* owner.open();
+                let bootstrapSelection: string | undefined;
+                let bootstrapMethod: "initialize" | "initialized" | undefined;
+                let bootstrapAttempted = false;
+                let adapterAttempted = false;
+                let initializeResponse: CodexSchema.V1InitializeResponse | undefined;
+                let observer:
+                  | CodexClient.CodexAppServerControlledClientOptions<CodexErrors.CodexAppServerFrameSubmissionError>["onOutcome"]
+                  | undefined;
+                const client = yield* CodexClient.makeControlledProcessProtocolClient(
+                  {
+                    pid: ChildProcessSpawner.ProcessId(io.pid),
+                    stdin: io.stdin.pipe(Sink.mapError(() => unavailable("stdin"))),
+                    stdout: io.stdout.pipe(Stream.mapError(() => unavailable("stdout"))),
+                    stderr: io.stderr.pipe(Stream.mapError(() => unavailable("stderr"))),
+                    exitCode: io.exitCode.pipe(
+                      Effect.map(ChildProcessSpawner.ExitCode),
+                      Effect.mapError(() => unavailable("exit")),
+                    ),
+                  },
+                  {
+                    wrapper: (frame, submit) =>
+                      bootstrapSelection !== undefined &&
+                      frame.selection === bootstrapSelection &&
+                      frame.method === bootstrapMethod
+                        ? submit()
+                        : Effect.fail(
+                            new CodexErrors.CodexAppServerFrameSubmissionError({
+                              outcome: "not_submitted",
+                              reason: "wrapper",
+                            }),
+                          ),
+                    onOutcome: (outcome) => (observer ? observer(outcome) : Effect.void),
+                  },
+                ).pipe(Effect.provideService(Scope.Scope, owner.scope));
+                const terminated = yield* client.awaitTermination.pipe(
+                  Effect.exit,
+                  Effect.forkIn(owner.scope),
+                );
+                const retained = Object.freeze(
+                  CodexClient.CodexAppServerControlledClient.of({
+                    ...client,
+                    raw: Object.freeze({ ...client.raw }),
+                    ownedProcess: Object.freeze({
+                      pid: ChildProcessSpawner.ProcessId(io.pid),
+                      isRunning: io.isRunning.pipe(Effect.mapError(() => unavailable("isRunning"))),
+                      awaitExit: io.exitCode.pipe(
+                        Effect.map(ChildProcessSpawner.ExitCode),
+                        Effect.mapError(() => unavailable("exit")),
+                      ),
+                    }),
                   }),
                 );
+                entry.client = retained;
+                entry.terminated = terminated;
+                const bootstrap = Effect.fn("WorkflowNativeCodexTransport.bootstrap")(
+                  function* () {
+                    if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+                      return yield* failure("boundary");
+                    return yield* Effect.uninterruptibleMask((resume) =>
+                      Effect.gen(function* () {
+                        if (bootstrapAttempted || closed || serviceScope.state._tag === "Closed")
+                          return yield* failure("closed");
+                        bootstrapAttempted = true;
+                        const scope = yield* Scope.make("sequential");
+                        yield* Scope.addFinalizer(serviceScope, Scope.close(scope, Exit.void));
+                        const work = Effect.gen(function* () {
+                          const profile = yield* owner.captureBootstrap();
+                          bootstrapSelection = profile.selection;
+                          bootstrapMethod = "initialize";
+                          const response = yield* client
+                            .request("initialize", profile.params, profile.selection)
+                            .pipe(Effect.timeout("10 seconds"));
+                          yield* owner.confirmInitialize();
+                          bootstrapMethod = "initialized";
+                          yield* client.notify("initialized", undefined, profile.selection);
+                          return Object.freeze({
+                            kind: "protocol-initialized" as const,
+                            transportId: owner.transportId,
+                            response,
+                          });
+                        }).pipe(
+                          Effect.interruptible,
+                          (work) =>
+                            PreparationOwner.withOperation(
+                              originalPreparationOwner,
+                              work,
+                              "native",
+                            ),
+                          Effect.ensuring(
+                            Effect.sync(() => {
+                              bootstrapSelection = undefined;
+                              bootstrapMethod = undefined;
+                            }),
+                          ),
+                        );
+                        const fiber = yield* work.pipe(Effect.forkIn(scope));
+                        entry.bootstrapFiber = fiber;
+                        const result = yield* resume(Fiber.await(fiber)).pipe(
+                          Effect.onInterrupt(() => stop(entry).pipe(Effect.ignore)),
+                        );
+                        if (Exit.isFailure(result)) {
+                          yield* stop(entry).pipe(Effect.ignore);
+                          entries.delete(entry);
+                          return yield* Effect.failCause(result.cause);
+                        }
+                        initializeResponse = Object.freeze({ ...result.value.response });
+                        return result.value;
+                      }),
+                    );
+                  },
+                  Effect.mapError(() => failure("failed")),
+                  Effect.interruptible,
+                );
+                const createAdapterRuntime = Effect.fn(
+                  "WorkflowNativeCodexTransport.createAdapterRuntime",
+                )(
+                  function* () {
+                    if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+                      return yield* failure("boundary");
+                    return yield* Effect.uninterruptibleMask((resume) =>
+                      Effect.gen(function* () {
+                        if (
+                          adapterAttempted ||
+                          !initializeResponse ||
+                          closed ||
+                          serviceScope.state._tag === "Closed"
+                        )
+                          return yield* failure("closed");
+                        adapterAttempted = true;
+                        const response = initializeResponse;
+                        const scope = yield* Scope.make("sequential");
+                        yield* Scope.addFinalizer(serviceScope, Scope.close(scope, Exit.void));
+                        const work = Effect.gen(function* () {
+                          const input = yield* owner.captureAdapterConstruction();
+                          yield* checkProfile();
+                          if (
+                            !(yield* retained.ownedProcess.isRunning) ||
+                            terminated.pollUnsafe() !== undefined
+                          )
+                            return yield* failure("closed");
+                          const runtimePolicy = yield* policy.resolve(input);
+                          if (runtimePolicy.cwd !== prepared.worktree.path)
+                            return yield* failure("profile");
+                          yield* owner.confirmAdapterConstruction();
+                          yield* checkProfile();
+                          const expected = {
+                            instanceId,
+                            threadId: input.thread.id,
+                            providerSessionId: ProviderSessionId.make(
+                              owner.current.providerSessionId,
+                            ),
+                            runtimePolicy,
+                            settings: config,
+                            environment: env,
+                          };
+                          let acquired = false;
+                          const clientFactory: CodexAdapter.CodexAppServerClientFactoryShape = {
+                            open: () => Effect.die("Native adoption cannot open another client"),
+                            adoptInitializedControlled: Effect.fn(
+                              "WorkflowNativeCodexTransport.adoptInitializedControlled",
+                            )(
+                              function* (
+                                actual: Parameters<
+                                  NonNullable<
+                                    CodexAdapter.CodexAppServerClientFactoryShape["adoptInitializedControlled"]
+                                  >
+                                >[0],
+                              ) {
+                                if (
+                                  acquired ||
+                                  observer !== undefined ||
+                                  stableStringify({
+                                    instanceId: actual.instanceId,
+                                    threadId: actual.threadId,
+                                    providerSessionId: actual.providerSessionId,
+                                    runtimePolicy: actual.runtimePolicy,
+                                    settings: actual.settings,
+                                    environment: actual.environment,
+                                  }) !== stableStringify(expected)
+                                )
+                                  return yield* failure("stale");
+                                acquired = true;
+                                yield* owner.confirmAdapterConstruction();
+                                yield* checkProfile();
+                                observer = actual.onOutcome;
+                                return { client: retained, initializeResponse: response };
+                              },
+                              (work, actual) =>
+                                work.pipe(
+                                  Effect.mapError(
+                                    (cause) =>
+                                      new ProviderAdapter.ProviderAdapterOpenSessionError({
+                                        driver: ProviderDriverKind.make("codex"),
+                                        providerSessionId: actual.providerSessionId,
+                                        cause,
+                                      }),
+                                  ),
+                                ),
+                            ),
+                          };
+                          const adapter = yield* CodexAdapter.makeCodexAdapterV2({
+                            instanceId,
+                            settings: config,
+                            environment: env,
+                            clientFactory,
+                            digest,
+                            fileSystem,
+                            idAllocator,
+                            serverConfig,
+                            onUsageLimits: profile.instance.snapshot.applyUsageLimits,
+                            compatibility: installation.compatibility,
+                            continuationRequests,
+                          }).pipe(
+                            Effect.provideService(
+                              McpProviderSessions.McpProviderSessions,
+                              mcpSessions,
+                            ),
+                            Effect.provideService(Scope.Scope, owner.scope),
+                          );
+                          const runtime = yield* adapter
+                            .openSession({
+                              threadId: input.thread.id,
+                              providerSessionId: expected.providerSessionId,
+                              modelSelection: input.modelSelection,
+                              runtimePolicy,
+                            })
+                            .pipe(Effect.provideService(Scope.Scope, owner.scope));
+                          yield* checkProfile();
+                          const freshPolicy = yield* policy.resolve(input);
+                          if (stableStringify(freshPolicy) !== stableStringify(runtimePolicy))
+                            return yield* failure("profile");
+                          if (
+                            !(yield* retained.ownedProcess.isRunning) ||
+                            terminated.pollUnsafe() !== undefined
+                          )
+                            return yield* failure("closed");
+                          yield* owner.confirmAdapterConstruction();
+                          Object.freeze(runtime.providerSession);
+                          return Object.freeze({
+                            kind: "adapter-runtime-created" as const,
+                            transportId: owner.transportId,
+                            runtime: Object.freeze(runtime),
+                            policy: runtimePolicy,
+                            runState: "preparing" as const,
+                            input,
+                          });
+                        }).pipe(Effect.interruptible, (work) =>
+                          PreparationOwner.withOperation(originalPreparationOwner, work, "native"),
+                        );
+                        const fiber = yield* work.pipe(
+                          Effect.forkIn(scope, { startImmediately: true }),
+                        );
+                        entry.adapterFiber = fiber;
+                        const result = yield* Effect.exit(
+                          resume(
+                            Effect.gen(function* () {
+                              const constructed = yield* Fiber.await(fiber);
+                              if (Exit.isFailure(constructed))
+                                return yield* Effect.failCause(constructed.cause);
+                              yield* checkProfile();
+                              yield* owner.confirmAdapterConstruction();
+                              return constructed.value;
+                            }).pipe(Effect.timeout("10 seconds")),
+                          ),
+                        );
+                        if (Exit.isFailure(result)) {
+                          yield* stop(entry).pipe(Effect.ignore);
+                          entries.delete(entry);
+                          return yield* Effect.failCause(result.cause);
+                        }
+                        entry.runtime = result.value.runtime;
+                        entry.construction = {
+                          input: result.value.input,
+                          policy: result.value.policy,
+                        };
+                        return Object.freeze({
+                          kind: result.value.kind,
+                          transportId: result.value.transportId,
+                          runtime: result.value.runtime,
+                          runState: result.value.runState,
+                        });
+                      }),
+                    );
+                  },
+                  Effect.mapError((error) =>
+                    isNativeTransportError(error) ? error : failure("failed"),
+                  ),
+                  Effect.interruptible,
+                );
+                return Object.freeze({
+                  kind: "transport-created" as const,
+                  runState: "preparing" as const,
+                  native: prepared.native,
+                  executionClaim: prepared.executionClaim,
+                  preparation: retiredPreparation,
+                  transportId: owner.transportId,
+                  bootstrap,
+                  client: retained,
+                  createAdapterRuntime,
+                  publishRuntime: Effect.fn("WorkflowNativeCodexTransport.publishRuntime")(
+                    function* () {
+                      if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+                        return yield* failure("boundary");
+                      if (closed || serviceScope.state._tag === "Closed" || !entry.runtime)
+                        return yield* failure("closed");
+                      const runtime = yield* Manager.publishNativeManagerRuntime(manager, owner);
+                      return Object.freeze({
+                        kind: "runtime-published" as const,
+                        transportId: owner.transportId,
+                        runtime,
+                        runState: "preparing" as const,
+                      });
+                    },
+                    Effect.mapError(() => failure("failed")),
+                    Effect.interruptible,
+                  ),
+                  close: Effect.fn("WorkflowNativeCodexTransport.close")(function* () {
+                    if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+                      return yield* failure("boundary");
+                    return yield* Effect.uninterruptibleMask((resume) =>
+                      Effect.gen(function* () {
+                        yield* retained.assertCanQuiesceOutput;
+                        yield* PreparationOwner.assertCanStop(originalPreparationOwner);
+                        const quiet = yield* Effect.exit(resume(client.quiesceOutput));
+                        if (Exit.isFailure(quiet)) {
+                          const error = Cause.findErrorOption(quiet.cause);
+                          if (
+                            Option.isSome(error) &&
+                            isFrameSubmissionError(error.value) &&
+                            error.value.reason === "reentrant"
+                          )
+                            return yield* Effect.failCause(quiet.cause);
+                        }
+                        const result = yield* stop(entry);
+                        entries.delete(entry);
+                        return result;
+                      }),
+                    );
+                  }),
+                });
               }),
-            });
+              "native",
+            );
           }).pipe(Effect.scoped, Effect.interruptible);
           const childScope = yield* Scope.make("sequential");
           yield* Scope.addFinalizer(serviceScope, Scope.close(childScope, Exit.void));

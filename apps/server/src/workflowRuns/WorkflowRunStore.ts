@@ -273,6 +273,17 @@ type NativeCoordinator = { readonly bootId: string; readonly workerId: string };
 type PreparationActor = {
   job: PreparationJob.Job;
   readonly resources: Map<string, PreparationResource.Resource>;
+  owner?: PreparationOwner.Owner;
+  consumption?: {
+    readonly fiber: Fiber.Fiber<unknown, unknown>;
+    readonly done: Deferred.Deferred<Exit.Exit<void, unknown>>;
+  };
+  readonly consumed: Deferred.Deferred<Exit.Exit<void, unknown>>;
+  native?: {
+    readonly close: () => Effect.Effect<NativeManagerDisposition, NativeManagerSourceError>;
+    readonly assertCanStop: () => Effect.Effect<void, NativeManagerSourceError>;
+    source: NativeManagerOwnerSource | undefined;
+  };
 };
 type NativeTransportActor = {
   readonly job: PreparationJob.Job;
@@ -308,7 +319,21 @@ export type NativeManagerSourceError =
   | WorkflowRunStoreError
   | PreparationOwner.PreparationProcessOwnerError
   | SqlError.SqlError;
+export interface NativeManagerPreparationSource {
+  readonly sql: SqlClient.SqlClient;
+  readonly owner: PreparationOwner.Owner;
+  readonly threadId: string;
+  readonly runId: string | null;
+  readonly current: NativeManagerOwnerSource["current"];
+  readonly assertCanStop: () => Effect.Effect<void, NativeManagerSourceError>;
+  readonly checkReservation: () => Effect.Effect<void, NativeManagerSourceError>;
+  readonly readNative: () => Effect.Effect<NativeManagerOwnerSource | undefined>;
+  readonly awaitConsumption: Effect.Effect<Exit.Exit<void, unknown>>;
+  readonly close: () => Effect.Effect<NativeManagerDisposition, NativeManagerSourceError>;
+}
 export interface NativeManagerOwnerSource {
+  readonly preparationOwner: PreparationOwner.Owner;
+  readonly assertCanStop: () => Effect.Effect<void, NativeManagerSourceError>;
   readonly sql: SqlClient.SqlClient;
   readonly transportId: string;
   readonly threadId: string;
@@ -344,7 +369,12 @@ export interface NativeManagerOwnerSource {
 }
 const nativeManagerSources = new WeakMap<
   object,
-  { readonly sql: SqlClient.SqlClient; readonly owners: WeakMap<object, NativeManagerOwnerSource> }
+  {
+    readonly sql: SqlClient.SqlClient;
+    readonly owners: WeakMap<object, NativeManagerOwnerSource>;
+    readonly preparations: WeakMap<object, NativeManagerPreparationSource>;
+    readonly retired: WeakMap<object, PreparationOwner.Owner>;
+  }
 >();
 export const readNativeManagerOwner = Effect.fn("WorkflowRunStore.readNativeManagerOwner")(
   function* (store: object, owner: object, sql: SqlClient.SqlClient) {
@@ -354,6 +384,25 @@ export const readNativeManagerOwner = Effect.fn("WorkflowRunStore.readNativeMana
     return source;
   },
 );
+
+export const readNativeManagerPreparationOwner = Effect.fn(
+  "WorkflowRunStore.readNativeManagerPreparationOwner",
+)(function* (store: object, owner: object, sql: SqlClient.SqlClient) {
+  const registered = nativeManagerSources.get(store);
+  const source = registered?.preparations.get(owner);
+  if (!source || registered?.sql !== sql || source.sql !== sql) return yield* integrity();
+  return source;
+});
+
+export const readNativeManagerWorkspaceOwner = Effect.fn(
+  "WorkflowRunStore.readNativeManagerWorkspaceOwner",
+)(function* (store: object, workspace: object, sql: SqlClient.SqlClient) {
+  const registered = nativeManagerSources.get(store);
+  const owner = registered?.retired.get(workspace);
+  if (!owner || registered?.sql !== sql || !registered.preparations.has(owner))
+    return yield* integrity();
+  return owner;
+});
 
 // Public constructors own the construction span; this helper is shared by their two capability sets.
 const makeStore = Effect.fnUntraced(function* (
@@ -377,6 +426,8 @@ const makeStore = Effect.fnUntraced(function* (
   >();
   const nativeTransports = new WeakSet<NativeTransportActor>();
   const managerOwners = new WeakMap<object, NativeManagerOwnerSource>();
+  const managerPreparations = new WeakMap<object, NativeManagerPreparationSource>();
+  const retiredManagerOwners = new WeakMap<object, PreparationOwner.Owner>();
 
   const preparationAcquisitions = new WeakMap<
     object,
@@ -6890,7 +6941,11 @@ const makeStore = Effect.fnUntraced(function* (
       acquisition.consumed = true;
       const claim = acquisition.job.input.nativeOwner?.executionClaim;
       if (!claim) return yield* integrity();
-      const actor: PreparationActor = { job: acquisition.job, resources: new Map() };
+      const actor: PreparationActor = {
+        job: acquisition.job,
+        resources: new Map(),
+        consumed: Deferred.makeUnsafe<Exit.Exit<void, unknown>>(),
+      };
       preparationActors.add(actor);
       const flags = { intakeSealed: false, stopping: false, blocked: false };
       const mutex = yield* Semaphore.make(1);
@@ -7279,6 +7334,8 @@ const makeStore = Effect.fnUntraced(function* (
           );
           yield* notify;
           retiredWorkspaces.set(result, { actor, flags });
+          if (!actor.owner) return yield* PreparationOwner.error("inventory", "invalid");
+          retiredManagerOwners.set(result, actor.owner);
           return result;
         }),
         checkOutsideWriter: outside,
@@ -7488,7 +7545,7 @@ const makeStore = Effect.fnUntraced(function* (
         }),
       };
       yield* writer("admission", checkNewWork(), () => {});
-      return yield* PreparationOwner.make(
+      const owner = yield* PreparationOwner.make(
         {
           jobId: actor.job.input.jobId,
           threadId: actor.job.input.threadId,
@@ -7498,9 +7555,85 @@ const makeStore = Effect.fnUntraced(function* (
         port,
         flags,
       );
+      actor.owner = owner;
+      const current = yield* decodeNativeTransportCurrent(actor.job.input.request.current).pipe(
+        Effect.mapError(integrity),
+      );
+      const assertCanStop = Effect.fn("WorkflowRunStore.assertPreparationManagerStop")(
+        function* () {
+          yield* PreparationOwner.assertCanStop(owner);
+          const fiber = yield* Effect.withFiber(Effect.succeed);
+          if (
+            actor.consumption &&
+            !Deferred.isDoneUnsafe(actor.consumption.done) &&
+            actor.consumption.fiber.id === fiber.id
+          )
+            return yield* integrity();
+          if (actor.native) yield* actor.native.assertCanStop();
+        },
+      );
+      managerPreparations.set(
+        owner,
+        Object.freeze({
+          sql,
+          owner,
+          current: Object.freeze(current),
+          threadId: actor.job.input.threadId,
+          runId: actor.job.input.runId,
+          assertCanStop,
+          checkReservation: Effect.fn("WorkflowRunStore.checkPreparationManagerReservation")(
+            function* () {
+              yield* writer(
+                "admission",
+                Effect.gen(function* () {
+                  const job = yield* checkNewWork();
+                  if (job.processExposed || actor.resources.size || commands.size)
+                    return yield* integrity();
+                }),
+                () => {},
+              );
+            },
+            (work) => PreparationOwner.withOperation(owner, work),
+          ),
+          readNative: Effect.fn("WorkflowRunStore.readPreparationNativeContinuation")(() =>
+            Effect.sync(() => actor.native?.source),
+          ),
+          awaitConsumption: Deferred.await(actor.consumed),
+          close: Effect.fn("WorkflowRunStore.closePreparationManagerReservation")(function* () {
+            yield* assertCanStop();
+            return yield* Effect.uninterruptible(
+              Effect.gen(function* () {
+                flags.intakeSealed = true;
+                flags.stopping = true;
+                const consumption = actor.consumption;
+                if (consumption && !Deferred.isDoneUnsafe(consumption.done))
+                  consumption.fiber.interruptUnsafe();
+                const consumed = consumption ? yield* Deferred.await(consumption.done) : undefined;
+                const nativeExit = yield* Effect.exit(
+                  actor.native
+                    ? actor.native.close()
+                    : Effect.succeed({ kind: "closed" as const, transportId: "" }),
+                );
+                const inventory = yield* Effect.exit(owner.stop());
+                const native = Exit.isSuccess(nativeExit) ? nativeExit.value : undefined;
+                if (
+                  Exit.isFailure(nativeExit) ||
+                  Exit.isFailure(inventory) ||
+                  inventory.value.inventory !== "all-retired" ||
+                  (consumed && Exit.isFailure(consumed)) ||
+                  native?.kind === "held"
+                )
+                  return { kind: "held" as const, transportId: native?.transportId ?? "" };
+                return native!;
+              }),
+            );
+          }),
+        }),
+      );
+      return owner;
     },
   );
-  const consumeNativeCodexTransportOwner = Effect.fn(
+  const consumeNativeCodexTransportOwnerWork = Effect.fn(
     "WorkflowRunStore.consumeNativeCodexTransportOwner",
   )(function* (
     acquired: object,
@@ -7582,6 +7715,7 @@ const makeStore = Effect.fnUntraced(function* (
         const bootstrapSelection = NodeCrypto.randomUUID();
         const frameAttempts = new Set<string>();
         let initializeRequestId: number | undefined;
+        let originalIo: object | undefined;
         let openAttempted = false;
         let createAttempted = false;
         let releaseAttempted = false;
@@ -7607,7 +7741,9 @@ const makeStore = Effect.fnUntraced(function* (
                 bodies.add(invocation);
                 return Effect.gen(function* () {
                   const exit = yield* Effect.exit(
-                    resume(PreparationOwner.sanitize("creation", work)),
+                    resume(PreparationOwner.sanitize("creation", work)).pipe((body) =>
+                      PreparationOwner.withOperation(acquisition.actor.owner!, body, "native"),
+                    ),
                   );
                   if (Exit.isFailure(exit)) flags.blocked = true;
                   bodies.delete(invocation);
@@ -7889,6 +8025,7 @@ const makeStore = Effect.fnUntraced(function* (
         );
         const close = Effect.fn("WorkflowRunStore.closeNativeCodexTransport")(function* () {
           yield* outside();
+          yield* assertCanStop();
           return yield* Effect.uninterruptible(
             Effect.withFiber((fiber) =>
               Effect.suspend(() => {
@@ -8017,6 +8154,32 @@ const makeStore = Effect.fnUntraced(function* (
             ),
           );
         });
+        const assertCanStop = Effect.fn("WorkflowRunStore.assertNativeTransportManagerStop")(
+          function* () {
+            yield* outside();
+            const fiber = yield* Effect.withFiber(Effect.succeed);
+            yield* PreparationOwner.assertNativeCanStop(acquisition.actor.owner!);
+            if (
+              (constructor?.id === fiber.id && constructor.pollUnsafe() === undefined) ||
+              (bootstrap?.id === fiber.id && bootstrap.pollUnsafe() === undefined) ||
+              (publication?.id === fiber.id && publication.pollUnsafe() === undefined) ||
+              (adapterConstruction?.id === fiber.id &&
+                adapterConstruction.pollUnsafe() === undefined) ||
+              [...bodies].some(
+                (invocation) =>
+                  invocation.fiber.id === fiber.id && !Deferred.isDoneUnsafe(invocation.done),
+              )
+            )
+              return yield* integrity();
+          },
+        );
+        if (!acquisition.actor.owner || acquisition.actor.native) return yield* integrity();
+        const native = {
+          close,
+          assertCanStop,
+          source: undefined as NativeManagerOwnerSource | undefined,
+        };
+        acquisition.actor.native = native;
         yield* Scope.addFinalizer(
           runtime.scope,
           close().pipe(Effect.ignore, Effect.ensuring(Scope.close(cleanupScope, Exit.void))),
@@ -8207,7 +8370,7 @@ const makeStore = Effect.fnUntraced(function* (
                   }),
                 ),
               );
-              return Object.freeze({
+              const io = Object.freeze({
                 ...payload,
                 stdin,
                 pid: selectedPending.pid,
@@ -8215,6 +8378,8 @@ const makeStore = Effect.fnUntraced(function* (
                 exitCode: selectedPending.awaitExit,
                 stderr: selectedPending.stderr,
               });
+              originalIo = io;
+              return io;
             }),
           );
         }, Effect.interruptible);
@@ -8276,63 +8441,103 @@ const makeStore = Effect.fnUntraced(function* (
             },
           ),
         });
-        managerOwners.set(
-          facade,
-          Object.freeze({
-            sql,
-            transportId: id,
-            threadId: job.input.threadId,
-            runId: job.input.runId,
-            current: facade.current,
-            scope: physical,
-            capturePublication,
-            checkPublicationInTransaction,
-            confirmPublication,
-            readConstruction,
-            close,
-            checkReservation: Effect.fn("WorkflowRunStore.checkNativeManagerReservation")(
-              function* () {
-                yield* outside();
-                const fiber = yield* Effect.withFiber(Effect.succeed);
-                if (
-                  constructor?.id !== fiber.id ||
-                  constructor.pollUnsafe() !== undefined ||
-                  actor.row ||
-                  flags.stopped ||
-                  flags.blocked ||
-                  physical.state._tag === "Closed" ||
-                  runtime.scope.state._tag === "Closed"
-                )
-                  return yield* integrity();
-              },
-            ),
-            readClient: Effect.fn("WorkflowRunStore.readOriginalNativeClient")(function* () {
-              const completed = constructor?.pollUnsafe();
-              if (!completed || Exit.isFailure(completed)) return undefined;
-              const value = completed.value;
+        const managerSource: NativeManagerOwnerSource = Object.freeze({
+          preparationOwner: acquisition.actor.owner,
+          assertCanStop,
+          sql,
+          transportId: id,
+          threadId: job.input.threadId,
+          runId: job.input.runId,
+          current: facade.current,
+          scope: physical,
+          capturePublication,
+          checkPublicationInTransaction,
+          confirmPublication,
+          readConstruction,
+          close,
+          checkReservation: Effect.fn("WorkflowRunStore.checkNativeManagerReservation")(
+            function* () {
+              yield* outside();
+              const fiber = yield* Effect.withFiber(Effect.succeed);
               if (
-                typeof value !== "object" ||
-                value === null ||
-                !("kind" in value) ||
-                value.kind !== "transport-created" ||
-                !("client" in value)
+                constructor?.id !== fiber.id ||
+                constructor.pollUnsafe() !== undefined ||
+                actor.row ||
+                flags.stopped ||
+                flags.blocked ||
+                physical.state._tag === "Closed" ||
+                runtime.scope.state._tag === "Closed"
               )
                 return yield* integrity();
-              return value.client as typeof CodexClient.CodexAppServerControlledClient.Service;
-            }),
-            readRetirement: Effect.fn("WorkflowRunStore.readOriginalNativeRetirement")(
-              function* () {
-                if (!closeDone || !Deferred.isDoneUnsafe(closeDone)) return yield* integrity();
-                const disposition = yield* Deferred.await(closeDone);
-                return Object.freeze({
-                  disposition,
-                  ...(actor.row ? { transport: actor.row } : {}),
-                });
-              },
-            ),
+            },
+          ),
+          readClient: Effect.fn("WorkflowRunStore.readOriginalNativeClient")(function* () {
+            const completed = constructor?.pollUnsafe();
+            if (!completed || Exit.isFailure(completed)) return undefined;
+            const value = completed.value;
+            if (originalIo !== undefined && value === originalIo) return undefined;
+            if (
+              typeof value !== "object" ||
+              value === null ||
+              !("kind" in value) ||
+              value.kind !== "transport-created" ||
+              !("client" in value)
+            )
+              return yield* integrity();
+            return value.client as typeof CodexClient.CodexAppServerControlledClient.Service;
           }),
-        );
+          readRetirement: Effect.fn("WorkflowRunStore.readOriginalNativeRetirement")(function* () {
+            if (!closeDone || !Deferred.isDoneUnsafe(closeDone)) return yield* integrity();
+            const disposition = yield* Deferred.await(closeDone);
+            return Object.freeze({
+              disposition,
+              ...(actor.row ? { transport: actor.row } : {}),
+            });
+          }),
+        });
+        native.source = managerSource;
+        managerOwners.set(facade, managerSource);
         return facade;
+      }),
+    );
+  });
+  const consumeNativeCodexTransportOwner = Effect.fn(
+    "WorkflowRunStore.consumeNativeCodexTransportOwnerContinuation",
+  )(function* (
+    acquired: object,
+    command: Parameters<typeof consumeNativeCodexTransportOwnerWork>[1],
+  ) {
+    const acquisition = retiredWorkspaces.get(acquired);
+    if (!acquisition || !acquisition.actor.owner || acquisition.actor.consumption)
+      return yield* integrity();
+    const actor = acquisition.actor;
+    return yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const fiber = yield* Effect.withFiber(Effect.succeed);
+        const invocation = yield* Effect.sync(() => {
+          if (
+            acquisition.flags.stopping ||
+            acquisition.flags.blocked ||
+            actor.consumption ||
+            retiredWorkspaces.get(acquired) !== acquisition
+          )
+            return undefined;
+          const captured = { fiber, done: Deferred.makeUnsafe<Exit.Exit<void, unknown>>() };
+          actor.consumption = captured;
+          return captured;
+        });
+        if (!invocation) return yield* integrity();
+        const result = yield* Effect.exit(
+          restore(
+            consumeNativeCodexTransportOwnerWork(acquired, command).pipe((work) =>
+              PreparationOwner.withOperation(actor.owner!, work, "consume"),
+            ),
+          ),
+        );
+        const observed = Exit.map(result, () => undefined);
+        Deferred.doneUnsafe(invocation.done, Exit.succeed(observed));
+        Deferred.doneUnsafe(actor.consumed, Exit.succeed(observed));
+        return yield* result;
       }),
     );
   });
@@ -8965,7 +9170,12 @@ const makeStore = Effect.fnUntraced(function* (
     readRecovery,
     compareAndApplyRecovery,
   };
-  nativeManagerSources.set(service, { sql, owners: managerOwners });
+  nativeManagerSources.set(service, {
+    sql,
+    owners: managerOwners,
+    preparations: managerPreparations,
+    retired: retiredManagerOwners,
+  });
   return service;
 });
 

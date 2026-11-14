@@ -190,6 +190,13 @@ function ownInput(value: unknown): CommandInput {
   });
 }
 
+const CurrentOwnerOperations = Context.Reference<
+  ReadonlySet<{
+    readonly owner: object;
+    readonly kind: "preparation" | "native" | "consume";
+    active: boolean;
+  }>
+>("t3/PreparationProcessOwner/Operations", { defaultValue: () => new Set() });
 export const make = Effect.fn("PreparationProcessOwner.make")(function* (
   identity: Identity,
   storeScope: Scope.Scope,
@@ -220,6 +227,32 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
   const invocations = new Set<Invocation>();
   const commands = new Set<Slot>();
   let workspaceEntry: Fiber.Fiber<unknown, unknown> | undefined;
+  const operationOwner = {};
+  const inventories = new Set<{
+    readonly fiber: Fiber.Fiber<unknown, unknown>;
+    readonly done: Deferred.Deferred<void>;
+  }>();
+  const operation = <A, E, R>(
+    work: Effect.Effect<A, E, R>,
+    kind: "preparation" | "native" | "consume" = "preparation",
+  ) =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const inherited = yield* CurrentOwnerOperations;
+        const current = { owner: operationOwner, kind, active: true };
+        return yield* restore(
+          work.pipe(
+            Effect.provideService(CurrentOwnerOperations, new Set([...inherited, current])),
+          ),
+        ).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              current.active = false;
+            }),
+          ),
+        );
+      }),
+    );
   const signalClose = (slot: Slot) => {
     slot.state.sealed = true;
     Deferred.doneUnsafe(slot.stopped, Exit.void);
@@ -269,26 +302,37 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
       ),
     ),
   );
+  const assertCanStop = Effect.fn("PreparationProcessOwner.assertCanStop")(
+    function* (): Effect.fn.Return<void, PreparationProcessOwnerError> {
+      yield* port.checkOutsideWriter("cleanup");
+      const fiber = yield* Effect.withFiber(Effect.succeed);
+      const activeWorkspace =
+        workspaceEntry !== undefined && workspaceEntry.pollUnsafe() === undefined;
+      const activeRetirement =
+        retirement !== undefined && !Deferred.isDoneUnsafe(retirement.invocation.done);
+      const activeInvocations = [...invocations].filter(
+        (invocation) => !Deferred.isDoneUnsafe(invocation.done),
+      );
+      if (
+        (activeRetirement && retirement?.invocation.fiber.id === fiber.id) ||
+        (activeWorkspace && workspaceEntry?.id === fiber.id) ||
+        activeInvocations.some((invocation) => invocation.fiber.id === fiber.id) ||
+        [...inventories].some(
+          (inventory) => inventory.fiber.id === fiber.id && !Deferred.isDoneUnsafe(inventory.done),
+        ) ||
+        [...(yield* CurrentOwnerOperations)].some(
+          (current) => current.owner === operationOwner && current.active,
+        )
+      )
+        return yield* error("cleanup", "invalid");
+    },
+  );
   let stopDone: Deferred.Deferred<Inventory, PreparationProcessOwnerError> | undefined;
   const stop = Effect.fn("PreparationProcessOwner.stop")(() =>
-    port.checkOutsideWriter("cleanup").pipe(
-      Effect.andThen(
-        Effect.uninterruptible(
-          Effect.withFiber((fiber) => {
-            if (
-              retirement?.invocation.fiber.id === fiber.id &&
-              !Deferred.isDoneUnsafe(retirement.invocation.done)
-            )
-              return Effect.fail(error("cleanup", "invalid"));
-            if (workspaceEntry?.id === fiber.id && workspaceEntry.pollUnsafe() === undefined)
-              return Effect.fail(error("cleanup", "invalid"));
-            if (
-              [...invocations].some(
-                (invocation) =>
-                  invocation.fiber.id === fiber.id && !Deferred.isDoneUnsafe(invocation.done),
-              )
-            )
-              return Effect.fail(error("cleanup", "invalid"));
+    Effect.uninterruptible(
+      assertCanStop().pipe(
+        Effect.andThen(
+          Effect.suspend(() => {
             flags.intakeSealed = true;
             flags.stopping = true;
             for (const slot of commands) signalClose(slot);
@@ -300,6 +344,12 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
             const completion = Deferred.makeUnsafe<Inventory, PreparationProcessOwnerError>();
             stopDone = completion;
             const cleanup = Effect.gen(function* () {
+              for (const inventory of inventories)
+                if (!Deferred.isDoneUnsafe(inventory.done)) inventory.fiber.interruptUnsafe();
+              yield* Effect.forEach(inventories, (inventory) => Deferred.await(inventory.done), {
+                concurrency: "unbounded",
+                discard: true,
+              });
               for (const invocation of invocations)
                 if (!Deferred.isDoneUnsafe(invocation.done)) invocation.fiber.interruptUnsafe();
               yield* Effect.forEach(invocations, (invocation) => Deferred.await(invocation.done), {
@@ -321,7 +371,7 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
               const inventory = yield* sanitize("inventory", port.assessInventory());
               if (failures.length > 0) return yield* Effect.failCause(Cause.fromReasons(failures));
               return inventory;
-            }).pipe(Effect.provideService(Scope.Scope, cleanupScope));
+            }).pipe(Effect.provideService(Scope.Scope, cleanupScope), operation);
             return cleanup.pipe(
               Effect.exit,
               Effect.tap((exit) =>
@@ -341,7 +391,7 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
     storeScope,
     stop().pipe(Effect.ignore, Effect.ensuring(Scope.close(cleanupScope, Exit.void))),
   );
-  const seal = Effect.fn("PreparationProcessOwner.seal")(function* () {
+  const sealBody = Effect.fn("PreparationProcessOwner.sealBody")(function* () {
     flags.intakeSealed = true;
     yield* port.checkOutsideWriter("inventory");
     const fiber = yield* Effect.withFiber(Effect.succeed);
@@ -369,6 +419,21 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
       discard: true,
     });
     return yield* sanitize("inventory", port.assessInventory());
+  }, Effect.interruptible);
+  const seal = Effect.fn("PreparationProcessOwner.seal")(function* () {
+    return yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const current = {
+          fiber: yield* Effect.withFiber(Effect.succeed),
+          done: Deferred.makeUnsafe<void>(),
+        };
+        inventories.add(current);
+        const result = yield* Effect.exit(restore(operation(sealBody())));
+        inventories.delete(current);
+        Deferred.doneUnsafe(current.done, Exit.void);
+        return yield* result;
+      }),
+    );
   }, Effect.interruptible);
   const startOwned = Effect.fn("PreparationProcessOwner.start")(function* (input: CommandInput) {
     const callerScope = yield* Effect.scope;
@@ -565,7 +630,7 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
             });
             const job = yield* port.retireWorkspace(completion);
             return Object.freeze({ kind: "retired" as const, job });
-          }).pipe((work) => sanitize("inventory", work), Effect.interruptible);
+          }).pipe((work) => sanitize("inventory", work), Effect.interruptible, operation);
           return Effect.gen(function* () {
             const exit = yield* Effect.exit(work);
             if (Exit.isFailure(exit)) flags.blocked = true;
@@ -593,11 +658,83 @@ export const make = Effect.fn("PreparationProcessOwner.make")(function* (
     seal,
     stop,
   });
-  constructedOwners.add(owner);
+  constructedOwners.set(owner, {
+    operation,
+    assertNativeCanStop: Effect.fn("PreparationProcessOwner.assertNativeCanStop")(function* () {
+      if (
+        [...(yield* CurrentOwnerOperations)].some(
+          (current) =>
+            current.owner === operationOwner && current.kind === "native" && current.active,
+        )
+      )
+        return yield* error("cleanup", "invalid");
+    }),
+    assertCanStop,
+    assertWorkspaceEntry: Effect.fn("PreparationProcessOwner.assertWorkspaceEntry")(function* () {
+      yield* port.checkOutsideWriter("admission");
+      const fiber = yield* Effect.withFiber(Effect.succeed);
+      if (
+        !workspaceEntry ||
+        workspaceEntry.id !== fiber.id ||
+        workspaceEntry.pollUnsafe() !== undefined ||
+        flags.intakeSealed ||
+        flags.stopping ||
+        flags.blocked ||
+        storeScope.state._tag === "Closed" ||
+        ownerScope.state._tag === "Closed"
+      )
+        return yield* error("admission", "invalid");
+    }),
+  });
   return owner;
 });
 export type Owner = Effect.Success<ReturnType<typeof make>>;
-const constructedOwners = new WeakSet<object>();
+const constructedOwners = new WeakMap<
+  object,
+  {
+    readonly operation: <A, E, R>(
+      work: Effect.Effect<A, E, R>,
+      kind?: "preparation" | "native" | "consume",
+    ) => Effect.Effect<A, E, R>;
+    readonly assertNativeCanStop: () => Effect.Effect<void, PreparationProcessOwnerError>;
+    readonly assertCanStop: () => Effect.Effect<void, PreparationProcessOwnerError>;
+    readonly assertWorkspaceEntry: () => Effect.Effect<void, PreparationProcessOwnerError>;
+  }
+>();
+export const withOperation = Effect.fn("PreparationProcessOwner.withOriginalOperation")(function* <
+  A,
+  E,
+  R,
+>(
+  owner: object,
+  work: Effect.Effect<A, E, R>,
+  kind: "preparation" | "native" | "consume" = "preparation",
+) {
+  const facts = constructedOwners.get(owner);
+  if (!facts) return yield* error("admission", "invalid");
+  return yield* facts.operation(work, kind);
+});
+export const assertNativeCanStop = Effect.fn("PreparationProcessOwner.assertOriginalNativeCanStop")(
+  function* (owner: object) {
+    const facts = constructedOwners.get(owner);
+    if (!facts) return yield* error("cleanup", "invalid");
+    yield* facts.assertNativeCanStop();
+  },
+);
+export const assertCanStop = Effect.fn("PreparationProcessOwner.assertOriginalCanStop")(function* (
+  owner: object,
+) {
+  const facts = constructedOwners.get(owner);
+  if (!facts) return yield* error("cleanup", "invalid");
+  yield* facts.assertCanStop();
+});
+export const assertWorkspaceEntry = Effect.fn(
+  "PreparationProcessOwner.assertOriginalWorkspaceEntry",
+)(function* (owner: object) {
+  const facts = constructedOwners.get(owner);
+  if (!facts) return yield* error("admission", "invalid");
+  yield* facts.assertWorkspaceEntry();
+});
 export const isOwner = (value: unknown): value is Owner =>
   typeof value === "object" && value !== null && constructedOwners.has(value);
 export const Current = Context.Reference<Owner | undefined>("t3/PreparationProcessOwner/Current", {

@@ -4,6 +4,8 @@ import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as WorkflowNativeLaunch from "./WorkflowNativeLaunchService.ts";
+import * as ProviderSessionManager from "./ProviderSessionManager.ts";
+import * as EventSink from "./EventSink.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as PreparationOwner from "../preparation/PreparationProcessOwner.ts";
 import { decodeNativeReservationLaunch } from "../workflowRuns/WorkflowNativeReservationMaterial.ts";
@@ -1595,6 +1597,8 @@ const makeNativeWorkspacePreparationOwned = Effect.fn(
 )(function* (coordinator: Parameters<typeof WorkflowNativeLaunch.make>[0]) {
   const sql = yield* SqlClient.SqlClient;
   const store = yield* WorkflowRunStore.WorkflowRunStore;
+  const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+  const sink = yield* EventSink.EventSinkV2;
   const producer = yield* WorkflowNativeLaunch.make(coordinator);
   const core = yield* GitVcsDriver.GitVcsDriver;
   const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -1610,6 +1614,7 @@ const makeNativeWorkspacePreparationOwned = Effect.fn(
   type Entry = {
     fiber?: Fiber.Fiber<unknown, unknown>;
     owner?: PreparationOwner.Owner;
+    admitted?: boolean;
     executionClaim?: Effect.Success<
       ReturnType<typeof producer.claimReservedIntent>
     >["executionClaim"];
@@ -1619,11 +1624,29 @@ const makeNativeWorkspacePreparationOwned = Effect.fn(
   const stopEntry = Effect.fn("ThreadLaunchService.stopNativeWorkspaceEntry")(function* (
     entry: Entry,
   ) {
+    if (entry.owner) {
+      const guard = yield* Effect.exit(PreparationOwner.assertCanStop(entry.owner));
+      if (Exit.isFailure(guard)) {
+        yield* Effect.logWarning("Native workspace stop refused.", { cause: guard.cause });
+        return;
+      }
+    }
     if (entry.fiber) {
       entry.fiber.interruptUnsafe();
       yield* Fiber.await(entry.fiber);
     }
-    if (entry.owner) yield* entry.owner.stop().pipe(Effect.ignore);
+    if (entry.owner)
+      yield* ProviderSessionManager.closeNativeManagerRuntime(manager, entry.owner).pipe(
+        Effect.catch((error) =>
+          error.reason === "unregistered"
+            ? entry.owner!.stop().pipe(Effect.asVoid)
+            : Effect.logWarning("Native preparation cleanup failed.", { cause: error }),
+        ),
+        Effect.asVoid,
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Native preparation cleanup failed.", { cause }),
+        ),
+      );
   });
   yield* Scope.addFinalizer(
     serviceScope,
@@ -1650,96 +1673,111 @@ const makeNativeWorkspacePreparationOwned = Effect.fn(
           const owner = selected.preparation.owner;
           entry.owner = owner;
           entry.executionClaim = selected.executionClaim;
-          yield* owner.captureWorkspaceEntry();
-          const job = selected.preparation.job;
-          const decoded = yield* decodeNativeReservationLaunch(job.input.request.launch);
-          const launch = decoded.launch;
-          const strategy = launch.workspaceStrategy;
-          if (
-            !PreparationOwner.isOwner(owner) ||
-            owner.jobId !== job.input.jobId ||
-            owner.threadId !== selected.native.threadId ||
-            owner.runId !== selected.native.runId ||
-            decoded.launchHash !== job.input.request.launchHash ||
-            platform !== "linux"
-          )
-            return yield* nativeWorkspaceError("invalid");
-          if (
-            launch.reuseExistingThread === true ||
-            strategy.type !== "worktree" ||
-            !strategy.branch ||
-            isTemporaryWorktreeBranch(strategy.branch) ||
-            strategy.startFromOrigin === true ||
-            launch.generateTitle === true ||
-            launch.initialMessage.attachments.length > 0
-          )
-            return yield* nativeWorkspaceError("profile");
-          const project = yield* sql
-            .withTransaction(
-              Effect.gen(function* () {
-                const current = yield* store.verifyClaimedNativeOperationInTransaction(
-                  selected.executionClaim,
+          return yield* PreparationOwner.withOperation(
+            owner,
+            Effect.gen(function* () {
+              yield* owner.captureWorkspaceEntry();
+              yield* ProviderSessionManager.reserveNativeManagerPreparation(manager, {
+                store,
+                owner,
+                sql,
+                sink,
+                onCleanup: () => {
+                  entries.delete(entry);
+                },
+              });
+              entry.admitted = true;
+              const job = selected.preparation.job;
+              const decoded = yield* decodeNativeReservationLaunch(job.input.request.launch);
+              const launch = decoded.launch;
+              const strategy = launch.workspaceStrategy;
+              if (
+                !PreparationOwner.isOwner(owner) ||
+                owner.jobId !== job.input.jobId ||
+                owner.threadId !== selected.native.threadId ||
+                owner.runId !== selected.native.runId ||
+                decoded.launchHash !== job.input.request.launchHash ||
+                platform !== "linux"
+              )
+                return yield* nativeWorkspaceError("invalid");
+              if (
+                launch.reuseExistingThread === true ||
+                strategy.type !== "worktree" ||
+                !strategy.branch ||
+                isTemporaryWorktreeBranch(strategy.branch) ||
+                strategy.startFromOrigin === true ||
+                launch.generateTitle === true ||
+                launch.initialMessage.attachments.length > 0
+              )
+                return yield* nativeWorkspaceError("profile");
+              const project = yield* sql
+                .withTransaction(
+                  Effect.gen(function* () {
+                    const current = yield* store.verifyClaimedNativeOperationInTransaction(
+                      selected.executionClaim,
+                    );
+                    if (
+                      current.kind !== "current" ||
+                      current.stage !== "preparing" ||
+                      current.threadId !== selected.native.threadId ||
+                      current.runId !== selected.native.runId
+                    )
+                      return yield* nativeWorkspaceError("stale");
+                    const value = yield* projects.get(launch.projectId);
+                    if (
+                      Option.isNone(value) ||
+                      !path.isAbsolute(value.value.workspaceRoot) ||
+                      job.input.projectId !== launch.projectId
+                    )
+                      return yield* nativeWorkspaceError("stale");
+                    return value.value;
+                  }),
+                )
+                .pipe(Effect.interruptible);
+              const currentSettings = yield* settings.getSettings;
+              if (
+                setupProjectScript(
+                  resolveProjectScripts(currentSettings, {
+                    id: project.projectId,
+                    scripts: project.scripts,
+                  }),
+                )
+              )
+                return yield* nativeWorkspaceError("profile");
+              const result = yield* core
+                .createWorktree(
+                  {
+                    cwd: project.workspaceRoot,
+                    refName: strategy.baseRef,
+                    newRefName: strategy.branch,
+                    path: null,
+                  },
+                  { fastCheckout: false, submodules: "none" },
+                )
+                .pipe(
+                  Effect.provideService(PreparationOwner.Current, owner),
+                  Effect.provideService(HostProcess.Environment, environment),
+                  Effect.provideService(HostProcess.WorkingDirectory, cwd),
+                  Effect.provideService(HostProcess.HomeDirectory, home),
+                  Effect.provideService(HostProcess.Platform, platform),
                 );
-                if (
-                  current.kind !== "current" ||
-                  current.stage !== "preparing" ||
-                  current.threadId !== selected.native.threadId ||
-                  current.runId !== selected.native.runId
-                )
-                  return yield* nativeWorkspaceError("stale");
-                const value = yield* projects.get(launch.projectId);
-                if (
-                  Option.isNone(value) ||
-                  !path.isAbsolute(value.value.workspaceRoot) ||
-                  job.input.projectId !== launch.projectId
-                )
-                  return yield* nativeWorkspaceError("stale");
-                return value.value;
-              }),
-            )
-            .pipe(Effect.interruptible);
-          const currentSettings = yield* settings.getSettings;
-          if (
-            setupProjectScript(
-              resolveProjectScripts(currentSettings, {
-                id: project.projectId,
-                scripts: project.scripts,
-              }),
-            )
-          )
-            return yield* nativeWorkspaceError("profile");
-          const result = yield* core
-            .createWorktree(
-              {
-                cwd: project.workspaceRoot,
-                refName: strategy.baseRef,
-                newRefName: strategy.branch,
-                path: null,
-              },
-              { fastCheckout: false, submodules: "none" },
-            )
-            .pipe(
-              Effect.provideService(PreparationOwner.Current, owner),
-              Effect.provideService(HostProcess.Environment, environment),
-              Effect.provideService(HostProcess.WorkingDirectory, cwd),
-              Effect.provideService(HostProcess.HomeDirectory, home),
-              Effect.provideService(HostProcess.Platform, platform),
-            );
-          yield* orchestrator.dispatch({
-            type: "thread.metadata.update",
-            commandId: CommandId.make(`${launch.commandId}:native-workspace`),
-            threadId: launch.threadId,
-            branch: result.worktree.refName,
-            worktreePath: result.worktree.path,
-            expectedBranch: strategy.branch,
-            expectedWorktreePath: null,
-          });
-          return Object.freeze({
-            kind: "worktree-created" as const,
-            state: "preparing-held" as const,
-            native: selected.native,
-            worktree: Object.freeze({ ...result.worktree }),
-          });
+              yield* orchestrator.dispatch({
+                type: "thread.metadata.update",
+                commandId: CommandId.make(`${launch.commandId}:native-workspace`),
+                threadId: launch.threadId,
+                branch: result.worktree.refName,
+                worktreePath: result.worktree.path,
+                expectedBranch: strategy.branch,
+                expectedWorktreePath: null,
+              });
+              return Object.freeze({
+                kind: "worktree-created" as const,
+                state: "preparing-held" as const,
+                native: selected.native,
+                worktree: Object.freeze({ ...result.worktree }),
+              });
+            }),
+          );
         }).pipe(Effect.scoped, Effect.interruptible);
         const fiber = yield* Effect.forkIn(body, entryScope);
         entry.fiber = fiber;
@@ -1748,7 +1786,7 @@ const makeNativeWorkspacePreparationOwned = Effect.fn(
           Effect.flatMap((exit) =>
             Effect.gen(function* () {
               if (Exit.isFailure(exit)) {
-                if (entry.owner) yield* entry.owner.stop().pipe(Effect.ignore);
+                yield* stopEntry(entry);
                 return yield* Effect.failCause(exit.cause);
               }
               if (!entry.owner || !entry.executionClaim)
@@ -1759,6 +1797,8 @@ const makeNativeWorkspacePreparationOwned = Effect.fn(
                   ? retirement.success
                   : Object.freeze({ kind: "held" as const, reason: retirement.failure.reason });
               const inventory = yield* entry.owner.seal();
+              if (retirement._tag === "Failure" || inventory.inventory !== "all-retired")
+                yield* stopEntry(entry);
               return Object.freeze({
                 kind: exit.value.kind,
                 runState: "preparing" as const,
@@ -1770,9 +1810,10 @@ const makeNativeWorkspacePreparationOwned = Effect.fn(
               });
             }),
           ),
+          Effect.onError(() => stopEntry(entry)),
           Effect.ensuring(
             Effect.sync(() => {
-              entries.delete(entry);
+              if (!entry.admitted) entries.delete(entry);
             }),
           ),
         );
