@@ -3,6 +3,8 @@ import * as Schema from "effect/Schema";
 import * as HashMap from "effect/HashMap";
 import { describe, expect, it } from "vite-plus/test";
 import {
+  TaskReplayConflict,
+  reduceTaskLifecycle,
   ReviewReplayConflict,
   reduceTaskReviews,
   ValidationReplayConflict,
@@ -1309,4 +1311,461 @@ describe("action review replay and complete task composition", () => {
       ).toThrow(ReviewReplayConflict);
     }
   });
+});
+
+function completeLifecycleFixture() {
+  const events: ReturnType<typeof lifecycleRecorded>[] = [];
+  let definitionRevision = 1;
+  let actionPolicyRevision = 1;
+  const append = (event: object, commandId?: string) => {
+    const sequence = events.length + 1;
+    const record = lifecycleRecorded(
+      sequence,
+      { definitionRevision, actionPolicyRevision, lifecycleRevision: sequence, ...event },
+      commandId,
+    );
+    events.push(record);
+    return record;
+  };
+  const policy = {
+    version: 1,
+    rules: [
+      {
+        id: "push",
+        action: reviewPayload.action,
+        target: reviewPayload.target,
+        decision: "review-first",
+      },
+    ],
+  };
+  const human = { type: "user", subject: "human", sessionId: "session" };
+  const execution = (
+    desiredMode: string,
+    reason: string,
+    previousManagerGeneration: number | null = 1,
+  ) =>
+    append({
+      type: "task.execution-updated",
+      desiredMode,
+      previousManagerGeneration,
+      manager: identity,
+      reason,
+    });
+  const firstDefinition = { ...definition, actionPolicy: policy };
+  append({ type: "task.created", definition: firstDefinition });
+  definitionRevision = 2;
+  const acceptedDefinition = { ...firstDefinition, revision: 2, objective: "Accepted work" };
+  append({ type: "task.definition-updated", definition: acceptedDefinition });
+  append({
+    type: "task.definition-accepted",
+    definition: acceptedDefinition,
+    attribution: human,
+  });
+  append({
+    type: "task.configuration-updated",
+    allowanceOverride: 2,
+    completionPolicy: {
+      type: "configured",
+      policy: { type: "automatic", validator: validationBinding.validator },
+    },
+  });
+  append({ type: "task.manager-bound", ...identity });
+  execution("active", "Start", null);
+  const allowance = { type: "configured", cap: 2, consumed: 0 };
+  append({
+    type: "task.allowance-configured",
+    previous: { type: "unconfigured", consumed: 0 },
+    resulting: allowance,
+  });
+  append({
+    type: "task.allowance-topped-up",
+    attribution: human,
+    previous: allowance,
+    resulting: { ...allowance, cap: 3 },
+  });
+  append({ type: "task.thread-linked", threadId: "ordinary" });
+  append({
+    type: "task.wait-updated",
+    ...identity,
+    waitId: "wait",
+    target: { type: "source", sourceId: "result" },
+    state: "registered",
+  });
+  append({
+    type: "task.result-recorded",
+    sourceId: "result",
+    contributorThreadId: "ordinary",
+    summary: "Work arrived",
+    results: evidence,
+  });
+  append({
+    type: "task.allowance-debited",
+    previous: { ...allowance, cap: 3 },
+    resulting: { ...allowance, cap: 3, consumed: 1 },
+    allowanceUnit: 1,
+  });
+  const source = { kind: "result", sourceId: "result", resultRef: "evidence" };
+  append({ type: "task.wake-source-recorded", source, reservationId: null, dirtyGeneration: 1 });
+  const wake = {
+    reservationId: "wake",
+    reservationCommandId: "launch",
+    managerGeneration: 1,
+    allowanceUnit: 1,
+    dirtyGeneration: 1,
+    acknowledgedGeneration: 0,
+  };
+  const pending = { sources: [source], overflowThroughGeneration: null };
+  append({ type: "task.wake-reserved", ...wake, pending });
+  append({
+    type: "task.wake-claimed",
+    ...wake,
+    pending,
+    runId: "wake-run",
+    messageId: "wake-message",
+  });
+  append({ type: "task.wake-claim-uncertain", ...wake, reason: "Response lost" });
+  append({
+    type: "task.continuation-accepted",
+    ...identity,
+    runId: "wake-run",
+    messageId: "wake-message",
+    effectId: "wake-effect",
+    sourceIds: ["result"],
+    dirtyGeneration: 1,
+  });
+  append({
+    type: "task.wake-acknowledged",
+    ...wake,
+    previousAcknowledgedGeneration: 0,
+    observedDirtyGeneration: 1,
+    acknowledgedGeneration: 1,
+  });
+  append({
+    type: "task.wait-updated",
+    ...identity,
+    waitId: "wait",
+    target: { type: "source", sourceId: "result" },
+    state: "cleared",
+  });
+  append({ type: "task.completion-submitted", ...claim, summary: "Validate", evidence });
+  append({
+    type: "task.allowance-debited",
+    previous: { ...allowance, cap: 3, consumed: 1 },
+    resulting: { ...allowance, cap: 3, consumed: 2 },
+    allowanceUnit: 2,
+  });
+  const attempt = { ...validationBinding, definitionRevision: 2, allowanceUnit: 2 };
+  append({ ...attempt, type: "task.validation-reserved" });
+  const started = { ...attempt, runId: "validator-run", startedAt: base.occurredAt };
+  append({ ...started, type: "task.validation-started" });
+  append({
+    ...started,
+    type: "task.validation-uncertain",
+    finishedAt: base.occurredAt,
+    reason: "Process lost",
+  });
+  append({
+    ...started,
+    type: "task.validation-result",
+    finishedAt: base.occurredAt,
+    outcome: "pass",
+    findings: [{ criterionId: "criterion", outcome: "pass", reason: "Observed", evidence }],
+  });
+  execution("closed", "Manual completion");
+  append({
+    type: "task.completed",
+    ...claim,
+    attribution: human,
+  });
+  append({ type: "task.reopened" });
+  execution("active", "Reopen");
+  const request = reviewRequest(events.length + 1).event;
+  if (request.type !== "task.action-review-requested") throw new Error("Expected request fixture");
+  append({
+    ...request,
+    definitionRevision: 2,
+    review: { ...request.review, definitionRevision: 2, runId: "wake-run" },
+  });
+  const decision = append({
+    type: "task.action-review-result-recorded",
+    reviewId: "review",
+    reviewRevision: 1,
+    ...identity,
+    runId: "wake-run",
+    payloadIdentity: reviewPayload,
+    decision: "approve",
+    human: { subject: "human", sessionId: "session" },
+  });
+  const binding = { ...reviewBinding, definitionRevision: 2, runId: "wake-run" };
+  append({
+    type: "task.action-review-continuation-released",
+    binding,
+    continuationId: "human-response",
+    decisionEventId: decision.event.id,
+    purpose: "approved_action",
+    decision: "approve",
+    reason: "Human approved",
+  });
+  execution("paused", "Pause");
+  definitionRevision = 3;
+  const edited = {
+    ...acceptedDefinition,
+    revision: 3,
+    actionPolicy: { version: 1, rules: [{ ...policy.rules[0], decision: "deny" }] },
+  };
+  append({ type: "task.definition-updated", definition: edited });
+  actionPolicyRevision = 2;
+  append({
+    type: "task.definition-accepted",
+    definition: edited,
+    attribution: human,
+  });
+  append({
+    type: "task.action-review-invalidated",
+    binding,
+    cause: "policy_changed",
+    reason: "Policy adopted",
+  });
+  const archive = append({
+    type: "task.archived",
+    archived: true,
+    attribution: human,
+  });
+  append(
+    {
+      type: "task.action-review-cancelled",
+      definitionRevision: 2,
+      actionPolicyRevision: 1,
+      binding,
+      reason: "Archived",
+      source: {
+        type: "task.archive",
+        commandId: archive.context.commandId,
+        human: { subject: "human", sessionId: "session" },
+      },
+    },
+    archive.context.commandId!,
+  );
+  append({ type: "task.archived", archived: false });
+  append({ type: "task.manager-retired", ...identity });
+  append({ type: "task.thread-unlinked", threadId: "ordinary" });
+  return events;
+}
+
+it("composes every event family without conflating launch references, draft policy or historical bindings", () => {
+  const events = completeLifecycleFixture();
+  let state: ReturnType<typeof reduceTaskLifecycle> | undefined;
+  for (const event of events) state = reduceTaskLifecycle(state, event);
+  expect(new Set(events.map((record) => record.event.type)).size).toBe(33);
+  let independent: ReturnType<typeof reduceTaskLifecycle> | undefined;
+  const bindingIndex = events.findIndex((record) => record.event.type === "task.manager-bound");
+  for (const record of events.slice(0, bindingIndex + 1)) {
+    independent = reduceTaskLifecycle(
+      independent,
+      decode({ ...record, event: { ...record.event, taskId: "independent-task" } }),
+    );
+  }
+  expect(independent!.foundation.taskId).toBe("independent-task");
+  expect(HashMap.getUnsafe(independent!.managers, 1)).toBe(identity.managerThreadId);
+  expect(independent!.custody!.allowance).toEqual({ type: "unconfigured", consumed: 0 });
+  expect(HashMap.size(independent!.units)).toBe(0);
+  expect(state!.foundation.taskId).toBe(base.taskId);
+  expect(() => reduceTaskLifecycle(independent, events[bindingIndex + 1]!)).toThrow(
+    TaskReplayConflict,
+  );
+
+  expect(HashMap.size(state!.events)).toBe(events.length);
+  expect(HashMap.size(state!.runOwners)).toBe(2);
+  expect(HashMap.size(state!.units)).toBe(2);
+  expect(state!.custody!.allowance).toEqual({ type: "configured", cap: 3, consumed: 2 });
+  expect(HashMap.getUnsafe(state!.reviews!.reviews, "review").status).toBe("cancelled");
+  expect(HashMap.getUnsafe(state!.reviews!.reviews, "review").decision).toBeDefined();
+  expect(HashMap.getUnsafe(state!.actionPolicies, 1).rules[0]!.decision).toBe("review-first");
+  expect(HashMap.getUnsafe(state!.actionPolicies, 2).rules[0]!.decision).toBe("deny");
+  expect(state!.foundation.revisions.actionPolicyRevision).toBe(2);
+  for (const event of events) expect(reduceTaskLifecycle(state, event)).toBe(state);
+  const sequence = events.length + 1;
+  const lateResult = lifecycleRecorded(sequence, {
+    type: "task.result-recorded",
+    definitionRevision: 2,
+    actionPolicyRevision: 1,
+    sourceId: "late",
+    summary: "Old work",
+    results: evidence,
+  });
+  const late = reduceTaskLifecycle(state, lateResult);
+  expect(late.foundation.revisions.definitionRevision).toBe(3);
+  expect(late.revisions.actionPolicyRevision).toBe(2);
+  expect(HashMap.getUnsafe(late.reviews!.reviews, "review").status).toBe("cancelled");
+  expect(Array.from(state!.foundation.results)).toHaveLength(1);
+  expect(Array.from(late.foundation.results)).toHaveLength(2);
+});
+
+it("rejects global identity, policy and unit/run contradictions across independent event families", () => {
+  const events = completeLifecycleFixture();
+  const until = (type: string) =>
+    events.slice(
+      0,
+      events.findIndex((record) => record.event.type === type),
+    );
+  const reduce = (records: typeof events) =>
+    records.reduce<ReturnType<typeof reduceTaskLifecycle> | undefined>(
+      reduceTaskLifecycle,
+      undefined,
+    )!;
+  const beforeValidation = reduce(until("task.validation-reserved"));
+  const reserved = events.find((record) => record.event.type === "task.validation-reserved")!;
+  expect(() =>
+    reduceTaskLifecycle(
+      beforeValidation,
+      lifecycleRecorded(
+        reserved.context.sequence,
+        { ...reserved.event, allowanceUnit: 1 },
+        reserved.context.commandId!,
+      ),
+    ),
+  ).toThrow(TaskReplayConflict);
+  const beforeStart = reduce(until("task.validation-started"));
+  const started = events.find((record) => record.event.type === "task.validation-started")!;
+  expect(() =>
+    reduceTaskLifecycle(
+      beforeStart,
+      lifecycleRecorded(
+        started.context.sequence,
+        { ...started.event, runId: "wake-run" },
+        started.context.commandId!,
+      ),
+    ),
+  ).toThrow(TaskReplayConflict);
+  const beforeEditAccepted = reduce(
+    events.slice(
+      0,
+      events.findLastIndex((record) => record.event.type === "task.definition-accepted"),
+    ),
+  );
+  const edited = events.findLast((record) => record.event.type === "task.definition-accepted")!;
+  expect(() =>
+    reduceTaskLifecycle(
+      beforeEditAccepted,
+      lifecycleRecorded(
+        edited.context.sequence,
+        { ...edited.event, actionPolicyRevision: 1 },
+        edited.context.commandId!,
+      ),
+    ),
+  ).toThrow(TaskReplayConflict);
+  for (const type of [
+    "task.manager-bound",
+    "task.manager-retired",
+    "task.allowance-configured",
+    "task.allowance-topped-up",
+    "task.allowance-debited",
+    "task.wake-reserved",
+  ]) {
+    const index = events.findIndex((record) => record.event.type === type);
+    const event = events[index]!;
+    const state = reduce(events.slice(0, index));
+    expect(() =>
+      reduceTaskLifecycle(
+        state,
+        lifecycleRecorded(
+          event.context.sequence,
+          { ...event.event, definitionRevision: 1, lifecycleRevision: 1, actionPolicyRevision: 1 },
+          event.context.commandId!,
+        ),
+      ),
+    ).toThrow(TaskReplayConflict);
+  }
+  const beforeContinuation = reduce(until("task.continuation-accepted"));
+  const continuation = events.find((record) => record.event.type === "task.continuation-accepted")!;
+  const launched = reduceTaskLifecycle(beforeContinuation, continuation);
+  const executionRef = (sequence: number, change: object = {}) =>
+    lifecycleRecorded(sequence, {
+      type: "task.execution-updated",
+      definitionRevision: 2,
+      lifecycleRevision: sequence,
+      desiredMode: "active",
+      previousManagerGeneration: 1,
+      manager: identity,
+      reason: "Observe",
+      runId: "wake-run",
+      messageId: "wake-message",
+      effectId: "wake-effect",
+      ...change,
+    });
+  for (const change of [{ messageId: "wrong" }, { effectId: "wrong" }])
+    expect(() =>
+      reduceTaskLifecycle(launched, executionRef(continuation.context.sequence + 1, change)),
+    ).toThrow(TaskReplayConflict);
+  const beforeClaim = reduce(until("task.wake-claimed"));
+  const refSequence = beforeClaim.lastSequence + 1;
+  const referenced = reduceTaskLifecycle(
+    beforeClaim,
+    executionRef(refSequence, {
+      runId: "early-run",
+      messageId: "early-message",
+      effectId: "early-effect",
+    }),
+  );
+  for (const change of [{ messageId: "wrong" }, { effectId: "wrong" }])
+    expect(() =>
+      reduceTaskLifecycle(
+        referenced,
+        lifecycleRecorded(refSequence + 1, {
+          ...continuation.event,
+          runId: "early-run",
+          messageId: "early-message",
+          effectId: "early-effect",
+          ...change,
+        }),
+      ),
+    ).toThrow(TaskReplayConflict);
+  const pending = reduce(until("task.action-review-result-recorded"));
+  const next = pending.lastSequence + 1;
+  const unarchive = lifecycleRecorded(next, {
+    type: "task.archived",
+    definitionRevision: 2,
+    lifecycleRevision: next,
+    archived: false,
+    attribution: { type: "user", subject: "human", sessionId: "session" },
+  });
+  const cancellation = (sequence: number, commandId: string) =>
+    lifecycleRecorded(
+      sequence,
+      {
+        type: "task.action-review-cancelled",
+        definitionRevision: 2,
+        binding: { ...reviewBinding, definitionRevision: 2, runId: "wake-run" },
+        reason: "Claimed archive",
+        source: {
+          type: "task.archive",
+          commandId,
+          human: { subject: "human", sessionId: "session" },
+        },
+      },
+      commandId,
+    );
+  expect(() =>
+    reduceTaskLifecycle(
+      reduceTaskLifecycle(pending, unarchive),
+      cancellation(next + 1, unarchive.context.commandId!),
+    ),
+  ).toThrow(TaskReplayConflict);
+  const cancelledFirst = reduceTaskLifecycle(pending, cancellation(next, "unarchive-command"));
+  expect(() =>
+    reduceTaskLifecycle(
+      cancelledFirst,
+      lifecycleRecorded(
+        next + 1,
+        { ...unarchive.event, lifecycleRevision: next + 1 },
+        "unarchive-command",
+      ),
+    ),
+  ).toThrow(TaskReplayConflict);
+  const first = events[0]!;
+  const changed = decode({
+    event: { ...base, id: first.event.id, type: "task.manager-bound", ...identity },
+    context: { ...first.context, sequence: 100 },
+  });
+  expect(() => reduceTaskLifecycle(beforeValidation, changed)).toThrow(TaskReplayConflict);
 });

@@ -180,7 +180,8 @@ export function reduceTaskFoundation(
     "completionPolicyRevision",
     "actionPolicyRevision",
   ] as const) {
-    if (event[key] < state.revisions[key]) return conflict("revision", event);
+    if (!historicalFoundation(event) && event[key] < state.revisions[key])
+      return conflict("revision", event);
   }
   const manager =
     event.type === "task.execution-updated"
@@ -201,10 +202,7 @@ export function reduceTaskFoundation(
   const next = {
     ...state,
     revisions: {
-      definitionRevision: event.definitionRevision,
-      lifecycleRevision: event.lifecycleRevision,
-      completionPolicyRevision: event.completionPolicyRevision,
-      actionPolicyRevision: event.actionPolicyRevision,
+      ...revisionHighWater(state.revisions, event),
     },
     events: HashMap.set(state.events, event.id, recorded),
     sequences: HashMap.set(state.sequences, context.sequence, recorded),
@@ -1111,5 +1109,438 @@ export function reduceTaskReviews(
     }
     default:
       return fail("unsupported");
+  }
+}
+
+type TaskRecorded = {
+  readonly event: WorkTaskEvent;
+  readonly context: WorkTaskPersistedEventContext;
+};
+type ManagerReference = {
+  readonly managerThreadId: string;
+  readonly managerGeneration: number;
+  readonly messageId?: string;
+  readonly effectId?: string;
+};
+type ManagerLaunch = ManagerReference & {
+  readonly type: "manager";
+  readonly runId: string;
+  readonly messageId: string;
+};
+type RunOwner = ManagerLaunch | { readonly type: "validation"; readonly attemptId: string };
+type TaskState = {
+  readonly foundation: FoundationState;
+  readonly custody?: CustodyState;
+  readonly validation?: ValidationState;
+  readonly reviews?: ReviewState;
+  readonly revisions: FoundationState["revisions"];
+  readonly actionPolicies: HashMap.HashMap<
+    number,
+    EventOf<"task.definition-accepted">["definition"]["actionPolicy"]
+  >;
+  readonly definitionPolicies: HashMap.HashMap<number, number>;
+  readonly managers: HashMap.HashMap<number, string>;
+  readonly threads: HashMap.HashMap<string, number>;
+  readonly runOwners: HashMap.HashMap<string, RunOwner>;
+  readonly runReferences: HashMap.HashMap<string, ManagerReference>;
+  readonly messages: HashMap.HashMap<string, ManagerLaunch>;
+  readonly effects: HashMap.HashMap<string, ManagerLaunch>;
+  readonly units: HashMap.HashMap<number, string>;
+  readonly archives: HashMap.HashMap<string, EventOf<"task.archived">>;
+  readonly cancellationSources: HashMap.HashMap<
+    string,
+    ReviewOf<"task.action-review-cancelled">["source"]["human"]
+  >;
+  readonly events: HashMap.HashMap<string, TaskRecorded>;
+  readonly sequences: HashMap.HashMap<number, TaskRecorded>;
+  readonly lastSequence: number;
+};
+export class TaskReplayConflict extends Schema.TaggedError<TaskReplayConflict>()(
+  "TaskReplayConflict",
+  {
+    code: Schema.Literals([
+      "creation",
+      "envelope",
+      "task_identity",
+      "event_identity",
+      "sequence",
+      "revision",
+      "policy",
+      "definition",
+      "manager",
+      "claim",
+      "unit",
+      "run",
+      "message",
+      "effect",
+      "archive",
+      "unsupported",
+    ]),
+    eventId: Schema.String,
+  },
+) {}
+const taskConflict = (code: TaskReplayConflict["code"], event: { readonly id: string }): never => {
+  throw new TaskReplayConflict({ code, eventId: event.id });
+};
+const historicalFoundation = (event: FoundationEvent) =>
+  event.type === "task.result-recorded" ||
+  event.type === "task.wait-updated" ||
+  event.type === "task.continuation-accepted" ||
+  event.type === "task.completion-submitted";
+const revisionHighWater = (
+  left: FoundationState["revisions"],
+  right: FoundationState["revisions"],
+) => ({
+  definitionRevision: Math.max(left.definitionRevision, right.definitionRevision),
+  lifecycleRevision: Math.max(left.lifecycleRevision, right.lifecycleRevision),
+  completionPolicyRevision: Math.max(left.completionPolicyRevision, right.completionPolicyRevision),
+  actionPolicyRevision: Math.max(left.actionPolicyRevision, right.actionPolicyRevision),
+});
+
+/** Composes every recorded task event; service authorization and external execution are separate. */
+export function reduceTaskLifecycle(
+  state: TaskState | undefined,
+  recorded: TaskRecorded,
+): TaskState {
+  const { event, context } = recorded;
+  const fail = (code: TaskReplayConflict["code"]): never => taskConflict(code, event);
+  if (event.id !== context.eventId || event.occurredAt !== context.occurredAt)
+    return fail("envelope");
+  if (!state) {
+    if (event.type !== "task.created") return fail("creation");
+    const foundation = reduceTaskFoundation(undefined, { event, context });
+    return {
+      foundation,
+      revisions: foundation.revisions,
+      actionPolicies: HashMap.empty(),
+      definitionPolicies: HashMap.empty(),
+      managers: HashMap.empty(),
+      threads: HashMap.empty(),
+      runOwners: HashMap.empty(),
+      runReferences: HashMap.empty(),
+      messages: HashMap.empty(),
+      effects: HashMap.empty(),
+      units: HashMap.empty(),
+      archives: HashMap.empty(),
+      cancellationSources: HashMap.empty(),
+      events: HashMap.set(HashMap.empty<string, TaskRecorded>(), event.id, recorded),
+      sequences: HashMap.set(HashMap.empty<number, TaskRecorded>(), context.sequence, recorded),
+      lastSequence: context.sequence,
+    };
+  }
+  if (event.taskId !== state.foundation.taskId) return fail("task_identity");
+  const duplicate = lookup(state.events, event.id) ?? lookup(state.sequences, context.sequence);
+  if (duplicate) {
+    if (NodeUtil.isDeepStrictEqual(duplicate, recorded)) return state;
+    return fail(duplicate.event.id === event.id ? "event_identity" : "sequence");
+  }
+  if (context.sequence <= state.lastSequence) return fail("sequence");
+  const custodyMutation = [
+    "task.manager-bound",
+    "task.manager-retired",
+    "task.allowance-configured",
+    "task.allowance-topped-up",
+    "task.allowance-debited",
+    "task.wake-reserved",
+  ].includes(event.type);
+  if (custodyMutation)
+    for (const key of [
+      "definitionRevision",
+      "lifecycleRevision",
+      "completionPolicyRevision",
+      "actionPolicyRevision",
+    ] as const)
+      if (event[key] < state.revisions[key]) return fail("revision");
+  let next: TaskState = {
+    ...state,
+    revisions: revisionHighWater(state.revisions, event),
+    events: HashMap.set(state.events, event.id, recorded),
+    sequences: HashMap.set(state.sequences, context.sequence, recorded),
+    lastSequence: context.sequence,
+  };
+  const manager =
+    "binding" in event
+      ? event.binding
+      : "review" in event
+        ? event.review
+        : "managerThreadId" in event
+          ? event
+          : "manager" in event
+            ? event.manager
+            : null;
+  if (manager) {
+    const knownThread = lookup(state.managers, manager.managerGeneration);
+    const knownGeneration = lookup(state.threads, manager.managerThreadId);
+    if (
+      (knownThread !== undefined && knownThread !== manager.managerThreadId) ||
+      (knownGeneration !== undefined && knownGeneration !== manager.managerGeneration)
+    )
+      return fail("manager");
+    next = {
+      ...next,
+      managers: HashMap.set(next.managers, manager.managerGeneration, manager.managerThreadId),
+      threads: HashMap.set(next.threads, manager.managerThreadId, manager.managerGeneration),
+    };
+  }
+  const referenceRun =
+    "binding" in event
+      ? event.binding.runId
+      : "review" in event
+        ? event.review.runId
+        : "runId" in event && manager
+          ? event.runId
+          : undefined;
+  if (manager && referenceRun !== undefined) {
+    const known = lookup(next.runReferences, referenceRun);
+    const messageId = "messageId" in event ? event.messageId : undefined;
+    const effectId = "effectId" in event ? event.effectId : undefined;
+    const reference = {
+      ...known,
+      managerThreadId: manager.managerThreadId,
+      managerGeneration: manager.managerGeneration,
+      ...(messageId === undefined ? {} : { messageId }),
+      ...(effectId === undefined ? {} : { effectId }),
+    };
+    const owner = lookup(next.runOwners, referenceRun);
+    if (
+      (known &&
+        (known.managerThreadId !== reference.managerThreadId ||
+          known.managerGeneration !== reference.managerGeneration)) ||
+      (owner &&
+        (owner.type !== "manager" ||
+          owner.managerThreadId !== reference.managerThreadId ||
+          owner.managerGeneration !== reference.managerGeneration))
+    )
+      return fail("run");
+    if (
+      messageId !== undefined &&
+      ((known?.messageId !== undefined && known.messageId !== messageId) ||
+        (owner?.type === "manager" && owner.messageId !== messageId))
+    )
+      return fail("message");
+    if (effectId !== undefined && known?.effectId !== undefined && known.effectId !== effectId)
+      return fail("effect");
+    next = { ...next, runReferences: HashMap.set(next.runReferences, referenceRun, reference) };
+  }
+  const claimUnit = (unit: number, owner: string) => {
+    const known = lookup(next.units, unit);
+    if (
+      !state.custody ||
+      !HashMap.has(state.custody.debits, unit) ||
+      (known !== undefined && known !== owner)
+    )
+      return fail("unit");
+    next = { ...next, units: HashMap.set(next.units, unit, owner) };
+  };
+  const managerLaunch = (launch: ManagerLaunch, effectId?: string) => {
+    const run = lookup(next.runOwners, launch.runId);
+    const message = lookup(next.messages, launch.messageId);
+    const reference = lookup(next.runReferences, launch.runId);
+    if (
+      (run && !NodeUtil.isDeepStrictEqual(run, launch)) ||
+      (reference &&
+        (reference.managerThreadId !== launch.managerThreadId ||
+          reference.managerGeneration !== launch.managerGeneration))
+    )
+      return fail("run");
+    if (reference?.messageId !== undefined && reference.messageId !== launch.messageId)
+      return fail("message");
+    if (
+      effectId !== undefined &&
+      reference?.effectId !== undefined &&
+      reference.effectId !== effectId
+    )
+      return fail("effect");
+    if (message && !NodeUtil.isDeepStrictEqual(message, launch)) return fail("message");
+    if (effectId !== undefined) {
+      const effect = lookup(next.effects, effectId);
+      if (effect && !NodeUtil.isDeepStrictEqual(effect, launch)) return fail("effect");
+    }
+    next = {
+      ...next,
+      runOwners: HashMap.set(next.runOwners, launch.runId, launch),
+      messages: HashMap.set(next.messages, launch.messageId, launch),
+      effects: effectId === undefined ? next.effects : HashMap.set(next.effects, effectId, launch),
+    };
+  };
+  switch (event.type) {
+    case "task.created":
+      return fail("creation");
+    case "task.definition-accepted": {
+      const policy = lookup(state.actionPolicies, event.actionPolicyRevision);
+      if (policy && !NodeUtil.isDeepStrictEqual(policy, event.definition.actionPolicy))
+        return fail("policy");
+      next = {
+        ...next,
+        actionPolicies: HashMap.set(
+          next.actionPolicies,
+          event.actionPolicyRevision,
+          event.definition.actionPolicy,
+        ),
+        definitionPolicies: HashMap.set(
+          next.definitionPolicies,
+          event.definitionRevision,
+          event.actionPolicyRevision,
+        ),
+      };
+      break;
+    }
+    case "task.action-review-requested": {
+      const review = event.review;
+      const accepted = lookup(state.foundation.acceptedByRevision, review.definitionRevision);
+      const policy = lookup(state.actionPolicies, review.actionPolicyRevision);
+      if (
+        !accepted ||
+        !policy ||
+        lookup(state.definitionPolicies, review.definitionRevision) !== review.actionPolicyRevision
+      )
+        return fail("definition");
+      const rule = policy.rules.find((rule) => rule.id === review.ruleId);
+      if (!rule || rule.action !== review.action || rule.target !== review.target)
+        return fail("policy");
+      break;
+    }
+    case "task.wake-reserved":
+      claimUnit(event.allowanceUnit, `wake:${event.reservationId}`);
+      break;
+    case "task.wake-claimed": {
+      const thread = lookup(next.managers, event.managerGeneration);
+      if (!thread) return fail("manager");
+      managerLaunch({
+        type: "manager",
+        managerThreadId: thread,
+        managerGeneration: event.managerGeneration,
+        runId: event.runId,
+        messageId: event.messageId,
+      });
+      break;
+    }
+    case "task.continuation-accepted":
+      managerLaunch(
+        {
+          type: "manager",
+          managerThreadId: event.managerThreadId,
+          managerGeneration: event.managerGeneration,
+          runId: event.runId,
+          messageId: event.messageId,
+        },
+        event.effectId,
+      );
+      break;
+    case "task.validation-reserved":
+    case "task.validation-started":
+    case "task.validation-result":
+    case "task.validation-uncertain": {
+      const claim = lookup(state.foundation.claimIds, event.claimId);
+      if (
+        !claim ||
+        claim.event.evidenceId !== event.evidenceId ||
+        claim.event.definitionRevision !== event.definitionRevision ||
+        claim.event.completionPolicyRevision !== event.completionPolicyRevision ||
+        claim.event.managerGeneration !== event.managerGeneration ||
+        !HashMap.has(state.foundation.acceptedByRevision, event.definitionRevision)
+      )
+        return fail("claim");
+      if (!HashMap.has(state.managers, event.managerGeneration)) return fail("manager");
+      claimUnit(event.allowanceUnit, `validation:${event.attemptId}`);
+      if ("runId" in event && event.runId !== undefined) {
+        const owner = { type: "validation" as const, attemptId: event.attemptId };
+        const known = lookup(next.runOwners, event.runId);
+        if (
+          HashMap.has(next.runReferences, event.runId) ||
+          (known && !NodeUtil.isDeepStrictEqual(known, owner))
+        )
+          return fail("run");
+        next = { ...next, runOwners: HashMap.set(next.runOwners, event.runId, owner) };
+      }
+      break;
+    }
+    case "task.archived": {
+      if (context.commandId !== null) {
+        if (HashMap.has(state.archives, context.commandId)) return fail("archive");
+        const cancellation = lookup(state.cancellationSources, context.commandId);
+        if (
+          cancellation &&
+          (!event.archived ||
+            event.attribution.type !== "user" ||
+            event.attribution.subject !== cancellation.subject ||
+            event.attribution.sessionId !== cancellation.sessionId)
+        )
+          return fail("archive");
+        next = { ...next, archives: HashMap.set(next.archives, context.commandId, event) };
+      }
+      break;
+    }
+    case "task.action-review-cancelled": {
+      const archive = lookup(state.archives, event.source.commandId);
+      if (
+        archive &&
+        (!archive.archived ||
+          archive.attribution.type !== "user" ||
+          archive.attribution.subject !== event.source.human.subject ||
+          archive.attribution.sessionId !== event.source.human.sessionId)
+      )
+        return fail("archive");
+      const known = lookup(state.cancellationSources, event.source.commandId);
+      if (known && !NodeUtil.isDeepStrictEqual(known, event.source.human)) return fail("archive");
+      next = {
+        ...next,
+        cancellationSources: HashMap.set(
+          next.cancellationSources,
+          event.source.commandId,
+          event.source.human,
+        ),
+      };
+      break;
+    }
+  }
+  switch (event.type) {
+    case "task.definition-updated":
+    case "task.definition-accepted":
+    case "task.thread-linked":
+    case "task.thread-unlinked":
+    case "task.configuration-updated":
+    case "task.execution-updated":
+    case "task.wait-updated":
+    case "task.result-recorded":
+    case "task.continuation-accepted":
+    case "task.completion-submitted":
+    case "task.completed":
+    case "task.reopened":
+    case "task.archived": {
+      if (!historicalFoundation(event))
+        for (const key of [
+          "definitionRevision",
+          "lifecycleRevision",
+          "completionPolicyRevision",
+          "actionPolicyRevision",
+        ] as const)
+          if (event[key] < state.revisions[key]) return fail("revision");
+      return { ...next, foundation: reduceTaskFoundation(state.foundation, { event, context }) };
+    }
+    case "task.manager-bound":
+    case "task.manager-retired":
+    case "task.allowance-configured":
+    case "task.allowance-topped-up":
+    case "task.allowance-debited":
+    case "task.wake-source-recorded":
+    case "task.wake-reserved":
+    case "task.wake-claimed":
+    case "task.wake-claim-uncertain":
+    case "task.wake-acknowledged":
+      return { ...next, custody: reduceTaskCustody(state.custody, { event, context }) };
+    case "task.validation-reserved":
+    case "task.validation-started":
+    case "task.validation-result":
+    case "task.validation-uncertain":
+      return { ...next, validation: reduceTaskValidation(state.validation, { event, context }) };
+    case "task.action-review-requested":
+    case "task.action-review-result-recorded":
+    case "task.action-review-invalidated":
+    case "task.action-review-cancelled":
+    case "task.action-review-continuation-released":
+      return { ...next, reviews: reduceTaskReviews(state.reviews, { event, context }) };
+    default:
+      return taskConflict("unsupported", event satisfies never);
   }
 }
