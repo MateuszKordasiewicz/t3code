@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   WorkTaskPersistedEvent,
+  WorkTaskPersistedCoordinationEvent,
   WorkTaskGraphEdgeRecord,
   WorkTaskGraphProvenance,
   WorkTaskGroupControlEvent,
@@ -37,6 +38,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
     assert.deepInclude(migrations, [93, "WorkTaskDependencies"]);
     assert.deepInclude(migrations, [94, "WorkTaskManagerGroups"]);
     assert.deepInclude(migrations, [95, "WorkTaskManagerMemberships"]);
+    assert.deepInclude(migrations, [96, "WorkTaskDirtyReconciliation"]);
     const tables = yield* sql<{ readonly name: string }>`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'work_task_%' ORDER BY name
     `;
@@ -50,6 +52,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
         "work_task_allowances",
         "work_task_claims",
         "work_task_current_state",
+        "work_task_dirty_events",
         "work_task_graph_edges",
         "work_task_group_managers",
         "work_task_group_memberships",
@@ -57,6 +60,8 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
         "work_task_manager_groups",
         "work_task_membership_companions",
         "work_task_projections",
+        "work_task_reconciliation_events",
+        "work_task_reconciliation_visits",
         "work_task_results",
         "work_task_review_events",
         "work_task_review_outcomes",
@@ -110,6 +115,7 @@ it.effect("upgrades predecessor rows and events without changing their bytes or 
       [93, "WorkTaskDependencies"],
       [94, "WorkTaskManagerGroups"],
       [95, "WorkTaskManagerMemberships"],
+      [96, "WorkTaskDirtyReconciliation"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM projection_projects ORDER BY project_id`,
@@ -155,6 +161,7 @@ it.effect("rolls back a failed migration and succeeds on rerun", () =>
       [93, "WorkTaskDependencies"],
       [94, "WorkTaskManagerGroups"],
       [95, "WorkTaskManagerMemberships"],
+      [96, "WorkTaskDirtyReconciliation"],
     ]);
     assert.deepStrictEqual(yield* runMigrations(), []);
   }).pipe(Effect.provide(db)),
@@ -281,6 +288,7 @@ it.effect(
         [93, "WorkTaskDependencies"],
         [94, "WorkTaskManagerGroups"],
         [95, "WorkTaskManagerMemberships"],
+        [96, "WorkTaskDirtyReconciliation"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -449,6 +457,7 @@ it.effect("preserves task custody through validation upgrade and rolls back migr
       [93, "WorkTaskDependencies"],
       [94, "WorkTaskManagerGroups"],
       [95, "WorkTaskManagerMemberships"],
+      [96, "WorkTaskDirtyReconciliation"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -590,6 +599,7 @@ it.effect("upgrades validation data atomically to action reviews and preserves p
       [93, "WorkTaskDependencies"],
       [94, "WorkTaskManagerGroups"],
       [95, "WorkTaskManagerMemberships"],
+      [96, "WorkTaskDirtyReconciliation"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -807,6 +817,7 @@ it.effect("upgrades existing tasks without inventing state and rolls back migrat
       [93, "WorkTaskDependencies"],
       [94, "WorkTaskManagerGroups"],
       [95, "WorkTaskManagerMemberships"],
+      [96, "WorkTaskDirtyReconciliation"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -909,6 +920,7 @@ it.effect("upgrades waits atomically while preserving task state and link proven
       [93, "WorkTaskDependencies"],
       [94, "WorkTaskManagerGroups"],
       [95, "WorkTaskManagerMemberships"],
+      [96, "WorkTaskDirtyReconciliation"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM work_task_thread_links ORDER BY link_event_id`,
@@ -1038,6 +1050,7 @@ it.effect("upgrades result history atomically without changing predecessor data"
       [93, "WorkTaskDependencies"],
       [94, "WorkTaskManagerGroups"],
       [95, "WorkTaskManagerMemberships"],
+      [96, "WorkTaskDirtyReconciliation"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_current_state`, state);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_thread_links`, links);
@@ -1183,6 +1196,7 @@ it.effect("upgrades claim history atomically and preserves prior task and ordina
       [93, "WorkTaskDependencies"],
       [94, "WorkTaskManagerGroups"],
       [95, "WorkTaskManagerMemberships"],
+      [96, "WorkTaskDirtyReconciliation"],
     ]);
     assert.deepStrictEqual(
       yield* Effect.forEach(tables, (name) => sql.unsafe(`SELECT * FROM ${name}`)),
@@ -1524,6 +1538,7 @@ it.effect("preserves legacy validation rows and rolls replay migration back befo
       [93, "WorkTaskDependencies"],
       [94, "WorkTaskManagerGroups"],
       [95, "WorkTaskManagerMemberships"],
+      [96, "WorkTaskDirtyReconciliation"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_attempts`, before);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_claims`, claims);
@@ -2639,6 +2654,7 @@ it.effect("preserves review evidence on upgrade and binds append-only outcomes a
       [93, "WorkTaskDependencies"],
       [94, "WorkTaskManagerGroups"],
       [95, "WorkTaskManagerMemberships"],
+      [96, "WorkTaskDirtyReconciliation"],
     ]);
     assert.deepStrictEqual(yield* snapshot(), before);
     assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
@@ -3038,6 +3054,7 @@ it.effect(
         [93, "WorkTaskDependencies"],
         [94, "WorkTaskManagerGroups"],
         [95, "WorkTaskManagerMemberships"],
+        [96, "WorkTaskDirtyReconciliation"],
       ]);
       const after = yield* snapshot();
       assert.deepStrictEqual(
@@ -3397,6 +3414,7 @@ it.effect(
       assert.deepStrictEqual(yield* runMigrations(), [
         [94, "WorkTaskManagerGroups"],
         [95, "WorkTaskManagerMemberships"],
+        [96, "WorkTaskDirtyReconciliation"],
       ]);
       const after = yield* capture();
       assert.deepStrictEqual(
@@ -4027,7 +4045,10 @@ it.effect(
         ),
       );
       yield* sql`DROP TRIGGER work_task_group_membership_initial`;
-      assert.deepStrictEqual(yield* runMigrations(), [[95, "WorkTaskManagerMemberships"]]);
+      assert.deepStrictEqual(yield* runMigrations(), [
+        [95, "WorkTaskManagerMemberships"],
+        [96, "WorkTaskDirtyReconciliation"],
+      ]);
       const after = yield* capture();
       assert.deepStrictEqual(
         { ...after, effect_sql_migrations: before.effect_sql_migrations! },
@@ -4044,4 +4065,477 @@ it.effect(
       assert.deepStrictEqual(yield* runMigrations(), []);
       assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
     }).pipe(Effect.provide(db)),
+);
+
+const dirtyEvent = (id: string, taskId = "a", sourceEventId = "source", sourceSequence = 1) => ({
+  id,
+  environmentId: "env",
+  occurredAt: "2026-11-15T00:00:00Z",
+  commandId: `command-${id}`,
+  attribution: { type: "server" },
+  type: "task.dirty-source-recorded",
+  sourceEventId,
+  sourceSequence,
+  task: { environmentId: "env", taskId },
+  membership: null,
+  previousDirtyGeneration: 0,
+  dirtyGeneration: 1,
+  acknowledgedGeneration: 0,
+});
+const scanEvent = (id: string) => ({
+  id,
+  environmentId: "env",
+  occurredAt: "2026-11-15T00:00:00Z",
+  commandId: `command-${id}`,
+  attribution: { type: "server" },
+  type: "task.reconciliation-progressed",
+  completed: false,
+  scan: {
+    kind: "graph_dependents",
+    sourceEventId: "source",
+    sourceSequence: 1,
+    blocker: { environmentId: "env", taskId: "b" },
+    capturedRevision: 0,
+  },
+  observedRevision: 0,
+  previousPosition: null,
+  position: { dependentTaskId: "a", edgeId: "edge" },
+  visited: [{ environmentId: "env", taskId: "a" }],
+});
+const decodeCoordination = Schema.decodeUnknownEffect(WorkTaskPersistedCoordinationEvent);
+const insertCoordination = Effect.fn("PersistentTasks.insertCoordination")(function* (
+  event: Record<string, unknown>,
+  sequence: number,
+  decode = true,
+  replace = false,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const decoded = decode
+    ? (yield* decodeCoordination({
+        event,
+        context: {
+          sequence,
+          eventId: event.id,
+          commandId: event.commandId,
+          occurredAt: event.occurredAt,
+        },
+      })).event
+    : event;
+  const table =
+    event.type === "task.reconciliation-progressed"
+      ? "work_task_reconciliation_events"
+      : "work_task_dirty_events";
+  yield* sql.unsafe(
+    `INSERT ${replace ? "OR REPLACE" : ""} INTO ${table}(event_id,sequence,event_json) SELECT json_extract(value,'$.id'),?,value FROM (SELECT ? value)`,
+    [sequence, JSON.stringify(decoded)],
+  );
+});
+it.effect("retains dirty generations and commits scan progress only with every dirty visit", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations();
+    yield* sql`INSERT INTO work_task_projections VALUES ('a',NULL,1,1,1,1,'{}','raw','raw'),('b',NULL,1,1,1,1,'{}','raw','raw'),('c',NULL,1,1,1,1,'{}','raw','raw')`;
+    const source = dirtyEvent("dirty-a");
+    const progress = scanEvent("progress");
+    for (const recursive of [0, 1]) {
+      yield* sql.unsafe(`PRAGMA recursive_triggers=${recursive}`);
+      yield* sql`BEGIN`;
+      yield* insertCoordination(progress, 3);
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(sql`COMMIT`)));
+      yield* sql`ROLLBACK`;
+      assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_reconciliation_events`, []);
+      for (const progressFirst of [true, false]) {
+        yield* sql`BEGIN`;
+        if (progressFirst) yield* insertCoordination(progress, 3);
+        yield* insertCoordination(source, 2);
+        if (!progressFirst) yield* insertCoordination(progress, 3);
+        assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+        for (const table of [
+          "work_task_dirty_events",
+          "work_task_reconciliation_events",
+          "work_task_reconciliation_visits",
+        ]) {
+          assert.isTrue(
+            Exit.isFailure(
+              yield* Effect.exit(sql.unsafe(`UPDATE ${table} SET event_id='rewritten'`)),
+            ),
+          );
+          assert.isTrue(Exit.isFailure(yield* Effect.exit(sql.unsafe(`DELETE FROM ${table}`))));
+          assert.isTrue(
+            Exit.isFailure(
+              yield* Effect.exit(
+                sql.unsafe(`INSERT OR REPLACE INTO ${table} SELECT * FROM ${table}`),
+              ),
+            ),
+          );
+        }
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(insertCoordination({ ...source, id: "replacement" }, 2, true, true)),
+          ),
+        );
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              insertCoordination(
+                { ...source, id: "duplicate", previousDirtyGeneration: 1, dirtyGeneration: 2 },
+                4,
+              ),
+            ),
+          ),
+        );
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              insertCoordination(
+                {
+                  ...progress,
+                  id: "restart",
+                  scan: { ...progress.scan, capturedRevision: 1 },
+                  observedRevision: 1,
+                },
+                4,
+              ),
+            ),
+          ),
+        );
+        assert.isTrue(
+          Exit.isFailure(yield* Effect.exit(insertCoordination({ ...progress, id: "stale" }, 4))),
+        );
+        yield* insertCoordination(
+          {
+            ...progress,
+            id: "finished",
+            previousPosition: progress.position,
+            position: progress.position,
+            visited: [],
+            completed: true,
+          },
+          4,
+        );
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              insertCoordination(
+                {
+                  ...progress,
+                  id: "resurrected",
+                  previousPosition: progress.position,
+                  position: progress.position,
+                  visited: [],
+                  completed: true,
+                },
+                5,
+              ),
+            ),
+          ),
+        );
+        yield* sql`ROLLBACK`;
+      }
+    }
+    yield* insertCoordination(source, 2);
+    yield* insertCoordination(
+      {
+        ...dirtyEvent("dirty-a-2", "a", "source2", 3),
+        previousDirtyGeneration: 1,
+        dirtyGeneration: 2,
+      },
+      4,
+    );
+    const { previousDirtyGeneration: _previous, ...common } = source;
+    const ack = {
+      ...common,
+      id: "ack",
+      type: "task.dirty-acknowledged",
+      previousAcknowledgedGeneration: 0,
+      acknowledgedGeneration: 1,
+      observedDirtyGeneration: 1,
+      dirtyGeneration: 2,
+    };
+    yield* insertCoordination(ack, 5);
+    assert.isTrue(
+      Exit.isFailure(yield* Effect.exit(insertCoordination({ ...ack, id: "stale-ack" }, 6))),
+    );
+    assert.isTrue(
+      Exit.isFailure(
+        yield* Effect.exit(
+          insertCoordination(
+            {
+              ...ack,
+              id: "future-ack",
+              previousAcknowledgedGeneration: 1,
+              acknowledgedGeneration: 2,
+              observedDirtyGeneration: 1,
+            },
+            6,
+            false,
+          ),
+        ),
+      ),
+    );
+    yield* insertCoordination(
+      {
+        ...dirtyEvent("third", "a", "source3", 6),
+        previousDirtyGeneration: 2,
+        dirtyGeneration: 3,
+        acknowledgedGeneration: 1,
+      },
+      7,
+    );
+    assert.deepStrictEqual(
+      (yield* sql`SELECT dirty_generation,acknowledged_generation FROM work_task_dirty_events WHERE task_id='a' ORDER BY sequence DESC LIMIT 1`).map(
+        (row) => ({ ...row }),
+      ),
+      [{ dirty_generation: 3, acknowledged_generation: 1 }],
+    );
+    const emptyAck = {
+      ...ack,
+      id: "empty-ack",
+      task: { environmentId: "env", taskId: "c" },
+      acknowledgedGeneration: 0,
+      observedDirtyGeneration: 0,
+      dirtyGeneration: 0,
+    };
+    yield* insertCoordination(emptyAck, 8);
+    assert.isTrue(
+      Exit.isFailure(
+        yield* Effect.exit(
+          insertCoordination(
+            {
+              ...dirtyEvent("wrong-env", "c", "other-source", 9),
+              environmentId: "other",
+              task: { environmentId: "other", taskId: "c" },
+            },
+            10,
+          ),
+        ),
+      ),
+    );
+    for (const [index, value] of ["\0x", "😀".repeat(1000), "\ud800"].entries()) {
+      yield* sql`BEGIN`;
+      yield* insertCoordination(
+        {
+          ...dirtyEvent(value, "b", `unicode-source-${index}`, 10),
+          commandId: "unicode-command",
+          occurredAt: "0000-01-01T00:00:00.000000001+23:59",
+        },
+        11,
+      );
+      assert.strictEqual(
+        (yield* sql<{
+          value: string;
+        }>`SELECT hex(event_id) value FROM work_task_dirty_events WHERE task_id='b'`)[0]!.value,
+        index === 2 ? "EDA080" : Buffer.from(value).toString("hex").toUpperCase(),
+      );
+      yield* sql`ROLLBACK`;
+    }
+    for (const patch of [
+      { id: " " },
+      { id: "x".repeat(2001) },
+      { sourceSequence: 11 },
+      { sourceEventId: "invalid" },
+      { attribution: { type: "human" } },
+      { occurredAt: "invalid" },
+      { previousDirtyGeneration: 0.5 },
+      { membership: {} },
+      { task: { environmentId: "other", taskId: "b" } },
+    ]) {
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            insertCoordination(
+              { ...dirtyEvent("invalid", "b", "source-invalid", 10), ...patch },
+              11,
+              false,
+            ),
+          ),
+        ),
+      );
+    }
+    yield* sql`BEGIN`;
+    yield* insertCoordination(progress, 12);
+    assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+    yield* sql`COMMIT`;
+    for (const query of [
+      "SELECT event_json FROM work_task_dirty_events WHERE task_id='a' ORDER BY sequence DESC LIMIT 1",
+      "SELECT event_json FROM work_task_reconciliation_events WHERE job_key='key' ORDER BY sequence DESC LIMIT 1",
+      "SELECT 1 FROM work_task_dirty_events WHERE source_id='source' AND source_sequence<>1",
+      "SELECT 1 FROM work_task_dirty_events WHERE source_sequence=1 AND source_id<>'source'",
+      "SELECT 1 FROM work_task_reconciliation_visits WHERE environment_id='env' AND task_id='a' AND source_id='source' AND source_sequence=1",
+    ]) {
+      const plan = yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`);
+      assert.isTrue(plan.some((row) => row.detail.includes("SEARCH")));
+      assert.isFalse(plan.some((row) => /SCAN |TEMP B-TREE/.test(row.detail)));
+    }
+    yield* sql`BEGIN`;
+    const visited = Array.from({ length: 100 }, (_, index) => ({
+      environmentId: "env",
+      taskId: `v${String(index).padStart(3, "0")}`,
+    }));
+    for (const [index, task] of visited.entries()) {
+      yield* sql`INSERT INTO work_task_projections VALUES (${task.taskId},NULL,1,1,1,1,'{}','raw','raw')`;
+      yield* insertCoordination(
+        dirtyEvent(`batch-${index}`, task.taskId, "batch-source", 400),
+        401 + index,
+      );
+    }
+    const batchScan = {
+      ...progress,
+      id: "batch-scan",
+      scan: { ...progress.scan, sourceEventId: "batch-source", sourceSequence: 400 },
+      position: { dependentTaskId: "v099", edgeId: "last-edge" },
+      visited,
+    };
+    for (const patch of [
+      { visited: [...visited, visited[0]] },
+      { visited: [visited[1], visited[0]], position: { dependentTaskId: "v000", edgeId: "edge" } },
+      { visited: [{ environmentId: "other", taskId: "v099" }] },
+      { previousPosition: { dependentTaskId: "z", edgeId: "edge" } },
+      { scan: { ...batchScan.scan, sourceSequence: 600 } },
+      { observedRevision: -1 },
+      { completed: undefined, unknown: false },
+    ])
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(insertCoordination({ ...batchScan, ...patch }, 600, false)),
+        ),
+      );
+    yield* insertCoordination(batchScan, 600);
+    assert.strictEqual(
+      (yield* sql<{
+        n: number;
+      }>`SELECT count(*) n FROM work_task_reconciliation_visits WHERE event_id='batch-scan'`)[0]!.n,
+      100,
+    );
+    assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+    yield* sql`ROLLBACK`;
+    const installed = yield* sql<{
+      sql: string;
+    }>`SELECT sql FROM sqlite_master WHERE name IN ('work_task_dirty_valid','work_task_reconciliation_valid')`;
+    for (const trigger of installed) {
+      const queries = [
+        ...trigger.sql.matchAll(
+          /SELECT event_json FROM work_task_(?:dirty|reconciliation)_events WHERE (?:task_id=NEW.task_id|job_key=NEW.job_key) ORDER BY sequence DESC LIMIT 1/g,
+        ),
+      ];
+      assert.isNotEmpty(queries);
+      for (const match of queries) {
+        const plan = yield* sql.unsafe<{ detail: string }>(
+          "EXPLAIN QUERY PLAN " +
+            match[0].replaceAll("NEW.task_id", "'a'").replaceAll("NEW.job_key", "'job'"),
+        );
+        assert.isTrue(plan.some((row) => row.detail.includes("SEARCH")));
+        assert.isFalse(plan.some((row) => /SCAN |TEMP B-TREE/.test(row.detail)));
+      }
+    }
+    assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect("preserves dirty scan membership observations and rolls back migration96", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations({ toMigrationInclusive: 95 });
+    yield* sql`INSERT INTO work_task_projections VALUES ('a',NULL,1,1,1,1,'{}','raw','raw'),('b',NULL,1,1,1,1,'{}','raw','raw')`;
+    yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('a',1,1,'{}','{}','accepted','raw')`;
+    yield* writeGroupControl(
+      decodeGroupControlEvent({
+        ...groupContext("group"),
+        type: "task-group.created",
+        control: emptyGroupControl(),
+      }),
+      100,
+    );
+    const batch = membershipJoin();
+    yield* sql.withTransaction(applyMembership(batch, 101));
+    const before = yield* sql`SELECT * FROM work_task_group_memberships`;
+    yield* sql`CREATE TABLE work_task_reconciliation_visits(collision TEXT)`;
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(runMigrations())));
+    assert.deepStrictEqual(
+      yield* sql`SELECT name FROM sqlite_master WHERE name IN ('work_task_dirty_events','work_task_reconciliation_events')`,
+      [],
+    );
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_group_memberships`, before);
+    yield* sql`DROP TABLE work_task_reconciliation_visits`;
+    assert.deepStrictEqual(yield* runMigrations(), [[96, "WorkTaskDirtyReconciliation"]]);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_group_memberships`, before);
+    const member = batch.event.snapshot.currentMembership!;
+    const source = {
+      ...dirtyEvent("member-dirty"),
+      membership: { group: member.group, membershipGeneration: member.membershipGeneration },
+    };
+    const event = {
+      ...scanEvent("member-scan"),
+      scan: {
+        kind: "group_members",
+        sourceEventId: "source",
+        sourceSequence: 1,
+        group: member.group,
+        capturedRevision: 1,
+      },
+      observedRevision: 1,
+      position: { taskId: "a" },
+      visited: [{ task: member.task, membershipGeneration: member.membershipGeneration }],
+    };
+    yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* insertCoordination(event, 201);
+        yield* insertCoordination(source, 200);
+      }),
+    );
+    const removed = membershipTransition(
+      batch.event.snapshot,
+      batch.companions.map((row) => row.control),
+      null,
+      "remove",
+    );
+    yield* sql.withTransaction(applyMembership(removed, 202));
+    yield* insertCoordination(
+      {
+        ...source,
+        id: "after-retirement",
+        sourceEventId: "later-source",
+        sourceSequence: 204,
+        previousDirtyGeneration: 1,
+        dirtyGeneration: 2,
+      },
+      205,
+    );
+    assert.isTrue(
+      Exit.isFailure(
+        yield* Effect.exit(
+          insertCoordination(
+            {
+              ...event,
+              id: "bad-member",
+              scan: { ...event.scan, sourceEventId: "new-source", sourceSequence: 206 },
+              visited: [{ task: member.task, membershipGeneration: 99 }],
+            },
+            207,
+          ),
+        ),
+      ),
+    );
+    yield* insertCoordination(
+      {
+        ...event,
+        id: "finished-member",
+        previousPosition: event.position,
+        visited: [],
+        completed: true,
+      },
+      208,
+    );
+    assert.isTrue(
+      Exit.isFailure(
+        yield* Effect.exit(
+          sql`INSERT OR REPLACE INTO work_task_reconciliation_visits VALUES ('member-scan','env','a','source',1,1)`,
+        ),
+      ),
+    );
+    const captured = yield* sql`SELECT * FROM work_task_dirty_events`;
+    assert.deepStrictEqual(yield* runMigrations(), []);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_dirty_events`, captured);
+    assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+  }).pipe(Effect.provide(db)),
 );
