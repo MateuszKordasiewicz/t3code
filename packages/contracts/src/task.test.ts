@@ -3550,6 +3550,10 @@ describe("staged selected work and reconciliation facts", () => {
     };
     expect(persisted(envelope(selected, 11))).toBeDefined();
     expect(() =>
+      persisted(envelope({ ...selected, previousOldestReadySequence: 15 }, 20)),
+    ).toThrow();
+    expect(persisted(envelope({ ...selected, previousOldestReadySequence: 10 }, 20))).toBeDefined();
+    expect(() =>
       persisted(envelope({ ...selected, previousOldestReadySequence: null }, 11)),
     ).toThrow();
     const requeued = {

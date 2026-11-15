@@ -2522,6 +2522,7 @@ const readyAccepted = Schema.Struct({
   Schema.makeFilter(
     (event) =>
       event.previousOldestReadySequence !== null &&
+      event.previousOldestReadySequence <= event.claim.acceptedSequence &&
       event.oldestReadySequence === null &&
       event.sourceEventId === event.claim.acceptedEventId &&
       event.sourceSequence === event.claim.acceptedSequence,
