@@ -1,7 +1,16 @@
-import { EnvironmentId, ProviderInstanceId, RunId, ThreadId } from "@t3tools/contracts";
+import { presentThreadShell } from "./models.ts";
+import { v2ThreadShell, v2Now } from "./orchestrationV2TestFixtures.ts";
+import {
+  EnvironmentId,
+  ProviderInstanceId,
+  RuntimeRequestId,
+  RunId,
+  ThreadId,
+} from "@t3tools/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
+  workInboxRows,
   createInboxReturnTracker,
   isThreadWorking,
   sortInboxThreadsByReturn,
@@ -239,5 +248,145 @@ describe("sortWorkingThreadsBySend", () => {
     expect(
       sortWorkingThreadsBySend([launched, sentFirst, sentLast]).map((thread) => thread.id),
     ).toEqual(["sent-last", "sent-first", "launched"]);
+  });
+});
+
+const local = EnvironmentId.make("local");
+const remote = EnvironmentId.make("remote");
+function shell(id: string, overrides: Partial<typeof v2ThreadShell> = {}, environmentId = local) {
+  return presentThreadShell(environmentId, {
+    ...v2ThreadShell,
+    id: ThreadId.make(id),
+    lineage: { parentThreadId: null, rootThreadId: ThreadId.make(id), relationshipToParent: null },
+    pendingRuntimeRequest: null,
+    status: "idle",
+    latestRunId: RunId.make("observed-run"),
+    ...overrides,
+  });
+}
+const request = {
+  id: RuntimeRequestId.make("request"),
+  kind: "user_input" as const,
+  createdAt: v2Now,
+};
+
+describe("Work inbox observed threads", () => {
+  it("keeps direct requests scoped, removes resolved requests and never promotes a rolled-up summary", () => {
+    const parent = { ...shell("parent"), pendingSubagentRequest: "approval" as const };
+    const rows = workInboxRows([
+      parent,
+      shell("same", { pendingRuntimeRequest: request }),
+      shell("same", { pendingRuntimeRequest: request }, remote),
+    ]);
+    expect(rows.filter((row) => row.attention)).toHaveLength(2);
+    expect(new Set(rows.map((row) => row.key)).size).toBe(3);
+    expect(new Set(rows.filter((row) => row.requestKey).map((row) => row.requestKey)).size).toBe(2);
+    expect(rows.find((row) => row.thread.id === parent.id)?.requestKey).toBeNull();
+    expect(
+      workInboxRows([
+        shell("internal", {
+          status: "running",
+          pendingRuntimeRequest: { ...request, kind: "dynamic_tool_call" },
+        }),
+      ])[0],
+    ).toMatchObject({ attention: false, status: "running", requestKey: null });
+
+    expect(workInboxRows([shell("same")])[0]).toMatchObject({
+      attention: false,
+      requestKey: null,
+      status: "idle",
+    });
+  });
+
+  it("preserves actual child ownership, visible parent links, ordinary roots and orphan access", () => {
+    const parent = shell("parent");
+    const child = shell("child", {
+      lineage: {
+        parentThreadId: parent.id,
+        rootThreadId: parent.id,
+        relationshipToParent: "subagent",
+      },
+      pendingRuntimeRequest: request,
+      status: "running",
+    });
+    const side = shell("side", {
+      lineage: {
+        parentThreadId: parent.id,
+        rootThreadId: parent.id,
+        relationshipToParent: null,
+        sideChat: true,
+      },
+      pendingRuntimeRequest: request,
+    });
+    const rows = workInboxRows([parent, child, side, shell("ordinary-worker-name")]);
+    expect(rows.find((row) => row.thread.id === child.id)).toMatchObject({
+      attention: false,
+      status: "coordinator-input",
+      requestKey: null,
+      parent,
+    });
+    expect(rows.find((row) => row.thread.id === side.id)).toMatchObject({
+      attention: true,
+      status: "input",
+      parent,
+    });
+    expect(
+      rows.find((row) => row.thread.id === ThreadId.make("ordinary-worker-name"))?.parent,
+    ).toBeNull();
+    expect(workInboxRows([child])[0]?.parent).toBeNull();
+    const failedChild = shell("failed-child", {
+      ...child.source,
+      id: ThreadId.make("failed-child"),
+      status: "failed",
+      activityRunStatus: null,
+    });
+    expect(workInboxRows([failedChild])[0]).toMatchObject({ attention: true, status: "failed" });
+    const activeChild = shell("active-child", {
+      ...child.source,
+      id: ThreadId.make("active-child"),
+      status: "queued",
+      activityRunStatus: "running",
+    });
+    expect(workInboxRows([activeChild])[0]).toMatchObject({
+      attention: false,
+      status: "coordinator-input",
+    });
+
+    expect(workInboxRows([child, shell("parent", {}, remote)])[0]?.parent).toBeNull();
+    expect(workInboxRows([child, { ...parent, archivedAt: "2026-01-01" }])[0]?.parent).toBeNull();
+    const approval = {
+      ...child,
+      source: { ...child.source, pendingRuntimeRequest: { ...request, kind: "command" as const } },
+    };
+    expect(workInboxRows([approval])[0]).toMatchObject({ attention: true, status: "approval" });
+    const native = {
+      ...approval,
+      source: { ...approval.source, creationSource: "provider" as const },
+    };
+    expect(workInboxRows([native])[0]).toMatchObject({ attention: false, requestKey: null });
+    const delegated = shell("parent", {
+      delegatedFrom: { environmentId: remote, threadId: parent.id, title: "Remote parent" },
+      pendingRuntimeRequest: request,
+    });
+    expect(workInboxRows([delegated, shell("parent", {}, remote)])[0]?.parent?.environmentId).toBe(
+      remote,
+    );
+  });
+
+  it("reports activity and failure without inferring Task progress or completion", () => {
+    const rows = workInboxRows([
+      shell("idle"),
+      shell("failed", { status: "failed" }),
+      shell("running", { status: "running" }),
+      shell("done", { status: "completed" }),
+      shell("deleted", { deletedAt: v2Now }),
+    ]);
+    expect(rows.map((row) => row.thread.id)).not.toContain(ThreadId.make("deleted"));
+    expect(rows.find((row) => row.thread.id === ThreadId.make("failed"))).toMatchObject({
+      attention: true,
+      status: "failed",
+    });
+    expect(rows.find((row) => row.thread.id === ThreadId.make("running"))?.status).toBe("running");
+    expect(rows.find((row) => row.thread.id === ThreadId.make("done"))?.status).toBe("idle");
   });
 });

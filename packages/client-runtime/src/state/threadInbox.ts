@@ -1,4 +1,6 @@
 // @effect-diagnostics globalTimers:off - Shelf placement timers run in web and native clients, outside an Effect runtime.
+import { isProviderNativeSubagentThread } from "@t3tools/contracts";
+import { threadKey } from "./entities.ts";
 import { threadRuntimeIsActive, type EnvironmentThreadShell } from "./models.ts";
 import { toSortableTimestamp } from "./threadSort.ts";
 import { effectiveSnoozed } from "./threadSettled.ts";
@@ -242,4 +244,108 @@ export function createInboxReturnTracker() {
       states.get(keyOf(thread))?.working ?? isThreadWorking(thread),
     returnedAt: (thread: ThreadKeyInput) => returns.get(keyOf(thread)),
   };
+}
+
+export type WorkInboxStatus =
+  | "approval"
+  | "input"
+  | "guest"
+  | "authentication"
+  | "failed"
+  | "limited"
+  | "preparing"
+  | "queued"
+  | "running"
+  | "waiting"
+  | "coordinator-input"
+  | "idle";
+
+function observedStatus(thread: EnvironmentThreadShell): WorkInboxStatus {
+  const request = thread.source.pendingRuntimeRequest;
+  if (
+    request !== null &&
+    request.kind !== "dynamic_tool_call" &&
+    !isProviderNativeSubagentThread(thread.source)
+  ) {
+    if (request.kind === "auth_refresh") return "authentication";
+    if (request.kind !== "user_input") return "approval";
+    const coordinatorOwned =
+      thread.lineage.sideChat !== true &&
+      (thread.lineage.relationshipToParent === "subagent" || thread.delegatedFrom !== null);
+    if (!coordinatorOwned) return "input";
+    const childLive =
+      thread.source.activityRunStatus !== undefined
+        ? thread.source.activityRunStatus !== null
+        : ["preparing", "starting", "running", "waiting"].includes(thread.source.status);
+    if (childLive) return "coordinator-input";
+  }
+  if ((thread.pendingGuestMessageCount ?? 0) > 0) return "guest";
+  if (thread.runtime?.status === "failed") {
+    return thread.runtime.lastErrorClass === "usage_limit" ? "limited" : "failed";
+  }
+  if (thread.blockedOnThreadWait === true) return "waiting";
+  switch (thread.runtime?.status) {
+    case "preparing":
+      return "preparing";
+    case "queued":
+      return "queued";
+    case "starting":
+    case "running":
+      return "running";
+    case "waiting":
+      return "waiting";
+    default:
+      return "idle";
+  }
+}
+
+const needsAttention = (status: WorkInboxStatus) =>
+  status === "approval" ||
+  status === "input" ||
+  status === "guest" ||
+  status === "authentication" ||
+  status === "failed" ||
+  status === "limited";
+
+export function workInboxRows(threads: ReadonlyArray<EnvironmentThreadShell>) {
+  // Resolve relationships only within the caller's authorized, tag-filtered shells.
+  const visible = new Map(
+    threads
+      .filter((thread) => thread.deletedAt === null)
+      .map(
+        (thread) =>
+          [
+            threadKey({ environmentId: thread.environmentId, threadId: thread.id }),
+            thread,
+          ] as const,
+      ),
+  );
+  return [...visible.entries()].map(([key, thread]) => {
+    const status = observedStatus(thread);
+    const parentRef =
+      thread.delegatedFrom ??
+      ((thread.lineage.relationshipToParent === "subagent" || thread.lineage.sideChat === true) &&
+      thread.lineage.parentThreadId !== null
+        ? { environmentId: thread.environmentId, threadId: thread.lineage.parentThreadId }
+        : null);
+    const candidate = parentRef === null ? null : (visible.get(threadKey(parentRef)) ?? null);
+    const parent =
+      candidate?.archivedAt === null &&
+      (candidate.id !== thread.id || candidate.environmentId !== thread.environmentId)
+        ? candidate
+        : null;
+    const request = thread.source.pendingRuntimeRequest;
+    return {
+      key,
+      thread,
+      status,
+      parent,
+      attention: needsAttention(status),
+      requestKey:
+        request !== null &&
+        (status === "approval" || status === "input" || status === "authentication")
+          ? JSON.stringify([thread.environmentId, thread.id, request.id])
+          : null,
+    };
+  });
 }

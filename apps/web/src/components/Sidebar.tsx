@@ -79,7 +79,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from "react";
-import { type AnyRouter, useRouter } from "@tanstack/react-router";
+import { type AnyRouter, Link, useRouter } from "@tanstack/react-router";
 
 import {
   isAtomCommandInterrupted,
@@ -2956,6 +2956,9 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
         className="min-h-full"
         fixedHeader={
           <SidebarGroup className="z-[1]">
+            <Button variant="ghost" render={<Link to="/work" />}>
+              Work inbox
+            </Button>
             <SidebarThreadHeader
               hasProjects={projectGroups.length > 0}
               projectScope={
