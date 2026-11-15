@@ -1,8 +1,11 @@
 import { useAtomValue } from "@effect/atom-react";
 import { Link } from "@tanstack/react-router";
 import { workInboxRows, type WorkInboxStatus } from "@t3tools/client-runtime/state/thread-inbox";
-import { threadKey } from "@t3tools/client-runtime/state/entities";
-import { useState } from "react";
+import { parseThreadKey, threadKey } from "@t3tools/client-runtime/state/entities";
+import { useEffect, useState } from "react";
+import { AsyncResult } from "effect/reactivity";
+import { threadFamilies } from "../state/threads";
+import { appAtomRegistry } from "../rpc/atomRegistry";
 import { useQuietThreadShells, useProjects } from "../state/entities";
 import { useEnvironments } from "../state/environments";
 import { liveShellEnvironmentIdsAtom } from "../state/shell";
@@ -24,6 +27,21 @@ const labels: Record<WorkInboxStatus, string> = {
   "coordinator-input": "Waiting for coordinator",
   idle: "No active run",
 };
+
+function RelatedFamily({ selected }: { selected: string }) {
+  const ref = parseThreadKey(selected);
+  const result = useAtomValue(threadFamilies.familyAtom(ref.environmentId, ref.threadId));
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- retains the selected family's shell rows only while its related view is open
+  useEffect(
+    () => threadFamilies.mount(appAtomRegistry, ref.environmentId, ref.threadId),
+    [ref.environmentId, ref.threadId],
+  );
+  return result.waiting || AsyncResult.isInitial(result) ? (
+    <p role="status">Loading related conversations…</p>
+  ) : AsyncResult.isFailure(result) ? (
+    <p role="alert">Related conversations could not be loaded. Clear the filter and try again.</p>
+  ) : null;
+}
 
 export function WorkInbox() {
   const threads = useQuietThreadShells();
@@ -49,7 +67,11 @@ export function WorkInbox() {
         row.key === related ||
         (row.parent !== null &&
           threadKey({ environmentId: row.parent.environmentId, threadId: row.parent.id }) ===
-            related)) &&
+            related) ||
+        threadKey({
+          environmentId: row.thread.environmentId,
+          threadId: row.thread.source.lineage.rootThreadId,
+        }) === related) &&
       (view === "all" ||
         (view === "attention" ? row.attention : !row.attention && row.status !== "idle")),
   );
@@ -154,6 +176,7 @@ export function WorkInbox() {
             </Button>
           )}
         </div>
+        {related !== null && <RelatedFamily selected={related} />}
         {shown.length === 0 ? (
           <p className="text-sm text-muted-foreground">
             No matching loaded conversations. Hidden threads follow your existing visibility
@@ -188,6 +211,19 @@ export function WorkInbox() {
                       ?.title ?? "Project unavailable"}
                     {thread.archivedAt !== null ? " · Archived" : ""}
                   </p>
+                  {row.parent === null && (
+                    <Button
+                      size="compact"
+                      variant="ghost"
+                      onClick={() => {
+                        setRelated(row.key);
+                        setView("all");
+                        reset();
+                      }}
+                    >
+                      Show related
+                    </Button>
+                  )}
                   {row.parent !== null && (
                     <div className="flex flex-wrap items-center gap-2 text-xs">
                       <span>Related to</span>

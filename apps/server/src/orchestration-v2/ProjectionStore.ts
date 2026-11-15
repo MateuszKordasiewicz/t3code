@@ -7374,6 +7374,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 AND r.status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
             )
             OR EXISTS (
+              SELECT 1 FROM orchestration_v2_projection_runs failed
+              WHERE failed.run_id = ${presentedShellRunId(sql.literal("t.thread_id"))}
+                AND failed.status = 'failed'
+            )
+            OR EXISTS (
               SELECT 1 FROM orchestration_v2_projection_runtime_requests request
               WHERE request.thread_id = t.thread_id AND request.status = 'pending'
             )

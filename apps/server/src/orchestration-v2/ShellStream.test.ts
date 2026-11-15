@@ -166,6 +166,8 @@ describe("omitIdleSubagentShells", () => {
     const threads = [
       row("root", null),
       row("idle", "root"),
+      row("failed", "root", { status: "failed" }),
+      row("orphan", "missing"),
       row("running", "root", { activityRunStatus: "running" }),
       row("queued", "root", { status: "queued" }),
       row("asking", "root", {
@@ -184,6 +186,8 @@ describe("omitIdleSubagentShells", () => {
     ];
     expect(omitIdleSubagentShells(threads).map((thread) => thread.id)).toEqual([
       "root",
+      "failed",
+      "orphan",
       "running",
       "queued",
       "asking",

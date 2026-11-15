@@ -158,7 +158,8 @@ const assertShellIndexCoversShells = Effect.fnUntraced(function* () {
   });
   assert.deepEqual(index.map(trimmed), shells.map(trimmed));
   shells.forEach((shell, position) => {
-    if (isLiveSubagentShell(shell)) assert.isTrue(index[position]?.mayBeLive, shell.id);
+    if (isLiveSubagentShell(shell) || shell.status === "failed")
+      assert.isTrue(index[position]?.mayBeLive, shell.id);
   });
 });
 
@@ -5590,6 +5591,10 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
           (yield* presented).map((shell) => shell.latestRunId),
           [runId, runId],
         );
+        assert.isTrue(
+          (yield* projectionStore.listActiveShellIndex()).find((row) => row.id === threadId)
+            ?.mayBeLive,
+        );
         yield* setRunStatus("running");
 
         // Claude can finish the run successfully even when its /compact failed.
@@ -5626,6 +5631,27 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
             silent ? { ...shell, latestUserMessageAt: false } : shell,
           ),
         );
+        if (!silent) {
+          yield* setRunStatus("failed");
+          const recovered = {
+            ...running,
+            id: RunId.make(`${runId}:recovered`),
+            ordinal: running.ordinal + 1,
+            status: "completed" as const,
+            completedAt: now,
+          };
+          yield* projectionStore.apply({
+            id: EventId.make(`event:${key}:recovered`),
+            type: "run.updated",
+            threadId,
+            occurredAt: now,
+            payload: recovered,
+          });
+          assert.isFalse(
+            (yield* projectionStore.listActiveShellIndex()).find((row) => row.id === threadId)
+              ?.mayBeLive,
+          );
+        }
       }),
   );
 

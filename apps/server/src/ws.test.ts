@@ -478,8 +478,28 @@ it.effect("shell groups read distinct threads once and keep each event's own seq
 
     const shellReads: Array<ReadonlyArray<string> | undefined> = [];
     let batchFails = false;
-    const collect = (afterSequence: number) =>
-      subscribeOrchestrationV2Shell({ afterSequence, requestCompletionMarker: true }).pipe(
+    let orphanRefreshes = 0;
+    const orphan = {
+      ...shell("thread:orphan"),
+      projectId: ProjectId.make("project:group"),
+      status: "completed",
+      activityRunStatus: null,
+      pendingRuntimeRequest: null,
+      pendingBackgroundTasks: [],
+      settledOverride: null,
+      settledAt: null,
+      lineage: {
+        parentThreadId: ThreadId.make("thread:archived"),
+        rootThreadId: ThreadId.make("thread:archived"),
+        relationshipToParent: "subagent",
+      },
+    } as OrchestrationV2ThreadShell;
+    const collect = (afterSequence: number, omitIdleSubagents = false) =>
+      subscribeOrchestrationV2Shell({
+        afterSequence,
+        requestCompletionMarker: true,
+        omitIdleSubagents,
+      }).pipe(
         Effect.flatMap((stream) =>
           stream.pipe(
             Stream.takeUntil((item) => item.kind === "synchronized"),
@@ -488,6 +508,18 @@ it.effect("shell groups read distinct threads once and keep each event's own seq
         ),
         Effect.provideService(ThreadManagement.ThreadManagementService, {
           listActiveSubagentThreadIds: () => Effect.succeed([]),
+          listActiveShellIndex: () =>
+            Effect.succeed([{ ...orphan, mayBeLive: false, pinnedAt: null, snoozedUntil: null }]),
+          readShellSnapshot: () =>
+            Effect.sync(() => {
+              orphanRefreshes += 1;
+              return Effect.succeed({
+                schemaVersion: 1,
+                snapshotSequence: missing,
+                threads: [orphan],
+                archivedThreads: [],
+              });
+            }),
           getShellSnapshot: (options?: { readonly threadIds?: ReadonlyArray<string> }) =>
             Effect.suspend(() => {
               shellReads.push(options?.threadIds);
@@ -548,6 +580,17 @@ it.effect("shell groups read distinct threads once and keep each event's own seq
       ["thread.removed", missing, "thread:missing"],
     ];
 
+    const refreshed = yield* collect(after, true);
+    assert.equal(orphanRefreshes, 1);
+    assert.deepEqual(
+      refreshed.flatMap((item) =>
+        item.kind === "snapshot" && item.snapshot.threads.some((thread) => thread.id === orphan.id)
+          ? [orphan.id]
+          : [],
+      ),
+      [orphan.id],
+    );
+    shellReads.length = 0;
     assert.deepEqual(yield* collectSummary(after), expectedGroup);
     assert.deepEqual(shellReads, [["thread:archived", "thread:active", "thread:missing"]]);
 
@@ -696,6 +739,8 @@ it.effect("shell snapshots omit idle children and older settled threads only on 
       shell("parent", null, null),
       shell("idle", "parent", null),
       shell("live", "parent", "running"),
+      { ...shell("failed", "parent", null), status: "failed" as const },
+      shell("orphan", "absent", null),
       ...Array.from({ length: 25 }, (_, index) => shell(`recent-${index}`, null, null, 1)),
       shell("old", null, null, 30),
     ];
@@ -713,7 +758,7 @@ it.effect("shell snapshots omit idle children and older settled threads only on 
                 ...thread,
                 pinnedAt: null,
                 snoozedUntil: null,
-                mayBeLive: thread.activityRunStatus !== null,
+                mayBeLive: thread.activityRunStatus !== null || thread.status === "failed",
               })),
             ),
           readShellSnapshot: (options?: { readonly threadIds?: ReadonlyArray<string> }) =>
@@ -747,7 +792,7 @@ it.effect("shell snapshots omit idle children and older settled threads only on 
         ),
       );
 
-    const recent = threads.slice(3, 28).map((thread) => thread.id);
+    const recent = threads.slice(5, 30).map((thread) => thread.id);
     const full = yield* firstSnapshot({});
     assert.deepEqual(
       full?.threads.map((thread) => thread.id),
@@ -757,12 +802,12 @@ it.effect("shell snapshots omit idle children and older settled threads only on 
     const withoutChildren = yield* firstSnapshot({ omitIdleSubagents: true });
     assert.deepEqual(
       withoutChildren?.threads.map((thread) => thread.id),
-      ["parent", "live", ...recent, "old"],
+      ["parent", "live", "failed", "orphan", ...recent, "old"],
     );
     const withoutOld = yield* firstSnapshot({ omitIdleSubagents: true, omitOlderSettled: true });
     assert.deepEqual(
       withoutOld?.threads.map((thread) => thread.id),
-      ["parent", "live", ...recent],
+      ["parent", "live", "failed", "orphan", ...recent],
     );
     assert.deepEqual(withoutOld?.olderSettled?.counts, [
       { projectId: ProjectId.make("project"), count: 1 },

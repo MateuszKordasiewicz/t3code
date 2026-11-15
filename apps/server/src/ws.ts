@@ -1247,6 +1247,30 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
         skipUnchangedThreadShells,
       );
 
+    const refreshOrphans = <E, R>(stream: Stream.Stream<OrchestrationV2ShellStreamItem, E, R>) =>
+      Stream.unwrap(
+        Effect.gen(function* () {
+          const refreshedThrough = yield* Ref.make(0);
+          return stream.pipe(
+            Stream.flatMap((item) => {
+              if (!input.omitIdleSubagents || item.kind !== "thread.removed")
+                return Stream.succeed(item);
+              // One authoritative refresh covers every removal already committed in the same batch.
+              return Stream.unwrap(
+                Effect.gen(function* () {
+                  if (item.sequence <= (yield* Ref.get(refreshedThrough))) return Stream.empty;
+                  const loaded = yield* loadSnapshot();
+                  yield* Ref.set(refreshedThrough, loaded.snapshot.snapshotSequence);
+                  return Stream.fromIterable<OrchestrationV2ShellStreamItem>(
+                    shellStreamItemsFromInitialSnapshot(loaded),
+                  );
+                }),
+              );
+            }),
+          );
+        }),
+      );
+
     const liveFrom = (afterSequence: number) =>
       bufferShellLiveStream(
         toShellStream(
@@ -1256,7 +1280,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
             filter: filterSubagentTranscript,
           }),
         ),
-      );
+      ).pipe(refreshOrphans);
 
     const enrichmentRefreshes = Stream.fromSubscription(enrichmentChanges).pipe(
       Stream.filter((change) => change.repositoryIdentityResolved),
@@ -1365,7 +1389,7 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
       if (input.afterSequence < (yield* applicationEvents.prunedThroughSequence)) {
         return yield* fromSnapshot;
       }
-      const replay = toShellStream(Stream.fromIterable(replayed));
+      const replay = toShellStream(Stream.fromIterable(replayed)).pipe(refreshOrphans);
       return composeShellStreamWithEnrichment({
         initial: initialEnrichmentItems(loaded),
         tail: Stream.concat(Stream.concat(replay, completionMarker), liveFrom(highWater)),

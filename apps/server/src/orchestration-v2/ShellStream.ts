@@ -83,6 +83,7 @@ type ShellTrimRow = Pick<
  */
 interface ShellTrimFacts {
   readonly subagentParentIds: ReadonlySet<string>;
+  readonly activeThreadIds: ReadonlySet<string>;
   readonly subagentThreadIds: Set<string>;
   /** Undefined when no thread is settled, so none is older. */
   readonly olderSettledBeforeMs: number | undefined;
@@ -120,6 +121,7 @@ function shellTrimFacts(rows: ReadonlyArray<ShellTrimRow>): ShellTrimFacts {
   }
   return {
     subagentParentIds,
+    activeThreadIds: new Set(rows.map((row) => row.id)),
     subagentThreadIds,
     olderSettledBeforeMs,
     olderSettledCounts: Array.from(counts, ([projectId, count]) => ({ projectId, count })),
@@ -140,12 +142,14 @@ function hiddenChildAncestorIds(
 
 function omitIdleSubagentShellsWith(
   threads: ReadonlyArray<OrchestrationV2ThreadShell>,
-  facts: Pick<ShellTrimFacts, "subagentParentIds">,
+  facts: Pick<ShellTrimFacts, "subagentParentIds" | "activeThreadIds">,
 ): ReadonlyArray<OrchestrationV2ThreadShell> {
   return threads.filter(
     (thread) =>
       thread.lineage.relationshipToParent !== "subagent" ||
       isLiveSubagentShell(thread) ||
+      thread.status === "failed" ||
+      !facts.activeThreadIds.has(thread.lineage.parentThreadId ?? "") ||
       facts.subagentParentIds.has(thread.id),
   );
 }
@@ -261,7 +265,10 @@ function shellSubscriberThreadIds(
   const subagents = index.filter(
     (entry) =>
       entry.lineage.relationshipToParent === "subagent" &&
-      (!options.omitIdleSubagents || entry.mayBeLive || facts.subagentParentIds.has(entry.id)),
+      (!options.omitIdleSubagents ||
+        entry.mayBeLive ||
+        !facts.activeThreadIds.has(entry.lineage.parentThreadId ?? "") ||
+        facts.subagentParentIds.has(entry.id)),
   );
   const ancestorIds = hiddenChildAncestorIds([
     ...subagents,
