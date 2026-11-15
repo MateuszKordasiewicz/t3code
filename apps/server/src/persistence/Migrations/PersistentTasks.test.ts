@@ -27,6 +27,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
     assert.deepInclude(migrations, [89, "WorkTaskValidationIdentity"]);
     assert.deepInclude(migrations, [90, "WorkTaskValidationReplay"]);
     assert.deepInclude(migrations, [91, "WorkTaskReviewOutcomes"]);
+    assert.deepInclude(migrations, [92, "WorkTaskSharedManagerBindings"]);
     const tables = yield* sql<{ readonly name: string }>`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'work_task_%' ORDER BY name
     `;
@@ -91,6 +92,7 @@ it.effect("upgrades predecessor rows and events without changing their bytes or 
       [89, "WorkTaskValidationIdentity"],
       [90, "WorkTaskValidationReplay"],
       [91, "WorkTaskReviewOutcomes"],
+      [92, "WorkTaskSharedManagerBindings"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM projection_projects ORDER BY project_id`,
@@ -132,6 +134,7 @@ it.effect("rolls back a failed migration and succeeds on rerun", () =>
       [89, "WorkTaskValidationIdentity"],
       [90, "WorkTaskValidationReplay"],
       [91, "WorkTaskReviewOutcomes"],
+      [92, "WorkTaskSharedManagerBindings"],
     ]);
     assert.deepStrictEqual(yield* runMigrations(), []);
   }).pipe(Effect.provide(db)),
@@ -254,6 +257,7 @@ it.effect(
         [89, "WorkTaskValidationIdentity"],
         [90, "WorkTaskValidationReplay"],
         [91, "WorkTaskReviewOutcomes"],
+        [92, "WorkTaskSharedManagerBindings"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -280,7 +284,7 @@ it.effect("constrains manager custody, source identity and finite wake reservati
     assert.isTrue(
       Exit.isFailure(
         yield* Effect.exit(
-          sql`INSERT INTO work_task_manager_bindings VALUES ('b', 1, 'manager1', 't', NULL)`,
+          sql`INSERT INTO work_task_manager_bindings VALUES ('a', 2, 'manager1', 't', 't')`,
         ),
       ),
     );
@@ -418,6 +422,7 @@ it.effect("preserves task custody through validation upgrade and rolls back migr
       [89, "WorkTaskValidationIdentity"],
       [90, "WorkTaskValidationReplay"],
       [91, "WorkTaskReviewOutcomes"],
+      [92, "WorkTaskSharedManagerBindings"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -555,6 +560,7 @@ it.effect("upgrades validation data atomically to action reviews and preserves p
       [89, "WorkTaskValidationIdentity"],
       [90, "WorkTaskValidationReplay"],
       [91, "WorkTaskReviewOutcomes"],
+      [92, "WorkTaskSharedManagerBindings"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -768,6 +774,7 @@ it.effect("upgrades existing tasks without inventing state and rolls back migrat
       [89, "WorkTaskValidationIdentity"],
       [90, "WorkTaskValidationReplay"],
       [91, "WorkTaskReviewOutcomes"],
+      [92, "WorkTaskSharedManagerBindings"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -866,6 +873,7 @@ it.effect("upgrades waits atomically while preserving task state and link proven
       [89, "WorkTaskValidationIdentity"],
       [90, "WorkTaskValidationReplay"],
       [91, "WorkTaskReviewOutcomes"],
+      [92, "WorkTaskSharedManagerBindings"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM work_task_thread_links ORDER BY link_event_id`,
@@ -991,6 +999,7 @@ it.effect("upgrades result history atomically without changing predecessor data"
       [89, "WorkTaskValidationIdentity"],
       [90, "WorkTaskValidationReplay"],
       [91, "WorkTaskReviewOutcomes"],
+      [92, "WorkTaskSharedManagerBindings"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_current_state`, state);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_thread_links`, links);
@@ -1132,6 +1141,7 @@ it.effect("upgrades claim history atomically and preserves prior task and ordina
       [89, "WorkTaskValidationIdentity"],
       [90, "WorkTaskValidationReplay"],
       [91, "WorkTaskReviewOutcomes"],
+      [92, "WorkTaskSharedManagerBindings"],
     ]);
     assert.deepStrictEqual(
       yield* Effect.forEach(tables, (name) => sql.unsafe(`SELECT * FROM ${name}`)),
@@ -1310,7 +1320,7 @@ it.effect(
         sql`INSERT OR REPLACE INTO work_task_claims VALUES ('new-event', 'a', 'claim', 'changed', 'm1', 1, 2, 1, 0, '{"type":"server"}', 's', '[{"type":"run","threadId":"t","runId":"r"}]', 1, 't')`,
         sql`INSERT OR REPLACE INTO work_task_claims VALUES ('new-event', 'a', 'new-claim', 'e', 'm1', 1, 1, 1, 0, '{"type":"server"}', 's', '[{"type":"run","threadId":"t","runId":"r"}]', 1, 't')`,
         sql`INSERT OR REPLACE INTO work_task_manager_bindings VALUES ('a', 1, 'changed', 't', 't')`,
-        sql`INSERT OR REPLACE INTO work_task_manager_bindings VALUES ('b', 2, 'm1', 't', 't')`,
+        sql`INSERT OR REPLACE INTO work_task_manager_bindings VALUES ('a', 5, 'm1', 't', 't')`,
         sql`INSERT OR REPLACE INTO work_task_manager_bindings VALUES ('a', 3, 'new-current', 't', NULL)`,
         sql`INSERT INTO work_task_validation_identity VALUES (NULL, 'a', 'claim', 2)`,
         sql`INSERT INTO work_task_validation_identity VALUES ('v2', NULL, 'claim', 2)`,
@@ -1469,6 +1479,7 @@ it.effect("preserves legacy validation rows and rolls replay migration back befo
     assert.deepStrictEqual(yield* runMigrations(), [
       [90, "WorkTaskValidationReplay"],
       [91, "WorkTaskReviewOutcomes"],
+      [92, "WorkTaskSharedManagerBindings"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_attempts`, before);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_claims`, claims);
@@ -1945,7 +1956,9 @@ it.effect("preserves review evidence on upgrade and binds append-only outcomes a
       [],
     );
     yield* sql`DROP INDEX work_task_reviews_history_idx`;
-    assert.deepStrictEqual(yield* runMigrations(), [[91, "WorkTaskReviewOutcomes"]]);
+    assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 91 }), [
+      [91, "WorkTaskReviewOutcomes"],
+    ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_action_reviews`, reviews);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_action_review_decisions`, decisions);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_action_review_releases`, releases);
@@ -2549,6 +2562,133 @@ it.effect("preserves review evidence on upgrade and binds append-only outcomes a
     }>`EXPLAIN QUERY PLAN SELECT * FROM work_task_review_outcomes WHERE task_id = 'a' ORDER BY sequence DESC, review_id DESC LIMIT 10`;
     assert.isTrue(historyPlan.some((row) => row.detail.includes("INDEX")));
     assert.isFalse(historyPlan.some((row) => row.detail.includes("TEMP B-TREE")));
+    assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 91 }), []);
+    yield* sql`INSERT INTO work_task_waits VALUES ('a','migration-wait',1,'{"type":"source","sourceId":"source"}','registered',101,'t')`;
+    const tables = yield* sql<{
+      readonly name: string;
+    }>`SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'work_task_%' ORDER BY name`;
+    const snapshot = Effect.fn("PersistentTasks.snapshotBindingsUpgrade")(function* () {
+      const rows: Record<string, readonly string[]> = {};
+      for (const table of tables) {
+        const data = yield* sql.unsafe(`SELECT * FROM "${table.name.replaceAll('"', '""')}"`);
+        rows[table.name] = data.map((row) => JSON.stringify(row)).toSorted();
+      }
+      return rows;
+    });
+    const before = yield* snapshot();
+    const bindingSchema =
+      yield* sql`SELECT sql FROM sqlite_master WHERE name = 'work_task_manager_bindings'`;
+    yield* sql`CREATE INDEX work_task_manager_thread_history_idx ON work_task_projections(task_id)`;
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(runMigrations())));
+    assert.deepStrictEqual(yield* snapshot(), before);
+    assert.deepStrictEqual(
+      yield* sql`SELECT sql FROM sqlite_master WHERE name = 'work_task_manager_bindings'`,
+      bindingSchema,
+    );
+    assert.deepStrictEqual(
+      yield* sql`SELECT migration_id FROM effect_sql_migrations WHERE migration_id = 92`,
+      [],
+    );
+    yield* sql`DROP INDEX work_task_manager_thread_history_idx`;
+    assert.deepStrictEqual(yield* runMigrations(), [[92, "WorkTaskSharedManagerBindings"]]);
+    assert.deepStrictEqual(yield* snapshot(), before);
+    assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
     assert.deepStrictEqual(yield* runMigrations(), []);
+    assert.deepStrictEqual(yield* snapshot(), before);
   }).pipe(Effect.provide(db)),
+);
+
+it.effect(
+  "shares manager threads across tasks while preserving task-local binding identities",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: 91 });
+      yield* sql`INSERT INTO work_task_projections VALUES ('a',NULL,1,1,1,1,'{}','1','1'),('b',NULL,1,1,1,1,'{}','1','1'),('c',NULL,1,1,1,1,'{}','1','1')`;
+      const encoded = JSON.stringify("shared\u0000😀\ud800");
+      yield* sql`INSERT INTO work_task_manager_bindings VALUES ('a',1,json_extract(${encoded},'$'),'bound',NULL),('a',2,'retired','old','retired'),('a',3,'free','old','retired')`;
+      yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('a',1,1,'{}','{}','definition','1')`;
+      yield* sql`INSERT INTO work_task_claims VALUES ('legacy-claim','a','claim','e','retired',2,1,1,0,'{"type":"server"}','legacy','[{"type":"run","threadId":"t","runId":"r"}]',1,'1')`;
+      const bytes =
+        yield* sql`SELECT task_id,generation,hex(thread_id) AS thread,hex(bound_at) AS bound,hex(retired_at) AS retired FROM work_task_manager_bindings ORDER BY task_id,generation`;
+      yield* runMigrations();
+      assert.deepStrictEqual(
+        yield* sql`SELECT task_id,generation,hex(thread_id) AS thread,hex(bound_at) AS bound,hex(retired_at) AS retired FROM work_task_manager_bindings ORDER BY task_id,generation`,
+        bytes,
+      );
+      yield* sql`INSERT INTO work_task_manager_bindings VALUES ('b',1,json_extract(${encoded},'$'),'bound',NULL)`;
+      assert.lengthOf(
+        yield* sql`SELECT * FROM work_task_manager_bindings WHERE thread_id = json_extract(${encoded},'$')`,
+        2,
+      );
+      for (const recursive of [0, 1]) {
+        yield* sql.unsafe(`PRAGMA recursive_triggers = ${recursive}`);
+        const before =
+          yield* sql`SELECT * FROM work_task_manager_bindings ORDER BY task_id,generation`;
+        const rejected = [
+          sql`UPDATE work_task_manager_bindings SET thread_id = 'changed' WHERE task_id = 'a' AND generation = 2`,
+          sql`UPDATE OR REPLACE work_task_manager_bindings SET generation = 2 WHERE task_id = 'a' AND generation = 3`,
+          sql`UPDATE OR REPLACE work_task_manager_bindings SET thread_id = 'retired' WHERE task_id = 'a' AND generation = 3`,
+          sql`UPDATE OR REPLACE work_task_manager_bindings SET generation = 1,thread_id = 'retired' WHERE task_id = 'a' AND generation = 3`,
+          sql`UPDATE OR REPLACE work_task_manager_bindings SET task_id = 'b',generation = 1 WHERE task_id = 'a' AND generation = 3`,
+          sql`UPDATE OR REPLACE work_task_manager_bindings SET retired_at = NULL WHERE task_id = 'a' AND generation = 3`,
+          sql`INSERT OR REPLACE INTO work_task_manager_bindings VALUES ('a',2,'changed','old','retired')`,
+          sql`INSERT OR REPLACE INTO work_task_manager_bindings VALUES ('a',4,'retired','old','retired')`,
+          sql`INSERT OR REPLACE INTO work_task_manager_bindings VALUES ('a',4,'new-current','1',NULL)`,
+          sql`INSERT OR IGNORE INTO work_task_manager_bindings VALUES ('a',2,'changed','old','retired')`,
+          sql`INSERT INTO work_task_manager_bindings VALUES ('a',4,json_extract(${encoded},'$'),'1','retired')`,
+          sql`DELETE FROM work_task_manager_bindings WHERE task_id = 'a' AND generation = 2`,
+          sql`DELETE FROM work_task_manager_bindings WHERE task_id = 'a' AND generation = 3`,
+          sql`INSERT OR REPLACE INTO work_task_manager_bindings (rowid,task_id,generation,thread_id,bound_at) VALUES (1,'c',1,'fresh','1')`,
+          sql`INSERT OR REPLACE INTO work_task_manager_bindings (oid,task_id,generation,thread_id,bound_at) VALUES (1,'c',1,'fresh','1')`,
+          sql`INSERT OR REPLACE INTO work_task_manager_bindings (_rowid_,task_id,generation,thread_id,bound_at) VALUES (1,'c',1,'fresh','1')`,
+          sql`INSERT OR REPLACE INTO work_task_manager_bindings VALUES ('c',1,'fresh','1',NULL),('a',2,'changed','1','retired')`,
+          sql`UPDATE work_task_manager_bindings SET generation = 0 WHERE task_id = 'a' AND generation = 3`,
+          sql`INSERT INTO work_task_manager_bindings VALUES ('missing',1,'missing','1',NULL)`,
+        ];
+        for (const statement of rejected) {
+          assert.isTrue(Exit.isFailure(yield* Effect.exit(statement)));
+          assert.deepStrictEqual(
+            yield* sql`SELECT * FROM work_task_manager_bindings ORDER BY task_id,generation`,
+            before,
+          );
+        }
+        assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+      }
+      yield* sql`UPDATE work_task_manager_bindings SET retired_at = 'retired' WHERE task_id = 'a' AND generation = 1`;
+      yield* sql`INSERT INTO work_task_manager_bindings VALUES ('a',4,'new-manager','next',NULL),('c',1,json_extract(${encoded},'$'),'next',NULL)`;
+      const members = yield* sql<{
+        readonly task_id: string;
+      }>`SELECT task_id FROM work_task_manager_bindings WHERE thread_id = json_extract(${encoded},'$') AND retired_at IS NULL ORDER BY task_id,generation LIMIT 1`;
+      assert.deepStrictEqual(
+        members.map((row) => row.task_id),
+        ["b"],
+      );
+      const nextMembers = yield* sql<{
+        readonly task_id: string;
+      }>`SELECT task_id FROM work_task_manager_bindings WHERE thread_id = json_extract(${encoded},'$') AND retired_at IS NULL AND (task_id,generation) > ('b',1) ORDER BY task_id,generation LIMIT 1`;
+      assert.deepStrictEqual(
+        nextMembers.map((row) => row.task_id),
+        ["c"],
+      );
+      const activePlan = yield* sql<{
+        readonly detail: string;
+      }>`EXPLAIN QUERY PLAN SELECT task_id,generation FROM work_task_manager_bindings WHERE thread_id = json_extract(${encoded},'$') AND retired_at IS NULL AND (task_id,generation) > ('a',1) ORDER BY task_id,generation LIMIT 50`;
+      assert.isTrue(
+        activePlan.some((row) => row.detail.includes("work_task_manager_active_thread_idx")),
+      );
+      assert.isFalse(activePlan.some((row) => row.detail.includes("TEMP B-TREE")));
+      const historyPlan = yield* sql<{
+        readonly detail: string;
+      }>`EXPLAIN QUERY PLAN SELECT task_id,generation FROM work_task_manager_bindings WHERE thread_id = json_extract(${encoded},'$') AND (task_id,generation) > ('a',1) ORDER BY task_id,generation LIMIT 50`;
+      assert.isTrue(
+        historyPlan.some((row) => row.detail.includes("work_task_manager_thread_history_idx")),
+      );
+      assert.isFalse(historyPlan.some((row) => row.detail.includes("TEMP B-TREE")));
+      assert.lengthOf(
+        yield* sql`SELECT * FROM work_task_claims WHERE manager_thread_id = 'retired' AND manager_generation = 2`,
+        1,
+      );
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+    }).pipe(Effect.provide(db)),
 );
