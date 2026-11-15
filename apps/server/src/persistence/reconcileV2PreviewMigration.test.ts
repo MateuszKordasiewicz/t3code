@@ -73,6 +73,7 @@ describe("V2 preview upgrade", () => {
         [91, "WorkTaskReviewOutcomes"],
         [92, "WorkTaskSharedManagerBindings"],
         [93, "WorkTaskDependencies"],
+        [94, "WorkTaskManagerGroups"],
       ]);
       assert.deepStrictEqual(yield* runMigrations(), []);
       assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_legacy_imports`, imports);
@@ -195,6 +196,7 @@ describe("V2 preview upgrade", () => {
         [91, "WorkTaskReviewOutcomes"],
         [92, "WorkTaskSharedManagerBindings"],
         [93, "WorkTaskDependencies"],
+        [94, "WorkTaskManagerGroups"],
       ]);
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );

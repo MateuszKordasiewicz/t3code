@@ -3,6 +3,7 @@ import {
   WorkTaskPersistedEvent,
   WorkTaskGraphEdgeRecord,
   WorkTaskGraphProvenance,
+  WorkTaskGroupControlEvent,
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
@@ -33,6 +34,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
     assert.deepInclude(migrations, [91, "WorkTaskReviewOutcomes"]);
     assert.deepInclude(migrations, [92, "WorkTaskSharedManagerBindings"]);
     assert.deepInclude(migrations, [93, "WorkTaskDependencies"]);
+    assert.deepInclude(migrations, [94, "WorkTaskManagerGroups"]);
     const tables = yield* sql<{ readonly name: string }>`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'work_task_%' ORDER BY name
     `;
@@ -47,7 +49,9 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
         "work_task_claims",
         "work_task_current_state",
         "work_task_graph_edges",
+        "work_task_group_managers",
         "work_task_manager_bindings",
+        "work_task_manager_groups",
         "work_task_projections",
         "work_task_results",
         "work_task_review_events",
@@ -100,6 +104,7 @@ it.effect("upgrades predecessor rows and events without changing their bytes or 
       [91, "WorkTaskReviewOutcomes"],
       [92, "WorkTaskSharedManagerBindings"],
       [93, "WorkTaskDependencies"],
+      [94, "WorkTaskManagerGroups"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM projection_projects ORDER BY project_id`,
@@ -143,6 +148,7 @@ it.effect("rolls back a failed migration and succeeds on rerun", () =>
       [91, "WorkTaskReviewOutcomes"],
       [92, "WorkTaskSharedManagerBindings"],
       [93, "WorkTaskDependencies"],
+      [94, "WorkTaskManagerGroups"],
     ]);
     assert.deepStrictEqual(yield* runMigrations(), []);
   }).pipe(Effect.provide(db)),
@@ -267,6 +273,7 @@ it.effect(
         [91, "WorkTaskReviewOutcomes"],
         [92, "WorkTaskSharedManagerBindings"],
         [93, "WorkTaskDependencies"],
+        [94, "WorkTaskManagerGroups"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -433,6 +440,7 @@ it.effect("preserves task custody through validation upgrade and rolls back migr
       [91, "WorkTaskReviewOutcomes"],
       [92, "WorkTaskSharedManagerBindings"],
       [93, "WorkTaskDependencies"],
+      [94, "WorkTaskManagerGroups"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -572,6 +580,7 @@ it.effect("upgrades validation data atomically to action reviews and preserves p
       [91, "WorkTaskReviewOutcomes"],
       [92, "WorkTaskSharedManagerBindings"],
       [93, "WorkTaskDependencies"],
+      [94, "WorkTaskManagerGroups"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -787,6 +796,7 @@ it.effect("upgrades existing tasks without inventing state and rolls back migrat
       [91, "WorkTaskReviewOutcomes"],
       [92, "WorkTaskSharedManagerBindings"],
       [93, "WorkTaskDependencies"],
+      [94, "WorkTaskManagerGroups"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -887,6 +897,7 @@ it.effect("upgrades waits atomically while preserving task state and link proven
       [91, "WorkTaskReviewOutcomes"],
       [92, "WorkTaskSharedManagerBindings"],
       [93, "WorkTaskDependencies"],
+      [94, "WorkTaskManagerGroups"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM work_task_thread_links ORDER BY link_event_id`,
@@ -1014,6 +1025,7 @@ it.effect("upgrades result history atomically without changing predecessor data"
       [91, "WorkTaskReviewOutcomes"],
       [92, "WorkTaskSharedManagerBindings"],
       [93, "WorkTaskDependencies"],
+      [94, "WorkTaskManagerGroups"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_current_state`, state);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_thread_links`, links);
@@ -1157,6 +1169,7 @@ it.effect("upgrades claim history atomically and preserves prior task and ordina
       [91, "WorkTaskReviewOutcomes"],
       [92, "WorkTaskSharedManagerBindings"],
       [93, "WorkTaskDependencies"],
+      [94, "WorkTaskManagerGroups"],
     ]);
     assert.deepStrictEqual(
       yield* Effect.forEach(tables, (name) => sql.unsafe(`SELECT * FROM ${name}`)),
@@ -1496,6 +1509,7 @@ it.effect("preserves legacy validation rows and rolls replay migration back befo
       [91, "WorkTaskReviewOutcomes"],
       [92, "WorkTaskSharedManagerBindings"],
       [93, "WorkTaskDependencies"],
+      [94, "WorkTaskManagerGroups"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_attempts`, before);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_claims`, claims);
@@ -2609,6 +2623,7 @@ it.effect("preserves review evidence on upgrade and binds append-only outcomes a
     assert.deepStrictEqual(yield* runMigrations(), [
       [92, "WorkTaskSharedManagerBindings"],
       [93, "WorkTaskDependencies"],
+      [94, "WorkTaskManagerGroups"],
     ]);
     assert.deepStrictEqual(yield* snapshot(), before);
     assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
@@ -3004,7 +3019,10 @@ it.effect(
       );
       assert.deepStrictEqual(yield* snapshot(), before);
       yield* sql`DROP INDEX work_task_graph_edges_reverse_idx`;
-      assert.deepStrictEqual(yield* runMigrations(), [[93, "WorkTaskDependencies"]]);
+      assert.deepStrictEqual(yield* runMigrations(), [
+        [93, "WorkTaskDependencies"],
+        [94, "WorkTaskManagerGroups"],
+      ]);
       const after = yield* snapshot();
       assert.deepStrictEqual(
         { ...after, effect_sql_migrations: before.effect_sql_migrations },
@@ -3012,5 +3030,363 @@ it.effect(
       );
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_graph_edges`, []);
       assert.deepStrictEqual(yield* runMigrations(), []);
+    }).pipe(Effect.provide(db)),
+);
+
+const decodeGroupControlEvent = Schema.decodeUnknownSync(WorkTaskGroupControlEvent);
+const emptyGroupControl = (groupId = "group") => ({
+  group: { environmentId: "env", groupId },
+  controlRevision: 0,
+  membershipRevision: 0,
+  highestManagerGeneration: 0,
+  currentManager: null,
+  dispatchHold: "none",
+});
+const groupContext = (id: string) => ({
+  id,
+  environmentId: "env",
+  commandId: `command-${id}`,
+  occurredAt: "2026-11-15T00:00:00.0001Z",
+  performedBy: { subject: "owner", sessionId: "session" },
+});
+const writeGroupControl = Effect.fn("PersistentTasks.writeGroupControl")(function* (
+  event: WorkTaskGroupControlEvent,
+  sequence: number,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const encoded = JSON.stringify(event);
+  if (event.type === "task-group.created") {
+    yield* sql`INSERT INTO work_task_manager_groups
+      (environment_id,group_id,control_revision,membership_revision,highest_manager_generation,current_manager_generation,current_manager_thread_id,dispatch_hold,created_event_id,created_sequence,created_event_json,control_event_id,control_sequence,control_event_json)
+      SELECT json_extract(value,'$.environmentId'),json_extract(value,'$.control.group.groupId'),0,0,0,NULL,NULL,'none',json_extract(value,'$.id'),${sequence},value,json_extract(value,'$.id'),${sequence},value FROM (SELECT ${encoded} AS value)`;
+  } else {
+    yield* sql`UPDATE work_task_manager_groups SET control_revision=json_extract(${encoded},'$.control.controlRevision'),membership_revision=json_extract(${encoded},'$.control.membershipRevision'),highest_manager_generation=json_extract(${encoded},'$.control.highestManagerGeneration'),current_manager_generation=json_extract(${encoded},'$.control.currentManager.managerGeneration'),current_manager_thread_id=json_extract(${encoded},'$.control.currentManager.threadId'),dispatch_hold=json_extract(${encoded},'$.control.dispatchHold'),control_event_id=json_extract(${encoded},'$.id'),control_sequence=${sequence},control_event_json=${encoded} WHERE environment_id=json_extract(${encoded},'$.environmentId') AND group_id=json_extract(${encoded},'$.control.group.groupId')`;
+  }
+});
+const bindGroupManager = Effect.fn("PersistentTasks.bindGroupManager")(function* (
+  event: WorkTaskGroupControlEvent,
+  sequence: number,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const manager = event.control.currentManager;
+  assert.isNotNull(manager);
+  const encoded = JSON.stringify(event);
+  yield* sql`INSERT INTO work_task_group_managers (environment_id,group_id,generation,manager_thread_id,bound_event_id,bound_sequence,bound_event_json,current_generation,current_manager_thread_id)
+    SELECT json_extract(value,'$.environmentId'),json_extract(value,'$.control.group.groupId'),json_extract(value,'$.control.currentManager.managerGeneration'),json_extract(value,'$.control.currentManager.threadId'),json_extract(value,'$.id'),${sequence},value,json_extract(value,'$.control.currentManager.managerGeneration'),json_extract(value,'$.control.currentManager.threadId') FROM (SELECT ${encoded} AS value)`;
+});
+const retireGroupManager = Effect.fn("PersistentTasks.retireGroupManager")(function* (
+  event: WorkTaskGroupControlEvent,
+  sequence: number,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  assert.strictEqual(event.type, "task-group.manager-changed");
+  if (event.type !== "task-group.manager-changed") throw new Error("Expected manager change");
+  const previous = event.previousControl.currentManager!;
+  yield* sql`UPDATE work_task_group_managers SET retired_event_id=${event.id},retired_sequence=${sequence},retired_event_json=${JSON.stringify(event)},current_generation=NULL,current_manager_thread_id=NULL
+    WHERE environment_id=${event.environmentId} AND group_id=${event.control.group.groupId} AND generation=${previous.managerGeneration}`;
+});
+it.effect("keeps group current-manager links commit-consistent and replacement-safe", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations();
+    const initial = emptyGroupControl();
+    const created = decodeGroupControlEvent({
+      ...groupContext("created"),
+      type: "task-group.created",
+      control: initial,
+    });
+    yield* writeGroupControl(created, 1);
+    const bound = decodeGroupControlEvent({
+      ...groupContext("bound"),
+      type: "task-group.manager-changed",
+      previousControl: initial,
+      control: {
+        ...initial,
+        controlRevision: 1,
+        highestManagerGeneration: 1,
+        currentManager: { managerGeneration: 1, threadId: "manager" },
+      },
+    });
+    yield* sql`BEGIN`;
+    yield* writeGroupControl(bound, 2);
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(sql`COMMIT`)));
+    yield* sql`ROLLBACK`;
+    assert.strictEqual(
+      (yield* sql<{
+        control_revision: number;
+      }>`SELECT control_revision FROM work_task_manager_groups`)[0]!.control_revision,
+      0,
+    );
+    yield* sql`BEGIN`;
+    yield* writeGroupControl(bound, 2);
+    yield* bindGroupManager(bound, 2);
+    yield* sql`COMMIT`;
+    let current = bound.control;
+    for (const [index, bindFirst] of [true, false].entries()) {
+      const replacement = decodeGroupControlEvent({
+        ...groupContext(`replacement-${index}`),
+        type: "task-group.manager-changed",
+        previousControl: current,
+        control: {
+          ...current,
+          controlRevision: current.controlRevision + 1,
+          highestManagerGeneration: current.highestManagerGeneration + 1,
+          currentManager: {
+            managerGeneration: current.highestManagerGeneration + 1,
+            threadId: `manager-${index}`,
+          },
+        },
+      });
+      yield* sql`BEGIN`;
+      yield* writeGroupControl(replacement, index + 3);
+      const prematureHold = decodeGroupControlEvent({
+        ...groupContext(`premature-${index}`),
+        type: "task-group.hold-changed",
+        previousControl: replacement.control,
+        control: {
+          ...replacement.control,
+          controlRevision: replacement.control.controlRevision + 1,
+          dispatchHold: "paused",
+        },
+      });
+      assert.isTrue(
+        Exit.isFailure(yield* Effect.exit(writeGroupControl(prematureHold, 20 + index))),
+      );
+      if (bindFirst) {
+        yield* bindGroupManager(replacement, index + 3);
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(sql`COMMIT`)));
+        yield* retireGroupManager(replacement, index + 3);
+      } else {
+        yield* retireGroupManager(replacement, index + 3);
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(sql`COMMIT`)));
+        yield* bindGroupManager(replacement, index + 3);
+      }
+      yield* sql`COMMIT`;
+      current = replacement.control;
+    }
+    const paused = decodeGroupControlEvent({
+      ...groupContext("paused"),
+      type: "task-group.hold-changed",
+      previousControl: current,
+      control: { ...current, controlRevision: current.controlRevision + 1, dispatchHold: "paused" },
+    });
+    yield* writeGroupControl(paused, 5);
+    assert.strictEqual(
+      (yield* sql<{
+        count: number;
+      }>`SELECT count(*) AS count FROM work_task_group_managers WHERE retired_event_id IS NOT NULL`)[0]!
+        .count,
+      2,
+    );
+    yield* sql`INSERT INTO work_task_projections VALUES ('task',NULL,1,1,1,1,'{}','1','1')`;
+    assert.isTrue(
+      Exit.isFailure(
+        yield* Effect.exit(
+          sql`INSERT INTO work_task_manager_bindings VALUES ('task',1,'manager-1','1',NULL)`,
+        ),
+      ),
+    );
+    yield* sql`INSERT INTO work_task_manager_bindings VALUES ('task',1,'legacy','1',NULL)`;
+    const legacyConflict = decodeGroupControlEvent({
+      ...groupContext("legacy-conflict"),
+      type: "task-group.manager-changed",
+      previousControl: paused.control,
+      control: {
+        ...paused.control,
+        controlRevision: paused.control.controlRevision + 1,
+        highestManagerGeneration: 4,
+        currentManager: { managerGeneration: 4, threadId: "legacy" },
+      },
+    });
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(writeGroupControl(legacyConflict, 6))));
+    for (const malformed of [
+      { ...created, id: "bad", extra: true },
+      { ...created, id: "bad", performedBy: { subject: "\t\ufeff", sessionId: "session" } },
+      { ...created, id: "bad", occurredAt: "2026-02-30T00:00:00Z" },
+      { ...created, id: "bad", occurredAt: "2026-11-15T00:00:00Z\0suffix" },
+      {
+        ...created,
+        id: "bad",
+        control: {
+          ...created.control,
+          group: { environmentId: "env", groupId: "bad" },
+          unknown: 1,
+        },
+      },
+    ]) {
+      const encoded = JSON.stringify(malformed);
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`INSERT INTO work_task_manager_groups VALUES ('env','bad',0,0,0,NULL,NULL,'none','bad',30,${encoded},'bad',30,${encoded})`,
+          ),
+        ),
+      );
+    }
+    for (const [id, sequence] of [
+      ["nul\0group", 40],
+      ["😀".repeat(1000), 41],
+      ["\ud800", 42],
+    ] as const) {
+      const accepted = decodeGroupControlEvent({
+        ...groupContext(`unicode-${sequence}`),
+        type: "task-group.created",
+        control: emptyGroupControl(id),
+      });
+      const encoded = JSON.stringify(accepted);
+      yield* sql`WITH input(value) AS (VALUES (${encoded})) INSERT INTO work_task_manager_groups SELECT json_extract(value,'$.environmentId'),json_extract(value,'$.control.group.groupId'),0,0,0,NULL,NULL,'none',json_extract(value,'$.id'),${sequence},value,json_extract(value,'$.id'),${sequence},value FROM input`;
+      const read = yield* sql<{
+        control_event_json: string;
+      }>`SELECT control_event_json FROM work_task_manager_groups WHERE created_sequence=${sequence}`;
+      assert.deepStrictEqual(JSON.parse(read[0]!.control_event_json), accepted);
+    }
+    const empty = decodeGroupControlEvent({
+      ...groupContext("empty"),
+      type: "task-group.created",
+      control: emptyGroupControl("empty"),
+    });
+    yield* writeGroupControl(empty, 50);
+    const unicode = decodeGroupControlEvent({
+      ...groupContext("unicode-manager"),
+      type: "task-group.manager-changed",
+      previousControl: emptyGroupControl("unicode-bound"),
+      control: {
+        ...emptyGroupControl("unicode-bound"),
+        controlRevision: 1,
+        highestManagerGeneration: 1,
+        currentManager: { managerGeneration: 1, threadId: "\ud800-manager" },
+      },
+    });
+    yield* writeGroupControl(
+      decodeGroupControlEvent({
+        ...groupContext("unicode-bound-created"),
+        type: "task-group.created",
+        control: emptyGroupControl("unicode-bound"),
+      }),
+      49,
+    );
+    yield* sql`BEGIN`;
+    yield* writeGroupControl(unicode, 51);
+    yield* bindGroupManager(unicode, 51);
+    yield* sql`COMMIT`;
+    const unicodeHistory = yield* sql<{
+      bound_event_json: string;
+    }>`SELECT bound_event_json FROM work_task_group_managers WHERE bound_sequence=51`;
+    assert.deepStrictEqual(JSON.parse(unicodeHistory[0]!.bound_event_json), unicode);
+    for (const [query, index] of [
+      [
+        "SELECT * FROM work_task_manager_groups WHERE current_manager_thread_id='manager-1'",
+        "work_task_group_current_thread_idx",
+      ],
+      [
+        "SELECT max(generation) FROM work_task_group_managers WHERE environment_id='env' AND group_id='group'",
+        "sqlite_autoindex_work_task_group_managers_2",
+      ],
+      [
+        "SELECT group_id,generation FROM work_task_group_managers WHERE environment_id='env' AND manager_thread_id='manager' ORDER BY group_id,generation",
+        "work_task_group_manager_thread_history_idx",
+      ],
+    ]) {
+      const plan = yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`);
+      assert.isTrue(
+        plan.some((row) => row.detail.includes(index!)),
+        JSON.stringify(plan),
+      );
+      assert.isFalse(plan.some((row) => row.detail.includes("TEMP B-TREE")));
+    }
+    assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+    for (const recursive of [0, 1]) {
+      yield* sql.unsafe(`PRAGMA recursive_triggers=${recursive}`);
+      const fresh = JSON.stringify(
+        decodeGroupControlEvent({
+          ...groupContext(`fresh-${recursive}`),
+          type: "task-group.created",
+          control: emptyGroupControl("empty"),
+        }),
+      );
+      for (const verb of ["INSERT OR REPLACE", "INSERT OR IGNORE"]) {
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              sql.unsafe(
+                `${verb} INTO work_task_manager_groups VALUES ('env','empty',0,0,0,NULL,NULL,'none',?,60,?,?,60,?)`,
+                [`fresh-${recursive}`, fresh, `fresh-${recursive}`, fresh],
+              ),
+            ),
+          ),
+        );
+      }
+
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`INSERT OR REPLACE INTO work_task_manager_groups SELECT * FROM work_task_manager_groups`,
+          ),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            sql`INSERT OR REPLACE INTO work_task_group_managers SELECT * FROM work_task_group_managers`,
+          ),
+        ),
+      );
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(sql`DELETE FROM work_task_group_managers`)));
+    }
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect(
+  "preserves populated predecessor storage through group migration rollback and retry",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: 93 });
+      yield* sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at) VALUES ('p','Project','/a','[ 1, 2 ]','raw','raw')`;
+      yield* sql`INSERT INTO orchestration_v2_projection_threads (thread_id,project_id,title,default_provider,runtime_mode,interaction_mode,created_at,updated_at,payload_json) VALUES ('thread','p','Thread','codex','full-access','default','raw','raw','{ "lineage": [1, 2] }')`;
+      yield* sql`INSERT INTO orchestration_events (event_id,aggregate_kind,stream_id,stream_version,event_type,occurred_at,actor_kind,payload_json,metadata_json) VALUES ('event','thread','thread',1,'thread.created','raw','client','{ "bytes": 1 }','{}')`;
+      yield* sql`INSERT INTO work_task_projections VALUES ('a',NULL,1,1,1,1,'{ "raw": 1 }','raw','raw'),('b',NULL,1,1,1,1,'{}','raw','raw')`;
+      yield* sql`INSERT INTO work_task_manager_bindings VALUES ('a',1,'legacy','raw',NULL)`;
+      yield* insertGraphJson(JSON.stringify(decodeGraphEdge(graphEdge("preserved", 1))), 90);
+      const tables = yield* sql<{
+        name: string;
+      }>`SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`;
+      const capture = Effect.fn("PersistentTasks.captureGroupUpgrade")(function* () {
+        const result: Record<string, readonly string[]> = {};
+        for (const table of tables) {
+          const name = table.name.replaceAll('"', '""');
+          const columns = yield* sql.unsafe<{ name: string }>(`PRAGMA table_info("${name}")`);
+          const expressions = columns.map((column) => {
+            const key = '"' + column.name.replaceAll('"', '""') + '"';
+            return `typeof(${key})||':'||coalesce(hex(CAST(${key} AS BLOB)),'NULL') AS ${key}`;
+          });
+          const rows = yield* sql.unsafe(`SELECT ${expressions.join(",")} FROM "${name}"`);
+          result[table.name] = rows.map((row) => JSON.stringify(row)).toSorted();
+        }
+        return result;
+      });
+      const before = yield* capture();
+      yield* sql`CREATE INDEX work_task_group_current_thread_idx ON work_task_projections(task_id)`;
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(runMigrations())));
+      assert.deepStrictEqual(
+        yield* sql`SELECT name FROM sqlite_master WHERE name IN ('work_task_manager_groups','work_task_group_managers')`,
+        [],
+      );
+      assert.deepStrictEqual(
+        yield* sql`SELECT migration_id FROM effect_sql_migrations WHERE migration_id=94`,
+        [],
+      );
+      assert.deepStrictEqual(yield* capture(), before);
+      yield* sql`DROP INDEX work_task_group_current_thread_idx`;
+      assert.deepStrictEqual(yield* runMigrations(), [[94, "WorkTaskManagerGroups"]]);
+      const after = yield* capture();
+      assert.deepStrictEqual(
+        { ...after, effect_sql_migrations: before.effect_sql_migrations! },
+        before,
+      );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_manager_groups`, []);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_group_managers`, []);
+      assert.deepStrictEqual(yield* runMigrations(), []);
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
     }).pipe(Effect.provide(db)),
 );
