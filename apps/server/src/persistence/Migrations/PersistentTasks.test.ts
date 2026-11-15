@@ -1,5 +1,9 @@
 import { assert, it } from "@effect/vitest";
-import { WorkTaskPersistedEvent } from "@t3tools/contracts";
+import {
+  WorkTaskPersistedEvent,
+  WorkTaskGraphEdgeRecord,
+  WorkTaskGraphProvenance,
+} from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -28,6 +32,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
     assert.deepInclude(migrations, [90, "WorkTaskValidationReplay"]);
     assert.deepInclude(migrations, [91, "WorkTaskReviewOutcomes"]);
     assert.deepInclude(migrations, [92, "WorkTaskSharedManagerBindings"]);
+    assert.deepInclude(migrations, [93, "WorkTaskDependencies"]);
     const tables = yield* sql<{ readonly name: string }>`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'work_task_%' ORDER BY name
     `;
@@ -41,6 +46,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
         "work_task_allowances",
         "work_task_claims",
         "work_task_current_state",
+        "work_task_graph_edges",
         "work_task_manager_bindings",
         "work_task_projections",
         "work_task_results",
@@ -93,6 +99,7 @@ it.effect("upgrades predecessor rows and events without changing their bytes or 
       [90, "WorkTaskValidationReplay"],
       [91, "WorkTaskReviewOutcomes"],
       [92, "WorkTaskSharedManagerBindings"],
+      [93, "WorkTaskDependencies"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM projection_projects ORDER BY project_id`,
@@ -135,6 +142,7 @@ it.effect("rolls back a failed migration and succeeds on rerun", () =>
       [90, "WorkTaskValidationReplay"],
       [91, "WorkTaskReviewOutcomes"],
       [92, "WorkTaskSharedManagerBindings"],
+      [93, "WorkTaskDependencies"],
     ]);
     assert.deepStrictEqual(yield* runMigrations(), []);
   }).pipe(Effect.provide(db)),
@@ -258,6 +266,7 @@ it.effect(
         [90, "WorkTaskValidationReplay"],
         [91, "WorkTaskReviewOutcomes"],
         [92, "WorkTaskSharedManagerBindings"],
+        [93, "WorkTaskDependencies"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -423,6 +432,7 @@ it.effect("preserves task custody through validation upgrade and rolls back migr
       [90, "WorkTaskValidationReplay"],
       [91, "WorkTaskReviewOutcomes"],
       [92, "WorkTaskSharedManagerBindings"],
+      [93, "WorkTaskDependencies"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -561,6 +571,7 @@ it.effect("upgrades validation data atomically to action reviews and preserves p
       [90, "WorkTaskValidationReplay"],
       [91, "WorkTaskReviewOutcomes"],
       [92, "WorkTaskSharedManagerBindings"],
+      [93, "WorkTaskDependencies"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -775,6 +786,7 @@ it.effect("upgrades existing tasks without inventing state and rolls back migrat
       [90, "WorkTaskValidationReplay"],
       [91, "WorkTaskReviewOutcomes"],
       [92, "WorkTaskSharedManagerBindings"],
+      [93, "WorkTaskDependencies"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -874,6 +886,7 @@ it.effect("upgrades waits atomically while preserving task state and link proven
       [90, "WorkTaskValidationReplay"],
       [91, "WorkTaskReviewOutcomes"],
       [92, "WorkTaskSharedManagerBindings"],
+      [93, "WorkTaskDependencies"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM work_task_thread_links ORDER BY link_event_id`,
@@ -1000,6 +1013,7 @@ it.effect("upgrades result history atomically without changing predecessor data"
       [90, "WorkTaskValidationReplay"],
       [91, "WorkTaskReviewOutcomes"],
       [92, "WorkTaskSharedManagerBindings"],
+      [93, "WorkTaskDependencies"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_current_state`, state);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_thread_links`, links);
@@ -1142,6 +1156,7 @@ it.effect("upgrades claim history atomically and preserves prior task and ordina
       [90, "WorkTaskValidationReplay"],
       [91, "WorkTaskReviewOutcomes"],
       [92, "WorkTaskSharedManagerBindings"],
+      [93, "WorkTaskDependencies"],
     ]);
     assert.deepStrictEqual(
       yield* Effect.forEach(tables, (name) => sql.unsafe(`SELECT * FROM ${name}`)),
@@ -1480,6 +1495,7 @@ it.effect("preserves legacy validation rows and rolls replay migration back befo
       [90, "WorkTaskValidationReplay"],
       [91, "WorkTaskReviewOutcomes"],
       [92, "WorkTaskSharedManagerBindings"],
+      [93, "WorkTaskDependencies"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_attempts`, before);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_claims`, claims);
@@ -2590,7 +2606,10 @@ it.effect("preserves review evidence on upgrade and binds append-only outcomes a
       [],
     );
     yield* sql`DROP INDEX work_task_manager_thread_history_idx`;
-    assert.deepStrictEqual(yield* runMigrations(), [[92, "WorkTaskSharedManagerBindings"]]);
+    assert.deepStrictEqual(yield* runMigrations(), [
+      [92, "WorkTaskSharedManagerBindings"],
+      [93, "WorkTaskDependencies"],
+    ]);
     assert.deepStrictEqual(yield* snapshot(), before);
     assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
     assert.deepStrictEqual(yield* runMigrations(), []);
@@ -2690,5 +2709,305 @@ it.effect(
         1,
       );
       assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+    }).pipe(Effect.provide(db)),
+);
+
+const decodeGraphEdge = Schema.decodeUnknownSync(WorkTaskGraphEdgeRecord);
+const decodeGraphProvenance = Schema.decodeUnknownSync(WorkTaskGraphProvenance);
+const graphProvenance = (eventId: string) => ({
+  eventId,
+  commandId: "command",
+  occurredAt: "2026-11-15T00:00:00.0001Z",
+  adoptedBy: { subject: "owner", sessionId: "session" },
+});
+const graphEdge = (edgeId: string, revision: number, dependent = "a", blocker = "b") => ({
+  edgeId,
+  dependent: { environmentId: "env", taskId: dependent },
+  blocker: { environmentId: "env", taskId: blocker },
+  createdGraphRevision: revision,
+  provenance: graphProvenance(`adopt-${edgeId}`),
+});
+const insertGraphJson = Effect.fn("PersistentTasks.insertGraphJson")(function* (
+  encoded: string,
+  sequence: number,
+  mode: "insert" | "replace" | "ignore" = "insert",
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const verb = { insert: "INSERT", replace: "INSERT OR REPLACE", ignore: "INSERT OR IGNORE" }[mode];
+  yield* sql.unsafe(
+    `WITH input(value) AS (VALUES (?)) ${verb} INTO work_task_graph_edges
+    (environment_id,edge_id,dependent_task_id,blocker_task_id,created_graph_revision,adopted_event_id,adopted_sequence,edge_json)
+    SELECT json_extract(value,'$.dependent.environmentId'),json_extract(value,'$.edgeId'),json_extract(value,'$.dependent.taskId'),json_extract(value,'$.blocker.taskId'),json_extract(value,'$.createdGraphRevision'),json_extract(value,'$.provenance.eventId'),?,value FROM input`,
+    [encoded, sequence],
+  );
+});
+const graphRevision = Effect.fn("PersistentTasks.graphRevision")(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const rows = yield* sql<{ revision: number }>`SELECT max(
+    coalesce((SELECT max(created_graph_revision) FROM work_task_graph_edges WHERE environment_id='env'),0),
+    coalesce((SELECT max(removed_graph_revision) FROM work_task_graph_edges WHERE environment_id='env' AND removed_graph_revision IS NOT NULL),0)
+  ) AS revision`;
+  return rows[0]!.revision;
+});
+
+it.effect("keeps native blocker history canonical, immutable and indexed", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations();
+    yield* sql`INSERT INTO work_task_projections VALUES ('a',NULL,1,1,1,1,'{}','1','1'),('b',NULL,1,1,1,1,'{}','1','1'),('c',NULL,1,1,1,1,'{}','1','1')`;
+    assert.strictEqual(yield* graphRevision(), 0);
+    for (const [id, revision, dependent, blocker] of [
+      ["one", 1, "a", "b"],
+      ["two", 2, "c", "b"],
+      ["three", 3, "a", "c"],
+    ] as const)
+      yield* insertGraphJson(
+        JSON.stringify(decodeGraphEdge(graphEdge(id, revision, dependent, blocker))),
+        revision * 10,
+      );
+    const removed = JSON.stringify(decodeGraphProvenance(graphProvenance("remove-three")));
+    yield* sql`UPDATE work_task_graph_edges SET removed_graph_revision=4, removed_event_id='remove-three',removed_sequence=40,removal_provenance_json=${removed} WHERE edge_id='three'`;
+    yield* insertGraphJson(JSON.stringify(decodeGraphEdge(graphEdge("four", 5, "a", "c"))), 50);
+    const normalized = decodeGraphEdge({
+      ...graphEdge("padded", 6, "b", "c"),
+      edgeId: " padded ",
+      provenance: {
+        ...graphProvenance("adopt-padded"),
+        adoptedBy: { subject: " owner ", sessionId: " session " },
+      },
+    });
+    yield* insertGraphJson(JSON.stringify(normalized), 60);
+    assert.strictEqual(yield* graphRevision(), 6);
+    const canonical = yield* sql<{
+      edge_json: string;
+    }>`SELECT edge_json FROM work_task_graph_edges WHERE edge_id='padded'`;
+    assert.deepStrictEqual(JSON.parse(canonical[0]!.edge_json), normalized);
+    const reject = Effect.fn("PersistentTasks.rejectGraph")(function* (
+      effect: Effect.Effect<unknown, SqlError, SqlClient.SqlClient>,
+    ) {
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(effect)));
+      assert.strictEqual(yield* graphRevision(), 6);
+    });
+    for (const edge of [
+      graphEdge("bad", 8, "b", "a"),
+      graphEdge("bad", 6, "b", "a"),
+      graphEdge("bad", Number.MAX_SAFE_INTEGER + 1, "b", "a"),
+      graphEdge("bad", 7, "a", "a"),
+      graphEdge("bad", 7, "missing", "a"),
+      {
+        ...graphEdge("bad", 7, "b", "a"),
+        dependent: { environmentId: "foreign", taskId: "b" },
+        createdGraphRevision: 1,
+      },
+      {
+        ...graphEdge("bad", 7, "b", "a"),
+        provenance: {
+          ...graphProvenance("bad"),
+          adoptedBy: { subject: "\t\ufeff", sessionId: "session" },
+        },
+      },
+      { ...graphEdge("bad", 7, "b", "a"), edgeId: "😀".repeat(1001) },
+      { ...graphEdge("bad", 7, "b", "a"), edgeId: " noncanonical " },
+      {
+        ...graphEdge("bad", 7, "b", "a"),
+        provenance: { ...graphProvenance("bad"), occurredAt: "2026-02-30T00:00:00Z" },
+      },
+      {
+        ...graphEdge("bad", 7, "b", "a"),
+        provenance: { ...graphProvenance("bad"), occurredAt: "2026-11-15T00:00:00Z\0suffix" },
+      },
+      {
+        ...graphEdge("bad", 7, "b", "a"),
+        provenance: { ...graphProvenance("bad"), adoptedBy: { subject: "owner" } },
+      },
+      { ...graphEdge("bad", 7, "b", "a"), extra: "discarded-on-wire" },
+    ])
+      yield* reject(insertGraphJson(JSON.stringify(edge), 70));
+    const validNext = JSON.stringify(graphEdge("bad", 7, "b", "a"));
+    for (const duplicate of [
+      validNext.replace('"edgeId":"bad"', '"edgeId":"bad","edgeId":"other"'),
+      validNext.replace('"subject":"owner"', '"subject":"owner","subject":"other"'),
+      validNext.replace('"eventId":"adopt-bad"', '"eventId":"adopt-bad","eventId":"other"'),
+    ])
+      yield* reject(insertGraphJson(duplicate, 70));
+    yield* reject(insertGraphJson(validNext, 59));
+    const otherEdge = decodeGraphEdge({
+      ...graphEdge("other", 1),
+      dependent: { environmentId: "other-env", taskId: "a" },
+      blocker: { environmentId: "other-env", taskId: "b" },
+    });
+    yield* insertGraphJson(JSON.stringify(otherEdge), 100);
+    yield* sql`UPDATE work_task_graph_edges SET removed_graph_revision=2,removed_event_id='remove-other',removed_sequence=110,removal_provenance_json=${JSON.stringify(graphProvenance("remove-other"))} WHERE environment_id='other-env'`;
+    for (const recursive of [0, 1]) {
+      yield* sql.unsafe(`PRAGMA recursive_triggers=${recursive}`);
+      const beforeReplacement =
+        yield* sql`SELECT * FROM work_task_graph_edges ORDER BY environment_id,edge_id`;
+      for (const mode of ["replace", "ignore"] as const) {
+        yield* reject(
+          insertGraphJson(
+            JSON.stringify({
+              ...graphEdge("one", 7, "b", "a"),
+              provenance: graphProvenance("fresh-replacement"),
+            }),
+            70,
+            mode,
+          ),
+        );
+        yield* reject(
+          insertGraphJson(
+            JSON.stringify({
+              ...graphEdge("replacement", 7, "b", "a"),
+              provenance: graphProvenance("adopt-one"),
+            }),
+            70,
+            mode,
+          ),
+        );
+        yield* reject(
+          insertGraphJson(
+            JSON.stringify({
+              ...graphEdge("replacement", 7, "b", "a"),
+              provenance: graphProvenance("remove-other"),
+            }),
+            70,
+            mode,
+          ),
+        );
+        yield* reject(insertGraphJson(validNext, 100, mode));
+        yield* reject(insertGraphJson(validNext, 110, mode));
+      }
+      yield* reject(
+        sql`UPDATE OR REPLACE work_task_graph_edges SET removed_graph_revision=7,removed_event_id='remove-other',removed_sequence=120,removal_provenance_json=${JSON.stringify(graphProvenance("remove-other"))} WHERE edge_id='two'`,
+      );
+      yield* reject(
+        sql`UPDATE work_task_graph_edges SET removed_graph_revision=7,removed_event_id='multi-remove',removed_sequence=70,removal_provenance_json=${JSON.stringify(graphProvenance("multi-remove"))} WHERE environment_id='env' AND edge_id IN ('one','two')`,
+      );
+      assert.deepStrictEqual(
+        yield* sql`SELECT * FROM work_task_graph_edges ORDER BY environment_id,edge_id`,
+        beforeReplacement,
+      );
+      yield* reject(
+        sql`INSERT OR REPLACE INTO work_task_graph_edges SELECT * FROM work_task_graph_edges WHERE edge_id='one'`,
+      );
+      yield* reject(
+        sql`INSERT OR IGNORE INTO work_task_graph_edges SELECT * FROM work_task_graph_edges WHERE edge_id='one'`,
+      );
+      yield* reject(
+        sql`UPDATE OR REPLACE work_task_graph_edges SET edge_id='one' WHERE edge_id='two'`,
+      );
+      yield* reject(
+        sql`UPDATE OR REPLACE work_task_graph_edges SET removed_graph_revision=7,removed_event_id='adopt-one',removed_sequence=70,removal_provenance_json=${JSON.stringify(graphProvenance("adopt-one"))} WHERE edge_id='two'`,
+      );
+      yield* reject(
+        sql`UPDATE work_task_graph_edges SET removed_graph_revision=NULL,removed_event_id=NULL,removed_sequence=NULL,removal_provenance_json=NULL WHERE edge_id='three'`,
+      );
+      yield* reject(sql`DELETE FROM work_task_graph_edges WHERE edge_id='one'`);
+    }
+    const lone = decodeGraphEdge({
+      ...graphEdge("\0😀\ud800", 7, "b", "a"),
+      provenance: {
+        ...graphProvenance("adopt-lone"),
+        adoptedBy: { subject: "😀".repeat(1000), sessionId: "session" },
+      },
+    });
+    yield* insertGraphJson(JSON.stringify(lone), 70);
+    const readback = yield* sql<{
+      edge_json: string;
+      identity: string;
+    }>`SELECT edge_json,hex(edge_id) AS identity FROM work_task_graph_edges WHERE edge_id=json_extract(${JSON.stringify(lone.edgeId)},'$')`;
+    assert.deepStrictEqual(JSON.parse(readback[0]!.edge_json), lone);
+    assert.strictEqual(readback[0]!.identity, "00F09F9880EDA080");
+    const reverse = yield* sql<{
+      edge_json: string;
+    }>`SELECT edge_json FROM work_task_graph_edges WHERE environment_id='env' AND blocker_task_id='b' AND removed_graph_revision IS NULL AND (dependent_task_id,edge_id)>(json_extract(${JSON.stringify("a")},'$'),json_extract(${JSON.stringify("one")},'$')) ORDER BY dependent_task_id,edge_id LIMIT 50`;
+    assert.deepStrictEqual(
+      reverse.map((row) => JSON.parse(row.edge_json).edgeId),
+      ["two"],
+    );
+    const plans = [
+      yield* sql<{
+        detail: string;
+      }>`EXPLAIN QUERY PLAN SELECT edge_json FROM work_task_graph_edges WHERE environment_id='env' AND dependent_task_id='a' AND removed_graph_revision IS NULL AND (blocker_task_id,edge_id)>('','') ORDER BY blocker_task_id,edge_id LIMIT 50`,
+      yield* sql<{
+        detail: string;
+      }>`EXPLAIN QUERY PLAN SELECT edge_json FROM work_task_graph_edges WHERE environment_id='env' AND blocker_task_id='b' AND removed_graph_revision IS NULL AND (dependent_task_id,edge_id)>('','') ORDER BY dependent_task_id,edge_id LIMIT 50`,
+      yield* sql<{
+        detail: string;
+      }>`EXPLAIN QUERY PLAN SELECT max(created_graph_revision) FROM work_task_graph_edges WHERE environment_id='env'`,
+      yield* sql<{
+        detail: string;
+      }>`EXPLAIN QUERY PLAN SELECT max(removed_graph_revision) FROM work_task_graph_edges WHERE environment_id='env' AND removed_graph_revision IS NOT NULL`,
+      yield* sql<{
+        detail: string;
+      }>`EXPLAIN QUERY PLAN SELECT adopted_sequence FROM work_task_graph_edges WHERE environment_id='env' ORDER BY created_graph_revision DESC LIMIT 1`,
+      yield* sql<{
+        detail: string;
+      }>`EXPLAIN QUERY PLAN SELECT removed_sequence FROM work_task_graph_edges WHERE environment_id='env' AND removed_graph_revision IS NOT NULL ORDER BY removed_graph_revision DESC LIMIT 1`,
+    ];
+    for (const [index, name] of [
+      "forward",
+      "reverse",
+      "created_revision",
+      "removed_revision",
+      "created_revision",
+      "removed_revision",
+    ].entries()) {
+      assert.isTrue(
+        plans[index]!.some((row) => row.detail.includes(`work_task_graph_edges_${name}_idx`)),
+      );
+      assert.isFalse(plans[index]!.some((row) => row.detail.includes("TEMP B-TREE")));
+    }
+    assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+    assert.deepStrictEqual(yield* runMigrations(), []);
+    assert.strictEqual(yield* graphRevision(), 7);
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect(
+  "rolls native graph migration and ledger back before preserving predecessor rows on retry",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: 92 });
+      yield* sql`INSERT INTO work_task_projections VALUES ('a',NULL,1,1,1,1,'{"bytes":"before"}','raw-created','raw-updated')`;
+      yield* sql`UPDATE work_task_view_fence SET generation=9,high_water_sequence=17`;
+      const tables = yield* sql<{
+        name: string;
+      }>`SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`;
+      const snapshot = Effect.fn("PersistentTasks.snapshotGraphUpgrade")(function* () {
+        const rows: Record<string, readonly string[]> = {};
+        for (const table of tables) {
+          const name = table.name.replaceAll('"', '""');
+          const columns = yield* sql.unsafe<{ name: string }>(`PRAGMA table_info("${name}")`);
+          const expressions = columns.map((column) => {
+            const c = '"' + column.name.replaceAll('"', '""') + '"';
+            return `typeof(${c})||':'||coalesce(hex(CAST(${c} AS BLOB)),'NULL') AS ${c}`;
+          });
+          const data = yield* sql.unsafe(`SELECT ${expressions.join(",")} FROM "${name}"`);
+          rows[table.name] = data.map((row) => JSON.stringify(row)).toSorted();
+        }
+        return rows;
+      });
+      const before = yield* snapshot();
+      yield* sql`CREATE INDEX work_task_graph_edges_reverse_idx ON work_task_projections(task_id)`;
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(runMigrations())));
+      assert.deepStrictEqual(
+        yield* sql`SELECT name FROM sqlite_master WHERE name='work_task_graph_edges'`,
+        [],
+      );
+      assert.deepStrictEqual(
+        yield* sql`SELECT migration_id FROM effect_sql_migrations WHERE migration_id=93`,
+        [],
+      );
+      assert.deepStrictEqual(yield* snapshot(), before);
+      yield* sql`DROP INDEX work_task_graph_edges_reverse_idx`;
+      assert.deepStrictEqual(yield* runMigrations(), [[93, "WorkTaskDependencies"]]);
+      const after = yield* snapshot();
+      assert.deepStrictEqual(
+        { ...after, effect_sql_migrations: before.effect_sql_migrations },
+        { ...before },
+      );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_graph_edges`, []);
+      assert.deepStrictEqual(yield* runMigrations(), []);
     }).pipe(Effect.provide(db)),
 );
