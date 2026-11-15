@@ -1887,3 +1887,190 @@ describe("task action review contracts", () => {
     expect(() => state({ type: "approve" })).toThrow();
   });
 });
+
+const decodeGraphProposalInput = Schema.decodeUnknownSync(task.WorkTaskCreateBlockerProposalInput);
+const decodeGraphAdoptionInput = Schema.decodeUnknownSync(task.WorkTaskAddBlockerInput);
+const decodeGraphReadInput = Schema.decodeUnknownSync(task.WorkTaskGraphReadInput);
+const decodeGraphPage = Schema.decodeUnknownSync(task.WorkTaskGraphReadResult);
+const decodeGraphRef = Schema.decodeUnknownSync(task.WorkTaskGraphTaskRef);
+const decodeGraphProposalRecord = Schema.decodeUnknownSync(task.WorkTaskGraphProposalRecord);
+const decodeGraphAddResult = Schema.decodeSync(task.WorkTaskAddBlockerResult);
+const decodeGraphRemoveResult = Schema.decodeSync(task.WorkTaskRemoveBlockerResult);
+const decodeGraphProposalResult = Schema.decodeSync(task.WorkTaskCreateBlockerProposalResult);
+const decodeExistingTaskId = Schema.decodeSync(task.WorkTaskId);
+
+it("bounds passive dependency contracts without accepting caller authority", () => {
+  const ref = { environmentId: "local", taskId: "a" };
+  const blocker = { environmentId: "local", taskId: "b" };
+  const proposal = { dependent: ref, blocker, observedGraphRevision: 0, reason: "needed" };
+  expect(
+    decodeGraphProposalInput({ ...proposal, actor: "human", ready: true, grant: "approve" }),
+  ).toEqual(proposal);
+  expect(
+    decodeGraphAdoptionInput({
+      dependent: ref,
+      blocker,
+      expectedGraphRevision: 0,
+      authority: "human",
+    }),
+  ).toEqual({
+    dependent: ref,
+    blocker,
+    expectedGraphRevision: 0,
+  });
+  for (const endpoint of [ref, { environmentId: " local ", taskId: " a " }]) {
+    expect(() =>
+      decodeGraphAdoptionInput({ dependent: ref, blocker: endpoint, expectedGraphRevision: 0 }),
+    ).toThrow();
+    expect(() => decodeGraphProposalInput({ ...proposal, blocker: endpoint })).toThrow();
+  }
+  expect(
+    decodeGraphAdoptionInput({
+      dependent: ref,
+      blocker: { environmentId: "remote", taskId: "a" },
+      expectedGraphRevision: 0,
+    }).blocker.environmentId,
+  ).toBe("remote");
+  for (const key of ["environmentId", "taskId"] as const) {
+    expect(decodeGraphRef({ ...ref, [key]: "x".repeat(2_000) })[key]).toHaveLength(2_000);
+    for (const value of [" ", "x".repeat(2_001)]) {
+      expect(() => decodeGraphRef({ ...ref, [key]: value })).toThrow();
+    }
+  }
+  expect(decodeExistingTaskId("x".repeat(2_001))).toHaveLength(2_001);
+  for (const revision of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1, Infinity]) {
+    expect(() =>
+      decodeGraphAdoptionInput({ dependent: ref, blocker, expectedGraphRevision: revision }),
+    ).toThrow();
+  }
+  expect(
+    decodeGraphAdoptionInput({
+      dependent: ref,
+      blocker,
+      expectedGraphRevision: Number.MAX_SAFE_INTEGER,
+    }).expectedGraphRevision,
+  ).toBe(Number.MAX_SAFE_INTEGER);
+  expect(decodeGraphReadInput({ task: ref, direction: "dependents" })).toEqual({
+    task: ref,
+    direction: "dependents",
+  });
+  for (const limit of [0, 101, 0.5])
+    expect(() => decodeGraphReadInput({ task: ref, direction: "blockers", limit })).toThrow();
+  expect(
+    decodeGraphReadInput({ task: ref, direction: "blockers", limit: 100, pageToken: "opaque" })
+      .pageToken,
+  ).toBe("opaque");
+  expect(() =>
+    decodeGraphReadInput({ task: ref, direction: "blockers", pageToken: "x".repeat(2_001) }),
+  ).toThrow();
+  const provenance = {
+    eventId: "edge-event",
+    commandId: "command",
+    occurredAt: "2026-11-15T06:00:00Z",
+    adoptedBy: { subject: "user", sessionId: "session" },
+  };
+  const edge = { edgeId: "edge", dependent: ref, blocker, createdGraphRevision: 1, provenance };
+  const snapshot = {
+    sequence: 1,
+    graphRevision: 1,
+    viewGeneration: 2,
+    edges: [edge],
+    nextPageToken: "opaque",
+  };
+  expect(decodeGraphPage(snapshot)).toEqual(snapshot);
+  expect(() => decodeGraphPage({ ...snapshot, graphRevision: 0 })).toThrow();
+  expect(() =>
+    decodeGraphPage({
+      ...snapshot,
+      edges: [{ ...edge, blocker: { ...blocker, environmentId: "remote" } }],
+    }),
+  ).toThrow();
+  expect(() => decodeGraphAddResult({ sequence: 1, graphRevision: 0, edge })).toThrow();
+  expect(() =>
+    decodeGraphPage({
+      ...snapshot,
+      edges: [{ ...edge, provenance: { ...provenance, occurredAt: "not-a-timestamp" } }],
+    }),
+  ).toThrow();
+  expect(
+    decodeGraphPage({
+      ...snapshot,
+      edges: Array.from({ length: 100 }, (_, i) => ({ ...edge, edgeId: `edge-${i}` })),
+    }).edges,
+  ).toHaveLength(100);
+  expect(() =>
+    decodeGraphPage({ ...snapshot, edges: Array.from({ length: 101 }, () => edge) }),
+  ).toThrow();
+  expect(() =>
+    decodeGraphPage({ ...snapshot, edges: [{ ...edge, createdGraphRevision: 0 }] }),
+  ).toThrow();
+  expect(() =>
+    decodeGraphPage({ ...snapshot, viewGeneration: Number.MAX_SAFE_INTEGER + 1 }),
+  ).toThrow();
+  for (const key of ["eventId", "commandId", "occurredAt"] as const) {
+    expect(() =>
+      decodeGraphPage({
+        ...snapshot,
+        edges: [{ ...edge, provenance: { ...provenance, [key]: "x".repeat(2_001) } }],
+      }),
+    ).toThrow();
+  }
+  for (const key of ["subject", "sessionId"] as const) {
+    expect(() =>
+      decodeGraphPage({
+        ...snapshot,
+        edges: [
+          {
+            ...edge,
+            provenance: {
+              ...provenance,
+              adoptedBy: { ...provenance.adoptedBy, [key]: "x".repeat(2_001) },
+            },
+          },
+        ],
+      }),
+    ).toThrow();
+  }
+  const proposalRecord = {
+    proposalId: "proposal",
+    dependent: ref,
+    blocker,
+    observedGraphRevision: 0,
+    proposedAt: provenance.occurredAt,
+    proposedBy: {
+      type: "agent" as const,
+      threadId: "thread",
+      providerSessionId: "provider",
+      runId: "run",
+    },
+  };
+  expect(
+    decodeGraphProposalRecord({ ...proposalRecord, status: "approved", grant: "bearer" }),
+  ).toEqual(proposalRecord);
+  for (const key of ["threadId", "providerSessionId", "runId"] as const) {
+    expect(() =>
+      decodeGraphProposalRecord({
+        ...proposalRecord,
+        proposedBy: { ...proposalRecord.proposedBy, [key]: "x".repeat(2_001) },
+      }),
+    ).toThrow();
+  }
+  expect(() =>
+    decodeGraphProposalRecord({ ...proposalRecord, proposedBy: { type: "human" } }),
+  ).toThrow();
+  expect(decodeGraphAddResult({ sequence: 1, graphRevision: 1, edge }).edge).toEqual(edge);
+  expect(
+    decodeGraphRemoveResult({
+      sequence: 2,
+      graphRevision: 2,
+      edgeId: "edge",
+      provenance,
+    }).graphRevision,
+  ).toBe(2);
+  expect(
+    decodeGraphProposalResult({
+      sequence: 1,
+      proposal: proposalRecord,
+    }).proposal,
+  ).toEqual(proposalRecord);
+});

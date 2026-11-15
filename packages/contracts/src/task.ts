@@ -4,6 +4,7 @@ import {
   AuthSessionId,
   CommandId,
   EventId,
+  EnvironmentId,
   IsoDateTime,
   MessageId,
   NonNegativeInt,
@@ -1376,3 +1377,146 @@ export const WorkTaskReceipt = Schema.Struct({
   managerGeneration: Schema.NullOr(PositiveInt),
 });
 export type WorkTaskReceipt = typeof WorkTaskReceipt.Type;
+
+const graphCounter = NonNegativeInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER));
+export const WorkTaskGraphRevision = graphCounter.pipe(Schema.brand("WorkTaskGraphRevision"));
+export type WorkTaskGraphRevision = typeof WorkTaskGraphRevision.Type;
+export const WorkTaskGraphEdgeId = shortText.pipe(Schema.brand("WorkTaskGraphEdgeId"));
+export type WorkTaskGraphEdgeId = typeof WorkTaskGraphEdgeId.Type;
+export const WorkTaskGraphProposalId = shortText.pipe(Schema.brand("WorkTaskGraphProposalId"));
+export type WorkTaskGraphProposalId = typeof WorkTaskGraphProposalId.Type;
+export const WorkTaskGraphTaskRef = Schema.Struct({
+  environmentId: EnvironmentId.check(Schema.isMaxLength(2_000)),
+  taskId: WorkTaskId.check(Schema.isMaxLength(2_000)),
+});
+export type WorkTaskGraphTaskRef = typeof WorkTaskGraphTaskRef.Type;
+const graphEndpoints = Schema.Struct({
+  dependent: WorkTaskGraphTaskRef,
+  blocker: WorkTaskGraphTaskRef,
+});
+const distinctGraphEndpoints = Schema.makeFilter(
+  (value: typeof graphEndpoints.Type) =>
+    value.dependent.environmentId !== value.blocker.environmentId ||
+    value.dependent.taskId !== value.blocker.taskId,
+  { expected: "different graph endpoints" },
+);
+const graphUser = Schema.Struct({
+  subject: shortText,
+  sessionId: AuthSessionId.check(Schema.isMaxLength(2_000)),
+});
+// These output identities describe provenance; the service must derive and authorize them.
+export const WorkTaskGraphProvenance = Schema.Struct({
+  eventId: EventId.check(Schema.isMaxLength(2_000)),
+  commandId: CommandId.check(Schema.isMaxLength(2_000)),
+  occurredAt: persistedTime,
+  adoptedBy: graphUser,
+});
+export type WorkTaskGraphProvenance = typeof WorkTaskGraphProvenance.Type;
+export const WorkTaskGraphEdgeRecord = Schema.Struct({
+  edgeId: WorkTaskGraphEdgeId,
+  ...graphEndpoints.fields,
+  createdGraphRevision: WorkTaskGraphRevision.check(Schema.isGreaterThan(0)),
+  provenance: WorkTaskGraphProvenance,
+}).check(
+  distinctGraphEndpoints,
+  Schema.makeFilter((value) => value.dependent.environmentId === value.blocker.environmentId, {
+    expected: "edge endpoints in one environment",
+  }),
+);
+export type WorkTaskGraphEdgeRecord = typeof WorkTaskGraphEdgeRecord.Type;
+export const WorkTaskGraphProposalRecord = Schema.Struct({
+  proposalId: WorkTaskGraphProposalId,
+  ...graphEndpoints.fields,
+  observedGraphRevision: WorkTaskGraphRevision,
+  reason: Schema.optional(shortText),
+  proposedAt: persistedTime,
+  proposedBy: Schema.Union([
+    Schema.Struct({ type: Schema.Literal("user"), ...graphUser.fields }),
+    Schema.Struct({
+      type: Schema.Literal("agent"),
+      threadId: ThreadId.check(Schema.isMaxLength(2_000)),
+      providerSessionId: ProviderSessionId.check(Schema.isMaxLength(2_000)),
+      runId: RunId.check(Schema.isMaxLength(2_000)),
+    }),
+  ]),
+}).check(distinctGraphEndpoints);
+export type WorkTaskGraphProposalRecord = typeof WorkTaskGraphProposalRecord.Type;
+export const WorkTaskCreateBlockerProposalInput = Schema.Struct({
+  ...graphEndpoints.fields,
+  observedGraphRevision: WorkTaskGraphRevision,
+  reason: Schema.optional(shortText),
+}).check(distinctGraphEndpoints);
+export type WorkTaskCreateBlockerProposalInput = typeof WorkTaskCreateBlockerProposalInput.Type;
+export const WorkTaskCreateBlockerProposalResult = Schema.Struct({
+  sequence: graphCounter,
+  proposal: WorkTaskGraphProposalRecord,
+});
+export type WorkTaskCreateBlockerProposalResult = typeof WorkTaskCreateBlockerProposalResult.Type;
+export const WorkTaskAddBlockerInput = Schema.Struct({
+  ...graphEndpoints.fields,
+  expectedGraphRevision: WorkTaskGraphRevision,
+}).check(distinctGraphEndpoints);
+export type WorkTaskAddBlockerInput = typeof WorkTaskAddBlockerInput.Type;
+export const WorkTaskAddBlockerResult = Schema.Struct({
+  sequence: graphCounter,
+  graphRevision: WorkTaskGraphRevision,
+  edge: WorkTaskGraphEdgeRecord,
+}).check(
+  Schema.makeFilter((value) => value.graphRevision === value.edge.createdGraphRevision, {
+    expected: "add result revision matching the created edge",
+  }),
+);
+export type WorkTaskAddBlockerResult = typeof WorkTaskAddBlockerResult.Type;
+export const WorkTaskRemoveBlockerInput = Schema.Struct({
+  edgeId: WorkTaskGraphEdgeId,
+  expectedGraphRevision: WorkTaskGraphRevision,
+});
+export type WorkTaskRemoveBlockerInput = typeof WorkTaskRemoveBlockerInput.Type;
+export const WorkTaskRemoveBlockerResult = Schema.Struct({
+  sequence: graphCounter,
+  graphRevision: WorkTaskGraphRevision,
+  edgeId: WorkTaskGraphEdgeId,
+  provenance: WorkTaskGraphProvenance,
+});
+export type WorkTaskRemoveBlockerResult = typeof WorkTaskRemoveBlockerResult.Type;
+export const WorkTaskGraphReadInput = Schema.Struct({
+  task: WorkTaskGraphTaskRef,
+  direction: Schema.Literals(["blockers", "dependents"]),
+  ...pageInput,
+});
+export type WorkTaskGraphReadInput = typeof WorkTaskGraphReadInput.Type;
+export const WorkTaskGraphReadResult = Schema.Struct({
+  sequence: graphCounter,
+  graphRevision: WorkTaskGraphRevision,
+  viewGeneration: graphCounter,
+  edges: Schema.Array(WorkTaskGraphEdgeRecord).check(Schema.isMaxLength(100)),
+  nextPageToken: Schema.optional(WorkTaskPageToken),
+}).check(
+  Schema.makeFilter(
+    (value) => value.edges.every((edge) => edge.createdGraphRevision <= value.graphRevision),
+    {
+      expected: "edges created no later than the graph snapshot",
+    },
+  ),
+);
+export type WorkTaskGraphReadResult = typeof WorkTaskGraphReadResult.Type;
+export const WorkTaskGraphErrorCode = Schema.Literals([
+  "graph_revision_conflict",
+  "dependency_self_edge",
+  "dependency_not_found_or_denied",
+  "dependency_foreign_environment",
+  "dependency_duplicate",
+  "dependency_cycle",
+  "dependency_limit_exceeded",
+  "invalid_page_token",
+  "stale_page_token",
+  "unsupported_capability",
+]);
+export type WorkTaskGraphErrorCode = typeof WorkTaskGraphErrorCode.Type;
+export class WorkTaskGraphError extends Schema.TaggedError<WorkTaskGraphError>()(
+  "WorkTaskGraphError",
+  {
+    code: WorkTaskGraphErrorCode,
+    message: shortText,
+  },
+) {}
