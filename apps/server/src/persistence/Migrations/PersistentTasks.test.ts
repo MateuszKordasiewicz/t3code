@@ -3922,6 +3922,31 @@ it.effect("commits complete group membership and rejects incomplete deferred his
       );
       assert.isFalse(plan.some((row) => row.detail.includes("TEMP B-TREE")));
     }
+    const triggers = yield* sql<{
+      sql: string;
+    }>`SELECT sql FROM sqlite_master WHERE type='trigger' AND name='work_task_membership_companion_insert'`;
+    const peerPredicate = triggers[0]!.sql.match(
+      /FROM work_task_membership_companions p WHERE (.*?)\n        AND/s,
+    )?.[1];
+    assert.isDefined(peerPredicate);
+    const boundPredicate = peerPredicate!
+      .replaceAll("NEW.peer_event_id", "'peer'")
+      .replaceAll("NEW.event_id", "'event'");
+    const peerPlan = yield* sql.unsafe<{ detail: string }>(
+      `EXPLAIN QUERY PLAN SELECT 1 FROM work_task_membership_companions p WHERE ${boundPredicate}`,
+    );
+    assert.isTrue(
+      peerPlan.some((row) => row.detail.includes("work_task_membership_peer_idx")),
+      JSON.stringify(peerPlan),
+    );
+    assert.isTrue(
+      peerPlan.some((row) => row.detail.includes("PRIMARY KEY")),
+      JSON.stringify(peerPlan),
+    );
+    assert.isFalse(
+      peerPlan.some((row) => row.detail.includes("SCAN")),
+      JSON.stringify(peerPlan),
+    );
     assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
   }).pipe(Effect.provide(db)),
 );

@@ -46,6 +46,7 @@ export default Effect.gen(function* () {
       OR (role='retire' AND retired_generation IS NOT NULL AND retired_generation=membership_generation AND joined_generation IS NULL)),
     CHECK(root_sequence<>sequence AND root_event_id<>event_id AND (peer_event_id IS NULL OR peer_event_id<>event_id))
   ) WITHOUT ROWID`;
+  yield* sql`CREATE INDEX work_task_membership_peer_idx ON work_task_membership_companions(peer_event_id)`;
   yield* sql`CREATE INDEX work_task_membership_root_idx ON work_task_membership_companions(root_event_id,root_sequence)`;
   yield* sql`CREATE INDEX work_task_membership_root_sequence_idx ON work_task_membership_companions(root_sequence)`;
   yield* sql`CREATE INDEX work_task_membership_group_history_idx ON work_task_membership_companions(environment_id,group_id,sequence DESC)`;
