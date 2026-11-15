@@ -3718,3 +3718,343 @@ describe("staged selected work and reconciliation facts", () => {
     ).toThrow();
   });
 });
+
+const acceptedRunIdentity = {
+  version: 2,
+  task: workBinding.task,
+  group: workBinding.group,
+  manager: workBinding.manager,
+  membershipGeneration: workBinding.membershipGeneration,
+  membershipRevision: workBinding.membershipRevision,
+  controlRevision: workBinding.controlRevision,
+  graphRevision: workBinding.graphRevision,
+  projectId: workBinding.projectId,
+  providerInstanceId: workBinding.providerInstanceId,
+  taskRevisions: workBinding.taskRevisions,
+  runId: workBinding.runId,
+  messageId: workBinding.messageId,
+};
+const runOwnership = {
+  run: acceptedRunIdentity,
+  recorded: {
+    eventId: "ownership",
+    sequence: 20,
+    occurredAt: "2026-11-15T00:00:00.0002Z",
+    commandId: "ownership-command",
+  },
+  nativeAcceptance: {
+    receipt: {
+      commandId: "native-command",
+      threadId: "manager",
+      commandType: "thread.message.send",
+      acceptedAt: "2026-11-15T00:00:00.0001Z",
+      resultSequence: 6,
+      status: "accepted",
+      error: null,
+    },
+    runEvent: { type: "run.created", eventId: "native-run", sequence: 5 },
+    messageEvent: { type: "message.updated", eventId: "native-message", sequence: 6 },
+    runStatus: "queued",
+  },
+  sourceEventId: "source",
+  sourceSequence: 1,
+  observedWorkSequence: 1,
+  prerequisites: [],
+  origin: initialWorkOrigin,
+};
+const decodeRunOwnership = Schema.decodeUnknownSync(task.WorkTaskAcceptedRunOwnership);
+it("retains real queued run ownership without inventing physical launch or charge", () => {
+  expect(decodeRunOwnership(runOwnership)).toEqual(runOwnership);
+});
+
+const runDebit = {
+  type: "task.allowance-debited",
+  eventId: "run-debit",
+  sequence: 7,
+  commandId: "reservation-command",
+  taskId: membershipTask.taskId,
+  definitionRevision: membershipRevisions.definitionRevision,
+  lifecycleRevision: membershipRevisions.lifecycleRevision,
+  completionPolicyRevision: membershipRevisions.completionPolicyRevision,
+  actionPolicyRevision: membershipRevisions.actionPolicyRevision,
+  allowanceUnit: 1,
+};
+const automaticRunOrigin = {
+  type: "automatic_followup",
+  reservationId: "run-reservation",
+  reservationCommandId: "reservation-command",
+  allowanceUnit: 1,
+  debitEvent: runDebit,
+  observedDirtyGeneration: 3,
+  acknowledgedGeneration: 1,
+  pending: { sources: [], overflowThroughGeneration: 3 },
+};
+const decodeOwnershipReference = Schema.decodeUnknownSync(
+  task.WorkTaskAcceptedRunOwnershipReference,
+);
+const decodeOwnershipEvent = Schema.decodeUnknownSync(
+  task.WorkTaskPersistedAcceptedRunOwnershipEvent,
+);
+const retainedRun = {
+  run: runOwnership.run,
+  recorded: runOwnership.recorded,
+  nativeRunEvent: runOwnership.nativeAcceptance.runEvent,
+  origin: runOwnership.origin,
+};
+const ownershipAccepted = {
+  type: "task.run-ownership-accepted",
+  id: runOwnership.recorded.eventId,
+  environmentId: membershipTask.environmentId,
+  commandId: runOwnership.recorded.commandId,
+  occurredAt: runOwnership.recorded.occurredAt,
+  attribution: { type: "server" },
+  ownership: runOwnership,
+};
+it("binds automatic ownership to its original debit and bounded acceptance evidence", () => {
+  for (const runStatus of ["queued", "preparing", "starting"])
+    for (const origin of [initialWorkOrigin, automaticRunOrigin]) {
+      const value = {
+        ...runOwnership,
+        origin,
+        nativeAcceptance: { ...runOwnership.nativeAcceptance, runStatus },
+      };
+      expect(decodeRunOwnership(value)).toEqual(value);
+    }
+  for (const key of [
+    "workClaimId",
+    "effectId",
+    "commandId",
+    "providerSessionId",
+    "providerThreadId",
+    "providerTurnId",
+  ])
+    expect(() =>
+      decodeRunOwnership({ ...runOwnership, run: { ...acceptedRunIdentity, [key]: "fabricated" } }),
+    ).toThrow();
+  for (const run of [
+    { ...acceptedRunIdentity, runId: "" },
+    { ...acceptedRunIdentity, messageId: "x".repeat(2001) },
+    { ...acceptedRunIdentity, providerInstanceId: "a/b" },
+    { ...acceptedRunIdentity, providerInstanceId: "x".repeat(65) },
+    { ...acceptedRunIdentity, membershipGeneration: 0 },
+    { ...acceptedRunIdentity, graphRevision: Number.MAX_SAFE_INTEGER + 1 },
+    { ...acceptedRunIdentity, task: { ...membershipTask, environmentId: "elsewhere" } },
+    {
+      ...acceptedRunIdentity,
+      taskRevisions: { ...membershipRevisions, acceptedDefinitionRevision: null },
+    },
+  ])
+    expect(() => decodeRunOwnership({ ...runOwnership, run })).toThrow();
+  for (const patch of [
+    { taskId: "other" },
+    { commandId: "other" },
+    { allowanceUnit: 2 },
+    { definitionRevision: 2 },
+    { lifecycleRevision: 6 },
+    { completionPolicyRevision: 8 },
+    { actionPolicyRevision: 7 },
+    { sequence: 20 },
+    { eventId: "native-run" },
+    { eventId: "ownership" },
+    { type: "task.allowance-configured" },
+  ])
+    expect(() =>
+      decodeRunOwnership({
+        ...runOwnership,
+        origin: { ...automaticRunOrigin, debitEvent: { ...runDebit, ...patch } },
+      }),
+    ).toThrow();
+  for (const origin of [
+    { ...automaticRunOrigin, debitEvent: undefined },
+    { ...automaticRunOrigin, allowanceUnit: 0 },
+    { ...automaticRunOrigin, acknowledgedGeneration: 4 },
+    { ...automaticRunOrigin, pending: { sources: [], overflowThroughGeneration: 4 } },
+    { ...automaticRunOrigin, startCommandId: "fake-start" },
+    { ...initialWorkOrigin, debitEvent: runDebit },
+    { ...initialWorkOrigin, allowanceUnit: 1 },
+    { ...initialWorkOrigin, pending: automaticRunOrigin.pending },
+  ])
+    expect(() => decodeRunOwnership({ ...runOwnership, origin })).toThrow();
+  const source = { kind: "thread_result", sourceId: "source", threadId: "thread", resultRef: null };
+  const sources = Array.from({ length: 32 }, (_, index) => ({
+    ...source,
+    sourceId: `source-${index}`,
+  }));
+  const withSources = (values: typeof sources) => ({
+    ...runOwnership,
+    origin: {
+      ...automaticRunOrigin,
+      pending: { sources: values, overflowThroughGeneration: null },
+    },
+  });
+  expect(decodeRunOwnership(withSources(sources))).toBeDefined();
+  expect(() => decodeRunOwnership(withSources([...sources, source]))).toThrow();
+  expect(() => decodeRunOwnership(withSources([source, source]))).toThrow();
+  for (const receipt of [
+    { ...runOwnership.nativeAcceptance.receipt, threadId: "other" },
+    { ...runOwnership.nativeAcceptance.receipt, resultSequence: 5 },
+    { ...runOwnership.nativeAcceptance.receipt, status: "rejected" },
+    { ...runOwnership.nativeAcceptance.receipt, error: "failed" },
+    { ...runOwnership.nativeAcceptance.receipt, acceptedAt: "not-a-time" },
+  ])
+    expect(() =>
+      decodeRunOwnership({
+        ...runOwnership,
+        nativeAcceptance: { ...runOwnership.nativeAcceptance, receipt },
+      }),
+    ).toThrow();
+  for (const patch of [
+    { sourceSequence: 20 },
+    { sourceEventId: "ownership" },
+    { observedWorkSequence: 21 },
+    { nativeAcceptance: { ...runOwnership.nativeAcceptance, runStatus: "running" } },
+    {
+      nativeAcceptance: {
+        ...runOwnership.nativeAcceptance,
+        messageEvent: { type: "message.updated", eventId: "native-run", sequence: 5 },
+      },
+    },
+  ])
+    expect(() => decodeRunOwnership({ ...runOwnership, ...patch })).toThrow();
+  const prerequisites = Array.from({ length: 64 }, (_, index) => ({
+    edgeId: `edge-${index}`,
+    blocker: { ...membershipTask, taskId: `blocker-${index}` },
+    completionEventId: `completion-${index}`,
+    completionSequence: 30 + index,
+  }));
+  const withPrerequisites = {
+    ...runOwnership,
+    recorded: { ...runOwnership.recorded, sequence: 100 },
+    prerequisites,
+  };
+  expect(decodeRunOwnership(withPrerequisites)).toEqual(withPrerequisites);
+  for (const values of [
+    [
+      ...prerequisites,
+      { ...prerequisites[0]!, edgeId: "extra", blocker: { ...membershipTask, taskId: "extra" } },
+    ],
+    [prerequisites[0], prerequisites[0]],
+    [{ ...prerequisites[0], blocker: membershipTask }],
+    [
+      {
+        ...prerequisites[0],
+        blocker: { ...membershipTask, environmentId: "remote", taskId: "other" },
+      },
+    ],
+  ])
+    expect(() => decodeRunOwnership({ ...withPrerequisites, prerequisites: values })).toThrow();
+});
+it("preserves queued ownership through uncertainty and separately evidenced termination", () => {
+  const automaticReference = {
+    ...retainedRun,
+    origin: {
+      type: automaticRunOrigin.type,
+      reservationId: automaticRunOrigin.reservationId,
+      reservationCommandId: automaticRunOrigin.reservationCommandId,
+      allowanceUnit: automaticRunOrigin.allowanceUnit,
+      debitEvent: runDebit,
+    },
+  };
+  for (const reference of [retainedRun, automaticReference])
+    expect(decodeOwnershipReference(reference)).toEqual(reference);
+  for (const patch of [
+    { nativeRunEvent: undefined },
+    { nativeRunEvent: { ...retainedRun.nativeRunEvent, sequence: 20 } },
+    { origin: automaticRunOrigin },
+    { origin: { ...automaticReference.origin, debitEvent: { ...runDebit, allowanceUnit: 2 } } },
+  ])
+    expect(() => decodeOwnershipReference({ ...retainedRun, ...patch })).toThrow();
+  const uncertain = {
+    ...ownershipAccepted,
+    type: "task.run-ownership-uncertain",
+    id: "uncertain",
+    ownership: retainedRun,
+    sourceEventId: "recovery",
+    sourceSequence: 21,
+    reason: "Native response was lost",
+  };
+  const before = {
+    ...ownershipAccepted,
+    type: "task.run-ownership-terminated",
+    id: "terminated",
+    ownership: retainedRun,
+    observedSequence: 22,
+    terminationEvidence: {
+      kind: "before_executable_claim",
+      terminalRunEvent: { type: "run.updated", eventId: "terminal", sequence: 8 },
+      terminalStatus: "cancelled",
+      settlementCommandId: "settlement",
+    },
+  };
+  const after = {
+    ...before,
+    terminationEvidence: {
+      kind: "after_executable_claim",
+      terminalRunEvent: { type: "run.updated", eventId: "terminal", sequence: 21 },
+      terminalStatus: "completed",
+      workClaimId: "real-claim",
+      workReleaseEvent: { type: "task-group.work-released", eventId: "release", sequence: 22 },
+    },
+  };
+  const wrap = (
+    event: typeof ownershipAccepted | typeof uncertain | typeof before | typeof after,
+    sequence: number,
+  ) => ({
+    event,
+    context: {
+      eventId: event.id,
+      sequence,
+      commandId: event.commandId,
+      occurredAt: event.occurredAt,
+    },
+  });
+  for (const [event, sequence] of [
+    [ownershipAccepted, 20],
+    [uncertain, 23],
+    [before, 23],
+    [after, 23],
+  ] as const) {
+    const value = wrap(event, sequence);
+    expect(decodeOwnershipEvent(value)).toEqual(value);
+    for (const patch of [
+      { eventId: "wrong" },
+      { commandId: null },
+      { occurredAt: "2026-11-15T00:00:01Z" },
+    ])
+      expect(() =>
+        decodeOwnershipEvent({ ...value, context: { ...value.context, ...patch } }),
+      ).toThrow();
+    expect(() =>
+      decodeOwnershipEvent({
+        ...value,
+        event: { ...event, attribution: { type: "human", sessionId: "claim" } },
+      }),
+    ).toThrow();
+    expect(() => decodeOldTaskEventForGraph(event)).toThrow();
+  }
+  expect(() => decodeOwnershipEvent(wrap(ownershipAccepted, 21))).toThrow();
+  expect(() => decodeOwnershipEvent(wrap(uncertain, 20))).toThrow();
+  expect(() => decodeOwnershipEvent(wrap(before, 22))).toThrow();
+  for (const terminationEvidence of [
+    {
+      ...before.terminationEvidence,
+      terminalRunEvent: { ...before.terminationEvidence.terminalRunEvent, sequence: 4 },
+    },
+    { ...before.terminationEvidence, terminalStatus: "completed" },
+    { ...before.terminationEvidence, workClaimId: "fabricated" },
+    { ...before.terminationEvidence, effectId: "fabricated" },
+    { ...after.terminationEvidence, workClaimId: undefined },
+    { ...after.terminationEvidence, settlementCommandId: "wrong-phase" },
+    {
+      ...after.terminationEvidence,
+      workReleaseEvent: { ...after.terminationEvidence.workReleaseEvent, sequence: 21 },
+    },
+    {
+      ...after.terminationEvidence,
+      terminalRunEvent: { ...after.terminationEvidence.terminalRunEvent, eventId: "native-run" },
+    },
+  ])
+    expect(() =>
+      decodeOwnershipEvent({ ...wrap(before, 23), event: { ...before, terminationEvidence } }),
+    ).toThrow();
+});

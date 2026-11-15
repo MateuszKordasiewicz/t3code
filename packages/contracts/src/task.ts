@@ -2842,3 +2842,405 @@ export const WorkTaskPersistedCoordinationEvent = Schema.Struct({
   ),
 );
 export type WorkTaskPersistedCoordinationEvent = typeof WorkTaskPersistedCoordinationEvent.Type;
+
+export const WorkTaskAcceptedRunIdentityV2 = Schema.Struct({
+  version: Schema.Literal(2),
+  task: WorkTaskGraphTaskRef,
+  group: WorkTaskManagerGroupRef,
+  manager: WorkTaskGroupManagerRef,
+  membershipGeneration: WorkTaskMembershipGeneration,
+  membershipRevision: WorkTaskGroupMembershipRevision.check(Schema.isGreaterThan(0)),
+  controlRevision: WorkTaskGroupControlRevision,
+  graphRevision: WorkTaskGraphRevision,
+  projectId: ProjectId.check(Schema.isMaxLength(2_000)),
+  providerInstanceId: ProviderInstanceId,
+  taskRevisions: acceptedWorkRevisions,
+  runId: RunId.check(Schema.isMaxLength(2_000)),
+  messageId: MessageId.check(Schema.isMaxLength(2_000)),
+  workClaimId: forbidden,
+  effectId: forbidden,
+  commandId: forbidden,
+  providerSessionId: forbidden,
+  providerThreadId: forbidden,
+  providerTurnId: forbidden,
+}).check(membershipEnvironment);
+export type WorkTaskAcceptedRunIdentityV2 = typeof WorkTaskAcceptedRunIdentityV2.Type;
+const acceptedRunEventReference = Schema.Struct({
+  type: Schema.Literal("run.created"),
+  eventId: graphEventFields.id,
+  sequence: groupCounter,
+});
+const acceptedRunDebit = Schema.Struct({
+  type: Schema.Literal("task.allowance-debited"),
+  eventId: graphEventFields.id,
+  sequence: groupCounter,
+  commandId: graphEventFields.commandId,
+  taskId: WorkTaskId.check(Schema.isMaxLength(2_000)),
+  definitionRevision: workPositive,
+  lifecycleRevision: workPositive,
+  completionPolicyRevision: workPositive,
+  actionPolicyRevision: workPositive,
+  allowanceUnit: workPositive,
+});
+const acceptedRunInitialOrigin = Schema.Struct({
+  ...initialWorkOrigin.fields,
+  debitEvent: forbidden,
+  pending: forbidden,
+});
+const acceptedRunAutomaticOrigin = Schema.Struct({
+  ...automaticWorkOrigin.fields,
+  debitEvent: acceptedRunDebit,
+  pending: wakeBatch,
+}).check(
+  Schema.makeFilter(
+    (value) =>
+      value.acknowledgedGeneration <= value.observedDirtyGeneration &&
+      (value.pending.overflowThroughGeneration === null ||
+        value.pending.overflowThroughGeneration <= value.observedDirtyGeneration),
+    { expected: "bounded pending sources within the observed dirty generation" },
+  ),
+);
+const acceptedRunOrigin = Schema.Union([acceptedRunInitialOrigin, acceptedRunAutomaticOrigin]);
+const acceptedRunAutomaticReference = Schema.Struct({
+  type: Schema.Literal("automatic_followup"),
+  reservationId: shortText,
+  reservationCommandId: graphEventFields.commandId,
+  allowanceUnit: workPositive,
+  debitEvent: acceptedRunDebit,
+  startCommandId: forbidden,
+  startEventId: forbidden,
+  startSequence: forbidden,
+  pending: forbidden,
+  observedDirtyGeneration: forbidden,
+  acknowledgedGeneration: forbidden,
+});
+const acceptedRunOriginReference = Schema.Union([
+  acceptedRunInitialOrigin,
+  acceptedRunAutomaticReference,
+]);
+const acceptedRunOriginMatches = (
+  run: WorkTaskAcceptedRunIdentityV2,
+  origin: typeof acceptedRunOrigin.Type | typeof acceptedRunOriginReference.Type,
+) =>
+  origin.type === "initial_start" ||
+  (origin.debitEvent.taskId === run.task.taskId &&
+    origin.debitEvent.commandId === origin.reservationCommandId &&
+    origin.debitEvent.allowanceUnit === origin.allowanceUnit &&
+    (
+      [
+        "definitionRevision",
+        "lifecycleRevision",
+        "completionPolicyRevision",
+        "actionPolicyRevision",
+      ] as const
+    ).every((key) => origin.debitEvent[key] === run.taskRevisions[key]));
+const acceptedRunOriginReferences = (
+  origin: typeof acceptedRunOrigin.Type | typeof acceptedRunOriginReference.Type,
+  taskId: string,
+): KnownJournalReference[] =>
+  origin.type === "initial_start"
+    ? [{ id: origin.startEventId, sequence: origin.startSequence, taskId }]
+    : [
+        {
+          id: origin.debitEvent.eventId,
+          sequence: origin.debitEvent.sequence,
+          kind: origin.debitEvent.type,
+          taskId,
+        },
+      ];
+const acceptedRunReferences = (value: {
+  run: WorkTaskAcceptedRunIdentityV2;
+  recorded: typeof groupEventContext.Type;
+  nativeRunEvent: typeof acceptedRunEventReference.Type;
+  origin: typeof acceptedRunOrigin.Type | typeof acceptedRunOriginReference.Type;
+}): KnownJournalReference[] => [
+  {
+    id: value.recorded.eventId,
+    sequence: value.recorded.sequence,
+    kind: "task.run-ownership-accepted",
+    taskId: value.run.task.taskId,
+  },
+  {
+    id: value.nativeRunEvent.eventId,
+    sequence: value.nativeRunEvent.sequence,
+    kind: value.nativeRunEvent.type,
+    taskId: value.run.task.taskId,
+  },
+  ...acceptedRunOriginReferences(value.origin, value.run.task.taskId),
+];
+export const WorkTaskAcceptedRunOwnership = Schema.Struct({
+  run: WorkTaskAcceptedRunIdentityV2,
+  recorded: groupEventContext,
+  nativeAcceptance: Schema.Struct({
+    receipt: Schema.Struct({
+      commandId: graphEventFields.commandId,
+      threadId: ThreadId.check(Schema.isMaxLength(2_000)),
+      commandType: shortText,
+      acceptedAt: persistedTime,
+      resultSequence: groupCounter,
+      status: Schema.Literal("accepted"),
+      error: Schema.Null,
+    }),
+    runEvent: acceptedRunEventReference,
+    messageEvent: Schema.Struct({
+      type: Schema.Literal("message.updated"),
+      eventId: graphEventFields.id,
+      sequence: groupCounter,
+    }),
+    runStatus: Schema.Literals(["queued", "preparing", "starting"]),
+  }),
+  sourceEventId: graphEventFields.id,
+  sourceSequence: groupCounter,
+  observedWorkSequence: groupCounter,
+  prerequisites: Schema.Array(WorkTaskPrerequisiteCompletionWitness).check(Schema.isMaxLength(64)),
+  origin: acceptedRunOrigin,
+}).check(
+  Schema.makeFilter(
+    (value) => {
+      const {
+        run,
+        recorded,
+        nativeAcceptance: native,
+        sourceEventId,
+        sourceSequence,
+        observedWorkSequence,
+        prerequisites,
+        origin,
+      } = value;
+      const refs = [
+        ...acceptedRunReferences({ ...value, nativeRunEvent: native.runEvent }),
+        {
+          id: native.messageEvent.eventId,
+          sequence: native.messageEvent.sequence,
+          kind: native.messageEvent.type,
+          taskId: run.task.taskId,
+        },
+        { id: sourceEventId, sequence: sourceSequence },
+        ...prerequisites.map((w) => ({
+          id: w.completionEventId,
+          sequence: w.completionSequence,
+          kind: "task.completed",
+          taskId: w.blocker.taskId,
+        })),
+      ];
+      return (
+        acceptedRunOriginMatches(run, origin) &&
+        native.receipt.threadId === run.manager.threadId &&
+        native.receipt.resultSequence >= native.runEvent.sequence &&
+        native.receipt.resultSequence >= native.messageEvent.sequence &&
+        observedWorkSequence <= recorded.sequence &&
+        compatibleJournalReferences(refs) &&
+        refs
+          .slice(1)
+          .every(
+            (ref) =>
+              ref.id !== recorded.eventId &&
+              ref.sequence !== undefined &&
+              ref.sequence < recorded.sequence,
+          ) &&
+        new Set(prerequisites.map((w) => w.edgeId)).size === prerequisites.length &&
+        new Set(prerequisites.map((w) => w.blocker.taskId)).size === prerequisites.length &&
+        prerequisites.every(
+          (w) =>
+            w.blocker.environmentId === run.task.environmentId &&
+            !sameMembershipTask(w.blocker, run.task),
+        )
+      );
+    },
+    { expected: "real native acceptance references and one original task-local ownership basis" },
+  ),
+);
+export type WorkTaskAcceptedRunOwnership = typeof WorkTaskAcceptedRunOwnership.Type;
+export const WorkTaskAcceptedRunOwnershipReference = Schema.Struct({
+  run: WorkTaskAcceptedRunIdentityV2,
+  recorded: groupEventContext,
+  nativeRunEvent: acceptedRunEventReference,
+  origin: acceptedRunOriginReference,
+}).check(
+  Schema.makeFilter(
+    (value) => {
+      const refs = acceptedRunReferences(value);
+      return (
+        acceptedRunOriginMatches(value.run, value.origin) &&
+        compatibleJournalReferences(refs) &&
+        refs
+          .slice(1)
+          .every(
+            (ref) =>
+              ref.id !== value.recorded.eventId &&
+              ref.sequence !== undefined &&
+              ref.sequence < value.recorded.sequence,
+          )
+      );
+    },
+    { expected: "retained original run creation, ownership and charged-unit identities" },
+  ),
+);
+export type WorkTaskAcceptedRunOwnershipReference =
+  typeof WorkTaskAcceptedRunOwnershipReference.Type;
+const ownershipTerminalRun = Schema.Struct({
+  type: Schema.Literal("run.updated"),
+  eventId: graphEventFields.id,
+  sequence: groupCounter,
+});
+const ownershipTermination = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("before_executable_claim"),
+    terminalRunEvent: ownershipTerminalRun,
+    terminalStatus: Schema.Literals(["cancelled", "failed", "interrupted"]),
+    settlementCommandId: graphEventFields.commandId,
+    workClaimId: forbidden,
+    workReleaseEvent: forbidden,
+    effectId: forbidden,
+    providerSessionId: forbidden,
+    providerTurnId: forbidden,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("after_executable_claim"),
+    terminalRunEvent: ownershipTerminalRun,
+    terminalStatus: Schema.Literals([
+      "completed",
+      "cancelled",
+      "failed",
+      "interrupted",
+      "rolled_back",
+    ]),
+    workClaimId: WorkTaskWorkClaimId,
+    workReleaseEvent: Schema.Struct({
+      type: Schema.Literal("task-group.work-released"),
+      eventId: graphEventFields.id,
+      sequence: groupCounter,
+    }),
+    settlementCommandId: forbidden,
+    effectId: forbidden,
+    providerSessionId: forbidden,
+    providerTurnId: forbidden,
+  }),
+]);
+const acceptedRunOwnershipEvent = Schema.Union([
+  Schema.Struct({
+    ...coordinationFields,
+    type: Schema.Literal("task.run-ownership-accepted"),
+    ownership: WorkTaskAcceptedRunOwnership,
+  }),
+  Schema.Struct({
+    ...coordinationFields,
+    type: Schema.Literal("task.run-ownership-uncertain"),
+    ownership: WorkTaskAcceptedRunOwnershipReference,
+    sourceEventId: graphEventFields.id,
+    sourceSequence: groupCounter,
+    reason: shortText,
+  }),
+  Schema.Struct({
+    ...coordinationFields,
+    type: Schema.Literal("task.run-ownership-terminated"),
+    ownership: WorkTaskAcceptedRunOwnershipReference,
+    observedSequence: groupCounter,
+    terminationEvidence: ownershipTermination,
+  }),
+]);
+const ownershipEventReferences = (
+  event: typeof acceptedRunOwnershipEvent.Type,
+): KnownJournalReference[] => {
+  const { ownership } = event;
+  const refs: KnownJournalReference[] = [
+    { id: event.id, kind: event.type, taskId: ownership.run.task.taskId },
+  ];
+  if (event.type === "task.run-ownership-accepted") {
+    const value = event.ownership;
+    refs.push(
+      ...acceptedRunReferences({ ...value, nativeRunEvent: value.nativeAcceptance.runEvent }),
+      {
+        id: value.nativeAcceptance.messageEvent.eventId,
+        sequence: value.nativeAcceptance.messageEvent.sequence,
+        kind: value.nativeAcceptance.messageEvent.type,
+        taskId: value.run.task.taskId,
+      },
+      { id: value.sourceEventId, sequence: value.sourceSequence },
+      ...value.prerequisites.map((w) => ({
+        id: w.completionEventId,
+        sequence: w.completionSequence,
+        kind: "task.completed",
+        taskId: w.blocker.taskId,
+      })),
+    );
+  } else {
+    refs.push(...acceptedRunReferences(event.ownership));
+    if (event.type === "task.run-ownership-uncertain")
+      refs.push({ id: event.sourceEventId, sequence: event.sourceSequence });
+    else {
+      const evidence = event.terminationEvidence;
+      refs.push({
+        id: evidence.terminalRunEvent.eventId,
+        sequence: evidence.terminalRunEvent.sequence,
+        kind: evidence.terminalRunEvent.type,
+        taskId: ownership.run.task.taskId,
+      });
+      if (evidence.kind === "after_executable_claim")
+        refs.push({
+          id: evidence.workReleaseEvent.eventId,
+          sequence: evidence.workReleaseEvent.sequence,
+          kind: evidence.workReleaseEvent.type,
+          taskId: ownership.run.task.taskId,
+        });
+    }
+  }
+  return refs;
+};
+export const WorkTaskAcceptedRunOwnershipEvent = acceptedRunOwnershipEvent.check(
+  Schema.makeFilter(
+    (event) => {
+      if (
+        event.environmentId !== event.ownership.run.task.environmentId ||
+        !compatibleJournalReferences(ownershipEventReferences(event))
+      )
+        return false;
+      if (event.type === "task.run-ownership-accepted")
+        return (
+          event.id === event.ownership.recorded.eventId &&
+          event.commandId === event.ownership.recorded.commandId &&
+          event.occurredAt === event.ownership.recorded.occurredAt
+        );
+      if (event.type === "task.run-ownership-terminated") {
+        const evidence = event.terminationEvidence;
+        return (
+          evidence.terminalRunEvent.sequence >= event.ownership.nativeRunEvent.sequence &&
+          evidence.terminalRunEvent.sequence <= event.observedSequence &&
+          (evidence.kind !== "after_executable_claim" ||
+            (evidence.terminalRunEvent.sequence < evidence.workReleaseEvent.sequence &&
+              evidence.workReleaseEvent.sequence <= event.observedSequence))
+        );
+      }
+      return true;
+    },
+    { expected: "server-recorded ownership observation with compatible native and task evidence" },
+  ),
+);
+export type WorkTaskAcceptedRunOwnershipEvent = typeof WorkTaskAcceptedRunOwnershipEvent.Type;
+export const WorkTaskPersistedAcceptedRunOwnershipEvent = Schema.Struct({
+  event: WorkTaskAcceptedRunOwnershipEvent,
+  context: groupEventContext,
+}).check(
+  exactGroupEventContext,
+  Schema.makeFilter(
+    ({ event, context }) => {
+      const refs = ownershipEventReferences(event);
+      if (
+        !compatibleJournalReferences([...refs, { id: event.id, sequence: context.sequence }]) ||
+        refs.some((ref) => ref.sequence !== undefined && ref.sequence > context.sequence)
+      )
+        return false;
+      if (event.type === "task.run-ownership-accepted")
+        return event.ownership.recorded.sequence === context.sequence;
+      return (
+        event.ownership.recorded.sequence < context.sequence &&
+        (event.type === "task.run-ownership-uncertain"
+          ? event.sourceSequence < context.sequence
+          : event.observedSequence < context.sequence)
+      );
+    },
+    { expected: "exact committed ownership context and earlier retained evidence" },
+  ),
+);
+export type WorkTaskPersistedAcceptedRunOwnershipEvent =
+  typeof WorkTaskPersistedAcceptedRunOwnershipEvent.Type;
