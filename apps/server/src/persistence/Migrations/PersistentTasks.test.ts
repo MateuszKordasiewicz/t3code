@@ -2844,6 +2844,9 @@ it.effect("keeps native blocker history canonical, immutable and indexed", () =>
         yield* sql`SELECT * FROM work_task_graph_edges ORDER BY environment_id,edge_id`;
       for (const mode of ["replace", "ignore"] as const) {
         yield* reject(
+          insertGraphJson(JSON.stringify(graphEdge("fresh-active-pair", 7, "a", "b")), 70, mode),
+        );
+        yield* reject(
           insertGraphJson(
             JSON.stringify({
               ...graphEdge("one", 7, "b", "a"),

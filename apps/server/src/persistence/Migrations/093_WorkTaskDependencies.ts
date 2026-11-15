@@ -104,6 +104,7 @@ export default Effect.gen(function* () {
     WHEN NEW.removed_graph_revision IS NOT NULL OR NEW.removed_event_id IS NOT NULL OR NEW.removed_sequence IS NOT NULL OR NEW.removal_provenance_json IS NOT NULL
       OR NEW.created_graph_revision IS NOT (${revision}+1) OR NEW.adopted_sequence<=${sequence}
       OR EXISTS(SELECT 1 FROM work_task_graph_edges WHERE (environment_id=NEW.environment_id AND edge_id=NEW.edge_id)
+        OR (environment_id=NEW.environment_id AND dependent_task_id=NEW.dependent_task_id AND blocker_task_id=NEW.blocker_task_id AND removed_graph_revision IS NULL)
         OR adopted_event_id=NEW.adopted_event_id OR removed_event_id=NEW.adopted_event_id OR adopted_sequence=NEW.adopted_sequence OR removed_sequence=NEW.adopted_sequence)
     BEGIN SELECT RAISE(ABORT,'graph adoption identity or revision conflict'); END`);
   yield* sql.unsafe(`CREATE TRIGGER work_task_graph_edges_update BEFORE UPDATE ON work_task_graph_edges
