@@ -1520,3 +1520,61 @@ export class WorkTaskGraphError extends Schema.TaggedError<WorkTaskGraphError>()
     message: shortText,
   },
 ) {}
+
+const groupCounter = NonNegativeInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER));
+export const WorkTaskManagerGroupId = shortText.pipe(Schema.brand("WorkTaskManagerGroupId"));
+export type WorkTaskManagerGroupId = typeof WorkTaskManagerGroupId.Type;
+export const WorkTaskGroupManagerGeneration = PositiveInt.check(
+  Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
+).pipe(Schema.brand("WorkTaskGroupManagerGeneration"));
+export type WorkTaskGroupManagerGeneration = typeof WorkTaskGroupManagerGeneration.Type;
+export const WorkTaskGroupControlRevision = groupCounter.pipe(
+  Schema.brand("WorkTaskGroupControlRevision"),
+);
+export type WorkTaskGroupControlRevision = typeof WorkTaskGroupControlRevision.Type;
+export const WorkTaskGroupMembershipRevision = groupCounter.pipe(
+  Schema.brand("WorkTaskGroupMembershipRevision"),
+);
+export type WorkTaskGroupMembershipRevision = typeof WorkTaskGroupMembershipRevision.Type;
+export const WorkTaskManagerGroupRef = Schema.Struct({
+  environmentId: EnvironmentId.check(Schema.isMaxLength(2_000)),
+  groupId: WorkTaskManagerGroupId,
+});
+export type WorkTaskManagerGroupRef = typeof WorkTaskManagerGroupRef.Type;
+export const WorkTaskGroupManagerRef = Schema.Struct({
+  threadId: ThreadId.check(Schema.isMaxLength(2_000)),
+  managerGeneration: WorkTaskGroupManagerGeneration,
+});
+export type WorkTaskGroupManagerRef = typeof WorkTaskGroupManagerRef.Type;
+export const WorkTaskManagerGroupControlSnapshot = Schema.Struct({
+  group: WorkTaskManagerGroupRef,
+  controlRevision: WorkTaskGroupControlRevision,
+  membershipRevision: WorkTaskGroupMembershipRevision,
+  highestManagerGeneration: groupCounter,
+  currentManager: Schema.NullOr(WorkTaskGroupManagerRef),
+  dispatchHold: Schema.Literals(["none", "paused", "stopped"]),
+}).check(
+  Schema.makeFilter(
+    (value) =>
+      value.currentManager === null ||
+      value.currentManager.managerGeneration === value.highestManagerGeneration,
+    { expected: "current manager matching the highest accepted group generation" },
+  ),
+);
+export type WorkTaskManagerGroupControlSnapshot = typeof WorkTaskManagerGroupControlSnapshot.Type;
+const groupControlGuards = {
+  group: WorkTaskManagerGroupRef,
+  expectedControlRevision: WorkTaskGroupControlRevision,
+  expectedMembershipRevision: WorkTaskGroupMembershipRevision,
+  expectedManagerGeneration: Schema.NullOr(WorkTaskGroupManagerGeneration),
+  reason: Schema.optional(shortText),
+};
+export const WorkTaskManagerGroupPauseInput = Schema.Struct(groupControlGuards);
+export type WorkTaskManagerGroupPauseInput = typeof WorkTaskManagerGroupPauseInput.Type;
+export const WorkTaskManagerGroupResumeInput = Schema.Struct(groupControlGuards);
+export type WorkTaskManagerGroupResumeInput = typeof WorkTaskManagerGroupResumeInput.Type;
+export const WorkTaskManagerGroupControlResult = Schema.Struct({
+  sequence: groupCounter,
+  control: WorkTaskManagerGroupControlSnapshot,
+});
+export type WorkTaskManagerGroupControlResult = typeof WorkTaskManagerGroupControlResult.Type;

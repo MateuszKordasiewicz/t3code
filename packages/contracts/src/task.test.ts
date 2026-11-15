@@ -2074,3 +2074,112 @@ it("bounds passive dependency contracts without accepting caller authority", () 
     }).proposal,
   ).toEqual(proposalRecord);
 });
+
+const decodeGroupControl = Schema.decodeUnknownSync(task.WorkTaskManagerGroupControlSnapshot);
+const decodeGroupRef = Schema.decodeUnknownSync(task.WorkTaskManagerGroupRef);
+const decodeGroupPause = Schema.decodeUnknownSync(task.WorkTaskManagerGroupPauseInput);
+const decodeGroupResume = Schema.decodeUnknownSync(task.WorkTaskManagerGroupResumeInput);
+const decodeGroupControlResult = Schema.decodeUnknownSync(task.WorkTaskManagerGroupControlResult);
+
+it("preserves explicit group control identities without inventing membership or runtime state", () => {
+  const group = { environmentId: "local", groupId: "stable-group" };
+  const empty = {
+    group,
+    controlRevision: 0,
+    membershipRevision: 0,
+    highestManagerGeneration: 0,
+    currentManager: null,
+    dispatchHold: "none",
+  };
+  expect(decodeGroupControl(empty)).toEqual(empty);
+  const manager = { threadId: "actual-manager", managerGeneration: 1 };
+  const current = { ...empty, highestManagerGeneration: 1, currentManager: manager };
+  expect(decodeGroupControl(current)).toEqual(current);
+  expect(decodeGroupControl({ ...current, currentManager: null }).highestManagerGeneration).toBe(1);
+  for (const dispatchHold of ["none", "paused", "stopped"]) {
+    expect(decodeGroupControl({ ...current, dispatchHold }).dispatchHold).toBe(dispatchHold);
+  }
+  expect(() => decodeGroupControl({ ...current, highestManagerGeneration: 2 })).toThrow();
+  expect(() =>
+    decodeGroupControl({ ...current, currentManager: { ...manager, managerGeneration: 0 } }),
+  ).toThrow();
+  expect(() =>
+    decodeGroupControl({
+      ...current,
+      currentManager: { ...manager, managerGeneration: Number.MAX_SAFE_INTEGER + 1 },
+    }),
+  ).toThrow();
+  for (const key of [
+    "currentManager",
+    "highestManagerGeneration",
+    "dispatchHold",
+    "controlRevision",
+    "membershipRevision",
+  ]) {
+    const input: Record<string, unknown> = { ...empty };
+    delete input[key];
+    expect(() => decodeGroupControl(input)).toThrow();
+  }
+  for (const key of [
+    "controlRevision",
+    "membershipRevision",
+    "highestManagerGeneration",
+  ] as const) {
+    for (const value of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1, Infinity]) {
+      expect(() => decodeGroupControl({ ...empty, [key]: value })).toThrow();
+    }
+    expect(decodeGroupControl({ ...empty, [key]: Number.MAX_SAFE_INTEGER })[key]).toBe(
+      Number.MAX_SAFE_INTEGER,
+    );
+  }
+  for (const key of ["environmentId", "groupId"] as const) {
+    expect(decodeGroupRef({ ...group, [key]: "😀".repeat(1_000) })[key]).toHaveLength(2_000);
+    expect(() => decodeGroupRef({ ...group, [key]: "😀".repeat(1_001) })).toThrow();
+    expect(() => decodeGroupRef({ ...group, [key]: " \t " })).toThrow();
+  }
+  expect(decodeGroupRef({ environmentId: " local ", groupId: " stable-group " })).toEqual(group);
+  expect(() =>
+    decodeGroupControl({ ...current, currentManager: { ...manager, threadId: "x".repeat(2_001) } }),
+  ).toThrow();
+  const guarded = {
+    group,
+    expectedControlRevision: 0,
+    expectedMembershipRevision: 0,
+    expectedManagerGeneration: null,
+    reason: "user hold",
+  };
+  for (const decode of [decodeGroupPause, decodeGroupResume]) {
+    expect(
+      decode({ ...guarded, actor: "human", groupBudget: 999, ready: true, grant: "approve" }),
+    ).toEqual(guarded);
+    expect(decode({ ...guarded, expectedManagerGeneration: 1 }).expectedManagerGeneration).toBe(1);
+    for (const key of [
+      "expectedControlRevision",
+      "expectedMembershipRevision",
+      "expectedManagerGeneration",
+    ]) {
+      const input: Record<string, unknown> = { ...guarded };
+      delete input[key];
+      expect(() => decode(input)).toThrow();
+      for (const value of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1])
+        expect(() => decode({ ...guarded, [key]: value })).toThrow();
+    }
+    expect(() => decode({ ...guarded, expectedManagerGeneration: 0 })).toThrow();
+    expect(() => decode({ ...guarded, reason: "\ufeff" })).toThrow();
+    expect(() => decode({ ...guarded, reason: "x".repeat(2_001) })).toThrow();
+  }
+  expect(
+    decodeGroupControlResult({ sequence: 0, control: current, ready: true, allowance: 99 }),
+  ).toEqual({ sequence: 0, control: current });
+  expect(() =>
+    decodeGroupControlResult({ sequence: Number.MAX_SAFE_INTEGER + 1, control: current }),
+  ).toThrow();
+  expect(
+    decodeGroupControl({
+      ...current,
+      running: true,
+      memberships: [{ taskId: "a" }],
+      caller: { actor: "human" },
+    }),
+  ).toEqual(current);
+});
