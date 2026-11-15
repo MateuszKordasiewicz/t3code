@@ -2183,3 +2183,407 @@ it("preserves explicit group control identities without inventing membership or 
     }),
   ).toEqual(current);
 });
+
+const membershipTask = { environmentId: "local", taskId: "a" };
+const membershipGroup = { environmentId: "local", groupId: "group-a" };
+const membershipOtherGroup = { environmentId: "local", groupId: "group-b" };
+const membershipProvenance = {
+  eventId: "joined-event",
+  commandId: "joined-command",
+  occurredAt: "2026-11-15T00:00:00.0001Z",
+  performedBy: { subject: "user", sessionId: "session" },
+};
+const membershipCurrent = {
+  state: "current",
+  task: membershipTask,
+  group: membershipGroup,
+  membershipGeneration: 3,
+  acceptedDefinitionRevisionAtJoin: 1,
+  joinedMembershipRevision: 4,
+  joined: membershipProvenance,
+};
+const membershipRevisions = {
+  definitionRevision: 3,
+  acceptedDefinitionRevision: 2,
+  lifecycleRevision: 5,
+  actionPolicyRevision: 6,
+  completionPolicyRevision: 7,
+};
+const membershipSnapshot = {
+  task: membershipTask,
+  highestMembershipGeneration: 3,
+  currentMembership: membershipCurrent,
+  taskRevisions: membershipRevisions,
+};
+const membershipControl = {
+  group: membershipGroup,
+  controlRevision: 2,
+  membershipRevision: 4,
+  highestManagerGeneration: 1,
+  currentManager: { threadId: "manager", managerGeneration: 1 },
+  dispatchHold: "paused",
+};
+const decodeMembershipRecord = Schema.decodeUnknownSync(task.WorkTaskMembershipRecord);
+const decodeMembershipSnapshot = Schema.decodeUnknownSync(task.WorkTaskMembershipSnapshot);
+const decodeMemberReadInput = Schema.decodeUnknownSync(task.WorkTaskGroupMemberReadInput);
+const decodeMemberRead = Schema.decodeUnknownSync(task.WorkTaskGroupMemberReadResult);
+const decodeMembershipHistoryInput = Schema.decodeUnknownSync(task.WorkTaskMembershipHistoryInput);
+const decodeMembershipHistory = Schema.decodeUnknownSync(task.WorkTaskMembershipHistoryResult);
+const decodeMembershipChange = Schema.decodeUnknownSync(task.WorkTaskChangeMembershipInput);
+const decodeMembershipChangeResult = Schema.decodeUnknownSync(task.WorkTaskChangeMembershipResult);
+
+it("preserves membership join evidence and task-global generation across retirement and rejoin", () => {
+  expect(decodeMembershipRecord(membershipCurrent)).toEqual(membershipCurrent);
+  const retired = {
+    ...membershipCurrent,
+    state: "retired",
+    retiredMembershipRevision: 5,
+    retired: { ...membershipProvenance, occurredAt: "2026-11-15T00:00:00.0009Z" },
+  };
+  expect(decodeMembershipRecord(retired)).toEqual(retired);
+  for (const occurredAt of ["2026-11-14T23:00:00.0001-01:00", "2026-11-15T00:00:00.0001Z"]) {
+    expect(
+      decodeMembershipRecord({ ...retired, retired: { ...retired.retired, occurredAt } }),
+    ).toBeDefined();
+  }
+  for (const malformed of [
+    { ...retired, retiredMembershipRevision: 4 },
+    { ...retired, retired: { ...retired.retired, occurredAt: "2026-11-15T00:00:00.0000Z" } },
+    { ...retired, retired: null },
+    { ...membershipCurrent, group: { ...membershipGroup, environmentId: "other" } },
+    { ...membershipCurrent, state: "candidate" },
+  ])
+    expect(() => decodeMembershipRecord(malformed)).toThrow();
+  expect(decodeMembershipSnapshot(membershipSnapshot)).toEqual(membershipSnapshot);
+  expect(
+    decodeMembershipSnapshot({ ...membershipSnapshot, currentMembership: null })
+      .highestMembershipGeneration,
+  ).toBe(3);
+  expect(
+    decodeMembershipSnapshot({
+      ...membershipSnapshot,
+      highestMembershipGeneration: 0,
+      currentMembership: null,
+      taskRevisions: { ...membershipRevisions, acceptedDefinitionRevision: null },
+    }).currentMembership,
+  ).toBeNull();
+  for (const malformed of [
+    { ...membershipSnapshot, highestMembershipGeneration: 2 },
+    { ...membershipSnapshot, task: { ...membershipTask, taskId: "b" } },
+    { ...membershipSnapshot, currentMembership: retired },
+    {
+      ...membershipSnapshot,
+      taskRevisions: { ...membershipRevisions, acceptedDefinitionRevision: null },
+    },
+    {
+      ...membershipSnapshot,
+      taskRevisions: { ...membershipRevisions, acceptedDefinitionRevision: 4 },
+    },
+    {
+      ...membershipSnapshot,
+      currentMembership: { ...membershipCurrent, acceptedDefinitionRevisionAtJoin: 3 },
+    },
+  ])
+    expect(() => decodeMembershipSnapshot(malformed)).toThrow();
+  for (const key of [
+    "membershipGeneration",
+    "joinedMembershipRevision",
+    "acceptedDefinitionRevisionAtJoin",
+  ]) {
+    for (const value of [0, -1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => decodeMembershipRecord({ ...membershipCurrent, [key]: value })).toThrow();
+    }
+  }
+  for (const key of Object.keys(membershipRevisions)) {
+    expect(() =>
+      decodeMembershipSnapshot({
+        ...membershipSnapshot,
+        taskRevisions: { ...membershipRevisions, [key]: Number.MAX_SAFE_INTEGER + 1 },
+      }),
+    ).toThrow();
+  }
+  for (const key of ["currentMembership", "highestMembershipGeneration", "taskRevisions"]) {
+    const missing: Record<string, unknown> = { ...membershipSnapshot };
+    delete missing[key];
+    expect(() => decodeMembershipSnapshot(missing)).toThrow();
+  }
+  for (const key of ["eventId", "commandId", "occurredAt"]) {
+    expect(() =>
+      decodeMembershipRecord({
+        ...membershipCurrent,
+        joined: { ...membershipProvenance, [key]: "x".repeat(2_001) },
+      }),
+    ).toThrow();
+  }
+  expect(() =>
+    decodeMembershipRecord({
+      ...membershipCurrent,
+      joined: { ...membershipProvenance, occurredAt: "2026-02-30T00:00:00Z" },
+    }),
+  ).toThrow();
+  for (const key of ["subject", "sessionId"]) {
+    for (const value of ["\ufeff\t", "😀".repeat(1_001)]) {
+      expect(() =>
+        decodeMembershipRecord({
+          ...membershipCurrent,
+          joined: {
+            ...membershipProvenance,
+            performedBy: { ...membershipProvenance.performedBy, [key]: value },
+          },
+        }),
+      ).toThrow();
+    }
+  }
+  expect(
+    decodeMembershipRecord({
+      ...membershipCurrent,
+      task: { ...membershipTask, taskId: "😀".repeat(1_000) },
+    }).task.taskId,
+  ).toHaveLength(2_000);
+  expect(() =>
+    decodeMembershipRecord({
+      ...membershipCurrent,
+      task: { ...membershipTask, taskId: "😀".repeat(1_001) },
+    }),
+  ).toThrow();
+  expect(
+    decodeMembershipRecord({
+      ...membershipCurrent,
+      task: { ...membershipTask, taskId: " a " },
+      grant: true,
+    }),
+  ).toEqual(membershipCurrent);
+});
+
+it("recovers membership changes from bounded task and empty or populated group reads", () => {
+  const input = { group: membershipGroup, limit: 100, pageToken: "opaque" };
+  expect(decodeMemberReadInput(input)).toEqual(input);
+  expect(decodeMemberReadInput({ group: membershipGroup })).toEqual({ group: membershipGroup });
+  expect(decodeMembershipHistoryInput({ task: membershipTask, limit: 50 })).toEqual({
+    task: membershipTask,
+    limit: 50,
+  });
+  for (const limit of [0, 101, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+    expect(() => decodeMemberReadInput({ ...input, limit })).toThrow();
+    expect(() => decodeMembershipHistoryInput({ task: membershipTask, limit })).toThrow();
+  }
+  expect(() => decodeMemberReadInput({ ...input, pageToken: "x".repeat(2_001) })).toThrow();
+  const source = decodeMemberRead({
+    sequence: 8,
+    viewGeneration: 4,
+    control: membershipControl,
+    members: [membershipCurrent],
+  });
+  const destination = decodeMemberRead({
+    sequence: 8,
+    viewGeneration: 4,
+    control: { ...membershipControl, group: membershipOtherGroup },
+    members: [],
+  });
+  const history = decodeMembershipHistory({
+    sequence: 8,
+    viewGeneration: 4,
+    snapshot: membershipSnapshot,
+    memberships: [membershipCurrent],
+  });
+  const guard = (control: typeof source.control) => ({
+    group: control.group,
+    expectedControlRevision: control.controlRevision,
+    expectedMembershipRevision: control.membershipRevision,
+    expectedManagerGeneration: control.currentManager?.managerGeneration ?? null,
+  });
+  const change = {
+    task: history.snapshot.task,
+    expectedTaskRevisions: history.snapshot.taskRevisions,
+    expectedMembershipGeneration: history.snapshot.highestMembershipGeneration,
+    sourceGroup: guard(source.control),
+    destinationGroup: guard(destination.control),
+    reason: "move selected task",
+  };
+  expect(
+    decodeMembershipChange({
+      ...change,
+      actor: "human",
+      allowance: 500,
+      grant: "allow",
+      ready: true,
+    }),
+  ).toEqual(change);
+  expect(
+    decodeMembershipChange({
+      ...change,
+      destinationGroup: null,
+      expectedTaskRevisions: { ...change.expectedTaskRevisions, acceptedDefinitionRevision: null },
+    }).destinationGroup,
+  ).toBeNull();
+  expect(
+    decodeMembershipChange({ ...change, sourceGroup: null }).expectedMembershipGeneration,
+  ).toBe(3);
+  for (const malformed of [
+    { ...change, sourceGroup: null, destinationGroup: null },
+    { ...change, destinationGroup: change.sourceGroup },
+    { ...change, expectedMembershipGeneration: 0 },
+    {
+      ...change,
+      destinationGroup: {
+        ...change.destinationGroup,
+        group: { ...membershipOtherGroup, environmentId: "foreign" },
+      },
+    },
+    {
+      ...change,
+      expectedTaskRevisions: { ...change.expectedTaskRevisions, acceptedDefinitionRevision: null },
+    },
+    { ...change, reason: "\t\ufeff" },
+  ])
+    expect(() => decodeMembershipChange(malformed)).toThrow();
+  for (const key of [
+    "sourceGroup",
+    "destinationGroup",
+    "expectedTaskRevisions",
+    "expectedMembershipGeneration",
+  ]) {
+    const missing: Record<string, unknown> = { ...change };
+    delete missing[key];
+    expect(() => decodeMembershipChange(missing)).toThrow();
+  }
+  for (const key of [
+    "expectedControlRevision",
+    "expectedMembershipRevision",
+    "expectedManagerGeneration",
+  ]) {
+    const missing: Record<string, unknown> = { ...change.sourceGroup };
+    delete missing[key];
+    expect(() => decodeMembershipChange({ ...change, sourceGroup: missing })).toThrow();
+  }
+  for (const count of [0, 100]) {
+    const members = Array.from({ length: count }, (_, index) => ({
+      ...membershipCurrent,
+      task: { ...membershipTask, taskId: `task-${index}` },
+    }));
+    expect(decodeMemberRead({ ...source, members }).members).toHaveLength(count);
+  }
+  for (const members of [
+    Array.from({ length: 101 }, (_, index) => ({
+      ...membershipCurrent,
+      task: { ...membershipTask, taskId: `task-${index}` },
+    })),
+    [membershipCurrent, membershipCurrent],
+    [{ ...membershipCurrent, group: membershipOtherGroup }],
+    [{ ...membershipCurrent, joinedMembershipRevision: 5 }],
+  ])
+    expect(() => decodeMemberRead({ ...source, members })).toThrow();
+  for (const value of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+    expect(() => decodeMemberRead({ ...source, sequence: value })).toThrow();
+    expect(() => decodeMembershipHistory({ ...history, viewGeneration: value })).toThrow();
+  }
+});
+
+it("rejects contradictory membership history and mutation-result snapshots", () => {
+  const retired = {
+    ...membershipCurrent,
+    state: "retired",
+    retiredMembershipRevision: 5,
+    retired: membershipProvenance,
+  };
+  const historical = { ...retired, membershipGeneration: 2 };
+  const page = {
+    sequence: 8,
+    viewGeneration: 4,
+    snapshot: membershipSnapshot,
+    memberships: [membershipCurrent, historical],
+  };
+  expect(decodeMembershipHistory(page).memberships).toHaveLength(2);
+  expect(decodeMembershipHistory({ ...page, memberships: [historical] }).memberships).toHaveLength(
+    1,
+  );
+  for (const memberships of [
+    [retired],
+    [historical, membershipCurrent],
+    [membershipCurrent, membershipCurrent],
+    [{ ...membershipCurrent, joined: { ...membershipProvenance, commandId: "other-command" } }],
+    [{ ...historical, task: { ...membershipTask, taskId: "other" } }],
+    [{ ...historical, membershipGeneration: 4 }],
+  ])
+    expect(() => decodeMembershipHistory({ ...page, memberships })).toThrow();
+  expect(() =>
+    decodeMembershipHistory({
+      ...page,
+      snapshot: { ...membershipSnapshot, currentMembership: null },
+      memberships: [membershipCurrent],
+    }),
+  ).toThrow();
+  const removed = { ...membershipSnapshot, currentMembership: null };
+  expect(
+    decodeMembershipHistory({ ...page, snapshot: removed, memberships: [retired, historical] })
+      .snapshot.highestMembershipGeneration,
+  ).toBe(3);
+  expect(() =>
+    decodeMembershipHistory({
+      ...page,
+      snapshot: {
+        ...removed,
+        taskRevisions: { ...membershipRevisions, acceptedDefinitionRevision: null },
+      },
+      memberships: [retired],
+    }),
+  ).toThrow();
+  const boundedHistory = Array.from({ length: 100 }, (_, index) => ({
+    ...historical,
+    membershipGeneration: 100 - index,
+  }));
+  const historicalSnapshot = { ...removed, highestMembershipGeneration: 100 };
+  expect(
+    decodeMembershipHistory({ ...page, snapshot: historicalSnapshot, memberships: boundedHistory })
+      .memberships,
+  ).toHaveLength(100);
+  expect(() =>
+    decodeMembershipHistory({
+      ...page,
+      snapshot: { ...historicalSnapshot, highestMembershipGeneration: 101 },
+      memberships: [{ ...historical, membershipGeneration: 101 }, ...boundedHistory],
+    }),
+  ).toThrow();
+  for (const highestMembershipGeneration of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+    expect(() => decodeMembershipSnapshot({ ...removed, highestMembershipGeneration })).toThrow();
+  }
+  const movedSnapshot = {
+    ...membershipSnapshot,
+    highestMembershipGeneration: 4,
+    currentMembership: {
+      ...membershipCurrent,
+      group: membershipOtherGroup,
+      membershipGeneration: 4,
+      joinedMembershipRevision: 5,
+    },
+  };
+  expect(
+    decodeMembershipChangeResult({
+      sequence: 9,
+      snapshot: movedSnapshot,
+      controls: [
+        { ...membershipControl, membershipRevision: 5 },
+        {
+          ...membershipControl,
+          group: membershipOtherGroup,
+          membershipRevision: 5,
+          currentManager: { threadId: "other-manager", managerGeneration: 1 },
+        },
+      ],
+    }).snapshot.highestMembershipGeneration,
+  ).toBe(4);
+  const result = { sequence: 9, snapshot: membershipSnapshot, controls: [membershipControl] };
+  expect(decodeMembershipChangeResult(result)).toEqual(result);
+  expect(decodeMembershipChangeResult({ ...result, snapshot: removed })).toEqual({
+    ...result,
+    snapshot: removed,
+  });
+  for (const controls of [
+    [],
+    [membershipControl, membershipControl],
+    [{ ...membershipControl, group: membershipOtherGroup }],
+    [{ ...membershipControl, membershipRevision: 3 }],
+    [{ ...membershipControl, group: { ...membershipGroup, environmentId: "foreign" } }],
+  ])
+    expect(() => decodeMembershipChangeResult({ ...result, controls })).toThrow();
+});

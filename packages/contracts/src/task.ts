@@ -1578,3 +1578,225 @@ export const WorkTaskManagerGroupControlResult = Schema.Struct({
   control: WorkTaskManagerGroupControlSnapshot,
 });
 export type WorkTaskManagerGroupControlResult = typeof WorkTaskManagerGroupControlResult.Type;
+
+const membershipPositive = PositiveInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER));
+export const WorkTaskMembershipGeneration = membershipPositive.pipe(
+  Schema.brand("WorkTaskMembershipGeneration"),
+);
+export type WorkTaskMembershipGeneration = typeof WorkTaskMembershipGeneration.Type;
+export const WorkTaskMembershipProvenance = Schema.Struct({
+  eventId: EventId.check(Schema.isMaxLength(2_000)),
+  commandId: CommandId.check(Schema.isMaxLength(2_000)),
+  occurredAt: persistedTime,
+  performedBy: graphUser,
+});
+export type WorkTaskMembershipProvenance = typeof WorkTaskMembershipProvenance.Type;
+const membershipFields = {
+  task: WorkTaskGraphTaskRef,
+  group: WorkTaskManagerGroupRef,
+  membershipGeneration: WorkTaskMembershipGeneration,
+  acceptedDefinitionRevisionAtJoin: membershipPositive,
+  joinedMembershipRevision: WorkTaskGroupMembershipRevision.check(Schema.isGreaterThan(0)),
+  joined: WorkTaskMembershipProvenance,
+};
+const membershipEnvironment = Schema.makeFilter(
+  (value: { task: WorkTaskGraphTaskRef; group: WorkTaskManagerGroupRef }) =>
+    value.task.environmentId === value.group.environmentId,
+  { expected: "task and membership group in the same environment" },
+);
+const currentMembership = Schema.Struct({
+  ...membershipFields,
+  state: Schema.Literal("current"),
+}).check(membershipEnvironment);
+const retiredMembership = Schema.Struct({
+  ...membershipFields,
+  state: Schema.Literal("retired"),
+  retiredMembershipRevision: WorkTaskGroupMembershipRevision,
+  retired: WorkTaskMembershipProvenance,
+}).check(
+  membershipEnvironment,
+  Schema.makeFilter(
+    (value) =>
+      value.retiredMembershipRevision > value.joinedMembershipRevision &&
+      isAtOrBefore(value.joined.occurredAt, value.retired.occurredAt),
+    { expected: "retirement after the join revision and not before its occurrence" },
+  ),
+);
+export const WorkTaskMembershipRecord = Schema.Union([currentMembership, retiredMembership]);
+export type WorkTaskMembershipRecord = typeof WorkTaskMembershipRecord.Type;
+export const WorkTaskMembershipTaskRevisions = Schema.Struct({
+  definitionRevision: membershipPositive,
+  acceptedDefinitionRevision: Schema.NullOr(membershipPositive),
+  lifecycleRevision: membershipPositive,
+  actionPolicyRevision: membershipPositive,
+  completionPolicyRevision: membershipPositive,
+}).check(
+  Schema.makeFilter(
+    (value) =>
+      value.acceptedDefinitionRevision === null ||
+      value.acceptedDefinitionRevision <= value.definitionRevision,
+    { expected: "accepted definition evidence no newer than the current definition" },
+  ),
+);
+export type WorkTaskMembershipTaskRevisions = typeof WorkTaskMembershipTaskRevisions.Type;
+const sameMembershipTask = (left: WorkTaskGraphTaskRef, right: WorkTaskGraphTaskRef) =>
+  left.environmentId === right.environmentId && left.taskId === right.taskId;
+const sameMembershipGroup = (left: WorkTaskManagerGroupRef, right: WorkTaskManagerGroupRef) =>
+  left.environmentId === right.environmentId && left.groupId === right.groupId;
+export const WorkTaskMembershipSnapshot = Schema.Struct({
+  task: WorkTaskGraphTaskRef,
+  highestMembershipGeneration: groupCounter,
+  currentMembership: Schema.NullOr(currentMembership),
+  taskRevisions: WorkTaskMembershipTaskRevisions,
+}).check(
+  Schema.makeFilter(
+    (value) =>
+      value.currentMembership === null ||
+      (sameMembershipTask(value.task, value.currentMembership.task) &&
+        value.highestMembershipGeneration === value.currentMembership.membershipGeneration &&
+        value.taskRevisions.acceptedDefinitionRevision !== null &&
+        value.currentMembership.acceptedDefinitionRevisionAtJoin <=
+          value.taskRevisions.acceptedDefinitionRevision),
+    { expected: "current membership matching the task high-water and accepted definition history" },
+  ),
+);
+export type WorkTaskMembershipSnapshot = typeof WorkTaskMembershipSnapshot.Type;
+const membershipPageInput = {
+  limit: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(100))),
+  pageToken: Schema.optional(WorkTaskPageToken),
+};
+const membershipPage = {
+  sequence: groupCounter,
+  viewGeneration: groupCounter,
+  nextPageToken: Schema.optional(WorkTaskPageToken),
+};
+export const WorkTaskGroupMemberReadInput = Schema.Struct({
+  group: WorkTaskManagerGroupRef,
+  ...membershipPageInput,
+});
+export type WorkTaskGroupMemberReadInput = typeof WorkTaskGroupMemberReadInput.Type;
+export const WorkTaskGroupMemberReadResult = Schema.Struct({
+  ...membershipPage,
+  control: WorkTaskManagerGroupControlSnapshot,
+  members: Schema.Array(currentMembership).check(Schema.isMaxLength(100)),
+}).check(
+  Schema.makeFilter(
+    (value) =>
+      new Set(value.members.map((member) => member.task.taskId)).size === value.members.length &&
+      value.members.every(
+        (member) =>
+          sameMembershipGroup(member.group, value.control.group) &&
+          member.joinedMembershipRevision <= value.control.membershipRevision,
+      ),
+    { expected: "unique current members belonging to the group control snapshot" },
+  ),
+);
+export type WorkTaskGroupMemberReadResult = typeof WorkTaskGroupMemberReadResult.Type;
+const sameCurrentMembership = (
+  left: typeof currentMembership.Type,
+  right: typeof currentMembership.Type,
+) =>
+  sameMembershipTask(left.task, right.task) &&
+  sameMembershipGroup(left.group, right.group) &&
+  left.membershipGeneration === right.membershipGeneration &&
+  left.acceptedDefinitionRevisionAtJoin === right.acceptedDefinitionRevisionAtJoin &&
+  left.joinedMembershipRevision === right.joinedMembershipRevision &&
+  left.joined.eventId === right.joined.eventId &&
+  left.joined.commandId === right.joined.commandId &&
+  left.joined.occurredAt === right.joined.occurredAt &&
+  left.joined.performedBy.subject === right.joined.performedBy.subject &&
+  left.joined.performedBy.sessionId === right.joined.performedBy.sessionId;
+export const WorkTaskMembershipHistoryInput = Schema.Struct({
+  task: WorkTaskGraphTaskRef,
+  ...membershipPageInput,
+});
+export type WorkTaskMembershipHistoryInput = typeof WorkTaskMembershipHistoryInput.Type;
+export const WorkTaskMembershipHistoryResult = Schema.Struct({
+  ...membershipPage,
+  snapshot: WorkTaskMembershipSnapshot,
+  memberships: Schema.Array(WorkTaskMembershipRecord).check(Schema.isMaxLength(100)),
+}).check(
+  Schema.makeFilter(
+    ({ snapshot, memberships }) =>
+      memberships.every((member, index) => {
+        if (
+          !sameMembershipTask(member.task, snapshot.task) ||
+          member.membershipGeneration > snapshot.highestMembershipGeneration ||
+          snapshot.taskRevisions.acceptedDefinitionRevision === null ||
+          member.acceptedDefinitionRevisionAtJoin >
+            snapshot.taskRevisions.acceptedDefinitionRevision ||
+          (index > 0 && memberships[index - 1]!.membershipGeneration <= member.membershipGeneration)
+        )
+          return false;
+        const current = snapshot.currentMembership;
+        if (member.state === "current")
+          return current !== null && sameCurrentMembership(member, current);
+        return current === null || member.membershipGeneration !== current.membershipGeneration;
+      }),
+    {
+      expected:
+        "descending distinct task history consistent with current membership and acceptance",
+    },
+  ),
+);
+export type WorkTaskMembershipHistoryResult = typeof WorkTaskMembershipHistoryResult.Type;
+const membershipGroupGuard = Schema.Struct({
+  group: WorkTaskManagerGroupRef,
+  expectedControlRevision: WorkTaskGroupControlRevision,
+  expectedMembershipRevision: WorkTaskGroupMembershipRevision,
+  expectedManagerGeneration: Schema.NullOr(WorkTaskGroupManagerGeneration),
+});
+export const WorkTaskChangeMembershipInput = Schema.Struct({
+  task: WorkTaskGraphTaskRef,
+  expectedTaskRevisions: WorkTaskMembershipTaskRevisions,
+  expectedMembershipGeneration: groupCounter,
+  sourceGroup: Schema.NullOr(membershipGroupGuard),
+  destinationGroup: Schema.NullOr(membershipGroupGuard),
+  reason: Schema.optional(shortText),
+}).check(
+  Schema.makeFilter(
+    ({
+      task,
+      expectedTaskRevisions,
+      expectedMembershipGeneration,
+      sourceGroup,
+      destinationGroup,
+    }) =>
+      (sourceGroup !== null || destinationGroup !== null) &&
+      (sourceGroup === null ||
+        (sourceGroup.group.environmentId === task.environmentId &&
+          expectedMembershipGeneration > 0)) &&
+      (destinationGroup === null ||
+        (destinationGroup.group.environmentId === task.environmentId &&
+          expectedTaskRevisions.acceptedDefinitionRevision !== null)) &&
+      (sourceGroup === null ||
+        destinationGroup === null ||
+        !sameMembershipGroup(sourceGroup.group, destinationGroup.group)),
+    {
+      expected: "explicit same-environment join, move or removal with recoverable revision guards",
+    },
+  ),
+);
+export type WorkTaskChangeMembershipInput = typeof WorkTaskChangeMembershipInput.Type;
+export const WorkTaskChangeMembershipResult = Schema.Struct({
+  sequence: groupCounter,
+  snapshot: WorkTaskMembershipSnapshot,
+  controls: Schema.Array(WorkTaskManagerGroupControlSnapshot).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(2),
+  ),
+}).check(
+  Schema.makeFilter(
+    ({ snapshot, controls }) =>
+      controls.every((control) => control.group.environmentId === snapshot.task.environmentId) &&
+      new Set(controls.map((control) => control.group.groupId)).size === controls.length &&
+      (snapshot.currentMembership === null ||
+        controls.some(
+          (control) =>
+            sameMembershipGroup(control.group, snapshot.currentMembership!.group) &&
+            snapshot.currentMembership!.joinedMembershipRevision <= control.membershipRevision,
+        )),
+    { expected: "distinct affected controls including the resulting current membership" },
+  ),
+);
+export type WorkTaskChangeMembershipResult = typeof WorkTaskChangeMembershipResult.Type;
