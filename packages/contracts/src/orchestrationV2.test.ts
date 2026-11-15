@@ -6,6 +6,8 @@ import { NodeId, RunAttemptId, TrimmedNonEmptyString } from "./index.ts";
 import {
   latestProviderTurnForAttempt,
   OrchestrationV2ProviderCapabilities,
+  OrchestrationV2Run,
+  OrchestrationV2RunJson,
   OrchestrationV2ProviderThread,
   OrchestrationV2ProviderThreadJson,
   OrchestrationV2RpcSchemas,
@@ -638,4 +640,88 @@ describe("latestProviderTurnForAttempt", () => {
     expect(latestProviderTurnForAttempt(turns, RunAttemptId.make("goal-attempt"))?.id).toBe("last");
     expect(latestProviderTurnForAttempt(turns, null)).toBeUndefined();
   });
+});
+
+const decodeBoundRun = Schema.decodeUnknownSync(OrchestrationV2Run);
+const decodeBoundRunJson = Schema.decodeUnknownSync(OrchestrationV2RunJson);
+
+it("checks selected-work binding identities in typed and JSON runs without changing legacy runs", () => {
+  const binding = {
+    version: 2,
+    workClaimId: "claim",
+    task: { environmentId: "local", taskId: "task" },
+    group: { environmentId: "local", groupId: "group" },
+    manager: { threadId: "manager", managerGeneration: 2 },
+    membershipGeneration: 3,
+    membershipRevision: 4,
+    controlRevision: 2,
+    graphRevision: 1,
+    projectId: "project",
+    providerInstanceId: "codex",
+    taskRevisions: {
+      definitionRevision: 3,
+      acceptedDefinitionRevision: 2,
+      lifecycleRevision: 1,
+      actionPolicyRevision: 1,
+      completionPolicyRevision: 1,
+    },
+    commandId: "command",
+    runId: "run",
+    messageId: "message",
+    effectId: "effect",
+  };
+  const run = {
+    id: "run",
+    threadId: "manager",
+    ordinal: 1,
+    providerInstanceId: "codex",
+    modelSelection: { instanceId: "codex", model: "model" },
+    providerThreadId: null,
+    userMessageId: "message",
+    rootNodeId: null,
+    activeAttemptId: null,
+    status: "queued",
+    requestedAt: now,
+    startedAt: null,
+    completedAt: null,
+    checkpointId: null,
+    contextHandoffId: null,
+  };
+  const legacy = {
+    taskId: "legacy-task",
+    managerGeneration: 9,
+    definitionRevision: 1,
+    lifecycleRevision: 1,
+    actionPolicyRevision: 1,
+    completionPolicyRevision: 1,
+  };
+  for (const [decode, input] of [
+    [decodeBoundRun, run],
+    [decodeBoundRunJson, { ...run, requestedAt: DateTime.formatIso(now) }],
+  ] as const) {
+    expect(() =>
+      decode({ ...input, taskWorkBindingV2: { ...binding, runId: "another-run" } }),
+    ).toThrow();
+    expect(decode(input)).not.toHaveProperty("taskWorkBindingV2");
+    expect(decode({ ...input, taskManagerBinding: legacy }).taskManagerBinding).toEqual(legacy);
+    expect(decode({ ...input, taskWorkBindingV2: binding }).taskWorkBindingV2).toEqual(binding);
+    for (const malformed of [
+      { ...input, taskWorkBindingV2: binding, taskManagerBinding: legacy },
+      {
+        ...input,
+        taskWorkBindingV2: {
+          ...binding,
+          manager: { ...binding.manager, threadId: "another-manager" },
+        },
+      },
+      { ...input, taskWorkBindingV2: { ...binding, messageId: "another-message" } },
+      { ...input, taskWorkBindingV2: { ...binding, providerInstanceId: "claude" } },
+      {
+        ...input,
+        taskWorkBindingV2: binding,
+        modelSelection: { ...run.modelSelection, instanceId: "claude" },
+      },
+    ])
+      expect(() => decode(malformed)).toThrow();
+  }
 });

@@ -2592,3 +2592,211 @@ it("rejects contradictory membership history and mutation-result snapshots", () 
   ])
     expect(() => decodeMembershipChangeResult({ ...result, controls })).toThrow();
 });
+
+const workBinding = {
+  version: 2,
+  workClaimId: "work-claim",
+  task: membershipTask,
+  group: membershipGroup,
+  manager: { threadId: "manager", managerGeneration: 2 },
+  membershipGeneration: 3,
+  membershipRevision: 4,
+  controlRevision: 2,
+  graphRevision: 1,
+  projectId: "launch-project",
+  providerInstanceId: "codex",
+  taskRevisions: membershipRevisions,
+  commandId: "accept-command",
+  runId: "accepted-run",
+  messageId: "accepted-message",
+  effectId: "accepted-effect",
+};
+const initialWorkOrigin = {
+  type: "initial_start",
+  startCommandId: "original-start-command",
+  startEventId: "original-start-event",
+  startSequence: 2,
+};
+const acceptedWork = {
+  binding: workBinding,
+  acceptedEventId: "accepted-event",
+  acceptedSequence: 10,
+  acceptedAt: "2026-11-15T00:00:00.0001Z",
+  sourceEventId: "ready-event",
+  sourceSequence: 8,
+  observedWorkSequence: 7,
+  prerequisites: [],
+  launchOrigin: initialWorkOrigin,
+};
+const decodeWorkBinding = Schema.decodeUnknownSync(task.WorkTaskRunBindingV2);
+const decodeAcceptedWork = Schema.decodeUnknownSync(task.WorkTaskAcceptedWorkClaim);
+
+it("records bounded selected work without treating a claim as caller or provider origin", () => {
+  expect(decodeAcceptedWork(acceptedWork)).toEqual(acceptedWork);
+  expect(decodeWorkBinding(workBinding)).toEqual(workBinding);
+  expect(decodeWorkBinding({ ...workBinding, graphRevision: 0 }).graphRevision).toBe(0);
+  expect(decodeAcceptedWork({ ...acceptedWork, sourceSequence: 9 }).observedWorkSequence).toBe(7);
+  for (const key of Object.keys(workBinding)) {
+    const missing: Record<string, unknown> = { ...workBinding };
+    delete missing[key];
+    expect(() => decodeWorkBinding(missing)).toThrow();
+  }
+  for (const key of Object.keys(acceptedWork)) {
+    const missing: Record<string, unknown> = { ...acceptedWork };
+    delete missing[key];
+    expect(() => decodeAcceptedWork(missing)).toThrow();
+  }
+  for (const key of ["workClaimId", "projectId", "commandId", "runId", "messageId", "effectId"]) {
+    for (const value of ["\t\ufeff", "😀".repeat(1_001)]) {
+      expect(() => decodeWorkBinding({ ...workBinding, [key]: value })).toThrow();
+    }
+    expect(decodeWorkBinding({ ...workBinding, [key]: "😀".repeat(1_000) })).toBeDefined();
+  }
+  for (const providerInstanceId of ["a/b", "x".repeat(65), "1-codex"]) {
+    expect(() => decodeWorkBinding({ ...workBinding, providerInstanceId })).toThrow();
+  }
+  expect(
+    decodeWorkBinding({ ...workBinding, providerInstanceId: " Codex_2 " }).providerInstanceId,
+  ).toBe("Codex_2");
+  for (const malformed of [
+    { ...workBinding, version: 1 },
+    { ...workBinding, group: { ...membershipGroup, environmentId: "foreign" } },
+    { ...workBinding, membershipGeneration: 0 },
+    { ...workBinding, membershipRevision: 0 },
+    { ...workBinding, manager: { ...workBinding.manager, managerGeneration: 0 } },
+    { ...workBinding, taskRevisions: { ...membershipRevisions, acceptedDefinitionRevision: null } },
+    { ...workBinding, taskRevisions: { ...membershipRevisions, acceptedDefinitionRevision: 4 } },
+  ])
+    expect(() => decodeWorkBinding(malformed)).toThrow();
+  for (const key of [
+    "membershipGeneration",
+    "membershipRevision",
+    "controlRevision",
+    "graphRevision",
+  ]) {
+    for (const value of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => decodeWorkBinding({ ...workBinding, [key]: value })).toThrow();
+    }
+  }
+  for (const key of ["acceptedSequence", "sourceSequence", "observedWorkSequence"]) {
+    for (const value of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => decodeAcceptedWork({ ...acceptedWork, [key]: value })).toThrow();
+    }
+  }
+  expect(() => decodeAcceptedWork({ ...acceptedWork, sourceSequence: 11 })).toThrow();
+  expect(() => decodeAcceptedWork({ ...acceptedWork, observedWorkSequence: 11 })).toThrow();
+  for (const acceptedAt of [
+    "not-a-time",
+    "2026-02-30T00:00:00Z",
+    `2026-11-15T00:00:00.${"0".repeat(2_000)}Z`,
+  ]) {
+    expect(() => decodeAcceptedWork({ ...acceptedWork, acceptedAt })).toThrow();
+  }
+  for (const key of ["acceptedEventId", "sourceEventId"]) {
+    expect(() => decodeAcceptedWork({ ...acceptedWork, [key]: "x".repeat(2_001) })).toThrow();
+  }
+  expect(
+    decodeAcceptedWork({
+      ...acceptedWork,
+      actor: "human",
+      grant: "allow",
+      emittingRunId: "invented-origin",
+      providerSessionId: "credential-namespace",
+      binding: {
+        ...workBinding,
+        emittingRunId: "invented-origin",
+        providerSessionId: "namespace",
+        prerequisites: [{ secret: "not-a-run-payload" }],
+      },
+    }),
+  ).toEqual(acceptedWork);
+  const witnesses = Array.from({ length: 64 }, (_, index) => ({
+    edgeId: `edge-${index}`,
+    blocker: { environmentId: "local", taskId: `blocker-${index}` },
+    completionEventId: `completed-${index}`,
+    completionSequence: 6,
+  }));
+  expect(
+    decodeAcceptedWork({ ...acceptedWork, prerequisites: witnesses }).prerequisites,
+  ).toHaveLength(64);
+  for (const prerequisites of [
+    [
+      ...witnesses,
+      { ...witnesses[0], edgeId: "edge-extra", blocker: { ...membershipTask, taskId: "extra" } },
+    ],
+    [witnesses[0], witnesses[0]],
+    [witnesses[0], { ...witnesses[0], edgeId: "another-edge" }],
+    [witnesses[0], { ...witnesses[1], edgeId: witnesses[0]!.edgeId }],
+    [{ ...witnesses[0], blocker: membershipTask }],
+    [{ ...witnesses[0], blocker: { ...membershipTask, environmentId: "foreign" } }],
+    [{ ...witnesses[0], completionSequence: 11 }],
+    [{ ...witnesses[0], completionEventId: "x".repeat(2_001) }],
+  ])
+    expect(() => decodeAcceptedWork({ ...acceptedWork, prerequisites })).toThrow();
+});
+
+it("distinguishes original Start from one reserved automatic follow-up unit", () => {
+  const initial = decodeAcceptedWork(acceptedWork);
+  expect(initial.binding.commandId).not.toBe(initialWorkOrigin.startCommandId);
+  expect(initial.launchOrigin).not.toHaveProperty("allowanceUnit");
+  const automatic = {
+    type: "automatic_followup",
+    reservationId: "reservation",
+    reservationCommandId: "reserve-command",
+    allowanceUnit: 1,
+    observedDirtyGeneration: 6,
+    acknowledgedGeneration: 5,
+  };
+  expect(decodeAcceptedWork({ ...acceptedWork, launchOrigin: automatic }).launchOrigin).toEqual(
+    automatic,
+  );
+  for (const acknowledgedGeneration of [0, 6]) {
+    expect(
+      decodeAcceptedWork({
+        ...acceptedWork,
+        launchOrigin: { ...automatic, acknowledgedGeneration },
+      }),
+    ).toBeDefined();
+  }
+  for (const key of [
+    "reservationId",
+    "reservationCommandId",
+    "allowanceUnit",
+    "observedDirtyGeneration",
+    "acknowledgedGeneration",
+  ]) {
+    const missing: Record<string, unknown> = { ...automatic };
+    delete missing[key];
+    expect(() => decodeAcceptedWork({ ...acceptedWork, launchOrigin: missing })).toThrow();
+    expect(() =>
+      decodeAcceptedWork({
+        ...acceptedWork,
+        launchOrigin: { ...initialWorkOrigin, [key]: automatic[key as keyof typeof automatic] },
+      }),
+    ).toThrow();
+  }
+  for (const key of ["startCommandId", "startEventId", "startSequence"]) {
+    const missing: Record<string, unknown> = { ...initialWorkOrigin };
+    delete missing[key];
+    expect(() => decodeAcceptedWork({ ...acceptedWork, launchOrigin: missing })).toThrow();
+    expect(() =>
+      decodeAcceptedWork({
+        ...acceptedWork,
+        launchOrigin: {
+          ...automatic,
+          [key]: initialWorkOrigin[key as keyof typeof initialWorkOrigin],
+        },
+      }),
+    ).toThrow();
+  }
+  for (const launchOrigin of [
+    { ...initialWorkOrigin, startSequence: 11 },
+    { ...initialWorkOrigin, startCommandId: "x".repeat(2_001) },
+    { ...automatic, acknowledgedGeneration: 7 },
+    { ...automatic, allowanceUnit: 0 },
+    { ...automatic, observedDirtyGeneration: 0 },
+    { ...automatic, reservationId: "\t" },
+    { ...automatic, allowanceUnit: Number.MAX_SAFE_INTEGER + 1 },
+  ])
+    expect(() => decodeAcceptedWork({ ...acceptedWork, launchOrigin })).toThrow();
+});

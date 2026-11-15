@@ -16,6 +16,7 @@ import {
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
 import { ModelSelection } from "./modelSelection.ts";
+import { ProviderInstanceId } from "./providerInstance.ts";
 
 export const WorkTaskId = TrimmedNonEmptyString.pipe(Schema.brand("WorkTaskId"));
 export type WorkTaskId = typeof WorkTaskId.Type;
@@ -1802,3 +1803,104 @@ export const WorkTaskChangeMembershipResult = Schema.Struct({
   ),
 );
 export type WorkTaskChangeMembershipResult = typeof WorkTaskChangeMembershipResult.Type;
+
+export const WorkTaskWorkClaimId = shortText.pipe(Schema.brand("WorkTaskWorkClaimId"));
+export type WorkTaskWorkClaimId = typeof WorkTaskWorkClaimId.Type;
+const workPositive = PositiveInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER));
+const acceptedWorkRevisions = Schema.Struct({
+  ...WorkTaskMembershipTaskRevisions.fields,
+  acceptedDefinitionRevision: workPositive,
+}).check(
+  Schema.makeFilter((value) => value.acceptedDefinitionRevision <= value.definitionRevision, {
+    expected: "accepted work definition no newer than the current draft",
+  }),
+);
+export const WorkTaskRunBindingV2 = Schema.Struct({
+  version: Schema.Literal(2),
+  workClaimId: WorkTaskWorkClaimId,
+  task: WorkTaskGraphTaskRef,
+  group: WorkTaskManagerGroupRef,
+  manager: WorkTaskGroupManagerRef,
+  membershipGeneration: WorkTaskMembershipGeneration,
+  membershipRevision: WorkTaskGroupMembershipRevision.check(Schema.isGreaterThan(0)),
+  controlRevision: WorkTaskGroupControlRevision,
+  graphRevision: WorkTaskGraphRevision,
+  projectId: ProjectId.check(Schema.isMaxLength(2_000)),
+  providerInstanceId: ProviderInstanceId,
+  taskRevisions: acceptedWorkRevisions,
+  commandId: CommandId.check(Schema.isMaxLength(2_000)),
+  runId: RunId.check(Schema.isMaxLength(2_000)),
+  messageId: MessageId.check(Schema.isMaxLength(2_000)),
+  effectId: shortText,
+}).check(membershipEnvironment);
+export type WorkTaskRunBindingV2 = typeof WorkTaskRunBindingV2.Type;
+export const WorkTaskPrerequisiteCompletionWitness = Schema.Struct({
+  edgeId: WorkTaskGraphEdgeId,
+  blocker: WorkTaskGraphTaskRef,
+  completionEventId: EventId.check(Schema.isMaxLength(2_000)),
+  completionSequence: groupCounter,
+});
+export type WorkTaskPrerequisiteCompletionWitness =
+  typeof WorkTaskPrerequisiteCompletionWitness.Type;
+const initialWorkOrigin = Schema.Struct({
+  type: Schema.Literal("initial_start"),
+  startCommandId: CommandId.check(Schema.isMaxLength(2_000)),
+  startEventId: EventId.check(Schema.isMaxLength(2_000)),
+  startSequence: groupCounter,
+  reservationId: forbidden,
+  reservationCommandId: forbidden,
+  allowanceUnit: forbidden,
+  observedDirtyGeneration: forbidden,
+  acknowledgedGeneration: forbidden,
+});
+const automaticWorkOrigin = Schema.Struct({
+  type: Schema.Literal("automatic_followup"),
+  reservationId: shortText,
+  reservationCommandId: CommandId.check(Schema.isMaxLength(2_000)),
+  allowanceUnit: workPositive,
+  observedDirtyGeneration: workPositive,
+  acknowledgedGeneration: groupCounter,
+  startCommandId: forbidden,
+  startEventId: forbidden,
+  startSequence: forbidden,
+}).check(
+  Schema.makeFilter((value) => value.acknowledgedGeneration <= value.observedDirtyGeneration, {
+    expected: "acknowledged work no later than the observed dirty generation",
+  }),
+);
+export const WorkTaskAcceptedWorkClaim = Schema.Struct({
+  binding: WorkTaskRunBindingV2,
+  acceptedEventId: EventId.check(Schema.isMaxLength(2_000)),
+  acceptedSequence: groupCounter,
+  acceptedAt: persistedTime,
+  sourceEventId: EventId.check(Schema.isMaxLength(2_000)),
+  sourceSequence: groupCounter,
+  observedWorkSequence: groupCounter,
+  prerequisites: Schema.Array(WorkTaskPrerequisiteCompletionWitness).check(Schema.isMaxLength(64)),
+  launchOrigin: Schema.Union([initialWorkOrigin, automaticWorkOrigin]),
+}).check(
+  Schema.makeFilter(
+    ({
+      binding,
+      acceptedSequence,
+      sourceSequence,
+      observedWorkSequence,
+      prerequisites,
+      launchOrigin,
+    }) =>
+      sourceSequence <= acceptedSequence &&
+      observedWorkSequence <= acceptedSequence &&
+      (launchOrigin.type !== "initial_start" || launchOrigin.startSequence <= acceptedSequence) &&
+      new Set(prerequisites.map((witness) => witness.edgeId)).size === prerequisites.length &&
+      new Set(prerequisites.map((witness) => witness.blocker.taskId)).size ===
+        prerequisites.length &&
+      prerequisites.every(
+        (witness) =>
+          witness.blocker.environmentId === binding.task.environmentId &&
+          !sameMembershipTask(witness.blocker, binding.task) &&
+          witness.completionSequence <= acceptedSequence,
+      ),
+    { expected: "bounded distinct prerequisite and launch evidence no later than work acceptance" },
+  ),
+);
+export type WorkTaskAcceptedWorkClaim = typeof WorkTaskAcceptedWorkClaim.Type;

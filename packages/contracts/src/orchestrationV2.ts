@@ -56,7 +56,7 @@ import {
   OrchestrationGetTurnDiffResult,
 } from "./checkpointDiff.ts";
 import { ModelSelection } from "./modelSelection.ts";
-import { WorkTaskManagerRunBinding } from "./task.ts";
+import { WorkTaskManagerRunBinding, WorkTaskRunBindingV2 } from "./task.ts";
 import {
   ThreadLinkedPullRequest,
   ThreadPullRequestLink,
@@ -682,10 +682,35 @@ export type OrchestrationV2ThreadLaunchWorkspaceStrategy =
 
 export const ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE = "workspace_preparation_failed";
 
+const selectedWorkRunBinding = Schema.makeFilter(
+  (run: {
+    id: RunId;
+    threadId: ThreadId;
+    userMessageId: MessageId;
+    providerInstanceId: ProviderInstanceId;
+    modelSelection: ModelSelection;
+    taskManagerBinding?: WorkTaskManagerRunBinding | undefined;
+    taskWorkBindingV2?: WorkTaskRunBindingV2 | undefined;
+  }) => {
+    const binding = run.taskWorkBindingV2;
+    return (
+      binding === undefined ||
+      (run.taskManagerBinding === undefined &&
+        run.id === binding.runId &&
+        run.threadId === binding.manager.threadId &&
+        run.userMessageId === binding.messageId &&
+        run.providerInstanceId === binding.providerInstanceId &&
+        run.modelSelection.instanceId === binding.providerInstanceId)
+    );
+  },
+  { expected: "one task binding matching the accepted run, manager, message and provider" },
+);
+
 export const OrchestrationV2Run = Schema.Struct({
   id: RunId,
   threadId: ThreadId,
   taskManagerBinding: Schema.optional(WorkTaskManagerRunBinding),
+  taskWorkBindingV2: Schema.optional(WorkTaskRunBindingV2),
   ordinal: PositiveInt,
   providerInstanceId: ProviderInstanceId,
   modelSelection: ModelSelection,
@@ -718,7 +743,7 @@ export const OrchestrationV2Run = Schema.Struct({
   workspacePreparation: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
   /** Starts a new provider conversation; earlier runs stay visible but never reach the provider. */
   freshContext: Schema.optional(Schema.Boolean),
-});
+}).check(selectedWorkRunBinding);
 export type OrchestrationV2Run = typeof OrchestrationV2Run.Type;
 
 export function orchestrationV2RunWorkStartedAt(
@@ -2343,7 +2368,7 @@ export const OrchestrationV2RunJson = OrchestrationV2Run.mapFields((fields) => (
   startedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
   completedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
   workStartedAt: Schema.optional(Schema.DateTimeUtcFromString),
-}));
+})).check(selectedWorkRunBinding);
 export type OrchestrationV2RunJson = typeof OrchestrationV2RunJson.Type;
 
 export const OrchestrationV2RunAttemptJson = OrchestrationV2RunAttempt.mapFields((fields) => ({
