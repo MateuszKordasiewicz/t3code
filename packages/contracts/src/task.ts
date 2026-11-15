@@ -2209,6 +2209,8 @@ export const WorkTaskMembershipChangedEvent = Schema.Struct({
         if (
           retired === null ||
           transition === undefined ||
+          event.id === source.joined.eventId ||
+          groupTransitions.some((entry) => entry.companionEventId === source.joined.eventId) ||
           !sameCurrentMembership(source, { ...retired, state: "current" }) ||
           retired.retiredMembershipRevision !== transition.control.membershipRevision ||
           !membershipProvenanceMatches(event, retired.retired)

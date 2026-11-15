@@ -3244,6 +3244,31 @@ describe("staged group control and membership events", () => {
       },
     ])
       expect(() => decode({ ...move, ...patch })).toThrow();
+    expect(() =>
+      decode({
+        ...move,
+        id: joined.joined.eventId,
+        snapshot: {
+          ...move.snapshot,
+          currentMembership: {
+            ...moved,
+            joined: { ...moveProvenance, eventId: joined.joined.eventId },
+          },
+        },
+        retiredMembership: {
+          ...retired,
+          retired: { ...moveProvenance, eventId: joined.joined.eventId },
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      decode({
+        ...move,
+        groupTransitions: move.groupTransitions.map((transition, index) =>
+          index === 0 ? { ...transition, companionEventId: joined.joined.eventId } : transition,
+        ),
+      }),
+    ).toThrow();
     const companions = companionsFor(move);
     for (const bad of [
       [],
