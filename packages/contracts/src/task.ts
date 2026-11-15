@@ -1651,12 +1651,14 @@ export const WorkTaskMembershipSnapshot = Schema.Struct({
 }).check(
   Schema.makeFilter(
     (value) =>
-      value.currentMembership === null ||
-      (sameMembershipTask(value.task, value.currentMembership.task) &&
-        value.highestMembershipGeneration === value.currentMembership.membershipGeneration &&
-        value.taskRevisions.acceptedDefinitionRevision !== null &&
-        value.currentMembership.acceptedDefinitionRevisionAtJoin <=
-          value.taskRevisions.acceptedDefinitionRevision),
+      (value.highestMembershipGeneration === 0 ||
+        value.taskRevisions.acceptedDefinitionRevision !== null) &&
+      (value.currentMembership === null ||
+        (sameMembershipTask(value.task, value.currentMembership.task) &&
+          value.highestMembershipGeneration === value.currentMembership.membershipGeneration &&
+          value.taskRevisions.acceptedDefinitionRevision !== null &&
+          value.currentMembership.acceptedDefinitionRevisionAtJoin <=
+            value.taskRevisions.acceptedDefinitionRevision)),
     { expected: "current membership matching the task high-water and accepted definition history" },
   ),
 );

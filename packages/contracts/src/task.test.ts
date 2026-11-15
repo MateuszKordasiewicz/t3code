@@ -2268,6 +2268,11 @@ it("preserves membership join evidence and task-global generation across retirem
     }).currentMembership,
   ).toBeNull();
   for (const malformed of [
+    {
+      ...membershipSnapshot,
+      currentMembership: null,
+      taskRevisions: { ...membershipRevisions, acceptedDefinitionRevision: null },
+    },
     { ...membershipSnapshot, highestMembershipGeneration: 2 },
     { ...membershipSnapshot, task: { ...membershipTask, taskId: "b" } },
     { ...membershipSnapshot, currentMembership: retired },
