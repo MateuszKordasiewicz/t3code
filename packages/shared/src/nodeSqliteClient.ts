@@ -962,19 +962,33 @@ const make = Effect.fn("makeWithDatabase")(function* (
       return value;
     };
 
+    let poisoned: SqlError | undefined;
+    const transactionState = () => {
+      try {
+        const state = db.isTransaction;
+        return typeof state === "boolean" ? state : undefined;
+      } catch {
+        return undefined;
+      }
+    };
     const prepare = (sql: string) =>
-      Effect.try({
-        try: () => {
-          const classification = { backpressure: false, check: false };
-          const statement = withClassification(classification, () => db.prepare(sql));
-          if (checkpoint !== undefined) checkpointClassifications.set(statement, classification);
-          return statement;
-        },
-        catch: (cause) =>
-          new SqlError({
-            reason: classifyError(cause, "Failed to prepare statement", "prepare"),
-          }),
-      });
+      Effect.suspend(() =>
+        poisoned !== undefined
+          ? Effect.fail(poisoned)
+          : Effect.try({
+              try: () => {
+                const classification = { backpressure: false, check: false };
+                const statement = withClassification(classification, () => db.prepare(sql));
+                if (checkpoint !== undefined)
+                  checkpointClassifications.set(statement, classification);
+                return statement;
+              },
+              catch: (cause) =>
+                new SqlError({
+                  reason: classifyError(cause, "Failed to prepare statement", "prepare"),
+                }),
+            }),
+      );
 
     const prepareCache = yield* Cache.makeWith(prepare, {
       capacity: 200,
@@ -991,6 +1005,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
       mode: "rows" | "raw" | "values" = "rows",
     ) =>
       Effect.withFiber<ReadonlyArray<any>, SqlError>((fiber) => {
+        if (poisoned !== undefined) return Exit.fail(poisoned);
         const classification = checkpointClassifications.get(statement);
         const execute = () => {
           let arrays = false;
@@ -1048,7 +1063,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
         runStatement(statement, params, "values"),
       );
 
-    return identity<Connection>({
+    const ownedConnection = identity<Connection>({
       execute(sql, params, rowTransform) {
         return rowTransform ? Effect.map(run(sql, params), rowTransform) : run(sql, params);
       },
@@ -1073,10 +1088,28 @@ const make = Effect.fn("makeWithDatabase")(function* (
         return Stream.die(new UnsupportedNodeSqliteOperationError());
       },
     });
+    const onCommitFailure = Effect.suspend(() => {
+      if (transactionState() === false) return Effect.void;
+      return ownedConnection.executeUnprepared("ROLLBACK", [], undefined).pipe(
+        Effect.asVoid,
+        Effect.catchCause((cause) =>
+          Effect.suspend(() => {
+            if (transactionState() === false) return Effect.void;
+            poisoned = failed(
+              cause,
+              "SQLite writer is unusable after failed COMMIT cleanup",
+              "rollback",
+            );
+            return Effect.failCause(cause);
+          }),
+        ),
+      );
+    });
+    return { connection: ownedConnection, onCommitFailure };
   });
 
   const semaphore = yield* Semaphore.make(1);
-  const connection = yield* makeConnection;
+  const { connection, onCommitFailure: recoverWriterCommit } = yield* makeConnection;
   // A reader that cannot start turns off the whole pool, so routing never picks a dead slot.
   const readerPool = { unavailable: false };
   const readers =
@@ -1244,6 +1277,10 @@ const make = Effect.fn("makeWithDatabase")(function* (
     borrower,
     compiler,
     transactionAcquirer,
+    onCommitFailure: (conn) =>
+      conn === connection
+        ? recoverWriterCommit
+        : conn.executeUnprepared("ROLLBACK", [], undefined).pipe(Effect.asVoid),
     // BEGIN IMMEDIATE avoids read-then-write SQLITE_BUSY_SNAPSHOT, which busy_timeout cannot resolve.
     beginTransaction: options.readonly === true ? "BEGIN" : "BEGIN IMMEDIATE",
     spanAttributes: [

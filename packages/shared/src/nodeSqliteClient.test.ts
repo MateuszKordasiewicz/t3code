@@ -2,6 +2,10 @@ import * as NodeSqlite from "node:sqlite";
 import type * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
+import * as Exit from "effect/Exit";
+import * as Schema from "effect/Schema";
+import { SqlError } from "effect/sql/SqlError";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -15,6 +19,8 @@ import type * as Tracer from "effect/Tracer";
 import { vi } from "vite-plus/test";
 
 import * as SqliteClient from "./nodeSqliteClient.ts";
+
+const isSqlError = Schema.is(SqlError);
 
 const startedWorkers = vi.hoisted((): Array<NodeWorkerThreads.Worker> => []);
 const silentWorkers = vi.hoisted(() => ({ on: false, readyOnTerminate: false }));
@@ -490,4 +496,139 @@ it.effect.each([
         masked ? [[1], [2]] : [[2]],
       );
     }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:" }))),
+);
+
+it.effect("rolls back failed deferred commits before releasing the writer", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`PRAGMA foreign_keys=ON`;
+    yield* sql`CREATE TABLE commit_parent(id INTEGER PRIMARY KEY)`;
+    yield* sql`CREATE TABLE commit_child(parent_id INTEGER REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+    const callbacks: string[] = [];
+    let bodyFinished = false;
+    const result = yield* Effect.exit(
+      sql.withTransaction(
+        Effect.gen(function* () {
+          yield* sql.withTransaction(sql`INSERT INTO commit_child VALUES (1)`);
+          yield* sql.afterCommit(
+            Effect.sync(() => {
+              callbacks.push("committed");
+            }),
+          );
+          bodyFinished = true;
+        }),
+      ),
+    );
+    assert.isTrue(bodyFinished);
+    assert.isTrue(Exit.isFailure(result));
+    if (Exit.isFailure(result)) {
+      assert.match(Cause.pretty(result.cause), /FOREIGN KEY constraint failed/);
+      assert.isTrue(
+        result.cause.reasons.some(
+          (reason) => Cause.isFailReason(reason) && isSqlError(reason.error),
+        ),
+      );
+    }
+    assert.deepEqual(callbacks, []);
+    assert.deepEqual(yield* sql`SELECT parent_id FROM commit_child`.values, []);
+    yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* sql`INSERT INTO commit_parent VALUES (2)`;
+        yield* sql`INSERT INTO commit_child VALUES (2)`;
+      }),
+    );
+    assert.deepEqual(yield* sql`SELECT parent_id FROM commit_child`.values, [[2]]);
+  }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:" }))),
+);
+
+it.effect("quarantines writer execution when failed-commit cleanup cannot establish closure", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`PRAGMA foreign_keys=ON`;
+    yield* sql`CREATE TABLE poisoned_parent(id INTEGER PRIMARY KEY)`;
+    yield* sql`CREATE TABLE poisoned_child(parent_id INTEGER REFERENCES poisoned_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+    const cached = sql`SELECT parent_id FROM poisoned_child`;
+    yield* cached;
+    const lazy = sql`SELECT id FROM poisoned_parent`;
+    const prepare = NodeSqlite.DatabaseSync.prototype.prepare;
+    using _rollback = vi
+      .spyOn(NodeSqlite.DatabaseSync.prototype, "prepare")
+      .mockImplementation(function (this: NodeSqlite.DatabaseSync, statement) {
+        if (statement.trim().toUpperCase() === "ROLLBACK")
+          throw new Error("injected rollback failure");
+        return prepare.call(this, statement);
+      });
+    const descriptor = Object.getOwnPropertyDescriptor(
+      NodeSqlite.DatabaseSync.prototype,
+      "isTransaction",
+    );
+    using _state = descriptor?.get
+      ? vi
+          .spyOn(NodeSqlite.DatabaseSync.prototype, "isTransaction", "get")
+          .mockImplementation(() => {
+            throw new Error("unavailable transaction state");
+          })
+      : undefined;
+    const result = yield* Effect.exit(
+      sql.withTransaction(sql`INSERT INTO poisoned_child VALUES (1)`),
+    );
+    assert.isTrue(Exit.isFailure(result));
+    if (Exit.isFailure(result)) {
+      const message = Cause.pretty(result.cause);
+      assert.match(message, /FOREIGN KEY constraint failed/);
+      assert.match(message, /injected rollback failure/);
+      assert.isTrue(Cause.hasDies(result.cause));
+    }
+    for (const query of [cached, lazy, sql`SELECT 1`]) {
+      const blocked = yield* Effect.exit(query);
+      assert.isTrue(Exit.isFailure(blocked));
+      if (Exit.isFailure(blocked)) assert.match(Cause.pretty(blocked.cause), /writer.*unusable/i);
+    }
+    let entered = false;
+    const next = yield* Effect.exit(
+      sql.withTransaction(
+        Effect.sync(() => {
+          entered = true;
+        }),
+      ),
+    );
+    assert.isTrue(Exit.isFailure(next));
+    assert.isFalse(entered);
+  }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:" }))),
+);
+
+it.effect("preserves a commit error after the native transaction has already ended", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`CREATE TABLE ended_commit(value INTEGER)`;
+    const prepare = NodeSqlite.DatabaseSync.prototype.prepare;
+    let inject = true;
+    let stateAvailable = false;
+    using _commit = vi
+      .spyOn(NodeSqlite.DatabaseSync.prototype, "prepare")
+      .mockImplementation(function (this: NodeSqlite.DatabaseSync, statement) {
+        if (inject && statement.trim().toUpperCase() === "COMMIT") {
+          inject = false;
+          stateAvailable = typeof this.isTransaction === "boolean";
+          this.exec("ROLLBACK");
+          throw new Error("injected ended commit");
+        }
+        return prepare.call(this, statement);
+      });
+    const result = yield* Effect.exit(
+      sql.withTransaction(sql`INSERT INTO ended_commit VALUES (1)`),
+    );
+    assert.isTrue(Exit.isFailure(result));
+    if (Exit.isFailure(result)) {
+      assert.match(Cause.pretty(result.cause), /injected ended commit/);
+      if (stateAvailable) assert.isFalse(Cause.hasDies(result.cause));
+    }
+    const next = yield* Effect.exit(sql.withTransaction(sql`INSERT INTO ended_commit VALUES (2)`));
+    if (stateAvailable) {
+      assert.isTrue(Exit.isSuccess(next));
+      assert.deepEqual(yield* sql`SELECT value FROM ended_commit`.values, [[2]]);
+    } else {
+      assert.isTrue(Exit.isFailure(next));
+    }
+  }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:" }))),
 );
