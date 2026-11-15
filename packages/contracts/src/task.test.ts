@@ -2927,3 +2927,354 @@ describe("staged graph event family", () => {
     }
   });
 });
+
+describe("staged group control and membership events", () => {
+  const occurredAt = "2026-11-15T00:00:01.0001Z";
+  const performedBy = { subject: "user", sessionId: "session" };
+  const group = { environmentId: "env", groupId: "a" };
+  const otherGroup = { environmentId: "env", groupId: "b" };
+  const control = {
+    group,
+    controlRevision: 0,
+    membershipRevision: 0,
+    highestManagerGeneration: 0,
+    currentManager: null,
+    dispatchHold: "none",
+  };
+  const common = {
+    id: "create",
+    environmentId: "env",
+    occurredAt,
+    commandId: "command",
+    performedBy,
+  };
+  const created = { ...common, type: "task-group.created", control };
+  const bound = {
+    ...control,
+    controlRevision: 1,
+    highestManagerGeneration: 1,
+    currentManager: { threadId: "manager", managerGeneration: 1 },
+  };
+  const managerChanged = {
+    ...common,
+    id: "bind",
+    type: "task-group.manager-changed",
+    previousControl: control,
+    control: bound,
+  };
+  const taskRef = { environmentId: "env", taskId: "task" };
+  const taskRevisions = {
+    definitionRevision: 2,
+    acceptedDefinitionRevision: 1,
+    lifecycleRevision: 2,
+    actionPolicyRevision: 3,
+    completionPolicyRevision: 4,
+  };
+  const detached = {
+    task: taskRef,
+    highestMembershipGeneration: 0,
+    currentMembership: null,
+    taskRevisions,
+  };
+  const joined = {
+    task: taskRef,
+    group,
+    membershipGeneration: 1,
+    acceptedDefinitionRevisionAtJoin: 1,
+    joinedMembershipRevision: 1,
+    joined: { eventId: "join", commandId: "command", occurredAt, performedBy },
+    state: "current",
+  };
+  const joinedSnapshot = { ...detached, highestMembershipGeneration: 1, currentMembership: joined };
+  const groupAfterJoin = { ...bound, membershipRevision: 1 };
+  const join = {
+    ...common,
+    id: "join",
+    type: "task.membership-changed",
+    previousSnapshot: detached,
+    snapshot: joinedSnapshot,
+    retiredMembership: null,
+    groupTransitions: [
+      { companionEventId: "join-group", previousControl: bound, control: groupAfterJoin },
+    ],
+  };
+  const movedAt = "2026-11-15T00:00:02.0001Z";
+  const moveProvenance = {
+    eventId: "move",
+    commandId: "command",
+    occurredAt: movedAt,
+    performedBy,
+  };
+  const otherControl = { ...bound, group: otherGroup };
+  const moved = {
+    ...joined,
+    group: otherGroup,
+    membershipGeneration: 2,
+    joined: moveProvenance,
+  };
+  const retired = {
+    ...joined,
+    state: "retired",
+    retiredMembershipRevision: 2,
+    retired: moveProvenance,
+  };
+  const move = {
+    ...join,
+    id: "move",
+    occurredAt: movedAt,
+    previousSnapshot: joinedSnapshot,
+    snapshot: { ...joinedSnapshot, highestMembershipGeneration: 2, currentMembership: moved },
+    retiredMembership: retired,
+    groupTransitions: [
+      {
+        companionEventId: "move-a",
+        previousControl: groupAfterJoin,
+        control: { ...groupAfterJoin, membershipRevision: 2 },
+      },
+      {
+        companionEventId: "move-b",
+        previousControl: otherControl,
+        control: { ...otherControl, membershipRevision: 1 },
+      },
+    ],
+  };
+  const companionsFor = (event: typeof join | typeof move) =>
+    event.groupTransitions.map((transition) => ({
+      ...common,
+      id: transition.companionEventId,
+      occurredAt: event.occurredAt,
+      type: "task-group.membership-changed",
+      rootEventId: event.id,
+      task: taskRef,
+      previousControl: transition.previousControl,
+      control: transition.control,
+    }));
+
+  it("records independent group control intent without implying quiescence or clearing work", () => {
+    const decode = Schema.decodeUnknownSync(task.WorkTaskGroupControlEvent);
+    expect(decode(created)).toEqual(created);
+    expect(decode(managerChanged)).toEqual(managerChanged);
+    const retiredManager = { ...bound, controlRevision: 2, currentManager: null };
+    expect(
+      decode({ ...managerChanged, previousControl: bound, control: retiredManager }),
+    ).toBeDefined();
+    expect(
+      decode({
+        ...managerChanged,
+        previousControl: retiredManager,
+        control: {
+          ...bound,
+          controlRevision: 3,
+          highestManagerGeneration: 2,
+          currentManager: { threadId: "next", managerGeneration: 2 },
+        },
+      }),
+    ).toBeDefined();
+    for (const hold of ["paused", "stopped"]) {
+      const held = { ...bound, controlRevision: 2, dispatchHold: hold };
+      const event = {
+        ...common,
+        type: "task-group.hold-changed",
+        previousControl: bound,
+        control: held,
+      };
+      expect(decode(event)).toEqual(event);
+      expect(
+        decode({ ...event, previousControl: held, control: { ...bound, controlRevision: 3 } }),
+      ).toBeDefined();
+    }
+    for (const patch of [
+      { control: bound },
+      { control: { ...control, membershipRevision: 1 } },
+      { control: { ...control, dispatchHold: "paused" } },
+      { environmentId: "foreign" },
+      { commandId: null },
+      { id: "x".repeat(2_001) },
+    ])
+      expect(() => decode({ ...created, ...patch })).toThrow();
+    for (const changed of [
+      { ...bound, controlRevision: 2 },
+      { ...bound, membershipRevision: 1 },
+      { ...bound, dispatchHold: "paused" },
+      { ...bound, group: otherGroup },
+      {
+        ...bound,
+        highestManagerGeneration: 2,
+        currentManager: { threadId: "manager", managerGeneration: 2 },
+      },
+    ])
+      expect(() => decode({ ...managerChanged, control: changed })).toThrow();
+    expect(() =>
+      decode({
+        ...managerChanged,
+        previousControl: bound,
+        control: {
+          ...bound,
+          controlRevision: 2,
+          highestManagerGeneration: 2,
+          currentManager: { threadId: "manager", managerGeneration: 2 },
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      decode({
+        ...managerChanged,
+        previousControl: { ...control, controlRevision: Number.MAX_SAFE_INTEGER },
+        control: { ...bound, controlRevision: Number.MAX_SAFE_INTEGER },
+      }),
+    ).toThrow();
+    for (const changed of [
+      bound,
+      { ...bound, controlRevision: 2, dispatchHold: "paused", membershipRevision: 1 },
+      { ...bound, controlRevision: 2, dispatchHold: "paused", currentManager: null },
+    ])
+      expect(() =>
+        decode({
+          ...common,
+          type: "task-group.hold-changed",
+          previousControl: bound,
+          control: changed,
+        }),
+      ).toThrow();
+    expect(decode({ ...created, actor: "human", approved: true, clearActiveClaim: true })).toEqual(
+      created,
+    );
+  });
+
+  it("preserves task-local membership lineage across join, move, removal and rejoin", () => {
+    const decode = Schema.decodeUnknownSync(task.WorkTaskMembershipChangedEvent);
+    const decodeBatch = Schema.decodeUnknownSync(task.WorkTaskMembershipEventBatch);
+    for (const event of [join, move]) {
+      expect(decode(event)).toEqual(event);
+      expect(decodeBatch({ event, companions: companionsFor(event) })).toBeDefined();
+    }
+    const removedAt = "2026-11-15T00:00:03Z";
+    const remove = {
+      ...move,
+      id: "remove",
+      occurredAt: removedAt,
+      previousSnapshot: move.snapshot,
+      snapshot: { ...move.snapshot, currentMembership: null },
+      retiredMembership: {
+        ...moved,
+        state: "retired",
+        retiredMembershipRevision: 2,
+        retired: { eventId: "remove", commandId: "command", occurredAt: removedAt, performedBy },
+      },
+      groupTransitions: [
+        {
+          companionEventId: "remove-b",
+          previousControl: move.groupTransitions[1]!.control,
+          control: { ...otherControl, membershipRevision: 2 },
+        },
+      ],
+    };
+    expect(decode(remove)).toEqual(remove);
+    const rejoin = {
+      ...join,
+      id: "rejoin",
+      previousSnapshot: remove.snapshot,
+      snapshot: {
+        ...joinedSnapshot,
+        highestMembershipGeneration: 3,
+        currentMembership: {
+          ...joined,
+          membershipGeneration: 3,
+          joinedMembershipRevision: 3,
+          joined: { ...joined.joined, eventId: "rejoin" },
+        },
+      },
+      groupTransitions: [
+        {
+          ...join.groupTransitions[0]!,
+          previousControl: { ...bound, membershipRevision: 2 },
+          control: { ...bound, membershipRevision: 3 },
+        },
+      ],
+    };
+    expect(decode(rejoin)).toEqual(rejoin);
+    for (const patch of [
+      {
+        snapshot: {
+          ...joinedSnapshot,
+          highestMembershipGeneration: 2,
+          currentMembership: { ...joined, membershipGeneration: 2 },
+        },
+      },
+      {
+        snapshot: {
+          ...joinedSnapshot,
+          currentMembership: { ...joined, joinedMembershipRevision: 2 },
+        },
+      },
+      {
+        snapshot: {
+          ...joinedSnapshot,
+          currentMembership: { ...joined, joined: { ...joined.joined, eventId: "wrong" } },
+        },
+      },
+      {
+        snapshot: { ...joinedSnapshot, taskRevisions: { ...taskRevisions, lifecycleRevision: 3 } },
+      },
+      {
+        previousSnapshot: {
+          ...detached,
+          taskRevisions: { ...taskRevisions, acceptedDefinitionRevision: null },
+        },
+      },
+      { retiredMembership: retired },
+      { groupTransitions: [] },
+      { groupTransitions: [...join.groupTransitions, ...join.groupTransitions] },
+      { groupTransitions: [{ ...join.groupTransitions[0]!, companionEventId: "join" }] },
+      { environmentId: "foreign" },
+    ])
+      expect(() => decode({ ...join, ...patch })).toThrow();
+    for (const patch of [
+      { retiredMembership: null },
+      { retiredMembership: { ...retired, joined: moveProvenance } },
+      { retiredMembership: { ...retired, retired: { ...moveProvenance, commandId: "other" } } },
+      { groupTransitions: [move.groupTransitions[1]] },
+      { snapshot: joinedSnapshot },
+      {
+        snapshot: {
+          ...move.snapshot,
+          highestMembershipGeneration: 3,
+          currentMembership: { ...moved, membershipGeneration: 3 },
+        },
+      },
+    ])
+      expect(() => decode({ ...move, ...patch })).toThrow();
+    const companions = companionsFor(move);
+    for (const bad of [
+      [],
+      [companions[0]],
+      [companions[0], companions[0]],
+      [companions[0], { ...companions[1], rootEventId: "other" }],
+      [companions[0], { ...companions[1], commandId: "other" }],
+      [companions[0], { ...companions[1], performedBy: { ...performedBy, subject: "other" } }],
+      [companions[0], { ...companions[1], control: { ...otherControl, membershipRevision: 2 } }],
+    ])
+      expect(() => decodeBatch({ event: move, companions: bad })).toThrow();
+  });
+
+  it("binds group and task-owned persisted envelopes exactly without altering old event unions", () => {
+    const decodeControl = Schema.decodeUnknownSync(task.WorkTaskPersistedGroupControlEvent);
+    const decodeMembership = Schema.decodeUnknownSync(task.WorkTaskPersistedMembershipEvent);
+    const context = { sequence: 100, eventId: created.id, occurredAt, commandId: "command" };
+    expect(decodeControl({ event: created, context })).toBeDefined();
+    expect(
+      decodeMembership({ event: join, context: { ...context, eventId: join.id } }),
+    ).toBeDefined();
+    for (const patch of [
+      { eventId: "wrong" },
+      { commandId: null },
+      { commandId: "wrong" },
+      { occurredAt: "2026-11-15T00:00:01.0009Z" },
+      { sequence: -1 },
+      { sequence: Number.MAX_SAFE_INTEGER + 1 },
+    ])
+      expect(() => decodeControl({ event: created, context: { ...context, ...patch } })).toThrow();
+    for (const event of [created, managerChanged, join, move])
+      expect(() => decodeOldTaskEventForGraph(event)).toThrow();
+  });
+});

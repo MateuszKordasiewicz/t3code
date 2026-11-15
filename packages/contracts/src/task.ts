@@ -2000,3 +2000,296 @@ export const WorkTaskPersistedGraphEvent = Schema.Struct({
   ),
 );
 export type WorkTaskPersistedGraphEvent = typeof WorkTaskPersistedGraphEvent.Type;
+
+const groupEventFields = { ...graphEventFields, performedBy: graphUser };
+const sameGroupManager = (
+  left: WorkTaskGroupManagerRef | null,
+  right: WorkTaskGroupManagerRef | null,
+) =>
+  left === null
+    ? right === null
+    : right !== null &&
+      left.threadId === right.threadId &&
+      left.managerGeneration === right.managerGeneration;
+const sameGroupControl = (
+  left: WorkTaskManagerGroupControlSnapshot,
+  right: WorkTaskManagerGroupControlSnapshot,
+) =>
+  sameMembershipGroup(left.group, right.group) &&
+  left.controlRevision === right.controlRevision &&
+  left.membershipRevision === right.membershipRevision &&
+  left.highestManagerGeneration === right.highestManagerGeneration &&
+  sameGroupManager(left.currentManager, right.currentManager) &&
+  left.dispatchHold === right.dispatchHold;
+const groupTransitionFields = {
+  previousControl: WorkTaskManagerGroupControlSnapshot,
+  control: WorkTaskManagerGroupControlSnapshot,
+};
+const localGroupTransition = Schema.makeFilter(
+  (value: {
+    environmentId: EnvironmentId;
+    previousControl: WorkTaskManagerGroupControlSnapshot;
+    control: WorkTaskManagerGroupControlSnapshot;
+  }) =>
+    sameMembershipGroup(value.previousControl.group, value.control.group) &&
+    value.control.group.environmentId === value.environmentId,
+  { expected: "one local group transition" },
+);
+const membershipControlChange = (
+  previous: WorkTaskManagerGroupControlSnapshot,
+  current: WorkTaskManagerGroupControlSnapshot,
+) =>
+  sameMembershipGroup(previous.group, current.group) &&
+  current.membershipRevision === previous.membershipRevision + 1 &&
+  current.controlRevision === previous.controlRevision &&
+  current.highestManagerGeneration === previous.highestManagerGeneration &&
+  sameGroupManager(current.currentManager, previous.currentManager) &&
+  current.dispatchHold === previous.dispatchHold;
+const groupCreated = Schema.Struct({
+  ...groupEventFields,
+  type: Schema.Literal("task-group.created"),
+  control: WorkTaskManagerGroupControlSnapshot,
+}).check(
+  Schema.makeFilter(
+    ({ environmentId, control }) =>
+      control.group.environmentId === environmentId &&
+      control.controlRevision === 0 &&
+      control.membershipRevision === 0 &&
+      control.highestManagerGeneration === 0 &&
+      control.currentManager === null &&
+      control.dispatchHold === "none",
+    { expected: "empty initial group control" },
+  ),
+);
+const groupManagerChanged = Schema.Struct({
+  ...groupEventFields,
+  type: Schema.Literal("task-group.manager-changed"),
+  ...groupTransitionFields,
+  reason: Schema.optional(shortText),
+}).check(
+  localGroupTransition,
+  Schema.makeFilter(
+    ({ previousControl: previous, control }) =>
+      control.controlRevision === previous.controlRevision + 1 &&
+      control.membershipRevision === previous.membershipRevision &&
+      control.dispatchHold === previous.dispatchHold &&
+      (control.currentManager === null
+        ? previous.currentManager !== null &&
+          control.highestManagerGeneration === previous.highestManagerGeneration
+        : control.highestManagerGeneration === previous.highestManagerGeneration + 1 &&
+          control.currentManager.threadId !== previous.currentManager?.threadId),
+    { expected: "manager bind/retirement preserving independent group domains" },
+  ),
+);
+const groupHoldChanged = Schema.Struct({
+  ...groupEventFields,
+  type: Schema.Literal("task-group.hold-changed"),
+  ...groupTransitionFields,
+  reason: Schema.optional(shortText),
+}).check(
+  localGroupTransition,
+  Schema.makeFilter(
+    ({ previousControl: previous, control }) =>
+      control.controlRevision === previous.controlRevision + 1 &&
+      control.membershipRevision === previous.membershipRevision &&
+      control.highestManagerGeneration === previous.highestManagerGeneration &&
+      sameGroupManager(control.currentManager, previous.currentManager) &&
+      control.dispatchHold !== previous.dispatchHold,
+    { expected: "changed group hold intent preserving manager and membership" },
+  ),
+);
+const groupMembershipChanged = Schema.Struct({
+  ...groupEventFields,
+  type: Schema.Literal("task-group.membership-changed"),
+  rootEventId: graphEventFields.id,
+  task: WorkTaskGraphTaskRef,
+  ...groupTransitionFields,
+}).check(
+  localGroupTransition,
+  Schema.makeFilter(
+    (value) =>
+      value.task.environmentId === value.environmentId &&
+      value.rootEventId !== value.id &&
+      membershipControlChange(value.previousControl, value.control),
+    { expected: "task-linked membership-only group companion" },
+  ),
+);
+export const WorkTaskGroupControlEvent = Schema.Union([
+  groupCreated,
+  groupManagerChanged,
+  groupHoldChanged,
+  groupMembershipChanged,
+]);
+export type WorkTaskGroupControlEvent = typeof WorkTaskGroupControlEvent.Type;
+const membershipGroupTransition = Schema.Struct({
+  companionEventId: graphEventFields.id,
+  ...groupTransitionFields,
+}).check(
+  Schema.makeFilter((value) => membershipControlChange(value.previousControl, value.control), {
+    expected: "one group membership revision advance",
+  }),
+);
+const membershipRevisionKeys = [
+  "definitionRevision",
+  "acceptedDefinitionRevision",
+  "lifecycleRevision",
+  "actionPolicyRevision",
+  "completionPolicyRevision",
+] as const;
+const sameRecordedPrincipal = (left: typeof graphUser.Type, right: typeof graphUser.Type) =>
+  left.subject === right.subject && left.sessionId === right.sessionId;
+const membershipProvenanceMatches = (
+  event: {
+    id: EventId;
+    commandId: CommandId;
+    occurredAt: string;
+    performedBy: typeof graphUser.Type;
+  },
+  provenance: WorkTaskMembershipProvenance,
+) =>
+  graphProvenanceMatches(event, { ...provenance, adoptedBy: provenance.performedBy }) &&
+  sameRecordedPrincipal(event.performedBy, provenance.performedBy);
+export const WorkTaskMembershipChangedEvent = Schema.Struct({
+  ...groupEventFields,
+  type: Schema.Literal("task.membership-changed"),
+  previousSnapshot: WorkTaskMembershipSnapshot,
+  snapshot: WorkTaskMembershipSnapshot,
+  retiredMembership: Schema.NullOr(retiredMembership),
+  groupTransitions: Schema.Array(membershipGroupTransition).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(2),
+  ),
+  reason: Schema.optional(shortText),
+}).check(
+  Schema.makeFilter(
+    (event) => {
+      const {
+        previousSnapshot: previous,
+        snapshot,
+        groupTransitions,
+        retiredMembership: retired,
+      } = event;
+      const source = previous.currentMembership;
+      const destination = snapshot.currentMembership;
+      if (
+        !sameMembershipTask(previous.task, snapshot.task) ||
+        snapshot.task.environmentId !== event.environmentId ||
+        !membershipRevisionKeys.every(
+          (key) => previous.taskRevisions[key] === snapshot.taskRevisions[key],
+        ) ||
+        (source === null && destination === null) ||
+        (source !== null &&
+          destination !== null &&
+          sameMembershipGroup(source.group, destination.group)) ||
+        snapshot.highestMembershipGeneration !==
+          previous.highestMembershipGeneration + (destination === null ? 0 : 1)
+      )
+        return false;
+      const groups = [source?.group, destination?.group].filter((group) => group !== undefined);
+      if (
+        groupTransitions.length !== groups.length ||
+        new Set(groupTransitions.map((transition) => transition.control.group.groupId)).size !==
+          groups.length ||
+        new Set(groupTransitions.map((transition) => transition.companionEventId)).size !==
+          groups.length ||
+        groupTransitions.some(
+          (transition) =>
+            transition.companionEventId === event.id ||
+            transition.control.group.environmentId !== event.environmentId ||
+            !groups.some((group) => sameMembershipGroup(group, transition.control.group)),
+        )
+      )
+        return false;
+      if (source === null) {
+        if (retired !== null) return false;
+      } else {
+        const transition = groupTransitions.find((entry) =>
+          sameMembershipGroup(entry.control.group, source.group),
+        );
+        if (
+          retired === null ||
+          transition === undefined ||
+          !sameCurrentMembership(source, { ...retired, state: "current" }) ||
+          retired.retiredMembershipRevision !== transition.control.membershipRevision ||
+          !membershipProvenanceMatches(event, retired.retired)
+        )
+          return false;
+      }
+      if (destination !== null) {
+        const transition = groupTransitions.find((entry) =>
+          sameMembershipGroup(entry.control.group, destination.group),
+        );
+        if (
+          transition === undefined ||
+          destination.acceptedDefinitionRevisionAtJoin !==
+            snapshot.taskRevisions.acceptedDefinitionRevision ||
+          destination.joinedMembershipRevision !== transition.control.membershipRevision ||
+          !membershipProvenanceMatches(event, destination.joined)
+        )
+          return false;
+      }
+      return true;
+    },
+    {
+      expected: "task-global membership transition with exact original and affected group evidence",
+    },
+  ),
+);
+export type WorkTaskMembershipChangedEvent = typeof WorkTaskMembershipChangedEvent.Type;
+export const WorkTaskMembershipEventBatch = Schema.Struct({
+  event: WorkTaskMembershipChangedEvent,
+  companions: Schema.Array(groupMembershipChanged).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(2),
+  ),
+}).check(
+  Schema.makeFilter(
+    ({ event, companions }) =>
+      companions.length === event.groupTransitions.length &&
+      new Set(companions.map((companion) => companion.id)).size === companions.length &&
+      companions.every((companion) => {
+        const transition = event.groupTransitions.find(
+          (entry) => entry.companionEventId === companion.id,
+        );
+        return (
+          transition !== undefined &&
+          companion.rootEventId === event.id &&
+          sameMembershipTask(companion.task, event.snapshot.task) &&
+          companion.environmentId === event.environmentId &&
+          companion.commandId === event.commandId &&
+          companion.occurredAt === event.occurredAt &&
+          sameRecordedPrincipal(companion.performedBy, event.performedBy) &&
+          sameGroupControl(companion.previousControl, transition.previousControl) &&
+          sameGroupControl(companion.control, transition.control)
+        );
+      }),
+    { expected: "complete exact group companions for one task-owned membership mutation" },
+  ),
+);
+export type WorkTaskMembershipEventBatch = typeof WorkTaskMembershipEventBatch.Type;
+const groupEventContext = Schema.Struct({
+  sequence: groupCounter,
+  eventId: graphEventFields.id,
+  occurredAt: persistedTime,
+  commandId: graphEventFields.commandId,
+});
+const exactGroupEventContext = Schema.makeFilter(
+  (value: {
+    event: { id: EventId; commandId: CommandId; occurredAt: string };
+    context: typeof groupEventContext.Type;
+  }) =>
+    value.context.eventId === value.event.id &&
+    value.context.commandId === value.event.commandId &&
+    value.context.occurredAt === value.event.occurredAt,
+  { expected: "exact persisted group or membership event identity, command and time" },
+);
+export const WorkTaskPersistedGroupControlEvent = Schema.Struct({
+  event: WorkTaskGroupControlEvent,
+  context: groupEventContext,
+}).check(exactGroupEventContext);
+export type WorkTaskPersistedGroupControlEvent = typeof WorkTaskPersistedGroupControlEvent.Type;
+export const WorkTaskPersistedMembershipEvent = Schema.Struct({
+  event: WorkTaskMembershipChangedEvent,
+  context: groupEventContext,
+}).check(exactGroupEventContext);
+export type WorkTaskPersistedMembershipEvent = typeof WorkTaskPersistedMembershipEvent.Type;
