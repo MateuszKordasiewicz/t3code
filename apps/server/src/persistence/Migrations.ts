@@ -97,6 +97,7 @@ import Migration0091 from "./Migrations/091_WorkTaskReviewOutcomes.ts";
 import Migration0092 from "./Migrations/092_WorkTaskSharedManagerBindings.ts";
 import Migration0093 from "./Migrations/093_WorkTaskDependencies.ts";
 import Migration0094 from "./Migrations/094_WorkTaskManagerGroups.ts";
+import Migration0095 from "./Migrations/095_WorkTaskManagerMemberships.ts";
 
 const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
@@ -194,6 +195,7 @@ const migrationEntries = [
   [92, "WorkTaskSharedManagerBindings", Migration0092],
   [93, "WorkTaskDependencies", Migration0093],
   [94, "WorkTaskManagerGroups", Migration0094],
+  [95, "WorkTaskManagerMemberships", Migration0095],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
