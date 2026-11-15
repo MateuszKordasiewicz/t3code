@@ -3303,3 +3303,414 @@ describe("staged group control and membership events", () => {
       expect(() => decodeOldTaskEventForGraph(event)).toThrow();
   });
 });
+
+describe("staged selected work and reconciliation facts", () => {
+  const common = {
+    id: "observation",
+    environmentId: membershipTask.environmentId,
+    commandId: "reconcile-command",
+    occurredAt: "2026-11-15T00:00:00.0009Z",
+    attribution: { type: "server" },
+  };
+  const accepted = {
+    ...common,
+    type: "task-group.work-accepted",
+    id: acceptedWork.acceptedEventId,
+    commandId: workBinding.commandId,
+    occurredAt: acceptedWork.acceptedAt,
+    previousActiveClaimId: null,
+    claim: acceptedWork,
+    control: {
+      ...membershipControl,
+      highestManagerGeneration: 2,
+      currentManager: workBinding.manager,
+      dispatchHold: "none",
+    },
+    membership: membershipSnapshot,
+  };
+  const claim = {
+    binding: workBinding,
+    acceptedEventId: acceptedWork.acceptedEventId,
+    acceptedSequence: 10,
+    acceptedAt: acceptedWork.acceptedAt,
+  };
+  const uncertain = {
+    ...common,
+    id: "uncertain",
+    type: "task-group.work-uncertain",
+    claim,
+    reason: "Unresponsive launch",
+    sourceEventId: "unresponsive-event",
+    sourceSequence: 11,
+  };
+  const terminalRunEvent = { type: "run.updated", eventId: "terminal-run", sequence: 30 };
+  const release = {
+    ...common,
+    id: "release",
+    type: "task-group.work-released",
+    claim,
+    observedSequence: 35,
+    releaseEvidence: {
+      type: "not_started",
+      terminalRunEvent,
+      settlementCommandId: "cancel-command",
+    },
+  };
+  const settledEvidence = {
+    type: "run_settled",
+    terminalRunEvent,
+    attempt: {
+      attemptId: "attempt",
+      providerThreadId: "provider-thread",
+      providerTurnId: null,
+      terminalAttemptEvent: {
+        type: "run-attempt.updated",
+        eventId: "terminal-attempt",
+        sequence: 25,
+      },
+    },
+    interruptResult: {
+      type: "turn-item.updated",
+      turnItemId: "interrupt-result",
+      eventId: "interrupt-event",
+      sequence: 26,
+    },
+  };
+  const envelope = <E extends { id: string; commandId: string; occurredAt: string }>(
+    event: E,
+    sequence: number,
+  ) => ({
+    event,
+    context: {
+      sequence,
+      eventId: event.id,
+      commandId: event.commandId,
+      occurredAt: event.occurredAt,
+    },
+  });
+  const membership = { group: membershipGroup, membershipGeneration: 3 };
+  const dirty = {
+    ...common,
+    type: "task.dirty-source-recorded",
+    task: membershipTask,
+    membership,
+    sourceEventId: "source",
+    sourceSequence: 8,
+    previousDirtyGeneration: 3,
+    dirtyGeneration: 4,
+    acknowledgedGeneration: 2,
+  };
+  const ack = {
+    ...common,
+    type: "task.dirty-acknowledged",
+    task: membershipTask,
+    membership,
+    sourceEventId: "observed-source",
+    sourceSequence: 9,
+    previousAcknowledgedGeneration: 2,
+    acknowledgedGeneration: 4,
+    observedDirtyGeneration: 4,
+    dirtyGeneration: 5,
+  };
+  const basis = {
+    taskRevisions: membershipRevisions,
+    graphRevision: 1,
+    controlRevision: 2,
+    membershipRevision: 4,
+    managerGeneration: 2,
+  };
+  const ready = {
+    ...common,
+    type: "task.ready-sequence-updated",
+    task: membershipTask,
+    ...membership,
+    basis,
+    sourceEventId: "ready-source",
+    sourceSequence: 8,
+    kind: "qualified",
+    previousOldestReadySequence: null,
+    oldestReadySequence: 9,
+  };
+  const graphScan = {
+    ...common,
+    type: "task.reconciliation-progressed",
+    scan: {
+      kind: "graph_dependents",
+      blocker: membershipTask,
+      sourceEventId: "changed-blocker",
+      sourceSequence: 5,
+      capturedRevision: 1,
+    },
+    observedRevision: 4,
+    previousPosition: null,
+    position: { dependentTaskId: "dependent", edgeId: "edge" },
+    visited: [{ environmentId: membershipTask.environmentId, taskId: "dependent" }],
+    completed: false,
+  };
+  const memberScan = {
+    ...graphScan,
+    scan: {
+      kind: "group_members",
+      group: membershipGroup,
+      sourceEventId: "changed-group",
+      sourceSequence: 6,
+      capturedRevision: 4,
+    },
+    observedRevision: 5,
+    position: { taskId: "dependent" },
+    visited: [{ task: graphScan.visited[0]!, membershipGeneration: 7 }],
+  };
+
+  it("keeps accepted, uncertain and released work attached to its exact immutable task claim", () => {
+    const decode = Schema.decodeUnknownSync(task.WorkTaskCoordinationEvent);
+    for (const event of [
+      accepted,
+      uncertain,
+      release,
+      { ...release, releaseEvidence: settledEvidence },
+    ])
+      expect(decode(event)).toEqual(event);
+    for (const patch of [
+      { previousActiveClaimId: "occupied" },
+      { id: "other" },
+      { commandId: "other" },
+      { control: { ...accepted.control, dispatchHold: "paused" } },
+      { control: { ...accepted.control, membershipRevision: 5 } },
+      {
+        control: {
+          ...accepted.control,
+          currentManager: { ...workBinding.manager, threadId: "other" },
+        },
+      },
+      { membership: { ...membershipSnapshot, currentMembership: null } },
+      {
+        membership: {
+          ...membershipSnapshot,
+          taskRevisions: { ...membershipRevisions, lifecycleRevision: 6 },
+        },
+      },
+      { environmentId: "foreign" },
+    ])
+      expect(() => decode({ ...accepted, ...patch })).toThrow();
+    for (const patch of [
+      { id: acceptedWork.acceptedEventId },
+      { launchOrigin: initialWorkOrigin },
+      { reservationId: "new" },
+      { allowanceUnit: 2 },
+      { reason: "\t" },
+    ])
+      expect(() => decode({ ...uncertain, ...patch })).toThrow();
+    for (const releaseEvidence of [
+      { type: "effectively_fenced", fenceId: "invented" },
+      { type: "not_started", terminalRunEvent },
+      { ...settledEvidence, attempt: { ...settledEvidence.attempt, providerThreadId: null } },
+      { ...settledEvidence, terminalRunEvent: { ...terminalRunEvent, type: "run.created" } },
+    ])
+      expect(() => decode({ ...release, releaseEvidence })).toThrow();
+    expect(decode({ ...uncertain, actor: "human", safe: true, approved: true })).toEqual(uncertain);
+  });
+
+  it("preserves concurrent dirty work and queue age without treating shared holds as task disqualification", () => {
+    const decode = Schema.decodeUnknownSync(task.WorkTaskCoordinationEvent);
+    const persisted = Schema.decodeUnknownSync(task.WorkTaskPersistedCoordinationEvent);
+    for (const event of [dirty, { ...dirty, membership: null }, ack])
+      expect(decode(event)).toEqual(event);
+    for (const patch of [
+      { dirtyGeneration: 5 },
+      { acknowledgedGeneration: 4 },
+      {
+        previousDirtyGeneration: Number.MAX_SAFE_INTEGER,
+        dirtyGeneration: Number.MAX_SAFE_INTEGER + 1,
+      },
+    ])
+      expect(() => decode({ ...dirty, ...patch })).toThrow();
+    for (const patch of [
+      { acknowledgedGeneration: 1 },
+      { acknowledgedGeneration: 5 },
+      { observedDirtyGeneration: 6 },
+      { membership: { ...membership, group: { ...membershipGroup, environmentId: "foreign" } } },
+    ])
+      expect(() => decode({ ...ack, ...patch })).toThrow();
+    expect(persisted(envelope(ready, 9))).toBeDefined();
+    expect(persisted(envelope({ ...ready, previousOldestReadySequence: 9 }, 11))).toBeDefined();
+    expect(() =>
+      persisted(
+        envelope({ ...ready, previousOldestReadySequence: 9, oldestReadySequence: 11 }, 11),
+      ),
+    ).toThrow();
+    expect(() => persisted(envelope(ready, 10))).toThrow();
+    const selected = {
+      ...ready,
+      kind: "accepted",
+      sourceEventId: acceptedWork.acceptedEventId,
+      sourceSequence: 10,
+      previousOldestReadySequence: 9,
+      oldestReadySequence: null,
+      claim,
+    };
+    expect(persisted(envelope(selected, 11))).toBeDefined();
+    expect(() =>
+      persisted(envelope({ ...selected, previousOldestReadySequence: null }, 11)),
+    ).toThrow();
+    const requeued = {
+      ...ready,
+      kind: "settled",
+      sourceEventId: "release",
+      sourceSequence: 40,
+      previousOldestReadySequence: null,
+      oldestReadySequence: 41,
+      releaseEventId: "release",
+      releaseSequence: 40,
+      claim,
+    };
+    expect(persisted(envelope(requeued, 41))).toBeDefined();
+    for (const releaseSequence of [9, 10, 41, 42])
+      expect(() =>
+        persisted(envelope({ ...requeued, sourceSequence: releaseSequence, releaseSequence }, 41)),
+      ).toThrow();
+    const disqualified = {
+      ...ready,
+      kind: "disqualified",
+      reason: "task_pause",
+      previousOldestReadySequence: 9,
+      oldestReadySequence: null,
+    };
+    expect(decode(disqualified)).toBeDefined();
+    for (const reason of ["group_paused", "native_hold", "unknown"])
+      expect(() => decode({ ...disqualified, reason })).toThrow();
+    expect(() =>
+      decode({
+        ...ready,
+        basis: {
+          ...basis,
+          taskRevisions: { ...membershipRevisions, acceptedDefinitionRevision: null },
+        },
+      }),
+    ).toThrow();
+  });
+
+  it("records bounded mutation-covered cursor positions separately from public snapshot tokens", () => {
+    const decode = Schema.decodeUnknownSync(task.WorkTaskCoordinationEvent);
+    for (const event of [graphScan, memberScan]) {
+      expect(decode(event)).toEqual(event);
+      expect(
+        decode({ ...event, previousPosition: event.position, visited: [], completed: true }),
+      ).toBeDefined();
+      for (const patch of [
+        { completed: false, visited: [] },
+        { observedRevision: 0 },
+        { visited: [...event.visited, ...event.visited] },
+        { position: null },
+        { previousPosition: event.position },
+        { environmentId: "foreign" },
+      ])
+        expect(() => decode({ ...event, ...patch })).toThrow();
+    }
+    for (const patch of [
+      {
+        visited: [membershipTask],
+        position: { dependentTaskId: membershipTask.taskId, edgeId: "edge" },
+      },
+      { previousPosition: { dependentTaskId: membershipTask.taskId, edgeId: "edge" } },
+      { position: { dependentTaskId: "other", edgeId: "edge" } },
+      { position: { dependentTaskId: "dependent", edgeId: "x".repeat(2_001) } },
+      {
+        visited: Array.from({ length: 101 }, (_, n) => ({
+          ...membershipTask,
+          taskId: `task-${n}`,
+        })),
+      },
+    ])
+      expect(() => decode({ ...graphScan, ...patch })).toThrow();
+    expect(() =>
+      decode({ ...memberScan, visited: [{ ...memberScan.visited[0]!, membershipGeneration: 0 }] }),
+    ).toThrow();
+    expect(() =>
+      decode({ ...graphScan, scan: { ...graphScan.scan, kind: "arbitrary_workflow" } }),
+    ).toThrow();
+  });
+
+  it("rejects contradictory known journal references and exact-context substitutions", () => {
+    const decode = Schema.decodeUnknownSync(task.WorkTaskPersistedCoordinationEvent);
+    for (const [event, sequence] of [
+      [accepted, 10],
+      [uncertain, 20],
+      [release, 40],
+      [dirty, 11],
+      [ack, 12],
+      [graphScan, 30],
+      [memberScan, 30],
+    ] as const) {
+      const value = envelope(event, sequence);
+      expect(decode(value)).toEqual(value);
+      for (const patch of [
+        { eventId: "other" },
+        { commandId: null },
+        { occurredAt: "2026-11-15T00:00:00.0008Z" },
+        { sequence: Number.MAX_SAFE_INTEGER + 1 },
+      ])
+        expect(() => decode({ ...value, context: { ...value.context, ...patch } })).toThrow();
+      expect(() => decodeOldTaskEventForGraph(event)).toThrow();
+    }
+    expect(() => decode(envelope(accepted, 11))).toThrow();
+    expect(() => decode(envelope(uncertain, 10))).toThrow();
+    for (const observedSequence of [29, 40, Number.MAX_SAFE_INTEGER + 1])
+      expect(() => decode(envelope({ ...release, observedSequence }, 40))).toThrow();
+    const attempt = settledEvidence.attempt;
+    for (const terminalAttemptEvent of [
+      { ...attempt.terminalAttemptEvent, eventId: terminalRunEvent.eventId },
+      { ...attempt.terminalAttemptEvent, sequence: terminalRunEvent.sequence },
+      {
+        ...attempt.terminalAttemptEvent,
+        eventId: terminalRunEvent.eventId,
+        sequence: terminalRunEvent.sequence,
+      },
+    ])
+      expect(() =>
+        decode(
+          envelope(
+            {
+              ...release,
+              releaseEvidence: {
+                ...settledEvidence,
+                attempt: { ...attempt, terminalAttemptEvent },
+              },
+            },
+            40,
+          ),
+        ),
+      ).toThrow();
+    expect(() =>
+      decode(
+        envelope(
+          { ...accepted, claim: { ...acceptedWork, sourceEventId: acceptedWork.acceptedEventId } },
+          10,
+        ),
+      ),
+    ).toThrow();
+    expect(
+      decode(
+        envelope(
+          {
+            ...accepted,
+            claim: {
+              ...acceptedWork,
+              sourceEventId: initialWorkOrigin.startEventId,
+              sourceSequence: initialWorkOrigin.startSequence,
+            },
+          },
+          10,
+        ),
+      ),
+    ).toBeDefined();
+    const witnesses = ["a", "b"].map((taskId, index) => ({
+      edgeId: `edge-${index}`,
+      blocker: { ...membershipTask, taskId },
+      completionEventId: "same-completion",
+      completionSequence: 6,
+    }));
+    expect(() =>
+      decode(envelope({ ...accepted, claim: { ...acceptedWork, prerequisites: witnesses } }, 10)),
+    ).toThrow();
+  });
+});

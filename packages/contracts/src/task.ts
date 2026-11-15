@@ -11,6 +11,10 @@ import {
   PositiveInt,
   ProjectId,
   ProviderSessionId,
+  ProviderThreadId,
+  ProviderTurnId,
+  RunAttemptId,
+  TurnItemId,
   RunId,
   ThreadId,
   TrimmedNonEmptyString,
@@ -2295,3 +2299,545 @@ export const WorkTaskPersistedMembershipEvent = Schema.Struct({
   context: groupEventContext,
 }).check(exactGroupEventContext);
 export type WorkTaskPersistedMembershipEvent = typeof WorkTaskPersistedMembershipEvent.Type;
+
+const coordinationFields = {
+  ...graphEventFields,
+  attribution: Schema.Struct({ type: Schema.Literal("server") }),
+};
+const journalSource = { sourceEventId: graphEventFields.id, sourceSequence: groupCounter };
+const claimReference = Schema.Struct({
+  binding: WorkTaskRunBindingV2,
+  acceptedEventId: graphEventFields.id,
+  acceptedSequence: groupCounter,
+  acceptedAt: persistedTime,
+});
+const retainedClaimFields = {
+  ...coordinationFields,
+  claim: claimReference,
+  launchOrigin: forbidden,
+  reservationId: forbidden,
+  reservationCommandId: forbidden,
+  allowanceUnit: forbidden,
+};
+const retainedClaimLocal = Schema.makeFilter(
+  (event: { id: EventId; environmentId: EnvironmentId; claim: typeof claimReference.Type }) =>
+    event.environmentId === event.claim.binding.task.environmentId &&
+    event.id !== event.claim.acceptedEventId,
+  { expected: "original local work claim and a distinct subsequent event" },
+);
+const workAccepted = Schema.Struct({
+  ...coordinationFields,
+  type: Schema.Literal("task-group.work-accepted"),
+  claim: WorkTaskAcceptedWorkClaim,
+  previousActiveClaimId: Schema.Null,
+  control: WorkTaskManagerGroupControlSnapshot,
+  membership: WorkTaskMembershipSnapshot,
+}).check(
+  Schema.makeFilter(
+    (event) => {
+      const { binding } = event.claim;
+      const member = event.membership.currentMembership;
+      return (
+        event.environmentId === binding.task.environmentId &&
+        event.id === event.claim.acceptedEventId &&
+        event.commandId === binding.commandId &&
+        event.occurredAt === event.claim.acceptedAt &&
+        event.control.dispatchHold === "none" &&
+        sameMembershipGroup(event.control.group, binding.group) &&
+        sameGroupManager(event.control.currentManager, binding.manager) &&
+        event.control.controlRevision === binding.controlRevision &&
+        event.control.membershipRevision === binding.membershipRevision &&
+        sameMembershipTask(event.membership.task, binding.task) &&
+        member !== null &&
+        sameMembershipGroup(member.group, binding.group) &&
+        member.membershipGeneration === binding.membershipGeneration &&
+        member.joinedMembershipRevision <= binding.membershipRevision &&
+        membershipRevisionKeys.every(
+          (key) => event.membership.taskRevisions[key] === binding.taskRevisions[key],
+        )
+      );
+    },
+    {
+      expected:
+        "accepted work matching its observed control, membership and exact acceptance context",
+    },
+  ),
+);
+const workUncertain = Schema.Struct({
+  ...retainedClaimFields,
+  type: Schema.Literal("task-group.work-uncertain"),
+  reason: shortText,
+  ...journalSource,
+}).check(retainedClaimLocal);
+const journalEventReference = <T extends string>(type: T) =>
+  Schema.Struct({
+    type: Schema.Literal(type),
+    eventId: graphEventFields.id,
+    sequence: groupCounter,
+  });
+const terminalRunReference = journalEventReference("run.updated");
+const terminalAttemptReference = journalEventReference("run-attempt.updated");
+const interruptReference = Schema.Struct({
+  ...journalEventReference("turn-item.updated").fields,
+  turnItemId: TurnItemId.check(Schema.isMaxLength(2_000)),
+});
+const releaseEvidence = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("not_started"),
+    terminalRunEvent: terminalRunReference,
+    settlementCommandId: graphEventFields.commandId,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("run_settled"),
+    terminalRunEvent: terminalRunReference,
+    attempt: Schema.Struct({
+      attemptId: RunAttemptId.check(Schema.isMaxLength(2_000)),
+      providerThreadId: ProviderThreadId.check(Schema.isMaxLength(2_000)),
+      providerTurnId: Schema.NullOr(ProviderTurnId.check(Schema.isMaxLength(2_000))),
+      terminalAttemptEvent: terminalAttemptReference,
+    }),
+    interruptResult: Schema.optional(interruptReference),
+    settlementCommandId: Schema.optional(graphEventFields.commandId),
+  }),
+]);
+const workReleased = Schema.Struct({
+  ...retainedClaimFields,
+  type: Schema.Literal("task-group.work-released"),
+  observedSequence: groupCounter,
+  releaseEvidence,
+}).check(retainedClaimLocal);
+const dirtyMembership = Schema.Struct({
+  group: WorkTaskManagerGroupRef,
+  membershipGeneration: WorkTaskMembershipGeneration,
+});
+const dirtyFields = {
+  ...coordinationFields,
+  ...journalSource,
+  task: WorkTaskGraphTaskRef,
+  membership: Schema.NullOr(dirtyMembership),
+};
+const dirtyScope = Schema.makeFilter(
+  (event: {
+    environmentId: EnvironmentId;
+    task: WorkTaskGraphTaskRef;
+    membership: typeof dirtyMembership.Type | null;
+  }) =>
+    event.task.environmentId === event.environmentId &&
+    (event.membership === null || event.membership.group.environmentId === event.environmentId),
+  { expected: "local dirty task and recorded membership epoch" },
+);
+const dirtyRecorded = Schema.Struct({
+  ...dirtyFields,
+  type: Schema.Literal("task.dirty-source-recorded"),
+  previousDirtyGeneration: groupCounter,
+  dirtyGeneration: groupCounter,
+  acknowledgedGeneration: groupCounter,
+}).check(
+  dirtyScope,
+  Schema.makeFilter(
+    (event) =>
+      event.dirtyGeneration === event.previousDirtyGeneration + 1 &&
+      event.acknowledgedGeneration <= event.previousDirtyGeneration,
+    { expected: "one dirty increment preserving acknowledgement" },
+  ),
+);
+const dirtyAcknowledged = Schema.Struct({
+  ...dirtyFields,
+  type: Schema.Literal("task.dirty-acknowledged"),
+  previousAcknowledgedGeneration: groupCounter,
+  acknowledgedGeneration: groupCounter,
+  observedDirtyGeneration: groupCounter,
+  dirtyGeneration: groupCounter,
+}).check(
+  dirtyScope,
+  Schema.makeFilter(
+    (event) =>
+      event.previousAcknowledgedGeneration <= event.acknowledgedGeneration &&
+      event.acknowledgedGeneration <= event.observedDirtyGeneration &&
+      event.observedDirtyGeneration <= event.dirtyGeneration,
+    { expected: "acknowledgement bounded by observed dirty work" },
+  ),
+);
+const readyFields = {
+  ...coordinationFields,
+  ...journalSource,
+  type: Schema.Literal("task.ready-sequence-updated"),
+  task: WorkTaskGraphTaskRef,
+  ...dirtyMembership.fields,
+  basis: Schema.Struct({
+    taskRevisions: WorkTaskMembershipTaskRevisions,
+    graphRevision: WorkTaskGraphRevision,
+    controlRevision: WorkTaskGroupControlRevision,
+    membershipRevision: WorkTaskGroupMembershipRevision.check(Schema.isGreaterThan(0)),
+    managerGeneration: Schema.NullOr(WorkTaskGroupManagerGeneration),
+  }),
+  previousOldestReadySequence: Schema.NullOr(groupCounter),
+  oldestReadySequence: Schema.NullOr(groupCounter),
+};
+const readyScope = Schema.makeFilter(
+  (event: {
+    environmentId: EnvironmentId;
+    task: WorkTaskGraphTaskRef;
+    group: WorkTaskManagerGroupRef;
+  }) =>
+    event.task.environmentId === event.environmentId &&
+    event.group.environmentId === event.environmentId,
+  { expected: "local fairness task and group" },
+);
+const readyClaimScope = Schema.makeFilter(
+  (event: {
+    task: WorkTaskGraphTaskRef;
+    group: WorkTaskManagerGroupRef;
+    membershipGeneration: WorkTaskMembershipGeneration;
+    claim: typeof claimReference.Type;
+  }) =>
+    sameMembershipTask(event.task, event.claim.binding.task) &&
+    sameMembershipGroup(event.group, event.claim.binding.group) &&
+    event.membershipGeneration === event.claim.binding.membershipGeneration,
+  { expected: "fairness evidence for the original selected task membership" },
+);
+const readyQualified = Schema.Struct({
+  ...readyFields,
+  kind: Schema.Literal("qualified"),
+  claim: forbidden,
+}).check(
+  readyScope,
+  Schema.makeFilter(
+    (event) =>
+      event.oldestReadySequence !== null &&
+      (event.previousOldestReadySequence === null ||
+        event.oldestReadySequence === event.previousOldestReadySequence) &&
+      event.basis.taskRevisions.acceptedDefinitionRevision !== null &&
+      event.basis.managerGeneration !== null,
+    { expected: "qualifying observation preserving existing queue age" },
+  ),
+);
+const readyAccepted = Schema.Struct({
+  ...readyFields,
+  kind: Schema.Literal("accepted"),
+  claim: claimReference,
+}).check(
+  readyScope,
+  readyClaimScope,
+  Schema.makeFilter(
+    (event) =>
+      event.previousOldestReadySequence !== null &&
+      event.oldestReadySequence === null &&
+      event.sourceEventId === event.claim.acceptedEventId &&
+      event.sourceSequence === event.claim.acceptedSequence,
+    { expected: "consumed queue age for this accepted claim" },
+  ),
+);
+const readySettled = Schema.Struct({
+  ...readyFields,
+  kind: Schema.Literal("settled"),
+  claim: claimReference,
+  releaseEventId: graphEventFields.id,
+  releaseSequence: groupCounter,
+}).check(
+  readyScope,
+  readyClaimScope,
+  Schema.makeFilter(
+    (event) =>
+      event.previousOldestReadySequence === null &&
+      event.oldestReadySequence !== null &&
+      event.claim.acceptedSequence < event.releaseSequence &&
+      event.sourceEventId === event.releaseEventId &&
+      event.sourceSequence === event.releaseSequence &&
+      event.basis.taskRevisions.acceptedDefinitionRevision !== null &&
+      event.basis.managerGeneration !== null,
+    { expected: "new queue age after original claim release" },
+  ),
+);
+const readyDisqualified = Schema.Struct({
+  ...readyFields,
+  kind: Schema.Literal("disqualified"),
+  claim: forbidden,
+  reason: Schema.Literals([
+    "task_pause",
+    "task_stop",
+    "done",
+    "archive",
+    "prerequisite_changed",
+    "definition_changed",
+    "policy_changed",
+    "membership_changed",
+  ]),
+}).check(
+  readyScope,
+  Schema.makeFilter((event) => event.oldestReadySequence === null, {
+    expected: "ended task eligibility epoch",
+  }),
+);
+const graphScanPosition = Schema.Struct({
+  dependentTaskId: WorkTaskId.check(Schema.isMaxLength(2_000)),
+  edgeId: WorkTaskGraphEdgeId,
+});
+const memberScanPosition = Schema.Struct({ taskId: WorkTaskId.check(Schema.isMaxLength(2_000)) });
+const scanFields = {
+  ...coordinationFields,
+  type: Schema.Literal("task.reconciliation-progressed"),
+  completed: Schema.Boolean,
+};
+const graphScanProgress = Schema.Struct({
+  ...scanFields,
+  scan: Schema.Struct({
+    ...journalSource,
+    kind: Schema.Literal("graph_dependents"),
+    blocker: WorkTaskGraphTaskRef,
+    capturedRevision: WorkTaskGraphRevision,
+  }),
+  observedRevision: WorkTaskGraphRevision,
+  previousPosition: Schema.NullOr(graphScanPosition),
+  position: Schema.NullOr(graphScanPosition),
+  visited: Schema.Array(WorkTaskGraphTaskRef).check(Schema.isMaxLength(100)),
+}).check(
+  Schema.makeFilter(
+    (event) => {
+      const { previousPosition: previous, position, visited, scan } = event;
+      if (
+        scan.blocker.environmentId !== event.environmentId ||
+        event.observedRevision < scan.capturedRevision ||
+        new Set(visited.map((row) => row.taskId)).size !== visited.length ||
+        visited.some(
+          (row) => row.environmentId !== event.environmentId || row.taskId === scan.blocker.taskId,
+        ) ||
+        previous?.dependentTaskId === scan.blocker.taskId ||
+        position?.dependentTaskId === scan.blocker.taskId
+      )
+        return false;
+      const unchanged =
+        previous === null
+          ? position === null
+          : position !== null &&
+            previous.dependentTaskId === position.dependentTaskId &&
+            previous.edgeId === position.edgeId;
+      return visited.length === 0
+        ? event.completed && unchanged
+        : !unchanged &&
+            position !== null &&
+            position.dependentTaskId === visited[visited.length - 1]!.taskId;
+    },
+    { expected: "bounded local non-self graph traversal with a typed position" },
+  ),
+);
+const memberScanProgress = Schema.Struct({
+  ...scanFields,
+  scan: Schema.Struct({
+    ...journalSource,
+    kind: Schema.Literal("group_members"),
+    group: WorkTaskManagerGroupRef,
+    capturedRevision: WorkTaskGroupMembershipRevision,
+  }),
+  observedRevision: WorkTaskGroupMembershipRevision,
+  previousPosition: Schema.NullOr(memberScanPosition),
+  position: Schema.NullOr(memberScanPosition),
+  visited: Schema.Array(
+    Schema.Struct({
+      task: WorkTaskGraphTaskRef,
+      membershipGeneration: WorkTaskMembershipGeneration,
+    }),
+  ).check(Schema.isMaxLength(100)),
+}).check(
+  Schema.makeFilter(
+    (event) => {
+      const { previousPosition: previous, position, visited, scan } = event;
+      if (
+        scan.group.environmentId !== event.environmentId ||
+        event.observedRevision < scan.capturedRevision ||
+        new Set(visited.map((row) => row.task.taskId)).size !== visited.length ||
+        visited.some((row) => row.task.environmentId !== event.environmentId)
+      )
+        return false;
+      const unchanged =
+        previous === null
+          ? position === null
+          : position !== null && previous.taskId === position.taskId;
+      return visited.length === 0
+        ? event.completed && unchanged
+        : !unchanged &&
+            position !== null &&
+            position.taskId === visited[visited.length - 1]!.task.taskId;
+    },
+    { expected: "bounded local membership traversal with actual generation observations" },
+  ),
+);
+const coordinationEvent = Schema.Union([
+  workAccepted,
+  workUncertain,
+  workReleased,
+  dirtyRecorded,
+  dirtyAcknowledged,
+  readyQualified,
+  readyAccepted,
+  readySettled,
+  readyDisqualified,
+  graphScanProgress,
+  memberScanProgress,
+]);
+type KnownJournalReference = {
+  id: string;
+  sequence?: number | undefined;
+  kind?: string | undefined;
+  taskId?: string | undefined;
+};
+const coordinationReferences = (event: typeof coordinationEvent.Type): KnownJournalReference[] => {
+  const taskId =
+    "claim" in event && event.claim !== undefined
+      ? event.claim.binding.task.taskId
+      : "task" in event
+        ? event.task.taskId
+        : undefined;
+  const refs: KnownJournalReference[] = [{ id: event.id, kind: event.type, taskId }];
+  if ("claim" in event && event.claim !== undefined)
+    refs.push({
+      id: event.claim.acceptedEventId,
+      sequence: event.claim.acceptedSequence,
+      kind: "task-group.work-accepted",
+      taskId,
+    });
+  if (event.type === "task-group.work-accepted") {
+    refs.push({ id: event.claim.sourceEventId, sequence: event.claim.sourceSequence });
+    if (event.claim.launchOrigin.type === "initial_start")
+      refs.push({
+        id: event.claim.launchOrigin.startEventId,
+        sequence: event.claim.launchOrigin.startSequence,
+        taskId,
+      });
+    for (const witness of event.claim.prerequisites)
+      refs.push({
+        id: witness.completionEventId,
+        sequence: witness.completionSequence,
+        kind: "task.completed",
+        taskId: witness.blocker.taskId,
+      });
+  } else if (event.type === "task-group.work-released") {
+    const evidence = event.releaseEvidence;
+    refs.push({
+      id: evidence.terminalRunEvent.eventId,
+      sequence: evidence.terminalRunEvent.sequence,
+      kind: evidence.terminalRunEvent.type,
+      taskId,
+    });
+    if (evidence.type === "run_settled") {
+      refs.push({
+        id: evidence.attempt.terminalAttemptEvent.eventId,
+        sequence: evidence.attempt.terminalAttemptEvent.sequence,
+        kind: evidence.attempt.terminalAttemptEvent.type,
+        taskId,
+      });
+      if (evidence.interruptResult !== undefined)
+        refs.push({
+          id: evidence.interruptResult.eventId,
+          sequence: evidence.interruptResult.sequence,
+          kind: evidence.interruptResult.type,
+          taskId,
+        });
+    }
+  } else if (event.type === "task.reconciliation-progressed")
+    refs.push({ id: event.scan.sourceEventId, sequence: event.scan.sourceSequence });
+  else {
+    refs.push({ id: event.sourceEventId, sequence: event.sourceSequence });
+    if (event.type === "task.ready-sequence-updated" && event.kind === "settled")
+      refs.push({
+        id: event.releaseEventId,
+        sequence: event.releaseSequence,
+        kind: "task-group.work-released",
+        taskId,
+      });
+  }
+  return refs;
+};
+const compatibleJournalReferences = (refs: readonly KnownJournalReference[]) => {
+  const byId = new Map<string, KnownJournalReference>();
+  const bySequence = new Map<number, string>();
+  for (const ref of refs) {
+    const previous = byId.get(ref.id);
+    if (
+      previous !== undefined &&
+      ((previous.sequence !== undefined &&
+        ref.sequence !== undefined &&
+        previous.sequence !== ref.sequence) ||
+        (previous.kind !== undefined && ref.kind !== undefined && previous.kind !== ref.kind) ||
+        (previous.taskId !== undefined &&
+          ref.taskId !== undefined &&
+          previous.taskId !== ref.taskId))
+    )
+      return false;
+    if (ref.sequence !== undefined) {
+      const existing = bySequence.get(ref.sequence);
+      if (existing !== undefined && existing !== ref.id) return false;
+      bySequence.set(ref.sequence, ref.id);
+    }
+    byId.set(ref.id, {
+      id: ref.id,
+      sequence: ref.sequence ?? previous?.sequence,
+      kind: ref.kind ?? previous?.kind,
+      taskId: ref.taskId ?? previous?.taskId,
+    });
+  }
+  return true;
+};
+export const WorkTaskCoordinationEvent = coordinationEvent.check(
+  Schema.makeFilter((event) => compatibleJournalReferences(coordinationReferences(event)), {
+    expected: "compatible known journal event identity, sequence, type and task",
+  }),
+);
+export type WorkTaskCoordinationEvent = typeof WorkTaskCoordinationEvent.Type;
+export const WorkTaskPersistedCoordinationEvent = Schema.Struct({
+  event: WorkTaskCoordinationEvent,
+  context: groupEventContext,
+}).check(
+  exactGroupEventContext,
+  Schema.makeFilter(
+    ({ event, context }) => {
+      const refs = coordinationReferences(event);
+      if (
+        !compatibleJournalReferences([...refs, { id: event.id, sequence: context.sequence }]) ||
+        refs.some((ref) => ref.sequence !== undefined && ref.sequence > context.sequence)
+      )
+        return false;
+      if (event.type === "task-group.work-accepted")
+        return event.claim.acceptedSequence === context.sequence;
+      if (
+        "claim" in event &&
+        event.claim !== undefined &&
+        event.claim.acceptedSequence >= context.sequence
+      )
+        return false;
+      if (event.type === "task-group.work-released")
+        return (
+          event.observedSequence < context.sequence &&
+          event.releaseEvidence.terminalRunEvent.sequence >= event.claim.acceptedSequence &&
+          refs.every(
+            (ref) =>
+              ref.sequence === undefined ||
+              ref.id === event.id ||
+              ref.sequence <= event.observedSequence,
+          ) &&
+          (event.releaseEvidence.type !== "run_settled" ||
+            (event.releaseEvidence.attempt.terminalAttemptEvent.sequence >=
+              event.claim.acceptedSequence &&
+              (event.releaseEvidence.interruptResult === undefined ||
+                event.releaseEvidence.interruptResult.sequence >= event.claim.acceptedSequence)))
+        );
+      const sourceSequence =
+        event.type === "task.reconciliation-progressed"
+          ? event.scan.sourceSequence
+          : event.sourceSequence;
+      if (sourceSequence >= context.sequence) return false;
+      if (event.type === "task.ready-sequence-updated")
+        return (
+          (event.previousOldestReadySequence === null ||
+            event.previousOldestReadySequence < context.sequence) &&
+          (event.oldestReadySequence === null || event.oldestReadySequence <= context.sequence) &&
+          ((event.kind !== "qualified" && event.kind !== "settled") ||
+            event.previousOldestReadySequence !== null ||
+            event.oldestReadySequence === context.sequence)
+        );
+      return true;
+    },
+    { expected: "committed coordination context with ordered causal and fairness evidence" },
+  ),
+);
+export type WorkTaskPersistedCoordinationEvent = typeof WorkTaskPersistedCoordinationEvent.Type;
