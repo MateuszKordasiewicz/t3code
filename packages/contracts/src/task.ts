@@ -1904,3 +1904,99 @@ export const WorkTaskAcceptedWorkClaim = Schema.Struct({
   ),
 );
 export type WorkTaskAcceptedWorkClaim = typeof WorkTaskAcceptedWorkClaim.Type;
+
+const graphEventFields = {
+  id: EventId.check(Schema.isMaxLength(2_000)),
+  environmentId: EnvironmentId.check(Schema.isMaxLength(2_000)),
+  occurredAt: persistedTime,
+  commandId: CommandId.check(Schema.isMaxLength(2_000)),
+};
+const graphChangeFields = {
+  ...graphEventFields,
+  previousGraphRevision: WorkTaskGraphRevision,
+  graphRevision: WorkTaskGraphRevision,
+  edge: WorkTaskGraphEdgeRecord,
+};
+const graphChangeConsistent = Schema.makeFilter(
+  (value: {
+    previousGraphRevision: WorkTaskGraphRevision;
+    graphRevision: WorkTaskGraphRevision;
+    environmentId: EnvironmentId;
+    edge: WorkTaskGraphEdgeRecord;
+  }) =>
+    value.graphRevision === value.previousGraphRevision + 1 &&
+    value.edge.dependent.environmentId === value.environmentId &&
+    value.edge.blocker.environmentId === value.environmentId,
+  { expected: "one topology revision advance with local edge endpoints" },
+);
+const graphProvenanceMatches = (
+  event: { id: EventId; commandId: CommandId; occurredAt: string },
+  provenance: WorkTaskGraphProvenance,
+) =>
+  event.id === provenance.eventId &&
+  event.commandId === provenance.commandId &&
+  event.occurredAt === provenance.occurredAt;
+const graphEdgeAdopted = Schema.Struct({
+  type: Schema.Literal("task.graph-edge-adopted"),
+  ...graphChangeFields,
+}).check(
+  graphChangeConsistent,
+  Schema.makeFilter(
+    (value) =>
+      value.edge.createdGraphRevision === value.graphRevision &&
+      graphProvenanceMatches(value, value.edge.provenance),
+    { expected: "adoption revision and event provenance" },
+  ),
+);
+const graphEdgeRemoved = Schema.Struct({
+  type: Schema.Literal("task.graph-edge-removed"),
+  ...graphChangeFields,
+  provenance: WorkTaskGraphProvenance,
+}).check(
+  graphChangeConsistent,
+  Schema.makeFilter(
+    (value) =>
+      value.edge.createdGraphRevision <= value.previousGraphRevision &&
+      value.id !== value.edge.provenance.eventId &&
+      graphProvenanceMatches(value, value.provenance),
+    { expected: "historical adoption and distinct removal event provenance" },
+  ),
+);
+const graphProposalRecorded = Schema.Struct({
+  type: Schema.Literal("task.graph-proposal-recorded"),
+  ...graphEventFields,
+  graphRevision: WorkTaskGraphRevision,
+  proposal: WorkTaskGraphProposalRecord,
+}).check(
+  Schema.makeFilter(
+    (value) =>
+      value.proposal.dependent.environmentId === value.environmentId &&
+      value.proposal.observedGraphRevision <= value.graphRevision &&
+      value.proposal.proposedAt === value.occurredAt,
+    { expected: "local inert proposal with observed revision and event time" },
+  ),
+);
+export const WorkTaskGraphEvent = Schema.Union([
+  graphEdgeAdopted,
+  graphEdgeRemoved,
+  graphProposalRecorded,
+]);
+export type WorkTaskGraphEvent = typeof WorkTaskGraphEvent.Type;
+export const WorkTaskPersistedGraphEvent = Schema.Struct({
+  event: WorkTaskGraphEvent,
+  context: Schema.Struct({
+    sequence: graphCounter,
+    eventId: graphEventFields.id,
+    occurredAt: persistedTime,
+    commandId: graphEventFields.commandId,
+  }),
+}).check(
+  Schema.makeFilter(
+    (value) =>
+      value.context.eventId === value.event.id &&
+      value.context.commandId === value.event.commandId &&
+      value.context.occurredAt === value.event.occurredAt,
+    { expected: "exact persisted graph event identity, command and time" },
+  ),
+);
+export type WorkTaskPersistedGraphEvent = typeof WorkTaskPersistedGraphEvent.Type;

@@ -2800,3 +2800,130 @@ it("distinguishes original Start from one reserved automatic follow-up unit", ()
   ])
     expect(() => decodeAcceptedWork({ ...acceptedWork, launchOrigin })).toThrow();
 });
+
+const decodeOldTaskEventForGraph = Schema.decodeUnknownSync(task.WorkTaskEvent);
+
+describe("staged graph event family", () => {
+  const occurredAt = "2026-11-15T00:00:00.0001Z";
+  const provenance = {
+    eventId: "adopt",
+    commandId: "command",
+    occurredAt,
+    adoptedBy: { subject: "user", sessionId: "session" },
+  };
+  const edge = {
+    edgeId: "edge",
+    dependent: { environmentId: "env", taskId: "dependent" },
+    blocker: { environmentId: "env", taskId: "blocker" },
+    createdGraphRevision: 4,
+    provenance,
+  };
+  const adoption = {
+    type: "task.graph-edge-adopted",
+    id: "adopt",
+    environmentId: "env",
+    occurredAt,
+    commandId: "command",
+    previousGraphRevision: 3,
+    graphRevision: 4,
+    edge,
+  };
+  const removal = {
+    ...adoption,
+    type: "task.graph-edge-removed",
+    id: "remove",
+    previousGraphRevision: 5,
+    graphRevision: 6,
+    provenance: { ...provenance, eventId: "remove" },
+  };
+  const proposal = {
+    type: "task.graph-proposal-recorded",
+    id: "propose",
+    environmentId: "env",
+    occurredAt,
+    commandId: "command",
+    graphRevision: 8,
+    proposal: {
+      proposalId: "proposal",
+      dependent: edge.dependent,
+      blocker: { environmentId: "foreign", taskId: "blocker" },
+      observedGraphRevision: 7,
+      proposedAt: occurredAt,
+      proposedBy: { type: "user", ...provenance.adoptedBy },
+    },
+  };
+
+  it("records local adoption/removal and inert foreign proposals without activating old task events", () => {
+    const decode = Schema.decodeUnknownSync(task.WorkTaskGraphEvent);
+    for (const event of [adoption, removal, proposal]) {
+      expect(decode(event)).toEqual(event);
+      expect(() => decodeOldTaskEventForGraph(event)).toThrow();
+      expect(decode({ ...event, actor: "human", grant: "all", authorized: true })).toEqual(event);
+    }
+    expect(decode(removal)).toMatchObject({
+      edge: { provenance },
+      provenance: { ...provenance, eventId: "remove" },
+    });
+    for (const patch of [
+      { graphRevision: 3 },
+      { graphRevision: 5 },
+      { previousGraphRevision: 4 },
+      { previousGraphRevision: 5 },
+      { graphRevision: Number.MAX_SAFE_INTEGER + 1 },
+      { previousGraphRevision: Number.MAX_SAFE_INTEGER, graphRevision: Number.MAX_SAFE_INTEGER },
+      { edge: { ...edge, createdGraphRevision: 3 } },
+      { edge: { ...edge, blocker: { ...edge.blocker, environmentId: "foreign" } } },
+      { environmentId: "foreign" },
+      { id: "other" },
+      { commandId: "other" },
+      { occurredAt: "2026-11-15T00:00:00.0009Z" },
+      { commandId: null },
+      { id: "x".repeat(2_001) },
+      { environmentId: "x".repeat(2_001) },
+      { commandId: "x".repeat(2_001) },
+      { occurredAt: "not-a-time" },
+      { previousGraphRevision: -1, graphRevision: 0 },
+      { previousGraphRevision: 3.5, graphRevision: 4.5 },
+    ])
+      expect(() => decode({ ...adoption, ...patch })).toThrow();
+    for (const patch of [
+      { previousGraphRevision: 3, graphRevision: 4 },
+      { id: "adopt", provenance },
+      { provenance: { ...provenance, eventId: "different" } },
+      { provenance: { ...removal.provenance, commandId: "different" } },
+      { provenance: { ...removal.provenance, occurredAt: "2026-11-15T00:00:00.0009Z" } },
+    ])
+      expect(() => decode({ ...removal, ...patch })).toThrow();
+    for (const patch of [
+      { graphRevision: 6 },
+      { environmentId: "foreign" },
+      { proposal: { ...proposal.proposal, proposedAt: "2026-11-15T00:00:00.0009Z" } },
+      { proposal: { ...proposal.proposal, observedGraphRevision: Number.MAX_SAFE_INTEGER + 1 } },
+    ])
+      expect(() => decode({ ...proposal, ...patch })).toThrow();
+    expect(() => decode({ ...adoption, type: "task.graph-revision-bumped" })).toThrow();
+  });
+
+  it("binds exact persisted command/event/time independently of topology revision", () => {
+    const decode = Schema.decodeUnknownSync(task.WorkTaskPersistedGraphEvent);
+    for (const event of [adoption, removal, proposal]) {
+      const context = { sequence: 100, eventId: event.id, occurredAt, commandId: "command" };
+      const envelope = { event, context };
+      expect(decode(envelope)).toEqual(envelope);
+      expect(decode({ ...envelope, context: { ...context, sequence: 0 } })).toBeDefined();
+      for (const patch of [
+        { sequence: -1 },
+        { sequence: 1.5 },
+        { sequence: Number.MAX_SAFE_INTEGER + 1 },
+        { eventId: "different" },
+        { commandId: "different" },
+        { commandId: null },
+        { eventId: "x".repeat(2_001) },
+        { commandId: "x".repeat(2_001) },
+        { occurredAt: "2026-11-15T00:00:00.0009Z" },
+        { occurredAt: "2026-11-15T00:00:00.000100Z" },
+      ])
+        expect(() => decode({ ...envelope, context: { ...context, ...patch } })).toThrow();
+    }
+  });
+});
