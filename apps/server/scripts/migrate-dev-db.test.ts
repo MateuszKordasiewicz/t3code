@@ -137,6 +137,75 @@ it.layer(NodeServices.layer)("migrate-dev-db", (it) => {
       const sourceDir = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-src-" });
       const destDir = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-dest-" });
       const source = yield* createFixtureSource(sourceDir);
+      yield* withDatabase(
+        source,
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`CREATE TABLE fixture_generated (
+          id INTEGER PRIMARY KEY, "raw""value" TEXT NOT NULL, payload BLOB NOT NULL,
+          virtual_value TEXT GENERATED ALWAYS AS (upper("raw""value")) VIRTUAL,
+          stored_value TEXT GENERATED ALWAYS AS (hex(payload)) STORED)`;
+          yield* sql`INSERT INTO fixture_generated(id,"raw""value",payload)
+          VALUES (7,'mixed' || char(0) || 'tail',X'00017FFF')`;
+          yield* sql`INSERT INTO work_task_projections VALUES ('copy-task',NULL,1,1,1,1,'{}','t','t')`;
+          yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('copy-task',1,1,'{}','{}','copy-definition','t')`;
+          yield* sql`INSERT INTO work_task_manager_bindings VALUES ('copy-task',1,'stopped-thread','t',NULL)`;
+          for (const [id, rowid] of [
+            ["copy-review", "-7"],
+            ["decision-target", "200"],
+            ["release-target", "300"],
+          ]) {
+            yield* sql`INSERT INTO work_task_action_reviews
+            (rowid,review_id,task_id,revision,manager_generation,manager_thread_id,provider_session_id,run_id,
+             command_id,runtime_request_id,rule_id,definition_revision,action_policy_revision,action,label,target,
+             preview_json,fingerprint,created_sequence,created_at)
+            VALUES (CAST(${rowid} AS INTEGER),${id},'copy-task',1,1,'stopped-thread','session','run-stopped-thread',
+              ${id},${id},'rule',1,1,'publish','Publish','target','{"content":"preview","artifacts":[]}','fp',1,'2026-08-01T00:00:00Z')`;
+          }
+          yield* sql`INSERT INTO work_task_action_review_decisions
+          (rowid,review_id,task_id,review_revision,action_policy_revision,fingerprint,manager_generation,
+           decision,human_subject,human_session_id,feedback,resolved_sequence,resolved_at)
+          VALUES (0,'copy-review','copy-task',1,1,'fp',1,'approve','human','session',NULL,2,'2026-08-01T00:00:01Z')`;
+          yield* sql`INSERT INTO work_task_action_review_releases
+          (rowid,review_id,task_id,review_revision,action_policy_revision,fingerprint,manager_generation,continuation_id,created_at)
+          VALUES (9007199254740993,'copy-review','copy-task',1,1,'fp',1,'continuation','2026-08-01T00:00:02Z')`.pipe(
+            Effect.provideService(SqlClient.SafeIntegers, true),
+          );
+          const dirty = {
+            type: "task.dirty-source-recorded",
+            id: "copy-dirty",
+            environmentId: "local",
+            commandId: "dirty-command",
+            occurredAt: "2026-08-01T00:00:00Z",
+            attribution: { type: "server" },
+            task: { environmentId: "local", taskId: "copy-task" },
+            membership: null,
+            sourceEventId: "copy-source",
+            sourceSequence: 1,
+            previousDirtyGeneration: 0,
+            dirtyGeneration: 1,
+            acknowledgedGeneration: 0,
+          };
+          yield* sql`INSERT INTO work_task_dirty_events(event_id,sequence,event_json) VALUES ('copy-dirty',2,${JSON.stringify(dirty)})`;
+        }).pipe(Effect.provideService(SqlClient.SafeIntegers, true)),
+      );
+      const readCompatibility = Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const generated = yield* sql`SELECT id,hex("raw""value") AS raw,hex(payload) AS payload,
+          hex(virtual_value) AS virtual_value,stored_value FROM fixture_generated`;
+        const dirty = yield* sql`SELECT * FROM work_task_dirty_events`;
+        const reviews =
+          yield* sql`SELECT CAST(rowid AS TEXT) AS allocated_rowid,* FROM work_task_action_reviews ORDER BY review_id`;
+        const decisions =
+          yield* sql`SELECT CAST(rowid AS TEXT) AS allocated_rowid,* FROM work_task_action_review_decisions`;
+        const releases =
+          yield* sql`SELECT CAST(rowid AS TEXT) AS allocated_rowid,* FROM work_task_action_review_releases`;
+        const reservations =
+          yield* sql`SELECT source,CAST(row_id AS TEXT) AS row_id FROM work_task_review_rowids ORDER BY source,row_id`;
+        return { generated, dirty, reviews, decisions, releases, reservations };
+      });
+      const sourceEvidence = yield* withDatabase(source, readCompatibility);
+      const sourceBytes = yield* fs.readFile(source);
 
       const result = yield* runMigrateDevDb(
         { baseDir: destDir, source, projects: 5, threadsPerProject: 2 },
@@ -144,6 +213,51 @@ it.layer(NodeServices.layer)("migrate-dev-db", (it) => {
       );
 
       assert.equal(result.databasePath, path.join(destDir, "userdata", "statev2.sqlite"));
+      assert.deepStrictEqual(
+        yield* withDatabase(result.databasePath, readCompatibility),
+        sourceEvidence,
+      );
+      assert.deepStrictEqual(yield* fs.readFile(source), sourceBytes);
+      yield* withDatabase(
+        result.databasePath,
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`INSERT INTO work_task_action_review_decisions
+          SELECT 'release-target',task_id,review_revision,action_policy_revision,fingerprint,manager_generation,
+            decision,human_subject,human_session_id,feedback,resolved_sequence,resolved_at
+          FROM work_task_action_review_decisions WHERE review_id='copy-review'`;
+          for (const recursive of [0, 1]) {
+            yield* sql.unsafe(`PRAGMA recursive_triggers=${recursive}`);
+            for (const statement of [
+              `INSERT OR REPLACE INTO work_task_action_reviews
+              SELECT rowid,'replacement-review',task_id,revision,manager_generation,manager_thread_id,provider_session_id,run_id,
+                'replacement-command','replacement-request',rule_id,definition_revision,action_policy_revision,action,label,target,
+                preview_json,fingerprint,created_sequence,created_at FROM work_task_action_reviews WHERE review_id='copy-review'`,
+              `INSERT OR REPLACE INTO work_task_action_review_decisions
+              SELECT rowid,'decision-target',task_id,review_revision,action_policy_revision,fingerprint,manager_generation,
+                decision,human_subject,human_session_id,feedback,resolved_sequence,resolved_at
+              FROM work_task_action_review_decisions WHERE review_id='copy-review'`,
+              `INSERT OR REPLACE INTO work_task_action_review_releases
+              SELECT rowid,'release-target',task_id,review_revision,action_policy_revision,fingerprint,manager_generation,
+                'replacement-continuation',created_at FROM work_task_action_review_releases WHERE review_id='copy-review'`,
+            ]) {
+              const table = statement.match(/INTO (\w+)/)![1]!;
+              const columns = yield* sql<{
+                name: string;
+              }>`SELECT name FROM pragma_table_info(${table}) ORDER BY cid`;
+              const quoted = columns.map(({ name }) => `"${name.replaceAll('"', '""')}"`).join(",");
+              const error = yield* sql
+                .unsafe(statement.replace(`INTO ${table}`, `INTO ${table}(rowid,${quoted})`))
+                .pipe(Effect.flip);
+              assert.include(
+                String(error.reason.cause),
+                recursive === 0 ? "immutable review rowid" : "immutable",
+              );
+            }
+          }
+          assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+        }).pipe(Effect.provideService(SqlClient.SafeIntegers, true)),
+      );
       const kept = yield* withDatabase(
         result.databasePath,
         Effect.gen(function* () {
@@ -352,6 +466,53 @@ it.layer(NodeServices.layer)("migrate-dev-db", (it) => {
       }
       assert.deepStrictEqual(yield* fs.readFile(source), sourceBefore);
       assert.deepStrictEqual(yield* fs.readFile(destination), destinationBefore);
+    }),
+  );
+
+  it.effect("rejects an incomplete copied foreign key without replacing the destination", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const sourceDir = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-fk-" });
+      const destDir = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-fk-dest-" });
+      const source = yield* createFixtureSource(sourceDir);
+      const destination = yield* createFixtureSource(destDir);
+      yield* withDatabase(
+        source,
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`CREATE TABLE fixture_parent (id TEXT PRIMARY KEY)`;
+          yield* sql`CREATE TABLE fixture_child (parent_id TEXT REFERENCES fixture_parent(id))`;
+          yield* sql`PRAGMA foreign_keys=OFF`;
+          yield* sql`INSERT INTO fixture_child VALUES ('missing')`;
+        }),
+      );
+      const sourceBefore = yield* fs.readFile(source);
+      const destinationBefore = yield* fs.readFile(destination);
+      const input = { baseDir: destDir, source, projects: 5, threadsPerProject: 2 };
+      const error = yield* runMigrateDevDb(input, { sharedHome: sourceDir }).pipe(Effect.flip);
+      assert.equal(error._tag, "MigrateDevDbPhaseError");
+      if (error._tag === "MigrateDevDbPhaseError") assert.equal(error.phase, "snapshot");
+      assert.deepStrictEqual(yield* fs.readFile(source), sourceBefore);
+      assert.deepStrictEqual(yield* fs.readFile(destination), destinationBefore);
+      assert.equal(yield* fs.exists(`${destination}.migrate-dev-db-tmp`), false);
+      yield* withDatabase(
+        source,
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`INSERT INTO fixture_parent VALUES ('missing')`;
+        }),
+      );
+      yield* runMigrateDevDb(input, { sharedHome: sourceDir });
+      yield* withDatabase(
+        destination,
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+          assert.deepStrictEqual(yield* sql`SELECT parent_id FROM fixture_child`, [
+            { parent_id: "missing" },
+          ]);
+        }),
+      );
     }),
   );
 

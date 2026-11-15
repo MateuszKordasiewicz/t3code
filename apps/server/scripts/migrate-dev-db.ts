@@ -203,6 +203,12 @@ const CLEARED_TABLES: ReadonlyArray<string> = [
 
 const PROVIDER_SESSIONS_TABLE = "orchestration_v2_projection_provider_sessions";
 const FTS5_SHADOW_SUFFIXES = ["_data", "_idx", "_content", "_docsize", "_config"];
+// Migration 091 reserves these allocated rowids to prevent immutable review replacement.
+const PRESERVED_ROWID_TABLES = new Set([
+  "work_task_action_reviews",
+  "work_task_action_review_decisions",
+  "work_task_action_review_releases",
+]);
 
 // Settled threads stay: they are most of real history, and the UI shows them.
 const rootIsVisible = (sql: SqlClient.SqlClient) => sql`
@@ -217,10 +223,22 @@ const copySourceSlice = Effect.fn("copyDevDbSourceSlice")(function* (sourcePath:
   const schema = yield* sql<{ type: string; name: string; sql: string }>`
     SELECT type, name, sql FROM src.sqlite_master
     WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'`;
-  const threadColumns = yield* sql<{ name: string; notnull: number }>`
-    SELECT m.name, c."notnull" FROM src.sqlite_master m, pragma_table_info(m.name, 'src') c
-    WHERE m.type = 'table' AND c.name = 'thread_id'`;
-  const threadIdNullable = new Map(threadColumns.map((row) => [row.name, row.notnull === 0]));
+  const tableColumns = yield* sql<{ table_name: string; column_name: string; notnull: number }>`
+    SELECT m.name AS table_name,c.name AS column_name,c."notnull"
+    FROM src.sqlite_master m,pragma_table_info(m.name,'src') c
+    WHERE m.type='table' ORDER BY m.name,c.cid`;
+  const writableColumns = new Map<string, string[]>();
+  for (const column of tableColumns) {
+    const columns = writableColumns.get(column.table_name) ?? [];
+    columns.push(column.column_name);
+    writableColumns.set(column.table_name, columns);
+  }
+  const quoteIdentifier = (name: string) => `"${name.replaceAll('"', '""')}"`;
+  const threadIdNullable = new Map(
+    tableColumns
+      .filter((row) => row.column_name === "thread_id")
+      .map((row) => [row.table_name, row.notnull === 0]),
+  );
   // FTS5 makes its own shadow tables and contentless rows cannot be copied:
   // create the virtual table, skip its shadow tables and rows, and rebuild the
   // index once the messages and triggers are in.
@@ -249,46 +267,58 @@ const copySourceSlice = Effect.fn("copyDevDbSourceSlice")(function* (sourcePath:
     }
   }
 
-  yield* sql.withTransaction(
-    Effect.gen(function* () {
-      for (const table of tables) yield* sql.unsafe(table.sql).unprepared;
-      // Explicit unique indexes must exist before inserts validate foreign-key parent keys.
-      for (const entry of schema) {
-        if (entry.type === "index") yield* sql.unsafe(entry.sql).unprepared;
-      }
-      if (filtered) {
-        yield* sql`CREATE TEMP TABLE copied_threads (thread_id TEXT PRIMARY KEY)`;
-        yield* sql`INSERT OR IGNORE INTO copied_threads
+  yield* sql
+    .withTransaction(
+      Effect.gen(function* () {
+        // Rebuilt parent tables can follow their children in sqlite_master; validate the complete copy at commit.
+        yield* sql`PRAGMA defer_foreign_keys = ON`;
+        for (const table of tables) yield* sql.unsafe(table.sql).unprepared;
+        // Explicit unique indexes must exist before inserts validate foreign-key parent keys.
+        for (const entry of schema) {
+          if (entry.type === "index") yield* sql.unsafe(entry.sql).unprepared;
+        }
+        if (filtered) {
+          yield* sql`CREATE TEMP TABLE copied_threads (thread_id TEXT PRIMARY KEY)`;
+          yield* sql`INSERT OR IGNORE INTO copied_threads
           SELECT family.thread_id FROM src.orchestration_v2_projection_threads family
           JOIN src.orchestration_v2_projection_threads root ON root.thread_id =
             COALESCE(json_extract(family.payload_json, '$.lineage.rootThreadId'), family.thread_id)
           WHERE ${rootIsVisible(sql)}`;
-      }
-      for (const { name } of tables) {
-        if (cleared.has(name) || virtualTables.includes(name)) continue;
-        const nullable = threadIdNullable.get(name);
-        const filter = !filtered
-          ? ""
-          : name === "orchestration_events"
-            ? // Two ranges let SQLite seek the (aggregate_kind, stream_id) index instead of scanning.
-              `WHERE (aggregate_kind = 'thread' AND stream_id IN (SELECT thread_id FROM copied_threads))
+        }
+        for (const { name } of tables) {
+          if (cleared.has(name) || virtualTables.includes(name)) continue;
+          const nullable = threadIdNullable.get(name);
+          const filter = !filtered
+            ? ""
+            : name === "orchestration_events"
+              ? // Two ranges let SQLite seek the (aggregate_kind, stream_id) index instead of scanning.
+                `WHERE (aggregate_kind = 'thread' AND stream_id IN (SELECT thread_id FROM copied_threads))
                 OR aggregate_kind < 'thread' OR aggregate_kind > 'thread'`
-            : nullable === undefined || name === PROVIDER_SESSIONS_TABLE
-              ? ""
-              : `WHERE thread_id IN (SELECT thread_id FROM copied_threads)${nullable ? " OR thread_id IS NULL" : ""}`;
-        yield* sql.unsafe(`INSERT INTO main."${name}" SELECT * FROM src."${name}" ${filter}`)
-          .unprepared;
-      }
-      yield* sql`DELETE FROM main.sqlite_sequence`;
-      yield* sql`INSERT INTO main.sqlite_sequence SELECT name, seq FROM src.sqlite_sequence`;
-      for (const entry of schema) {
-        if (entry.type !== "table" && entry.type !== "index")
-          yield* sql.unsafe(entry.sql).unprepared;
-      }
-      yield* rebuildMessageSearch(sql);
-    }),
-  );
-  yield* sql`DETACH DATABASE src`;
+              : nullable === undefined || name === PROVIDER_SESSIONS_TABLE
+                ? ""
+                : `WHERE thread_id IN (SELECT thread_id FROM copied_threads)${nullable ? " OR thread_id IS NULL" : ""}`;
+          const columns = [
+            ...(PRESERVED_ROWID_TABLES.has(name) ? ["rowid"] : []),
+            ...(writableColumns.get(name) ?? []),
+          ]
+            .map(quoteIdentifier)
+            .join(",");
+          const table = quoteIdentifier(name);
+          yield* sql.unsafe(
+            `INSERT INTO main.${table} (${columns}) SELECT ${columns} FROM src.${table} ${filter}`,
+          ).unprepared;
+        }
+        yield* sql`DELETE FROM main.sqlite_sequence`;
+        yield* sql`INSERT INTO main.sqlite_sequence SELECT name, seq FROM src.sqlite_sequence`;
+        for (const entry of schema) {
+          if (entry.type !== "table" && entry.type !== "index")
+            yield* sql.unsafe(entry.sql).unprepared;
+        }
+        yield* rebuildMessageSearch(sql);
+      }),
+    )
+    .pipe(Effect.provideService(SqlClient.SafeIntegers, true));
+  yield* sql`DETACH DATABASE src`.pipe(Effect.provideService(SqlClient.SafeIntegers, true));
 });
 
 const pruneSnapshot = Effect.fn("pruneDevDbSnapshot")(function* (input: RunMigrateDevDbInput) {
