@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   WorkTaskPersistedEvent,
+  WorkTaskPersistedAcceptedRunOwnershipEvent,
   WorkTaskPersistedCoordinationEvent,
   WorkTaskGraphEdgeRecord,
   WorkTaskGraphProvenance,
@@ -39,6 +40,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
     assert.deepInclude(migrations, [94, "WorkTaskManagerGroups"]);
     assert.deepInclude(migrations, [95, "WorkTaskManagerMemberships"]);
     assert.deepInclude(migrations, [96, "WorkTaskDirtyReconciliation"]);
+    assert.deepInclude(migrations, [97, "WorkTaskAcceptedRuns"]);
     const tables = yield* sql<{ readonly name: string }>`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'work_task_%' ORDER BY name
     `;
@@ -46,6 +48,9 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
       tables.map((row) => row.name),
       [
         "work_task_accepted_definitions",
+        "work_task_accepted_run_debits",
+        "work_task_accepted_run_references",
+        "work_task_accepted_runs",
         "work_task_action_review_decisions",
         "work_task_action_review_releases",
         "work_task_action_reviews",
@@ -116,6 +121,7 @@ it.effect("upgrades predecessor rows and events without changing their bytes or 
       [94, "WorkTaskManagerGroups"],
       [95, "WorkTaskManagerMemberships"],
       [96, "WorkTaskDirtyReconciliation"],
+      [97, "WorkTaskAcceptedRuns"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM projection_projects ORDER BY project_id`,
@@ -162,6 +168,7 @@ it.effect("rolls back a failed migration and succeeds on rerun", () =>
       [94, "WorkTaskManagerGroups"],
       [95, "WorkTaskManagerMemberships"],
       [96, "WorkTaskDirtyReconciliation"],
+      [97, "WorkTaskAcceptedRuns"],
     ]);
     assert.deepStrictEqual(yield* runMigrations(), []);
   }).pipe(Effect.provide(db)),
@@ -289,6 +296,7 @@ it.effect(
         [94, "WorkTaskManagerGroups"],
         [95, "WorkTaskManagerMemberships"],
         [96, "WorkTaskDirtyReconciliation"],
+        [97, "WorkTaskAcceptedRuns"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -458,6 +466,7 @@ it.effect("preserves task custody through validation upgrade and rolls back migr
       [94, "WorkTaskManagerGroups"],
       [95, "WorkTaskManagerMemberships"],
       [96, "WorkTaskDirtyReconciliation"],
+      [97, "WorkTaskAcceptedRuns"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -600,6 +609,7 @@ it.effect("upgrades validation data atomically to action reviews and preserves p
       [94, "WorkTaskManagerGroups"],
       [95, "WorkTaskManagerMemberships"],
       [96, "WorkTaskDirtyReconciliation"],
+      [97, "WorkTaskAcceptedRuns"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -818,6 +828,7 @@ it.effect("upgrades existing tasks without inventing state and rolls back migrat
       [94, "WorkTaskManagerGroups"],
       [95, "WorkTaskManagerMemberships"],
       [96, "WorkTaskDirtyReconciliation"],
+      [97, "WorkTaskAcceptedRuns"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -921,6 +932,7 @@ it.effect("upgrades waits atomically while preserving task state and link proven
       [94, "WorkTaskManagerGroups"],
       [95, "WorkTaskManagerMemberships"],
       [96, "WorkTaskDirtyReconciliation"],
+      [97, "WorkTaskAcceptedRuns"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM work_task_thread_links ORDER BY link_event_id`,
@@ -1051,6 +1063,7 @@ it.effect("upgrades result history atomically without changing predecessor data"
       [94, "WorkTaskManagerGroups"],
       [95, "WorkTaskManagerMemberships"],
       [96, "WorkTaskDirtyReconciliation"],
+      [97, "WorkTaskAcceptedRuns"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_current_state`, state);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_thread_links`, links);
@@ -1197,6 +1210,7 @@ it.effect("upgrades claim history atomically and preserves prior task and ordina
       [94, "WorkTaskManagerGroups"],
       [95, "WorkTaskManagerMemberships"],
       [96, "WorkTaskDirtyReconciliation"],
+      [97, "WorkTaskAcceptedRuns"],
     ]);
     assert.deepStrictEqual(
       yield* Effect.forEach(tables, (name) => sql.unsafe(`SELECT * FROM ${name}`)),
@@ -1539,6 +1553,7 @@ it.effect("preserves legacy validation rows and rolls replay migration back befo
       [94, "WorkTaskManagerGroups"],
       [95, "WorkTaskManagerMemberships"],
       [96, "WorkTaskDirtyReconciliation"],
+      [97, "WorkTaskAcceptedRuns"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_attempts`, before);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_claims`, claims);
@@ -2655,6 +2670,7 @@ it.effect("preserves review evidence on upgrade and binds append-only outcomes a
       [94, "WorkTaskManagerGroups"],
       [95, "WorkTaskManagerMemberships"],
       [96, "WorkTaskDirtyReconciliation"],
+      [97, "WorkTaskAcceptedRuns"],
     ]);
     assert.deepStrictEqual(yield* snapshot(), before);
     assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
@@ -3055,6 +3071,7 @@ it.effect(
         [94, "WorkTaskManagerGroups"],
         [95, "WorkTaskManagerMemberships"],
         [96, "WorkTaskDirtyReconciliation"],
+        [97, "WorkTaskAcceptedRuns"],
       ]);
       const after = yield* snapshot();
       assert.deepStrictEqual(
@@ -3415,6 +3432,7 @@ it.effect(
         [94, "WorkTaskManagerGroups"],
         [95, "WorkTaskManagerMemberships"],
         [96, "WorkTaskDirtyReconciliation"],
+        [97, "WorkTaskAcceptedRuns"],
       ]);
       const after = yield* capture();
       assert.deepStrictEqual(
@@ -4048,6 +4066,7 @@ it.effect(
       assert.deepStrictEqual(yield* runMigrations(), [
         [95, "WorkTaskManagerMemberships"],
         [96, "WorkTaskDirtyReconciliation"],
+        [97, "WorkTaskAcceptedRuns"],
       ]);
       const after = yield* capture();
       assert.deepStrictEqual(
@@ -4457,7 +4476,10 @@ it.effect("preserves dirty scan membership observations and rolls back migration
     );
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_group_memberships`, before);
     yield* sql`DROP TABLE work_task_reconciliation_visits`;
-    assert.deepStrictEqual(yield* runMigrations(), [[96, "WorkTaskDirtyReconciliation"]]);
+    assert.deepStrictEqual(yield* runMigrations(), [
+      [96, "WorkTaskDirtyReconciliation"],
+      [97, "WorkTaskAcceptedRuns"],
+    ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_group_memberships`, before);
     const member = batch.event.snapshot.currentMembership!;
     const source = {
@@ -4538,4 +4560,674 @@ it.effect("preserves dirty scan membership observations and rolls back migration
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_dirty_events`, captured);
     assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
   }).pipe(Effect.provide(db)),
+);
+
+const acceptedRunPaths = {
+  run_id: "ownership.run.runId",
+  message_id: "ownership.run.messageId",
+  environment_id: "environmentId",
+  task_id: "ownership.run.task.taskId",
+  group_id: "ownership.run.group.groupId",
+  manager_generation: "ownership.run.manager.managerGeneration",
+  manager_thread_id: "ownership.run.manager.threadId",
+  membership_generation: "ownership.run.membershipGeneration",
+  project_id: "ownership.run.projectId",
+  provider_instance_id: "ownership.run.providerInstanceId",
+  definition_revision: "ownership.run.taskRevisions.definitionRevision",
+  accepted_definition_revision: "ownership.run.taskRevisions.acceptedDefinitionRevision",
+  lifecycle_revision: "ownership.run.taskRevisions.lifecycleRevision",
+  completion_policy_revision: "ownership.run.taskRevisions.completionPolicyRevision",
+  action_policy_revision: "ownership.run.taskRevisions.actionPolicyRevision",
+  graph_revision: "ownership.run.graphRevision",
+  control_revision: "ownership.run.controlRevision",
+  membership_revision: "ownership.run.membershipRevision",
+  recorded_event_id: "id",
+  recorded_sequence: "ownership.recorded.sequence",
+  recorded_command_id: "commandId",
+  recorded_at: "occurredAt",
+  native_run_event_id: "ownership.nativeAcceptance.runEvent.eventId",
+  native_run_sequence: "ownership.nativeAcceptance.runEvent.sequence",
+  native_message_event_id: "ownership.nativeAcceptance.messageEvent.eventId",
+  native_message_sequence: "ownership.nativeAcceptance.messageEvent.sequence",
+  native_receipt_command_id: "ownership.nativeAcceptance.receipt.commandId",
+  native_receipt_result_sequence: "ownership.nativeAcceptance.receipt.resultSequence",
+  origin_type: "ownership.origin.type",
+  reservation_id: "ownership.origin.reservationId",
+  reservation_command_id: "ownership.origin.reservationCommandId",
+  allowance_unit: "ownership.origin.allowanceUnit",
+  debit_event_id: "ownership.origin.debitEvent.eventId",
+  debit_sequence: "ownership.origin.debitEvent.sequence",
+};
+const insertAcceptedRun = Effect.fn("PersistentTasks.insertAcceptedRun")(function* (
+  event: unknown,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql.unsafe(
+    `INSERT INTO work_task_accepted_runs (${Object.keys(acceptedRunPaths).join(",")},event_json)
+    SELECT ${Object.values(acceptedRunPaths)
+      .map((p) => `json_extract(value,'$.${p}')`)
+      .join(",")},value FROM (SELECT ? AS value)`,
+    [JSON.stringify(event)],
+  );
+});
+const decodeAcceptedOwnership = Schema.decodeSync(WorkTaskPersistedAcceptedRunOwnershipEvent);
+const decodeAcceptedOwnershipEffect = Schema.decodeUnknownEffect(
+  WorkTaskPersistedAcceptedRunOwnershipEvent,
+);
+const acceptedOwnershipFixture = (suffix = "one", offset = 0) => {
+  const occurredAt = "2026-11-15T00:00:01.0009Z";
+  const recorded = {
+    eventId: `owner-${suffix}`,
+    sequence: 1000 + offset,
+    commandId: `record-${suffix}`,
+    occurredAt,
+  };
+  const decoded = decodeAcceptedOwnership({
+    context: recorded,
+    event: {
+      id: recorded.eventId,
+      type: "task.run-ownership-accepted",
+      environmentId: "env",
+      commandId: recorded.commandId,
+      occurredAt,
+      attribution: { type: "server" },
+      ownership: {
+        recorded,
+        run: {
+          version: 2,
+          task: { environmentId: "env", taskId: "a" },
+          group: { environmentId: "env", groupId: "group" },
+          manager: { managerGeneration: 1, threadId: "manager" },
+          membershipGeneration: 1,
+          membershipRevision: 1,
+          controlRevision: 1,
+          graphRevision: 0,
+          projectId: "project",
+          providerInstanceId: "codex",
+          runId: `run-${suffix}`,
+          messageId: `message-${suffix}`,
+          taskRevisions: {
+            definitionRevision: 3,
+            acceptedDefinitionRevision: 2,
+            lifecycleRevision: 1,
+            completionPolicyRevision: 2,
+            actionPolicyRevision: 3,
+          },
+        },
+        nativeAcceptance: {
+          receipt: {
+            commandId: `native-${suffix}`,
+            threadId: "manager",
+            commandType: "thread.message.send",
+            acceptedAt: "2026-11-15T00:00:01.0001Z",
+            resultSequence: 202 + offset,
+            status: "accepted",
+            error: null,
+          },
+          runEvent: {
+            type: "run.created",
+            eventId: `native-run-${suffix}`,
+            sequence: 201 + offset,
+          },
+          messageEvent: {
+            type: "message.updated",
+            eventId: `native-message-${suffix}`,
+            sequence: 202 + offset,
+          },
+          runStatus: "queued",
+        },
+        sourceEventId: "shared-source",
+        sourceSequence: 100,
+        observedWorkSequence: 100,
+        prerequisites: [],
+        origin: {
+          type: "initial_start",
+          startCommandId: "start-command",
+          startEventId: "shared-source",
+          startSequence: 100,
+        },
+      },
+    },
+  }).event;
+  if (decoded.type !== "task.run-ownership-accepted")
+    throw new Error("Expected accepted ownership");
+  return decoded;
+};
+const seedAcceptedOwnership = Effect.fn("PersistentTasks.seedAcceptedOwnership")(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`INSERT INTO work_task_projections VALUES ('a',NULL,1,1,1,1,'{}','raw','raw')`;
+  yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('a',1,1,'{}','{}','definition-one','raw')`;
+  yield* writeGroupControl(
+    decodeGroupControlEvent({
+      ...groupContext("owner-group"),
+      type: "task-group.created",
+      control: emptyGroupControl(),
+    }),
+    10,
+  );
+  const join = membershipJoin();
+  yield* sql.withTransaction(applyMembership(join, 11));
+  const bound = decodeGroupControlEvent({
+    ...groupContext("owner-manager"),
+    type: "task-group.manager-changed",
+    previousControl: join.companions[0]!.control,
+    control: {
+      ...join.companions[0]!.control,
+      controlRevision: 1,
+      highestManagerGeneration: 1,
+      currentManager: { managerGeneration: 1, threadId: "manager" },
+    },
+  });
+  yield* sql.withTransaction(
+    Effect.gen(function* () {
+      yield* writeGroupControl(bound, 13);
+      yield* bindGroupManager(bound, 13);
+    }),
+  );
+  yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('a',2,1,'{}','{}','definition-two','raw')`;
+  yield* sql`UPDATE work_task_projections SET definition_revision=3,completion_policy_revision=2,action_policy_revision=3 WHERE task_id='a'`;
+  return { bound, join };
+});
+const automaticOwnershipFixture = (suffix: string, offset: number, unit = 1) => {
+  const base = acceptedOwnershipFixture(suffix, offset);
+  const sequence = 203 + offset;
+  const commandId = `reservation-command-${suffix}`;
+  const revisions = base.ownership.run.taskRevisions;
+  const debit = decodePersistedEvent({
+    event: {
+      id: `debit-${suffix}`,
+      type: "task.allowance-debited",
+      taskId: "a",
+      commandId,
+      occurredAt: base.occurredAt,
+      definitionRevision: revisions.definitionRevision,
+      lifecycleRevision: revisions.lifecycleRevision,
+      completionPolicyRevision: revisions.completionPolicyRevision,
+      actionPolicyRevision: revisions.actionPolicyRevision,
+      attribution: { type: "server" },
+      previous: { type: "configured", cap: unit, consumed: unit - 1 },
+      resulting: { type: "configured", cap: unit, consumed: unit },
+      allowanceUnit: unit,
+    },
+    context: { eventId: `debit-${suffix}`, sequence, commandId, occurredAt: base.occurredAt },
+  });
+  const event = decodeAcceptedOwnership({
+    context: base.ownership.recorded,
+    event: {
+      ...base,
+      ownership: {
+        ...base.ownership,
+        origin: {
+          type: "automatic_followup",
+          reservationId: `reservation-${suffix}`,
+          reservationCommandId: commandId,
+          allowanceUnit: unit,
+          observedDirtyGeneration: 3,
+          acknowledgedGeneration: 1,
+          pending: {
+            sources: [{ kind: "result", sourceId: "pending", resultRef: null }],
+            overflowThroughGeneration: 3,
+          },
+          debitEvent: {
+            type: "task.allowance-debited",
+            eventId: debit.event.id,
+            sequence,
+            commandId,
+            taskId: "a",
+            definitionRevision: revisions.definitionRevision,
+            lifecycleRevision: revisions.lifecycleRevision,
+            completionPolicyRevision: revisions.completionPolicyRevision,
+            actionPolicyRevision: revisions.actionPolicyRevision,
+            allowanceUnit: unit,
+          },
+        },
+      },
+    },
+  }).event;
+  if (event.type !== "task.run-ownership-accepted") throw new Error("Expected accepted ownership");
+  return { event, debit };
+};
+const insertAcceptedDebit = Effect.fn("PersistentTasks.insertAcceptedDebit")(function* (
+  runId: string,
+  event: unknown,
+  sequence: number,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`INSERT INTO work_task_accepted_run_debits(event_id,run_id,sequence,task_id,command_id,allowance_unit,definition_revision,lifecycle_revision,completion_policy_revision,action_policy_revision,occurred_at,event_json)
+    SELECT json_extract(value,'$.id'),json_extract(${JSON.stringify(runId)},'$'),${sequence},json_extract(value,'$.taskId'),json_extract(value,'$.commandId'),json_extract(value,'$.allowanceUnit'),
+      json_extract(value,'$.definitionRevision'),json_extract(value,'$.lifecycleRevision'),json_extract(value,'$.completionPolicyRevision'),json_extract(value,'$.actionPolicyRevision'),json_extract(value,'$.occurredAt'),value FROM (SELECT ${JSON.stringify(event)} value)`;
+});
+it.effect(
+  "retains accepted run ownership without physical launch or another allowance charge",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      yield* seedAcceptedOwnership();
+      const event = acceptedOwnershipFixture();
+      yield* insertAcceptedRun(event);
+      assert.deepStrictEqual(
+        JSON.parse(
+          (yield* sql<{
+            event_json: string;
+          }>`SELECT event_json FROM work_task_accepted_runs WHERE run_id='run-one'`)[0]!.event_json,
+        ),
+        event,
+      );
+      assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_run_debits`, []);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_allowances`, []);
+      for (const [index, reverse] of [false, true].entries()) {
+        const automatic = automaticOwnershipFixture(`auto-${index}`, 20 + index * 20, index + 1);
+        const owner = insertAcceptedRun(automatic.event);
+        const debit = insertAcceptedDebit(
+          automatic.event.ownership.run.runId,
+          automatic.debit.event,
+          automatic.debit.context.sequence,
+        );
+        yield* sql`BEGIN`;
+        yield* reverse ? debit : owner;
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(sql`COMMIT`)));
+        yield* sql`ROLLBACK`;
+        yield* sql`BEGIN`;
+        yield* reverse ? debit : owner;
+        yield* reverse ? owner : debit;
+        yield* sql`COMMIT`;
+      }
+      assert.strictEqual(
+        (yield* sql<{ count: number }>`SELECT count(*) count FROM work_task_accepted_runs`)[0]!
+          .count,
+        3,
+      );
+      const unicode = acceptedOwnershipFixture("\0😀\ud800", 60);
+      yield* insertAcceptedRun(unicode);
+      assert.deepStrictEqual(
+        JSON.parse(
+          (yield* sql<{
+            event_json: string;
+          }>`SELECT event_json FROM work_task_accepted_runs WHERE recorded_sequence=1060`)[0]!
+            .event_json,
+        ),
+        unicode,
+      );
+      const batch = automaticOwnershipFixture("bounded", 80, 3);
+      const pending = {
+        sources: Array.from({ length: 32 }, (_, i) => ({
+          kind: "result",
+          sourceId: `source-${i}`,
+          resultRef: null,
+        })),
+        overflowThroughGeneration: 3,
+      };
+      const prerequisites = Array.from({ length: 64 }, (_, i) => ({
+        edgeId: `edge-${i}`,
+        blocker: { environmentId: "env", taskId: `blocker-${i}` },
+        completionEventId: `completion-${i}`,
+        completionSequence: i,
+      }));
+      const bounded = {
+        ...batch.event,
+        ownership: {
+          ...batch.event.ownership,
+          prerequisites,
+          origin: { ...batch.event.ownership.origin, pending },
+        },
+      };
+      yield* decodeAcceptedOwnershipEffect({
+        event: bounded,
+        context: bounded.ownership.recorded,
+      });
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* insertAcceptedRun(bounded);
+          yield* insertAcceptedDebit(
+            bounded.ownership.run.runId,
+            batch.debit.event,
+            batch.debit.context.sequence,
+          );
+        }),
+      );
+      assert.strictEqual(
+        (yield* sql<{
+          count: number;
+        }>`SELECT count(*) count FROM work_task_accepted_run_references WHERE accepted_event_id='owner-bounded'`)[0]!
+          .count,
+        69,
+      );
+      for (const reverse of [false, true]) {
+        const unknownBase = acceptedOwnershipFixture("unknown", 100);
+        const unknown = {
+          ...unknownBase,
+          ownership: {
+            ...unknownBase.ownership,
+            sourceEventId: "future-native",
+            sourceSequence: 400,
+          },
+        };
+        const knownBase = acceptedOwnershipFixture("known", 200);
+        const known = {
+          ...knownBase,
+          ownership: {
+            ...knownBase.ownership,
+            nativeAcceptance: {
+              ...knownBase.ownership.nativeAcceptance,
+              runEvent: { type: "run.created", eventId: "future-native", sequence: 400 },
+            },
+          },
+        };
+        yield* sql`BEGIN`;
+        yield* insertAcceptedRun(reverse ? known : unknown);
+        yield* insertAcceptedRun(reverse ? unknown : known);
+        const conflictBase = acceptedOwnershipFixture("conflict", 300);
+        for (const ownership of [
+          { ...conflictBase.ownership, sourceEventId: "future-native", sourceSequence: 401 },
+          { ...conflictBase.ownership, sourceEventId: "different", sourceSequence: 400 },
+          {
+            ...conflictBase.ownership,
+            prerequisites: [
+              {
+                edgeId: "wrong-kind",
+                blocker: { environmentId: "env", taskId: "other" },
+                completionEventId: "future-native",
+                completionSequence: 400,
+              },
+            ],
+          },
+        ])
+          assert.isTrue(
+            Exit.isFailure(yield* Effect.exit(insertAcceptedRun({ ...conflictBase, ownership }))),
+          );
+        yield* sql`ROLLBACK`;
+      }
+      assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_allowances`, []);
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+    }).pipe(Effect.provide(db)),
+);
+
+it.effect("rejects contradictory accepted ownership and deferred legacy interleavings", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations();
+    yield* seedAcceptedOwnership();
+    const reject = Effect.fn("PersistentTasks.rejectAcceptedWrite")(function* (
+      effect: Effect.Effect<unknown, SqlError, SqlClient.SqlClient>,
+    ) {
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(effect)));
+    });
+    const base = acceptedOwnershipFixture();
+    const changes: ReadonlyArray<readonly [string, unknown]> = [
+      ["$.id", "x".repeat(2001)],
+      ["$.occurredAt", "2026-02-30T00:00:00Z"],
+      ["$.attribution.type", "user"],
+      ["$.ownership.run.version", 3],
+      ["$.ownership.run.providerInstanceId", "a/b"],
+      ["$.ownership.run.providerInstanceId", "a\0b"],
+      ["$.ownership.run.providerInstanceId", "a".repeat(65)],
+      ["$.ownership.run.membershipGeneration", 0],
+      ["$.ownership.run.manager.managerGeneration", 0],
+      ["$.ownership.run.task.environmentId", "other"],
+      ["$.ownership.run.taskRevisions.acceptedDefinitionRevision", 4],
+      ["$.ownership.run.effectId", "fabricated"],
+      ["$.ownership.run.runId", "\t\ufeff"],
+      ["$.ownership.sourceSequence", 1000],
+      ["$.ownership.observedWorkSequence", 1001],
+      ["$.ownership.recorded.commandId", "wrong"],
+      ["$.ownership.nativeAcceptance.receipt.threadId", "other"],
+      ["$.ownership.nativeAcceptance.receipt.resultSequence", 200],
+      ["$.ownership.nativeAcceptance.receipt.acceptedAt", "no"],
+      ["$.ownership.nativeAcceptance.receipt.error", "error"],
+      ["$.ownership.nativeAcceptance.runEvent.eventId", "native-message-one"],
+      ["$.ownership.nativeAcceptance.runEvent.sequence", 202],
+      [
+        "$.ownership.prerequisites",
+        [
+          {
+            edgeId: "e",
+            blocker: { environmentId: "env", taskId: "a" },
+            completionEventId: "done",
+            completionSequence: 5,
+          },
+        ],
+      ],
+      ["$.ownership.origin.allowanceUnit", 1],
+    ];
+    for (const [path, value] of changes) {
+      const [row] = yield* sql<{
+        value: string;
+      }>`SELECT json_set(${JSON.stringify(base)},${path},json(${JSON.stringify(value)})) value`;
+      const variant: unknown = JSON.parse(row!.value);
+      yield* reject(insertAcceptedRun(variant));
+    }
+    yield* insertAcceptedRun(base);
+    const automatic = automaticOwnershipFixture("guarded", 20);
+    for (const [path, value] of [
+      [
+        "$.ownership.origin.pending.sources",
+        Array.from({ length: 33 }, (_, i) => ({ kind: "r", sourceId: String(i), resultRef: null })),
+      ],
+      [
+        "$.ownership.origin.pending.sources",
+        [
+          { kind: "r", sourceId: "same", resultRef: null },
+          { kind: "r", sourceId: "same", resultRef: "different" },
+        ],
+      ],
+      ["$.ownership.origin.pending.sources", [{ kind: "r", sourceId: "missing", extra: null }]],
+      ["$.ownership.origin.pending.overflowThroughGeneration", 4],
+      ["$.ownership.origin.debitEvent.allowanceUnit", 2],
+      ["$.ownership.origin.debitEvent.taskId", "other"],
+    ] as ReadonlyArray<readonly [string, unknown]>) {
+      const [row] = yield* sql<{
+        value: string;
+      }>`SELECT json_set(${JSON.stringify(automatic.event)},${path},json(${JSON.stringify(value)})) value`;
+      const malformed: unknown = JSON.parse(row!.value);
+      yield* reject(insertAcceptedRun(malformed));
+    }
+    const owner = insertAcceptedRun(automatic.event);
+    const debit = insertAcceptedDebit(
+      automatic.event.ownership.run.runId,
+      automatic.debit.event,
+      automatic.debit.context.sequence,
+    );
+    const origin = automatic.event.ownership.origin;
+    if (origin.type !== "automatic_followup") throw new Error("Expected automatic origin");
+    yield* sql`INSERT INTO work_task_manager_bindings VALUES ('a',1,'legacy-manager','raw',NULL)`;
+    yield* sql`INSERT INTO work_task_allowances VALUES ('a',20,1)`;
+    yield* sql`INSERT INTO work_task_claims VALUES ('legacy-claim','a','legacy-claim','evidence','legacy-manager',1,1,1,0,'{"type":"server"}','summary','[{"type":"artifact","uri":"u","hash":"h"}]',2,'raw')`;
+    yield* sql`INSERT INTO work_task_validation_attempts VALUES ('attempt','a',1,1,1,'evidence','watermark','{}',NULL,'reserved',NULL,'raw',NULL,NULL)`;
+    const legacyWake = sql`INSERT INTO work_task_wake_reservations VALUES ('legacy-reservation','a',1,'legacy-command',NULL,NULL,1,1,0,'raw',NULL)`;
+    const legacyValidation = sql`INSERT INTO work_task_validation_identity VALUES ('attempt','a','legacy-claim',1)`;
+    for (const recursive of [0, 1]) {
+      yield* sql.unsafe(`PRAGMA recursive_triggers=${recursive}`);
+      for (const legacy of [legacyWake, legacyValidation]) {
+        for (const first of [owner, debit]) {
+          yield* sql`BEGIN`;
+          yield* first;
+          yield* reject(legacy);
+          yield* sql`ROLLBACK`;
+          yield* sql`BEGIN`;
+          yield* legacy;
+          yield* reject(first);
+          yield* sql`ROLLBACK`;
+        }
+      }
+      yield* sql`BEGIN`;
+      yield* owner;
+      yield* sql`INSERT INTO work_task_wake_reservations VALUES ('unrelated','a',1,'unrelated',NULL,NULL,2,1,0,'raw',NULL)`;
+      for (const set of [
+        "allowance_unit=1",
+        "run_id='run-guarded'",
+        "message_id='message-guarded'",
+        "reservation_id='reservation-guarded'",
+        "command_id='reservation-command-guarded'",
+      ])
+        yield* reject(
+          sql.unsafe(
+            `UPDATE OR REPLACE work_task_wake_reservations SET ${set} WHERE reservation_id='unrelated'`,
+          ),
+        );
+      yield* sql`ROLLBACK`;
+      yield* sql`BEGIN`;
+      yield* debit;
+      yield* sql`INSERT INTO work_task_validation_identity VALUES ('attempt','a','legacy-claim',2)`;
+      yield* reject(
+        sql`UPDATE OR REPLACE work_task_validation_identity SET allowance_unit=1 WHERE attempt_id='attempt'`,
+      );
+      yield* sql`ROLLBACK`;
+      for (const table of ["work_task_accepted_runs", "work_task_accepted_run_references"]) {
+        yield* reject(sql.unsafe(`INSERT OR REPLACE INTO ${table} SELECT * FROM ${table}`));
+        yield* reject(
+          sql.unsafe(
+            `UPDATE ${table} SET ${table.endsWith("references") ? "sequence=sequence" : "recorded_sequence=recorded_sequence"}`,
+          ),
+        );
+        yield* reject(sql.unsafe(`DELETE FROM ${table}`));
+      }
+      yield* reject(
+        sql`UPDATE work_task_accepted_definitions SET definition_json='{"changed":true}' WHERE task_id='a' AND definition_revision=2`,
+      );
+      yield* reject(
+        sql`INSERT OR REPLACE INTO work_task_accepted_definitions VALUES ('a',2,1,'{}','{}','new-definition','raw')`,
+      );
+      yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('a',4,1,'{}','{}','unrelated-definition','raw')`;
+      yield* reject(
+        sql`UPDATE OR REPLACE work_task_accepted_definitions SET definition_revision=2 WHERE definition_revision=4`,
+      );
+      yield* reject(
+        sql`UPDATE OR REPLACE work_task_accepted_definitions SET accepted_event_id='definition-two' WHERE definition_revision=4`,
+      );
+      yield* sql`DELETE FROM work_task_accepted_definitions WHERE definition_revision=4`;
+    }
+    for (const key of [
+      "commandId",
+      "definitionRevision",
+      "lifecycleRevision",
+      "completionPolicyRevision",
+      "actionPolicyRevision",
+    ] as const) {
+      const value = key === "commandId" ? "other" : 9;
+      const wrong = { ...automatic.debit.event, [key]: value };
+      yield* sql`BEGIN`;
+      yield* owner;
+      const inserted = yield* Effect.exit(
+        insertAcceptedDebit(
+          automatic.event.ownership.run.runId,
+          wrong,
+          automatic.debit.context.sequence,
+        ),
+      );
+      if (Exit.isSuccess(inserted)) yield* reject(sql`COMMIT`);
+      yield* sql`ROLLBACK`;
+    }
+    yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* debit;
+        yield* owner;
+      }),
+    );
+    const before = yield* sql`SELECT * FROM work_task_accepted_run_debits`;
+    yield* reject(
+      sql`INSERT OR REPLACE INTO work_task_accepted_run_debits SELECT * FROM work_task_accepted_run_debits`,
+    );
+    yield* reject(sql`UPDATE work_task_accepted_run_debits SET sequence=sequence`);
+    yield* reject(sql`DELETE FROM work_task_accepted_run_debits`);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_run_debits`, before);
+    assert.deepStrictEqual(yield* sql`SELECT configured_cap,consumed FROM work_task_allowances`, [
+      { configured_cap: 20, consumed: 1 },
+    ]);
+    assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect(
+  "preserves accepted ownership through migration retry and manager retirement with indexed reads",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: 96 });
+      const { bound, join } = yield* seedAcceptedOwnership();
+      yield* sql`INSERT INTO projection_projects(project_id,title,workspace_root,scripts_json,created_at,updated_at,deleted_at) VALUES ('ordinary','Ordinary','/untouched','[ 1 ]','raw','raw',NULL)`;
+      const names = (yield* sql<{
+        name: string;
+      }>`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`).map(
+        (r) => r.name,
+      );
+      const capture = Effect.fn("PersistentTasks.captureAcceptedPredecessor")(function* () {
+        return Object.fromEntries(
+          yield* Effect.forEach(names, (name) =>
+            sql.unsafe(`SELECT * FROM "${name}"`).pipe(Effect.map((rows) => [name, rows] as const)),
+          ),
+        );
+      });
+      const before = yield* capture();
+      yield* sql`CREATE INDEX work_task_accepted_thread_idx ON work_task_projections(task_id)`;
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(runMigrations())));
+      assert.deepStrictEqual(yield* capture(), before);
+      assert.deepStrictEqual(
+        yield* sql`SELECT name FROM sqlite_master WHERE type='table' AND name='work_task_accepted_runs'`,
+        [],
+      );
+      yield* sql`DROP INDEX work_task_accepted_thread_idx`;
+      assert.deepStrictEqual(yield* runMigrations(), [[97, "WorkTaskAcceptedRuns"]]);
+      const after = yield* capture();
+      for (const name of names.filter((name) => name !== "effect_sql_migrations"))
+        assert.deepStrictEqual(after[name], before[name]);
+      const first = acceptedOwnershipFixture();
+      const second = acceptedOwnershipFixture("two", 20);
+      yield* insertAcceptedRun(first);
+      yield* insertAcceptedRun(second);
+      const retained = yield* sql`SELECT * FROM work_task_accepted_runs ORDER BY run_id`;
+      const retired = membershipTransition(
+        { ...join.event.snapshot, taskRevisions: first.ownership.run.taskRevisions },
+        [bound.control],
+        null,
+        "retire-owner-member",
+      );
+      yield* sql.withTransaction(applyMembership(retired, 5000));
+      const previousControl = retired.companions[0]!.control;
+      const stopped = decodeGroupControlEvent({
+        ...groupContext("retire-owner-manager"),
+        occurredAt: retired.event.occurredAt,
+        type: "task-group.manager-changed",
+        previousControl,
+        control: {
+          ...previousControl,
+          controlRevision: previousControl.controlRevision + 1,
+          currentManager: null,
+        },
+      });
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* writeGroupControl(stopped, 5002);
+          yield* retireGroupManager(stopped, 5002);
+        }),
+      );
+      assert.deepStrictEqual(
+        yield* sql`SELECT * FROM work_task_accepted_runs ORDER BY run_id`,
+        retained,
+      );
+      for (const query of [
+        "SELECT event_json FROM work_task_accepted_runs WHERE run_id='run-one'",
+        "SELECT run_id FROM work_task_accepted_runs WHERE task_id='a' AND (recorded_sequence,run_id)<(2000,'z') ORDER BY recorded_sequence DESC,run_id LIMIT 50",
+        "SELECT run_id FROM work_task_accepted_runs WHERE environment_id='env' AND group_id='group' ORDER BY recorded_sequence,run_id LIMIT 50",
+        "SELECT run_id FROM work_task_accepted_runs WHERE manager_thread_id='manager' ORDER BY run_id LIMIT 50",
+        "SELECT event_id FROM work_task_accepted_run_references WHERE event_id='shared-source' AND sequence=100",
+        "SELECT event_id FROM work_task_accepted_run_references WHERE sequence=100 AND event_id='shared-source'",
+      ]) {
+        const plan = (yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`))
+          .map((r) => r.detail)
+          .join(" ");
+        assert.include(plan, "SEARCH");
+        assert.notInclude(plan, "TEMP B-TREE");
+      }
+      assert.deepStrictEqual(
+        (yield* sql<{
+          run_id: string;
+        }>`SELECT run_id FROM work_task_accepted_runs WHERE task_id='a' ORDER BY recorded_sequence DESC,run_id LIMIT 1`).map(
+          (r) => r.run_id,
+        ),
+        ["run-two"],
+      );
+      assert.deepStrictEqual(yield* runMigrations(), []);
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+    }).pipe(Effect.provide(db)),
 );
