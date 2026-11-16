@@ -7027,7 +7027,12 @@ it.effect("consumes and settles ready epochs without erasing pending custody or 
         .oldest_ready_sequence,
       2000,
     );
-    const claim = physicalClaimFixture(owner);
+    const originalClaim = physicalClaimFixture(owner);
+    const claim = {
+      ...originalClaim,
+      id: "1" as typeof originalClaim.id,
+      claim: { ...originalClaim.claim, acceptedEventId: "1" as typeof originalClaim.id },
+    };
     yield* insertPhysicalClaim(claim);
     const accepted = decodeReady(
       {
@@ -7040,6 +7045,13 @@ it.effect("consumes and settles ready epochs without erasing pending custody or 
       },
       3001,
     );
+    for (const badClaim of [
+      { ...retainedPhysicalClaim(claim), acceptedSequence: "3000" },
+      { ...retainedPhysicalClaim(claim), acceptedEventId: 1 },
+      { ...retainedPhysicalClaim(claim), acceptedEventId: true },
+      { ...retainedPhysicalClaim(claim), acceptedAt: 123 },
+    ])
+      yield* rejectOwnershipWrite(insertReady({ ...accepted, claim: badClaim }, 3001));
     yield* insertReady(accepted, 3001);
     yield* rejectOwnershipWrite(insertReady(readyFixture(3100), 3100));
     yield* insertReady(
@@ -7062,6 +7074,14 @@ it.effect("consumes and settles ready epochs without erasing pending custody or 
         yield* insertPhysicalRelease(release);
       }),
     );
+    for (const badClaim of [
+      { ...release.event.claim, acceptedSequence: "3000" },
+      { ...release.event.claim, acceptedEventId: 1 },
+      { ...release.event.claim, acceptedEventId: true },
+    ])
+      yield* rejectOwnershipWrite(
+        insertReady({ ...settledReady(release, 4001), claim: badClaim }, 4001),
+      );
     yield* insertReady(settledReady(release, 4001), 4001);
     const expected = yield* sql`SELECT * FROM work_task_ready_state`;
     assert.strictEqual(expected[0]!.oldest_ready_sequence, 4001);

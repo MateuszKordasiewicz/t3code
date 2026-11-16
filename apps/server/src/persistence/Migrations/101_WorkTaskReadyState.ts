@@ -131,7 +131,8 @@ export default Effect.gen(function* () {
     SELECT CASE WHEN NEW.kind IN ('accepted','settled') AND NOT EXISTS(
       SELECT 1 FROM work_task_executable_claims c WHERE c.work_claim_id=NEW.claim_id AND c.task_id=NEW.task_id AND c.group_id=NEW.group_id
         AND c.environment_id=NEW.environment_id AND c.membership_generation=NEW.membership_generation AND c.accepted_sequence<NEW.sequence
-        AND c.work_claim_id=${latestClaim("NEW")} AND ${object("claim", 4)} AND ${same(get("claim.binding"), "json_extract(c.event_json,'$.claim.binding')")}
+        AND c.work_claim_id=${latestClaim("NEW")} AND ${object("claim", 4)}
+        AND ${integer("claim.acceptedSequence")} AND ${type("claim.acceptedEventId", "text")} AND ${type("claim.acceptedAt", "text")} AND ${same(get("claim.binding"), "json_extract(c.event_json,'$.claim.binding')")}
         AND ${get("claim.acceptedEventId")} IS c.accepted_event_id AND NEW.claim_accepted_sequence IS c.accepted_sequence AND ${get("claim.acceptedAt")} IS json_extract(c.event_json,'$.occurredAt')
         AND CASE NEW.kind WHEN 'accepted' THEN NEW.source_event_id=c.accepted_event_id AND NEW.source_sequence=c.accepted_sequence
           AND ${same(get("basis.taskRevisions"), "json_extract(c.event_json,'$.claim.binding.taskRevisions')")}
