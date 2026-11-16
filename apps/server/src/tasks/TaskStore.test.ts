@@ -215,9 +215,29 @@ it.effect(
       const append = Effect.fn("TaskStoreTest.appendWakeHistory")(function* (
         input: Record<string, unknown>,
       ) {
-        const value = yield* appendTaskFact(input).pipe(sql.withTransaction);
+        const value = yield* appendTaskFact({
+          definitionRevision: history.at(-1)!.event.definitionRevision,
+          ...input,
+        }).pipe(sql.withTransaction);
         history.push(value);
         return value;
+      });
+      yield* append(humanAcceptance);
+      yield* append(configuration);
+      yield* append({
+        ...execution(1),
+        manager: { managerThreadId: "manager", managerGeneration: 1 },
+      });
+      const linked = yield* append({ type: "task.thread-linked", threadId: "ordinary" });
+      yield* append({ type: "task.thread-unlinked", threadId: "ordinary" });
+      const draft = { ...definition, revision: 2, title: "Mixed history draft" };
+      yield* append({ type: "task.definition-updated", definitionRevision: 2, definition: draft });
+      yield* append({ ...humanAcceptance, definition: draft });
+      yield* append({
+        type: "task.allowance-topped-up",
+        attribution: { type: "user", subject: "human", sessionId: "session" },
+        previous: { type: "configured", cap: 2, consumed: 1 },
+        resulting: { type: "configured", cap: 3, consumed: 1 },
       });
       const sources = Array.from({ length: 33 }, (_, index) => ({
         kind: "result",
@@ -293,6 +313,28 @@ it.effect(
         acknowledgedGeneration: 34,
         observedDirtyGeneration: 34,
       });
+      assert.sameMembers(
+        [...new Set(history.map((value) => value.event.type))],
+        [
+          "task.created",
+          "task.definition-updated",
+          "task.definition-accepted",
+          "task.configuration-updated",
+          "task.execution-updated",
+          "task.thread-linked",
+          "task.thread-unlinked",
+          "task.manager-bound",
+          "task.manager-retired",
+          "task.allowance-configured",
+          "task.allowance-topped-up",
+          "task.allowance-debited",
+          "task.wake-source-recorded",
+          "task.wake-reserved",
+          "task.wake-claimed",
+          "task.wake-claim-uncertain",
+          "task.wake-acknowledged",
+        ],
+      );
       const before = yield* wakeSnapshot();
       for (const value of history.filter((value) => value.event.type.startsWith("task.wake-")))
         assert.isFalse((yield* store.applyWake(value)).applied);
@@ -315,6 +357,7 @@ it.effect(
         switch (event.type) {
           case "task.manager-bound":
           case "task.manager-retired":
+          case "task.allowance-topped-up":
           case "task.allowance-configured":
           case "task.allowance-debited":
           case "task.wake-source-recorded":
@@ -328,8 +371,32 @@ it.effect(
       assert.equal(view.dirtyGeneration, pure?.dirtyGeneration);
       assert.equal(view.acknowledgedGeneration, pure?.acknowledgedGeneration);
       assert.equal(view.overflowThroughGeneration, pure?.overflowThroughGeneration);
+      let foundation: ReturnType<typeof reduceTaskFoundation> | undefined;
+      for (const value of history) {
+        const event = value.event;
+        switch (event.type) {
+          case "task.created":
+          case "task.definition-updated":
+          case "task.definition-accepted":
+          case "task.configuration-updated":
+          case "task.execution-updated":
+          case "task.thread-linked":
+          case "task.thread-unlinked":
+            foundation = reduceTaskFoundation(foundation, { event, context: value.context });
+        }
+      }
+      assert.deepStrictEqual(
+        (yield* store.readFoundation("task"))?.draft,
+        foundation!.draft.event.definition,
+      );
+      assert.deepStrictEqual((yield* store.readAllowance("task"))?.allowance, {
+        type: "configured",
+        cap: 3,
+        consumed: 1,
+      });
       const live = {
         foundation: yield* store.readFoundation("task"),
+        link: yield* store.readThreadLink({ taskId: "task", linkEventId: linked.event.id }),
         custody: yield* store.readManagerCustody("task"),
         allowance: yield* store.readAllowance("task"),
         view,
@@ -339,6 +406,8 @@ it.effect(
         yield* runMigrations();
         const rebuilt = yield* TaskStore.TaskStore;
         const database = yield* SqlClient.SqlClient;
+        assert.deepStrictEqual(yield* database`SELECT * FROM orchestration_events`, []);
+        assert.deepStrictEqual(yield* database`SELECT * FROM work_task_projections`, []);
         for (const [version, value] of history.entries()) yield* insert(value, version);
         const sourceBefore = yield* database`SELECT * FROM orchestration_events ORDER BY sequence`;
         yield* rebuilt.rebuildCustodyProjection({
@@ -351,6 +420,7 @@ it.effect(
         );
         return {
           foundation: yield* rebuilt.readFoundation("task"),
+          link: yield* rebuilt.readThreadLink({ taskId: "task", linkEventId: linked.event.id }),
           custody: yield* rebuilt.readManagerCustody("task"),
           allowance: yield* rebuilt.readAllowance("task"),
           view: yield* rebuilt.readWake("task"),
