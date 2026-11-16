@@ -7528,7 +7528,6 @@ it.effect("upgrades native task lookup compatibility without changing predecesso
       yield* sql`INSERT INTO work_task_current_state(rowid,task_id,configuration_json,desired_mode,execution_mode,manager_thread_id,manager_generation,attention_json,completion,archived,last_applied_sequence)
         VALUES(${i - 1},${id},' {"allowanceOverride":null} ','active',NULL,json_extract(${JSON.stringify(manager)},'$'),${manager === null ? null : 1},NULL,NULL,NULL,7)`;
     }
-    yield* sql`UPDATE work_task_view_fence SET generation=5,high_water_sequence=7`;
     const payloads = [
       "{",
       '{"manager":"wrong"}',
@@ -7541,6 +7540,7 @@ it.effect("upgrades native task lookup compatibility without changing predecesso
         VALUES(${`source-${i}`},'task','source-stream',${i},${i === 4 ? "task.configuration-updated" : "task.execution-updated"},'2026-11-16T00:00:00.0001Z',NULL,'system',${payload},'{}',2)`;
     yield* sql`INSERT INTO orchestration_events(event_id,aggregate_kind,stream_id,stream_version,event_type,occurred_at,command_id,actor_kind,payload_json,metadata_json,application_event_version)
       VALUES('ordinary-source','thread','ordinary',0,'thread.created','1',NULL,'system','{','{}',2)`;
+    yield* sql`UPDATE work_task_view_fence SET generation=5,high_water_sequence=7`;
     const capture = Effect.fn("PersistentTasks.captureProjectionSourcePredecessor")(function* () {
       return Object.fromEntries(
         yield* Effect.forEach(tables, ({ name }) =>
@@ -7550,7 +7550,7 @@ it.effect("upgrades native task lookup compatibility without changing predecesso
     });
     const before = yield* capture();
     const rowids =
-      yield* sql`SELECT rowid,task_id,hex(manager_thread_id) AS manager_hex,hex(configuration_json) AS config_hex FROM work_task_current_state ORDER BY task_id`;
+      yield* sql`SELECT CAST(rowid AS TEXT) AS rowid,task_id,hex(manager_thread_id) AS manager_hex,hex(configuration_json) AS config_hex FROM work_task_current_state ORDER BY task_id`;
     const schema = yield* sql`SELECT sql FROM sqlite_master WHERE name='work_task_current_state'`;
     yield* sql`CREATE INDEX idx_task_source_type_sequence ON work_task_projections(task_id)`;
     assert.isTrue(Exit.isFailure(yield* Effect.exit(runMigrations())));
@@ -7563,6 +7563,10 @@ it.effect("upgrades native task lookup compatibility without changing predecesso
       yield* sql`SELECT name FROM sqlite_master WHERE name='work_task_current_state_v102'`,
       [],
     );
+    assert.deepStrictEqual(
+      yield* sql`SELECT name FROM sqlite_temp_master WHERE name='work_task_projection_source_write_marker'`,
+      [],
+    );
     assert.isTrue(
       Exit.isFailure(
         yield* Effect.exit(
@@ -7570,14 +7574,29 @@ it.effect("upgrades native task lookup compatibility without changing predecesso
         ),
       ),
     );
+    assert.deepStrictEqual(
+      yield* sql`SELECT CAST(rowid AS TEXT) AS rowid,task_id,hex(manager_thread_id) AS manager_hex,hex(configuration_json) AS config_hex FROM work_task_current_state ORDER BY task_id`,
+      rowids,
+    );
     yield* sql`DROP INDEX idx_task_source_type_sequence`;
+    for (const rowid of ["-9223372036854775808", "9223372036854775807"]) {
+      yield* sql`INSERT INTO work_task_projections VALUES (${rowid},NULL,1,1,1,1,'{}','1','1')`;
+      yield* sql`INSERT INTO work_task_current_state(rowid,task_id) VALUES(CAST(${rowid} AS INTEGER),${rowid})`.pipe(
+        Effect.provideService(SqlClient.SafeIntegers, true),
+      );
+    }
+    yield* sql`INSERT INTO orchestration_events(event_id,aggregate_kind,stream_id,stream_version,event_type,occurred_at,command_id,actor_kind,payload_json,metadata_json,application_event_version)
+      VALUES('retry-source','thread','retry',0,'thread.created','1',NULL,'system','{}','{}',2)`;
+    const retryBefore = yield* capture();
+    const retryRowids =
+      yield* sql`SELECT CAST(rowid AS TEXT) AS rowid,task_id,hex(manager_thread_id) AS manager_hex,hex(configuration_json) AS config_hex FROM work_task_current_state ORDER BY task_id`;
     assert.deepStrictEqual(yield* runMigrations(), [[102, "WorkTaskProjectionSource"]]);
     const after = yield* capture();
     for (const { name } of tables.filter((t) => t.name !== "effect_sql_migrations"))
-      assert.deepStrictEqual(after[name], before[name]);
+      assert.deepStrictEqual(after[name], retryBefore[name]);
     assert.deepStrictEqual(
-      yield* sql`SELECT rowid,task_id,hex(manager_thread_id) AS manager_hex,hex(configuration_json) AS config_hex FROM work_task_current_state ORDER BY task_id`,
-      rowids,
+      yield* sql`SELECT CAST(rowid AS TEXT) AS rowid,task_id,hex(manager_thread_id) AS manager_hex,hex(configuration_json) AS config_hex FROM work_task_current_state ORDER BY task_id`,
+      retryRowids,
     );
     assert.deepStrictEqual(yield* sql`PRAGMA table_xinfo(work_task_current_state)`, columns);
     assert.deepStrictEqual(
@@ -7586,6 +7605,10 @@ it.effect("upgrades native task lookup compatibility without changing predecesso
     );
     assert.deepStrictEqual(
       yield* sql`SELECT name FROM sqlite_master WHERE name='work_task_current_state_v102'`,
+      [],
+    );
+    assert.deepStrictEqual(
+      yield* sql`SELECT name FROM sqlite_temp_master WHERE name='work_task_projection_source_write_marker'`,
       [],
     );
     const invalid = [

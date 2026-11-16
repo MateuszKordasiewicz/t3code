@@ -21,6 +21,10 @@ export default Effect.gen(function* () {
   `;
   yield* sql`INSERT INTO work_task_current_state_v102(rowid,task_id,configuration_json,desired_mode,execution_mode,manager_thread_id,manager_generation,attention_json,completion,archived,last_applied_sequence)
     SELECT rowid,task_id,configuration_json,desired_mode,execution_mode,manager_thread_id,manager_generation,attention_json,completion,archived,last_applied_sequence FROM work_task_current_state`;
+  // Node converts write metadata outside this migration too; reset the copied 64-bit rowid.
+  yield* sql`CREATE TEMP TABLE work_task_projection_source_write_marker (id INTEGER PRIMARY KEY)`;
+  yield* sql`INSERT INTO work_task_projection_source_write_marker VALUES (1)`;
+  yield* sql`DROP TABLE work_task_projection_source_write_marker`;
   yield* sql`DROP TABLE work_task_current_state`;
   yield* sql`ALTER TABLE work_task_current_state_v102 RENAME TO work_task_current_state`;
   yield* sql`CREATE INDEX idx_task_source_type_sequence ON orchestration_events(stream_id,event_type,sequence DESC)
@@ -29,4 +33,4 @@ export default Effect.gen(function* () {
     stream_id,CASE WHEN json_valid(payload_json) THEN json_extract(payload_json,'$.manager.managerGeneration') END,sequence DESC)
     WHERE aggregate_kind='task' AND application_event_version=2 AND event_type='task.execution-updated'
       AND CASE WHEN json_valid(payload_json) THEN json_type(payload_json,'$.manager') END='object'`;
-});
+}).pipe(Effect.provideService(SqlClient.SafeIntegers, true));
