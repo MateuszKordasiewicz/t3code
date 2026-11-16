@@ -11,6 +11,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import { runMigrations } from "../persistence/Migrations.ts";
 import * as TaskStore from "./TaskStore.ts";
+import { reduceTaskFoundation } from "./TaskLifecycle.ts";
 
 const decode = Schema.decodeUnknownEffect(WorkTaskPersistedEvent);
 const timestamp = "2026-11-16T00:00:00.000Z";
@@ -620,4 +621,501 @@ it.effect(
         );
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "projects foundation facts atomically and replays old source without changing the view",
+  () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* TaskStore.TaskStore;
+      const events = [
+        yield* record(1),
+        yield* record(2, {
+          type: "task.definition-accepted",
+          attribution: { type: "user", subject: "human", sessionId: "session" },
+        }),
+        yield* record(3, configuration),
+        yield* record(4, execution(1)),
+        yield* record(5, { type: "task.thread-linked", threadId: "ordinary" }, "command-2"),
+        yield* record(6, { type: "task.thread-unlinked", threadId: "ordinary" }),
+        yield* record(7, {
+          type: "task.definition-updated",
+          definitionRevision: 2,
+          definition: { ...definition, revision: 2, title: "Draft" },
+        }),
+      ];
+      for (const [version, value] of events.entries()) {
+        yield* insert(value, version);
+        assert.isTrue((yield* store.applyFoundation(value)).applied);
+      }
+      const current = yield* store.readFoundation("task");
+      assert.strictEqual(current?.projection.definition.title, "Draft");
+      assert.strictEqual(current?.accepted?.definition.title, "Outcome");
+      assert.strictEqual(current?.draft?.title, "Draft");
+      assert.strictEqual(current?.projection.current?.desiredMode, "active");
+      assert.isNull(current?.projection.current?.executionMode);
+      assert.isNull(current?.projection.current?.attention);
+      assert.isNull(current?.projection.current?.completion);
+      assert.isNull(current?.projection.current?.archived);
+      assert.isTrue(current?.sourceVerified);
+      const link = yield* store.readThreadLink({ taskId: "task", linkEventId: "event-5" });
+      assert.strictEqual(link?.unlinked?.eventId, "event-6");
+      const before = yield* sql`SELECT * FROM work_task_view_fence`;
+      assert.isFalse((yield* store.applyFoundation(events[0]!)).applied);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_view_fence`, before);
+      assert.deepStrictEqual(yield* store.readFoundation("task"), current);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+const humanAcceptance = {
+  type: "task.definition-accepted",
+  attribution: { type: "user", subject: "human", sessionId: "session" },
+};
+const projectionSnapshot = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  return [
+    yield* sql`SELECT * FROM work_task_projections`,
+    yield* sql`SELECT * FROM work_task_current_state`,
+    yield* sql`SELECT * FROM work_task_accepted_definitions`,
+    yield* sql`SELECT * FROM work_task_thread_links`,
+    yield* sql`SELECT * FROM work_task_view_fence`,
+  ];
+});
+
+it.effect("rejects contradictory foundation identities without partial writes", () =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* TaskStore.TaskStore;
+    const draft = { ...definition, revision: 2, title: "Draft two" };
+    const seed = [
+      yield* record(1),
+      yield* record(2, humanAcceptance),
+      yield* record(3, configuration),
+      yield* record(4, execution(1)),
+      yield* record(5, {
+        type: "task.definition-updated",
+        definitionRevision: 2,
+        definition: draft,
+      }),
+      yield* record(6, { ...execution(2), definitionRevision: 2 }),
+      yield* record(7, { ...execution(null), definitionRevision: 2 }),
+    ];
+    for (const [i, value] of seed.entries()) {
+      yield* insert(value, i);
+      yield* store.applyFoundation(value);
+    }
+    const before = yield* projectionSnapshot;
+    const changedPolicy = {
+      version: 1,
+      rules: [{ id: "r", action: "edit", target: "file", decision: "allow" }],
+    };
+    for (const [patch, command, code] of [
+      [{ type: "task.definition-updated", definitionRevision: 1, definition }, "c", "revision"],
+      [{ ...humanAcceptance, definition: { ...draft, title: "Different" } }, "c", "definition"],
+      [
+        {
+          ...humanAcceptance,
+          definitionRevision: 3,
+          definition: { ...definition, revision: 3, actionPolicy: changedPolicy },
+        },
+        "c",
+        "policy",
+      ],
+      [
+        { ...humanAcceptance, definitionRevision: 3, definition: { ...definition, revision: 3 } },
+        "command-2",
+        "definition",
+      ],
+      [
+        { ...configuration, completionPolicy: { type: "configured", policy: { type: "manual" } } },
+        "c",
+        "policy",
+      ],
+      [
+        { ...execution(2), manager: { managerThreadId: "other", managerGeneration: 2 } },
+        "c",
+        "manager",
+      ],
+      [execution(1), "c", "manager"],
+      [{ type: "task.thread-unlinked", threadId: "missing" }, "c", "link"],
+    ] as const) {
+      yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const value = yield* record(8, { definitionRevision: 2, ...patch }, command);
+            yield* insert(value, 7);
+            assert.strictEqual((yield* store.applyFoundation(value).pipe(Effect.flip)).code, code);
+            assert.deepStrictEqual(yield* projectionSnapshot, before);
+            return yield* Effect.fail("fixture rollback");
+          }),
+        )
+        .pipe(Effect.flip);
+    }
+    const accepted = yield* record(8, {
+      ...humanAcceptance,
+      definitionRevision: 3,
+      definition: { ...definition, revision: 3 },
+    });
+    yield* insert(accepted, 7);
+    yield* store.applyFoundation(accepted);
+    assert.strictEqual((yield* store.readFoundation("task"))?.draft?.revision, 2);
+    assert.strictEqual((yield* store.readFoundation("task"))?.accepted?.definitionRevision, 3);
+    yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const duplicate = yield* record(9, {
+            ...humanAcceptance,
+            definitionRevision: 3,
+            definition: { ...definition, revision: 3 },
+          });
+          yield* insert(duplicate, 8);
+          assert.strictEqual(
+            (yield* store.applyFoundation(duplicate).pipe(Effect.flip)).code,
+            "definition",
+          );
+          return yield* Effect.fail("fixture rollback");
+        }),
+      )
+      .pipe(Effect.flip);
+    const configSource = yield* record(9, {
+      ...configuration,
+      definitionRevision: 3,
+      completionPolicyRevision: 2,
+    });
+    const oldTime = "2000-01-01T00:00:00.000Z";
+    const configured = yield* decode({
+      event: { ...configSource.event, occurredAt: oldTime },
+      context: { ...configSource.context, occurredAt: oldTime },
+    });
+    yield* insert(configured, 8);
+    yield* store.applyFoundation(configured);
+    assert.strictEqual((yield* store.readFoundation("task"))?.projection.updatedAt, oldTime);
+    const linked = yield* record(10, {
+      type: "task.thread-linked",
+      threadId: "ordinary",
+      definitionRevision: 3,
+      completionPolicyRevision: 3,
+    });
+    yield* insert(linked, 9);
+    yield* store.applyFoundation(linked);
+    const nextPolicy = yield* record(11, {
+      ...configuration,
+      definitionRevision: 3,
+      completionPolicyRevision: 3,
+      completionPolicy: { type: "configured", policy: { type: "manual" } },
+    });
+    yield* insert(nextPolicy, 10);
+    yield* store.applyFoundation(nextPolicy);
+    const duplicateLink = yield* record(12, {
+      type: "task.thread-linked",
+      threadId: "ordinary",
+      definitionRevision: 3,
+      completionPolicyRevision: 3,
+    });
+    yield* insert(duplicateLink, 11);
+    assert.strictEqual(
+      (yield* store.applyFoundation(duplicateLink).pipe(Effect.flip)).code,
+      "link",
+    );
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "keeps legacy projections unverified and never skips unsupported or unavailable source",
+  () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* TaskStore.TaskStore;
+      const created = yield* record(1);
+      yield* insert(created, 0);
+      yield* sql`INSERT INTO work_task_projections VALUES('task','project',1,1,1,1,${JSON.stringify(definition)},'legacy','legacy')`;
+      assert.isFalse((yield* store.readFoundation("task"))?.sourceVerified);
+      assert.isNull((yield* store.readFoundation("task"))?.projection.current);
+      assert.strictEqual((yield* store.applyFoundation(created).pipe(Effect.flip)).code, "legacy");
+      yield* sql`INSERT INTO work_task_current_state(task_id) VALUES('task')`;
+      assert.isNull((yield* store.readFoundation("task"))?.projection.current?.lastSequence);
+      assert.strictEqual((yield* store.applyFoundation(created).pipe(Effect.flip)).code, "legacy");
+      yield* sql`DELETE FROM work_task_current_state`;
+      yield* sql`DELETE FROM work_task_projections`;
+      yield* store.applyFoundation(created);
+      const unsupported = yield* record(2, { type: "task.archived", archived: true });
+      const later = yield* record(3, configuration);
+      yield* insert(unsupported, 1);
+      yield* insert(later, 2);
+      const before = yield* projectionSnapshot;
+      assert.strictEqual(
+        (yield* store.applyFoundation(unsupported).pipe(Effect.flip)).code,
+        "unsupported",
+      );
+      assert.strictEqual(
+        (yield* store.applyFoundation(later).pipe(Effect.flip)).code,
+        "source_version",
+      );
+      assert.deepStrictEqual(yield* projectionSnapshot, before);
+      yield* sql`UPDATE work_task_current_state SET last_applied_sequence=2,archived=1`;
+      yield* store.applyFoundation(later);
+      assert.strictEqual((yield* store.readFoundation("task"))?.projection.current?.archived, 1);
+      yield* sql`INSERT INTO orchestration_v2_projection_metadata VALUES('event-log-pruned-through',2,1,${timestamp})`;
+      assert.strictEqual(
+        (yield* store.applyFoundation(created).pipe(Effect.flip)).code,
+        "source_unavailable",
+      );
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("uses durable CAS and a finite fence with rollback and concurrent exact replay", () =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* TaskStore.TaskStore;
+    const created = yield* record(1);
+    yield* insert(created, 0);
+    yield* store.applyFoundation(created);
+    const accepted = yield* record(2, humanAcceptance);
+    yield* insert(accepted, 1);
+    const before = yield* projectionSnapshot;
+    yield* sql`CREATE TEMP TRIGGER stale_revision BEFORE UPDATE OF last_applied_sequence ON work_task_current_state
+      BEGIN UPDATE work_task_projections SET lifecycle_revision=lifecycle_revision+1 WHERE task_id=NEW.task_id; END`;
+    assert.strictEqual((yield* store.applyFoundation(accepted).pipe(Effect.flip)).code, "cas");
+    assert.deepStrictEqual(yield* projectionSnapshot, before);
+    yield* sql`DROP TRIGGER stale_revision`;
+    yield* sql`CREATE TEMP TRIGGER fail_fence BEFORE UPDATE ON work_task_view_fence BEGIN SELECT RAISE(ABORT,'fixture'); END`;
+    assert.strictEqual((yield* store.applyFoundation(accepted).pipe(Effect.flip)).code, "sql");
+    assert.deepStrictEqual(yield* projectionSnapshot, before);
+    yield* sql`DROP TRIGGER fail_fence`;
+    yield* sql`UPDATE work_task_view_fence SET generation=9007199254740991`;
+    assert.strictEqual((yield* store.applyFoundation(accepted).pipe(Effect.flip)).code, "fence");
+    yield* sql`UPDATE work_task_view_fence SET generation=1,high_water_sequence=9007199254740991`;
+    const outcomes = yield* Effect.all(
+      [store.applyFoundation(accepted), store.applyFoundation(accepted)],
+      { concurrency: 2 },
+    );
+    assert.strictEqual(outcomes.filter((value) => value.applied).length, 1);
+    assert.strictEqual(
+      (yield* sql`SELECT high_water_sequence FROM work_task_view_fence`)[0]!.high_water_sequence,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const reloaded = yield* Effect.gen(function* () {
+      const fresh = yield* TaskStore.TaskStore;
+      return yield* fresh.applyFoundation(created);
+    }).pipe(Effect.provide(TaskStore.layer));
+    assert.isFalse(reloaded.applied);
+    assert.strictEqual(reloaded.lastSequence, 2);
+    const altered = yield* decode({
+      ...created,
+      event: { ...created.event, definition: { ...definition, title: "Altered" } },
+    });
+    assert.strictEqual((yield* store.applyFoundation(altered).pipe(Effect.flip)).code, "replay");
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("roundtrips projection and link identity bytes without owning ordinary threads", () =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* TaskStore.TaskStore;
+    yield* sql`INSERT INTO projection_projects(project_id,title,workspace_root,scripts_json,created_at,updated_at) VALUES('p','Project','/p','[]','raw','raw')`;
+    yield* sql`INSERT INTO orchestration_v2_projection_threads(thread_id,project_id,title,default_provider,runtime_mode,interaction_mode,created_at,updated_at,payload_json)
+      VALUES('ordinary','p','Thread','codex','full-access','default','raw','raw','{}')`;
+    const ordinary = yield* sql`SELECT * FROM orchestration_v2_projection_threads`;
+    for (const [i, taskId] of ["\0task", "\ud800", "\udc00", "😀"].entries()) {
+      const base = i * 10 + 1;
+      const values = [
+        yield* record(base, {
+          taskId,
+          projectId: taskId,
+          definition: { ...definition, data: taskId },
+        }),
+        yield* record(base + 1, {
+          ...humanAcceptance,
+          taskId,
+          id: `accepted:${taskId}`,
+          definition: { ...definition, data: taskId },
+        }),
+        yield* record(base + 2, {
+          ...execution(1),
+          taskId,
+          manager: { managerThreadId: taskId, managerGeneration: 1 },
+        }),
+        yield* record(base + 3, {
+          type: "task.thread-linked",
+          taskId,
+          threadId: "ordinary",
+          id: `link:${taskId}`,
+        }),
+        yield* record(base + 4, {
+          type: "task.thread-unlinked",
+          taskId,
+          threadId: "ordinary",
+          id: `unlink:${taskId}`,
+        }),
+        yield* record(base + 5, {
+          type: "task.thread-linked",
+          taskId,
+          threadId: "ordinary",
+          id: `relink:${taskId}`,
+        }),
+      ];
+      for (const [version, value] of values.entries()) {
+        yield* insert(value, version);
+        yield* store.applyFoundation(value);
+      }
+      const read = yield* store.readFoundation(taskId);
+      assert.strictEqual(read?.projection.taskId, taskId);
+      assert.strictEqual(read?.projection.projectId, taskId);
+      assert.strictEqual(read?.projection.current?.managerThreadId, taskId);
+      assert.strictEqual(
+        (yield* store.readAcceptedDefinition({ taskId, revision: 1 }))?.eventId,
+        `accepted:${taskId}`,
+      );
+      assert.strictEqual(
+        (yield* store.readThreadLink({ taskId, linkEventId: `link:${taskId}` }))?.unlinked?.eventId,
+        `unlink:${taskId}`,
+      );
+      assert.isNull(
+        (yield* store.readThreadLink({ taskId, linkEventId: `relink:${taskId}` }))?.unlinked,
+      );
+    }
+    assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_projection_threads`, ordinary);
+    assert.strictEqual(
+      (yield* sql`SELECT count(*) AS n FROM work_task_thread_links WHERE unlink_event_id IS NULL`)[0]!
+        .n,
+      4,
+    );
+    yield* sql`UPDATE work_task_current_state SET manager_thread_id=CAST(unhex('EDA0BDEDB880') AS TEXT) WHERE task_id=char(0)||'task'`;
+    assert.strictEqual((yield* store.readFoundation("\0task").pipe(Effect.flip)).code, "invalid");
+    yield* sql`UPDATE work_task_current_state SET manager_thread_id=char(0)||'task' WHERE task_id=char(0)||'task'`;
+    yield* sql`UPDATE work_task_projections SET definition_json='{"revision":1}' WHERE task_id=char(0)||'task'`;
+    assert.strictEqual((yield* store.readFoundation("\0task").pipe(Effect.flip)).code, "invalid");
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "rebuilds an empty target once from native source and matches pure foundation reduction",
+  () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* TaskStore.TaskStore;
+      const draft = { ...definition, revision: 2, title: "New draft" };
+      const events = [
+        yield* record(1),
+        yield* record(2, humanAcceptance),
+        yield* record(3, configuration),
+        yield* record(4, execution(1)),
+        yield* record(5, { type: "task.thread-linked", threadId: "ordinary" }),
+        yield* record(6, { type: "task.thread-unlinked", threadId: "ordinary" }),
+        yield* record(7, {
+          type: "task.definition-updated",
+          definitionRevision: 2,
+          definition: draft,
+        }),
+        yield* record(8, { ...humanAcceptance, definitionRevision: 2, definition: draft }),
+        yield* record(9, {
+          type: "task.thread-linked",
+          threadId: "ordinary",
+          definitionRevision: 2,
+        }),
+        yield* record(10, { ...execution(null), definitionRevision: 2 }),
+      ];
+      let pure: ReturnType<typeof reduceTaskFoundation> | undefined;
+      for (const [version, value] of events.entries()) {
+        yield* insert(value, version);
+        const event = value.event;
+        switch (event.type) {
+          case "task.created":
+          case "task.definition-accepted":
+          case "task.definition-updated":
+          case "task.configuration-updated":
+          case "task.execution-updated":
+          case "task.thread-linked":
+          case "task.thread-unlinked":
+            pure = reduceTaskFoundation(pure, { event, context: value.context });
+            break;
+          default:
+            assert.fail("Unsupported fixture");
+        }
+      }
+      const journal =
+        yield* sql`SELECT sequence,hex(payload_json) AS payload FROM orchestration_events ORDER BY sequence`;
+      const rebuilt = yield* store.rebuildFoundation({ taskId: "task", throughSequence: 10 });
+      assert.deepStrictEqual(rebuilt?.projection.definition, pure!.definition.event.definition);
+      assert.deepStrictEqual(rebuilt?.draft, pure!.draft.event.definition);
+      assert.strictEqual(rebuilt?.accepted?.definitionRevision, 2);
+      assert.deepStrictEqual(rebuilt?.projection.current?.configuration, {
+        allowanceOverride: null,
+        completionPolicy: { type: "inherit" },
+      });
+      assert.isNull(rebuilt?.projection.current?.managerThreadId);
+      assert.strictEqual(rebuilt?.projection.current?.lastSequence, pure!.lastSequence);
+      for (const [id, link] of pure!.links) {
+        const stored = yield* store.readThreadLink({ taskId: "task", linkEventId: id });
+        assert.deepStrictEqual(stored?.attribution, link.linked.event.attribution);
+        assert.strictEqual(stored?.unlinked?.eventId, link.unlinked?.event.id);
+      }
+      assert.deepStrictEqual(
+        yield* sql`SELECT sequence,hex(payload_json) AS payload FROM orchestration_events ORDER BY sequence`,
+        journal,
+      );
+      const before = yield* projectionSnapshot;
+      assert.strictEqual(
+        (yield* store.rebuildFoundation({ taskId: "task", throughSequence: 10 }).pipe(Effect.flip))
+          .code,
+        "legacy",
+      );
+      for (const value of events) assert.isFalse((yield* store.applyFoundation(value)).applied);
+      assert.deepStrictEqual(yield* projectionSnapshot, before);
+      yield* insert(yield* record(11, { taskId: "unsupported" }), 0);
+      yield* insert(
+        yield* record(12, { taskId: "unsupported", type: "task.archived", archived: true }),
+        1,
+      );
+      assert.strictEqual(
+        (yield* store
+          .rebuildFoundation({ taskId: "unsupported", throughSequence: 12 })
+          .pipe(Effect.flip)).code,
+        "unsupported",
+      );
+      assert.isUndefined(yield* store.readFoundation("unsupported"));
+      assert.deepStrictEqual(yield* projectionSnapshot, before);
+      for (const [query, index] of [
+        [
+          "SELECT * FROM work_task_projections WHERE task_id='task'",
+          "sqlite_autoindex_work_task_projections",
+        ],
+        [
+          "SELECT * FROM work_task_current_state WHERE task_id='task'",
+          "sqlite_autoindex_work_task_current_state",
+        ],
+        [
+          "SELECT * FROM work_task_accepted_definitions WHERE task_id='task' AND definition_revision=2 ORDER BY definition_revision DESC LIMIT 1",
+          "sqlite_autoindex_work_task_accepted_definitions",
+        ],
+        [
+          "SELECT * FROM work_task_accepted_definitions WHERE task_id='task' ORDER BY definition_revision DESC LIMIT 1",
+          "sqlite_autoindex_work_task_accepted_definitions",
+        ],
+        [
+          "SELECT * FROM work_task_thread_links WHERE link_event_id='event-5' AND task_id='task'",
+          "sqlite_autoindex_work_task_thread_links",
+        ],
+        [
+          "SELECT link_event_id FROM work_task_thread_links WHERE task_id='task' AND thread_id='ordinary' AND unlink_event_id IS NULL",
+          "work_task_thread_links_active_idx",
+        ],
+        [
+          "UPDATE work_task_current_state SET last_applied_sequence=11 WHERE task_id='task' AND last_applied_sequence=10 AND EXISTS(SELECT 1 FROM work_task_projections p WHERE p.task_id=work_task_current_state.task_id AND definition_revision=2 AND lifecycle_revision=1 AND completion_policy_revision=1 AND action_policy_revision=1) RETURNING 1",
+          "sqlite_autoindex_work_task_current_state",
+        ],
+      ]) {
+        const plan = JSON.stringify(yield* sql.unsafe(`EXPLAIN QUERY PLAN ${query}`));
+        assert.include(plan, index!);
+        assert.include(plan, "SEARCH");
+        assert.notInclude(plan, "TEMP B-TREE");
+      }
+    }).pipe(Effect.provide(testLayer)),
 );

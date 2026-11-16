@@ -1,4 +1,15 @@
-import { WorkTaskPersistedEvent } from "@t3tools/contracts";
+import {
+  WorkTaskPersistedEvent,
+  WorkTaskDraftDefinition,
+  WorkTaskAcceptedDefinition,
+  WorkTaskCallerContext,
+  WorkTaskCompletionPolicyOverride,
+  WorkTaskId,
+  ProjectId,
+  ThreadId,
+  EventId,
+} from "@t3tools/contracts";
+import * as NodeUtil from "node:util";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -53,9 +64,122 @@ type FoundationSource = {
   readonly acceptance: Native | undefined;
   readonly prunedThrough: number;
 };
+export class TaskProjectionError extends Schema.TaggedError<TaskProjectionError>()(
+  "TaskProjectionError",
+  {
+    code: Schema.Literals([
+      "invalid",
+      "unsupported",
+      "legacy",
+      "replay",
+      "revision",
+      "definition",
+      "policy",
+      "manager",
+      "link",
+      "cas",
+      "fence",
+      "sql",
+    ]),
+  },
+) {}
+const isProjectionError = Schema.is(TaskProjectionError);
+const natural = Schema.Number.check(
+  Schema.isInt(),
+  Schema.isGreaterThanOrEqualTo(0),
+  Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
+);
+const positive = natural.check(Schema.isGreaterThan(0));
+const revisions = {
+  definitionRevision: positive,
+  lifecycleRevision: positive,
+  completionPolicyRevision: positive,
+  actionPolicyRevision: positive,
+};
+const Configuration = Schema.Struct({
+  allowanceOverride: Schema.NullOr(positive),
+  completionPolicy: WorkTaskCompletionPolicyOverride,
+});
+const Projection = Schema.Struct({
+  taskId: WorkTaskId,
+  projectId: Schema.NullOr(ProjectId),
+  ...revisions,
+  definition: WorkTaskDraftDefinition,
+  createdAt: Schema.String,
+  updatedAt: Schema.String,
+  current: Schema.NullOr(
+    Schema.Struct({
+      configuration: Schema.NullOr(Configuration),
+      desiredMode: Schema.NullOr(Schema.Literals(["not_started", "active", "paused", "closed"])),
+      executionMode: Schema.NullOr(
+        Schema.Literals(["not_started", "idle", "queued", "running", "waiting"]),
+      ),
+      managerThreadId: Schema.NullOr(ThreadId),
+      managerGeneration: Schema.NullOr(positive),
+      attention: Schema.Unknown,
+      completion: Schema.NullOr(
+        Schema.Literals(["incomplete", "ready_for_review", "validating", "done"]),
+      ),
+      archived: Schema.NullOr(Schema.Literals([0, 1])),
+      lastSequence: Schema.NullOr(natural),
+    }),
+  ),
+});
+const Accepted = Schema.Struct({
+  taskId: WorkTaskId,
+  definitionRevision: positive,
+  actionPolicyRevision: positive,
+  definition: WorkTaskAcceptedDefinition,
+  attribution: WorkTaskCallerContext,
+  eventId: EventId,
+  occurredAt: Schema.String,
+});
+const Link = Schema.Struct({
+  taskId: WorkTaskId,
+  threadId: ThreadId,
+  eventId: EventId,
+  occurredAt: Schema.String,
+  attribution: WorkTaskCallerContext,
+  unlinked: Schema.NullOr(
+    Schema.Struct({
+      eventId: EventId,
+      occurredAt: Schema.String,
+      attribution: WorkTaskCallerContext,
+    }),
+  ),
+});
+type ProjectionRead = {
+  readonly projection: typeof Projection.Type;
+  readonly sourceVerified: boolean;
+  readonly draft: WorkTaskDraftDefinition | undefined;
+  readonly accepted: typeof Accepted.Type | undefined;
+};
+type ProjectionFailure = TaskProjectionError | TaskSourceError;
+
 export class TaskStore extends Context.Service<
   TaskStore,
   {
+    readonly applyFoundation: (
+      recorded: WorkTaskPersistedEvent,
+    ) => Effect.Effect<
+      { readonly applied: boolean; readonly lastSequence: number; readonly viewGeneration: number },
+      ProjectionFailure
+    >;
+    readonly readFoundation: (
+      taskId: string,
+    ) => Effect.Effect<ProjectionRead | undefined, ProjectionFailure>;
+    readonly readAcceptedDefinition: (input: {
+      readonly taskId: string;
+      readonly revision?: number;
+    }) => Effect.Effect<typeof Accepted.Type | undefined, ProjectionFailure>;
+    readonly readThreadLink: (input: {
+      readonly taskId: string;
+      readonly linkEventId: string;
+    }) => Effect.Effect<typeof Link.Type | undefined, ProjectionFailure>;
+    readonly rebuildFoundation: (input: {
+      readonly taskId: string;
+      readonly throughSequence: number;
+    }) => Effect.Effect<ProjectionRead | undefined, ProjectionFailure>;
     readonly readNativeEvent: (input: {
       readonly taskId: string;
       readonly eventId: string;
@@ -531,7 +655,353 @@ const make = Effect.gen(function* () {
         }),
       ),
   );
+  const encodeProjectionJson = Effect.fn("TaskStore.encodeProjectionJson")(
+    Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown)),
+    Effect.mapError(() => new TaskProjectionError({ code: "invalid" })),
+  );
+  const guard = (condition: boolean, code: TaskProjectionError["code"]) =>
+    condition ? Effect.void : Effect.fail(new TaskProjectionError({ code }));
+  const projectTransaction = <A, E>(operation: Effect.Effect<A, E>) =>
+    operation.pipe(
+      sql.withTransaction,
+      Effect.mapError((error) =>
+        isSourceError(error) || isProjectionError(error)
+          ? error
+          : new TaskProjectionError({ code: "sql" }),
+      ),
+    );
+  const stored = Effect.fn("TaskStore.decodeProjection")(function* <A>(
+    schema: Schema.Codec<A, unknown>,
+    row: { payload: string; valid: number } | undefined,
+  ) {
+    if (!row) return undefined;
+    yield* guard(row.valid === 1, "invalid");
+    const value = yield* attempt(() => JSON.parse(decodeHex(row.payload))).pipe(
+      Effect.mapError(() => new TaskProjectionError({ code: "invalid" })),
+    );
+    const decoded = yield* Schema.decodeUnknownEffect(schema)(value).pipe(
+      Effect.mapError(() => new TaskProjectionError({ code: "invalid" })),
+    );
+    yield* guard(NodeUtil.isDeepStrictEqual(value, decoded), "invalid");
+    const atoms = yield* sql<{ side: number; key: string; kind: string; atom: string | null }>`
+        SELECT 0 AS side,hex(fullkey) AS key,CASE WHEN type IN ('integer','real') THEN 'number' ELSE type END AS kind,
+          CASE WHEN type='text' THEN hex(atom) END AS atom FROM json_tree(CAST(unhex(${row.payload}) AS TEXT))
+        UNION ALL SELECT 1,hex(fullkey),CASE WHEN type IN ('integer','real') THEN 'number' ELSE type END,
+          CASE WHEN type='text' THEN hex(atom) END FROM json_tree(${yield* encodeProjectionJson(decoded)})`;
+    const signature = (side: number) =>
+      atoms
+        .filter((item) => item.side === side)
+        .map(({ key, kind, atom }) => JSON.stringify([key, kind, atom]))
+        .sort();
+    yield* guard(NodeUtil.isDeepStrictEqual(signature(0), signature(1)), "invalid");
+    return decoded;
+  });
+  const readProjection = Effect.fn("TaskStore.readProjectionRow")(function* (taskId: string) {
+    const found = yield* sql<{ payload: string; valid: number }>`SELECT
+      typeof(definition_revision)='integer' AND typeof(lifecycle_revision)='integer' AND typeof(completion_policy_revision)='integer' AND typeof(action_policy_revision)='integer'
+      AND NOT EXISTS(SELECT 1 FROM work_task_current_state c WHERE c.task_id=p.task_id AND
+        ((c.manager_generation IS NOT NULL AND typeof(c.manager_generation)<>'integer') OR (c.last_applied_sequence IS NOT NULL AND typeof(c.last_applied_sequence)<>'integer') OR (c.archived IS NOT NULL AND typeof(c.archived)<>'integer'))) AS valid,
+      hex(json_object('taskId',task_id,'projectId',project_id,'definitionRevision',definition_revision,'lifecycleRevision',lifecycle_revision,
+        'completionPolicyRevision',completion_policy_revision,'actionPolicyRevision',action_policy_revision,'definition',json(definition_json),'createdAt',created_at,'updatedAt',updated_at,
+        'current',json((SELECT json_object('configuration',json(configuration_json),'desiredMode',desired_mode,'executionMode',execution_mode,'managerThreadId',manager_thread_id,
+          'managerGeneration',manager_generation,'attention',json(attention_json),'completion',completion,'archived',archived,'lastSequence',last_applied_sequence)
+          FROM work_task_current_state c WHERE c.task_id=p.task_id)))) AS payload
+      FROM work_task_projections p WHERE task_id=json_extract(${yield* encodeProjectionJson(taskId)},'$')`;
+    const value = yield* stored(Projection, found[0]);
+    if (value)
+      yield* guard(
+        value.taskId === taskId &&
+          (value.current?.managerThreadId == null) === (value.current?.managerGeneration == null),
+        "invalid",
+      );
+    return value;
+  });
+  const acceptedRow = Effect.fn("TaskStore.readAcceptedRow")(function* (input: {
+    taskId: string;
+    revision?: number;
+  }) {
+    if (input.revision !== undefined)
+      yield* guard(Number.isSafeInteger(input.revision) && input.revision > 0, "invalid");
+    const found = yield* sql<{
+      payload: string;
+      valid: number;
+    }>`SELECT typeof(definition_revision)='integer' AND typeof(action_policy_revision)='integer' AS valid,
+      hex(json_object('taskId',task_id,'definitionRevision',definition_revision,'actionPolicyRevision',action_policy_revision,'definition',json(definition_json),
+        'attribution',json(attribution_json),'eventId',accepted_event_id,'occurredAt',accepted_at)) AS payload
+      FROM work_task_accepted_definitions WHERE task_id=json_extract(${yield* encodeProjectionJson(input.taskId)},'$')
+      ${input.revision === undefined ? sql.literal("") : sql`AND definition_revision=${input.revision}`} ORDER BY definition_revision DESC LIMIT 1`;
+    const value = yield* stored(Accepted, found[0]);
+    if (value)
+      yield* guard(
+        value.taskId === input.taskId && value.definitionRevision === value.definition.revision,
+        "invalid",
+      );
+    return value;
+  });
+  const linkRow = Effect.fn("TaskStore.readLinkRow")(function* (input: {
+    taskId: string;
+    linkEventId: string;
+  }) {
+    const found = yield* sql<{ payload: string; valid: number }>`SELECT 1 AS valid,
+      hex(json_object('taskId',task_id,'threadId',thread_id,'eventId',link_event_id,'occurredAt',linked_at,'attribution',json(linked_attribution_json),
+        'unlinked',CASE WHEN unlink_event_id IS NULL THEN NULL ELSE json_object('eventId',unlink_event_id,'occurredAt',unlinked_at,'attribution',json(unlinked_attribution_json)) END)) AS payload
+      FROM work_task_thread_links WHERE link_event_id=json_extract(${yield* encodeProjectionJson(input.linkEventId)},'$') AND task_id=json_extract(${yield* encodeProjectionJson(input.taskId)},'$')`;
+    return yield* stored(Link, found[0]);
+  });
+  const readAcceptedDefinition = Effect.fn("TaskStore.readAcceptedDefinition")(
+    (input: { taskId: string; revision?: number }) =>
+      projectTransaction(acceptedRow(input)).pipe(NodeSqliteClient.readOnly),
+  );
+  const readThreadLink = Effect.fn("TaskStore.readThreadLink")(
+    (input: { taskId: string; linkEventId: string }) =>
+      projectTransaction(linkRow(input)).pipe(NodeSqliteClient.readOnly),
+  );
+  const readFoundation = Effect.fn("TaskStore.readFoundation")((taskId: string) =>
+    projectTransaction(
+      Effect.gen(function* () {
+        const projection = yield* readProjection(taskId);
+        if (!projection) return undefined;
+        const accepted = yield* acceptedRow({ taskId });
+        const sequence = projection.current?.lastSequence;
+        if (sequence == null)
+          return { projection, accepted, sourceVerified: false, draft: undefined };
+        const source = yield* readFoundationSource({ taskId, checkpointSequence: sequence });
+        const draftEvent = source.latestDefinition?.recorded.event;
+        const draft = draftEvent && "definition" in draftEvent ? draftEvent.definition : undefined;
+        return { projection, accepted, sourceVerified: true, draft };
+      }),
+    ).pipe(NodeSqliteClient.readOnly),
+  );
+  const fence = Effect.fn("TaskStore.readViewFence")(function* () {
+    const found = yield* sql<{
+      generation: string;
+      high: string;
+      valid: number;
+    }>`SELECT CAST(generation AS TEXT) AS generation,CAST(high_water_sequence AS TEXT) AS high,
+      typeof(generation)='integer' AND typeof(high_water_sequence)='integer' AS valid FROM work_task_view_fence WHERE singleton_id=1`;
+    yield* guard(found.length === 1 && found[0]?.valid === 1, "fence");
+    return yield* attempt(() => ({
+      generation: counter(found[0]!.generation),
+      high: counter(found[0]!.high),
+    })).pipe(Effect.mapError(() => new TaskProjectionError({ code: "fence" })));
+  });
+  const applyFoundation = Effect.fn("TaskStore.applyFoundation")((input: WorkTaskPersistedEvent) =>
+    projectTransaction(
+      Effect.gen(function* () {
+        const recorded = yield* decodeRecorded(input).pipe(
+          Effect.mapError(() => new TaskProjectionError({ code: "invalid" })),
+        );
+        const { event, context } = recorded;
+        yield* guard(
+          [
+            "task.created",
+            "task.definition-updated",
+            "task.definition-accepted",
+            "task.configuration-updated",
+            "task.execution-updated",
+            "task.thread-linked",
+            "task.thread-unlinked",
+          ].includes(event.type),
+          "unsupported",
+        );
+        const original = yield* readNativeEvent({ taskId: event.taskId, eventId: event.id });
+        yield* guard(NodeUtil.isDeepStrictEqual(original.recorded, recorded), "replay");
+        const current = yield* readProjection(event.taskId);
+        if (current) yield* guard(current.current?.lastSequence != null, "legacy");
+        const checkpoint = current?.current?.lastSequence ?? null;
+        const source = yield* readFoundationSource({
+          taskId: event.taskId,
+          checkpointSequence: checkpoint,
+          incomingEventId: event.id,
+          ...(event.type === "task.execution-updated" && event.manager
+            ? { managerGeneration: event.manager.managerGeneration }
+            : {}),
+          ...(event.type === "task.definition-accepted" && context.commandId !== null
+            ? { acceptanceCommandId: context.commandId }
+            : {}),
+        });
+        const view = yield* fence();
+        if (source.checkpoint && original.streamVersion <= source.checkpoint.streamVersion)
+          return { applied: false, lastSequence: checkpoint!, viewGeneration: view.generation };
+        yield* guard(source.next?.recorded.event.id === event.id, "replay");
+        yield* guard(view.generation < Number.MAX_SAFE_INTEGER, "fence");
+        const keys = [
+          "definitionRevision",
+          "lifecycleRevision",
+          "completionPolicyRevision",
+          "actionPolicyRevision",
+        ] as const;
+        if (current) for (const key of keys) yield* guard(event[key] >= current[key], "revision");
+        yield* guard(
+          current ? event.type !== "task.created" : event.type === "task.created",
+          "replay",
+        );
+        let effective = current?.definition;
+        let activeLink: string | undefined;
+        switch (event.type) {
+          case "task.created":
+            effective = event.definition;
+            break;
+          case "task.definition-updated":
+          case "task.definition-accepted": {
+            const draft = source.latestDefinition?.recorded.event;
+            if (
+              draft &&
+              "definition" in draft &&
+              draft.definition.revision === event.definitionRevision
+            )
+              yield* guard(
+                NodeUtil.isDeepStrictEqual(draft.definition, event.definition),
+                "definition",
+              );
+            const previous = yield* acceptedRow({
+              taskId: event.taskId,
+              revision: event.definitionRevision,
+            });
+            if (event.type === "task.definition-updated") {
+              if (previous)
+                yield* guard(
+                  NodeUtil.isDeepStrictEqual(previous.definition, event.definition),
+                  "definition",
+                );
+            } else {
+              yield* guard(
+                !previous && !source.acceptance && context.commandId !== null,
+                "definition",
+              );
+              const latest = yield* acceptedRow({ taskId: event.taskId });
+              if (latest?.actionPolicyRevision === event.actionPolicyRevision)
+                yield* guard(
+                  NodeUtil.isDeepStrictEqual(
+                    latest.definition.actionPolicy,
+                    event.definition.actionPolicy,
+                  ),
+                  "policy",
+                );
+            }
+            effective = event.definition;
+            break;
+          }
+          case "task.configuration-updated": {
+            const previous = source.configuration?.recorded.event;
+            if (
+              previous?.type === "task.configuration-updated" &&
+              previous.completionPolicyRevision === event.completionPolicyRevision
+            )
+              yield* guard(
+                NodeUtil.isDeepStrictEqual(previous.completionPolicy, event.completionPolicy),
+                "policy",
+              );
+            break;
+          }
+          case "task.execution-updated": {
+            const known = source.manager?.recorded.event;
+            const highest = source.highestManager?.recorded.event;
+            if (event.manager) {
+              if (known?.type === "task.execution-updated" && known.manager)
+                yield* guard(
+                  known.manager.managerThreadId === event.manager.managerThreadId,
+                  "manager",
+                );
+              if (highest?.type === "task.execution-updated" && highest.manager)
+                yield* guard(
+                  event.manager.managerGeneration >= highest.manager.managerGeneration,
+                  "manager",
+                );
+            }
+            break;
+          }
+          case "task.thread-linked":
+          case "task.thread-unlinked": {
+            const links = yield* sql<{
+              id: string;
+            }>`SELECT hex(link_event_id) AS id FROM work_task_thread_links
+          WHERE task_id=json_extract(${yield* encodeProjectionJson(event.taskId)},'$') AND thread_id=json_extract(${yield* encodeProjectionJson(event.threadId)},'$') AND unlink_event_id IS NULL`;
+            activeLink = links[0] ? yield* attempt(() => decodeHex(links[0]!.id)) : undefined;
+            yield* guard(
+              event.type === "task.thread-linked" ? !activeLink : activeLink !== undefined,
+              "link",
+            );
+            break;
+          }
+        }
+        yield* guard(effective !== undefined, "definition");
+        if (current) {
+          const changed =
+            yield* sql`UPDATE work_task_current_state SET last_applied_sequence=${context.sequence}
+        WHERE task_id=json_extract(${yield* encodeProjectionJson(event.taskId)},'$') AND last_applied_sequence=${checkpoint}
+        AND EXISTS(SELECT 1 FROM work_task_projections p WHERE p.task_id=work_task_current_state.task_id
+          AND definition_revision=${current.definitionRevision} AND lifecycle_revision=${current.lifecycleRevision}
+          AND completion_policy_revision=${current.completionPolicyRevision} AND action_policy_revision=${current.actionPolicyRevision}) RETURNING 1`;
+          yield* guard(changed.length === 1, "cas");
+          const updated =
+            yield* sql`UPDATE work_task_projections SET definition_revision=${event.definitionRevision},lifecycle_revision=${event.lifecycleRevision},
+        completion_policy_revision=${event.completionPolicyRevision},action_policy_revision=${event.actionPolicyRevision},definition_json=${yield* encodeProjectionJson(effective)},updated_at=${event.occurredAt}
+        WHERE task_id=json_extract(${yield* encodeProjectionJson(event.taskId)},'$') AND definition_revision=${current.definitionRevision} AND lifecycle_revision=${current.lifecycleRevision}
+        AND completion_policy_revision=${current.completionPolicyRevision} AND action_policy_revision=${current.actionPolicyRevision} RETURNING 1`;
+          yield* guard(updated.length === 1, "cas");
+        } else if (event.type === "task.created") {
+          yield* sql`INSERT INTO work_task_projections VALUES(json_extract(${yield* encodeProjectionJson(event.taskId)},'$'),json_extract(${yield* encodeProjectionJson(event.projectId ?? null)},'$'),
+        ${event.definitionRevision},${event.lifecycleRevision},${event.completionPolicyRevision},${event.actionPolicyRevision},${yield* encodeProjectionJson(event.definition)},${event.occurredAt},${event.occurredAt})`;
+          yield* sql`INSERT INTO work_task_current_state(task_id,last_applied_sequence) VALUES(json_extract(${yield* encodeProjectionJson(event.taskId)},'$'),${context.sequence})`;
+        }
+        switch (event.type) {
+          case "task.definition-accepted":
+            yield* sql`INSERT INTO work_task_accepted_definitions VALUES(json_extract(${yield* encodeProjectionJson(event.taskId)},'$'),${event.definitionRevision},${event.actionPolicyRevision},
+          ${yield* encodeProjectionJson(event.definition)},${yield* encodeProjectionJson(event.attribution)},json_extract(${yield* encodeProjectionJson(event.id)},'$'),${event.occurredAt})`;
+            break;
+          case "task.configuration-updated":
+            yield* sql`UPDATE work_task_current_state SET configuration_json=${yield* encodeProjectionJson({ allowanceOverride: event.allowanceOverride, completionPolicy: event.completionPolicy })} WHERE task_id=json_extract(${yield* encodeProjectionJson(event.taskId)},'$')`;
+            break;
+          case "task.execution-updated":
+            yield* sql`UPDATE work_task_current_state SET desired_mode=${event.desiredMode},manager_thread_id=json_extract(${yield* encodeProjectionJson(event.manager?.managerThreadId ?? null)},'$'),
+          manager_generation=${event.manager?.managerGeneration ?? null} WHERE task_id=json_extract(${yield* encodeProjectionJson(event.taskId)},'$')`;
+            break;
+          case "task.thread-linked":
+            yield* sql`INSERT INTO work_task_thread_links(link_event_id,task_id,thread_id,linked_at,linked_attribution_json) VALUES(json_extract(${yield* encodeProjectionJson(event.id)},'$'),json_extract(${yield* encodeProjectionJson(event.taskId)},'$'),json_extract(${yield* encodeProjectionJson(event.threadId)},'$'),${event.occurredAt},${yield* encodeProjectionJson(event.attribution)})`;
+            break;
+          case "task.thread-unlinked": {
+            const changed =
+              yield* sql`UPDATE work_task_thread_links SET unlink_event_id=json_extract(${yield* encodeProjectionJson(event.id)},'$'),unlinked_at=${event.occurredAt},unlinked_attribution_json=${yield* encodeProjectionJson(event.attribution)}
+          WHERE link_event_id=json_extract(${yield* encodeProjectionJson(activeLink)},'$') AND task_id=json_extract(${yield* encodeProjectionJson(event.taskId)},'$') AND unlink_event_id IS NULL RETURNING 1`;
+            yield* guard(changed.length === 1, "cas");
+            break;
+          }
+        }
+        const advanced =
+          yield* sql`UPDATE work_task_view_fence SET generation=${view.generation + 1},high_water_sequence=${Math.max(view.high, context.sequence)}
+      WHERE singleton_id=1 AND generation=${view.generation} AND high_water_sequence=${view.high} RETURNING 1`;
+        yield* guard(advanced.length === 1, "cas");
+        return {
+          applied: true,
+          lastSequence: context.sequence,
+          viewGeneration: view.generation + 1,
+        };
+      }),
+    ),
+  );
+  const rebuildFoundation = Effect.fn("TaskStore.rebuildFoundation")(
+    (input: { taskId: string; throughSequence: number }) =>
+      projectTransaction(
+        Effect.gen(function* () {
+          yield* guard((yield* readProjection(input.taskId)) === undefined, "legacy");
+          let after: Anchor | undefined;
+          do {
+            const page = yield* readNativeHistory({ ...input, ...(after ? { after } : {}) });
+            for (const value of page.records) yield* applyFoundation(value.recorded);
+            after = page.next;
+          } while (after);
+          return yield* readFoundation(input.taskId);
+        }),
+      ),
+  );
+
   return TaskStore.of({
+    applyFoundation,
+    readFoundation,
+    readAcceptedDefinition,
+    readThreadLink,
+    rebuildFoundation,
     readNativeEvent,
     readNativeSequence,
     readFoundationSource,
