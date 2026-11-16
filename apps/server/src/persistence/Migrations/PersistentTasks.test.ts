@@ -50,6 +50,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
     assert.deepInclude(migrations, [98, "WorkTaskAcceptedRunObservations"]);
     assert.deepInclude(migrations, [99, "WorkTaskManagerClaims"]);
     assert.deepInclude(migrations, [100, "WorkTaskOwnershipReleaseBridge"]);
+    assert.deepInclude(migrations, [104, "WorkTaskWakeState"]);
     const tables = yield* sql<{ readonly name: string }>`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'work_task_%' ORDER BY name
     `;
@@ -99,8 +100,11 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
         "work_task_validation_replay",
         "work_task_view_fence",
         "work_task_waits",
+        "work_task_wake_phase_state",
         "work_task_wake_reservations",
+        "work_task_wake_source_state",
         "work_task_wake_sources",
+        "work_task_wake_state",
       ],
     );
     assert.deepStrictEqual(yield* runMigrations(), []);
@@ -148,6 +152,7 @@ it.effect("upgrades predecessor rows and events without changing their bytes or 
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
       [103, "WorkTaskReferenceEvidence"],
+      [104, "WorkTaskWakeState"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM projection_projects ORDER BY project_id`,
@@ -201,6 +206,7 @@ it.effect("rolls back a failed migration and succeeds on rerun", () =>
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
       [103, "WorkTaskReferenceEvidence"],
+      [104, "WorkTaskWakeState"],
     ]);
     assert.deepStrictEqual(yield* runMigrations(), []);
   }).pipe(Effect.provide(db)),
@@ -335,6 +341,7 @@ it.effect(
         [101, "WorkTaskReadyState"],
         [102, "WorkTaskProjectionSource"],
         [103, "WorkTaskReferenceEvidence"],
+        [104, "WorkTaskWakeState"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -511,6 +518,7 @@ it.effect("preserves task custody through validation upgrade and rolls back migr
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
       [103, "WorkTaskReferenceEvidence"],
+      [104, "WorkTaskWakeState"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -660,6 +668,7 @@ it.effect("upgrades validation data atomically to action reviews and preserves p
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
       [103, "WorkTaskReferenceEvidence"],
+      [104, "WorkTaskWakeState"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -885,6 +894,7 @@ it.effect("upgrades existing tasks without inventing state and rolls back migrat
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
       [103, "WorkTaskReferenceEvidence"],
+      [104, "WorkTaskWakeState"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -995,6 +1005,7 @@ it.effect("upgrades waits atomically while preserving task state and link proven
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
       [103, "WorkTaskReferenceEvidence"],
+      [104, "WorkTaskWakeState"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM work_task_thread_links ORDER BY link_event_id`,
@@ -1132,6 +1143,7 @@ it.effect("upgrades result history atomically without changing predecessor data"
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
       [103, "WorkTaskReferenceEvidence"],
+      [104, "WorkTaskWakeState"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_current_state`, state);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_thread_links`, links);
@@ -1285,6 +1297,7 @@ it.effect("upgrades claim history atomically and preserves prior task and ordina
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
       [103, "WorkTaskReferenceEvidence"],
+      [104, "WorkTaskWakeState"],
     ]);
     assert.deepStrictEqual(
       yield* Effect.forEach(tables, (name) => sql.unsafe(`SELECT * FROM ${name}`)),
@@ -1634,6 +1647,7 @@ it.effect("preserves legacy validation rows and rolls replay migration back befo
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
       [103, "WorkTaskReferenceEvidence"],
+      [104, "WorkTaskWakeState"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_attempts`, before);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_claims`, claims);
@@ -2757,6 +2771,7 @@ it.effect("preserves review evidence on upgrade and binds append-only outcomes a
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
       [103, "WorkTaskReferenceEvidence"],
+      [104, "WorkTaskWakeState"],
     ]);
     assert.deepStrictEqual(yield* snapshot(), before);
     assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
@@ -3164,6 +3179,7 @@ it.effect(
         [101, "WorkTaskReadyState"],
         [102, "WorkTaskProjectionSource"],
         [103, "WorkTaskReferenceEvidence"],
+        [104, "WorkTaskWakeState"],
       ]);
       const after = yield* snapshot();
       assert.deepStrictEqual(
@@ -3531,6 +3547,7 @@ it.effect(
         [101, "WorkTaskReadyState"],
         [102, "WorkTaskProjectionSource"],
         [103, "WorkTaskReferenceEvidence"],
+        [104, "WorkTaskWakeState"],
       ]);
       const after = yield* capture();
       assert.deepStrictEqual(
@@ -4171,6 +4188,7 @@ it.effect(
         [101, "WorkTaskReadyState"],
         [102, "WorkTaskProjectionSource"],
         [103, "WorkTaskReferenceEvidence"],
+        [104, "WorkTaskWakeState"],
       ]);
       const after = yield* capture();
       assert.deepStrictEqual(
@@ -4589,6 +4607,7 @@ it.effect("preserves dirty scan membership observations and rolls back migration
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
       [103, "WorkTaskReferenceEvidence"],
+      [104, "WorkTaskWakeState"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_group_memberships`, before);
     const member = batch.event.snapshot.currentMembership!;
@@ -5293,6 +5312,7 @@ it.effect(
         [101, "WorkTaskReadyState"],
         [102, "WorkTaskProjectionSource"],
         [103, "WorkTaskReferenceEvidence"],
+        [104, "WorkTaskWakeState"],
       ]);
       const after = yield* capture();
       for (const name of names.filter((name) => name !== "effect_sql_migrations"))
@@ -5784,6 +5804,7 @@ it.effect(
         [101, "WorkTaskReadyState"],
         [102, "WorkTaskProjectionSource"],
         [103, "WorkTaskReferenceEvidence"],
+        [104, "WorkTaskWakeState"],
       ]);
       const after = yield* capture();
       for (const name of names.filter((name) => name !== "effect_sql_migrations"))
@@ -6340,6 +6361,7 @@ it.effect(
         [101, "WorkTaskReadyState"],
         [102, "WorkTaskProjectionSource"],
         [103, "WorkTaskReferenceEvidence"],
+        [104, "WorkTaskWakeState"],
       ]);
       const after = yield* capture();
       for (const name of names.filter((n) => n !== "effect_sql_migrations"))
@@ -6926,6 +6948,7 @@ it.effect(
         [101, "WorkTaskReadyState"],
         [102, "WorkTaskProjectionSource"],
         [103, "WorkTaskReferenceEvidence"],
+        [104, "WorkTaskWakeState"],
       ]);
       const after = yield* capture();
       for (const { name } of tables.filter((r) => r.name !== "effect_sql_migrations"))
@@ -7492,6 +7515,7 @@ it.effect("upgrades ready storage preserving every predecessor row and rolls bac
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
       [103, "WorkTaskReferenceEvidence"],
+      [104, "WorkTaskWakeState"],
     ]);
     const after = yield* capture();
     for (const { name } of tables.filter((t) => t.name !== "effect_sql_migrations"))
@@ -7614,6 +7638,7 @@ it.effect("upgrades native task lookup compatibility without changing predecesso
     assert.deepStrictEqual(yield* runMigrations(), [
       [102, "WorkTaskProjectionSource"],
       [103, "WorkTaskReferenceEvidence"],
+      [104, "WorkTaskWakeState"],
     ]);
     const after = yield* capture();
     for (const { name } of tables.filter((t) => t.name !== "effect_sql_migrations"))
@@ -7717,7 +7742,10 @@ it.effect(
         [],
       );
       yield* sql`DROP INDEX idx_task_reference_generation`;
-      assert.deepStrictEqual(yield* runMigrations(), [[103, "WorkTaskReferenceEvidence"]]);
+      assert.deepStrictEqual(yield* runMigrations(), [
+        [103, "WorkTaskReferenceEvidence"],
+        [104, "WorkTaskWakeState"],
+      ]);
       const after = yield* capture();
       for (const { name } of tables.filter((row) => row.name !== "effect_sql_migrations"))
         assert.deepStrictEqual(after[name], before[name]);
@@ -7791,5 +7819,452 @@ it.effect(
           name.endsWith("unit") ? [] : ["valid"],
         );
       }
+    }).pipe(Effect.provide(db)),
+);
+
+it.effect(
+  "retains wake arrival and phase evidence through uncertain claim and incremental acknowledgement",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      yield* sql`INSERT INTO work_task_projections VALUES('wake','p',1,1,1,1,'{}','t','t')`;
+      yield* sql`INSERT INTO work_task_manager_bindings VALUES('wake',1,'manager','t',NULL)`;
+      yield* sql`INSERT INTO work_task_allowances VALUES('wake',2,1)`;
+      yield* sql`INSERT INTO work_task_wake_state VALUES('wake',0,0,NULL)`;
+      for (let generation = 1; generation <= 33; generation++) {
+        yield* sql`INSERT INTO work_task_wake_sources VALUES('wake','custom-kind',${String(generation)},NULL,NULL)`;
+        yield* sql`INSERT INTO work_task_wake_source_state VALUES('wake','custom-kind',${String(generation)},${`source-${generation}`},${generation},${generation},${generation <= 32 ? 1 : 0},NULL,NULL)`;
+      }
+      assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_wake_state`, [
+        {
+          task_id: "wake",
+          dirty_generation: 33,
+          acknowledged_generation: 0,
+          overflow_through_generation: 33,
+        },
+      ]);
+      yield* sql`INSERT INTO work_task_wake_reservations VALUES('reservation','wake',1,'command',NULL,NULL,1,33,0,'2026-11-16T00:00:00Z',NULL)`;
+      yield* sql`INSERT INTO work_task_wake_phase_state VALUES('reserved',34,'wake','reservation','reserved',33,0,NULL,NULL,NULL,NULL,NULL)`;
+      yield* sql`INSERT INTO work_task_wake_phase_state VALUES('uncertain',35,'wake','reservation','uncertain',33,0,NULL,NULL,NULL,NULL,NULL)`;
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* sql`INSERT INTO work_task_wake_phase_state VALUES('claimed',36,'wake','reservation','claimed',33,0,NULL,NULL,'message','run','2026-11-16T00:00:01.0000001Z')`;
+          yield* sql`UPDATE work_task_wake_reservations SET message_id='message',run_id='run',claimed_at='2026-11-16T00:00:01.0000001Z' WHERE reservation_id='reservation'`;
+        }),
+      );
+      yield* sql`INSERT INTO work_task_wake_phase_state VALUES('ack-1',37,'wake','reservation','acknowledged',33,16,0,33,NULL,NULL,NULL)`;
+      assert.strictEqual(
+        (yield* sql<{
+          n: number;
+        }>`SELECT count(*) AS n FROM work_task_wake_source_state WHERE retained_pending=1`)[0]!.n,
+        16,
+      );
+      yield* sql`INSERT INTO work_task_wake_sources VALUES('wake','custom-kind','34','reservation','result')`;
+      yield* sql`INSERT INTO work_task_wake_source_state VALUES('wake','custom-kind','34','source-34',38,34,1,'reservation','result')`;
+      assert.strictEqual(
+        (yield* sql<{
+          n: number;
+        }>`SELECT retained_pending AS n FROM work_task_wake_source_state WHERE source_id='33'`)[0]!
+          .n,
+        0,
+      );
+      yield* sql`INSERT INTO work_task_wake_phase_state VALUES('ack-2',39,'wake','reservation','acknowledged',34,32,16,33,NULL,NULL,NULL)`;
+      assert.strictEqual(
+        (yield* sql<{
+          n: number;
+        }>`SELECT count(*) AS n FROM work_task_wake_source_state WHERE retained_pending=1`)[0]!.n,
+        1,
+      );
+      assert.strictEqual(
+        (yield* sql<{
+          n: number;
+        }>`SELECT overflow_through_generation AS n FROM work_task_wake_state`)[0]!.n,
+        33,
+      );
+      yield* sql`INSERT INTO work_task_wake_phase_state VALUES('ack-3',40,'wake','reservation','acknowledged',34,33,32,33,NULL,NULL,NULL)`;
+      assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_wake_state`, [
+        {
+          task_id: "wake",
+          dirty_generation: 34,
+          acknowledged_generation: 33,
+          overflow_through_generation: null,
+        },
+      ]);
+      assert.strictEqual(
+        (yield* sql<{ n: number }>`SELECT count(*) AS n FROM work_task_wake_phase_state`)[0]!.n,
+        6,
+      );
+      yield* sql`INSERT INTO work_task_wake_reservations VALUES('second','wake',1,'second-command',NULL,NULL,2,34,33,'2026-11-16T00:00:02Z',NULL)`;
+      yield* sql`INSERT INTO work_task_wake_phase_state VALUES('second-reserved',41,'wake','second','reserved',34,33,NULL,NULL,NULL,NULL,NULL)`;
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* sql`INSERT INTO work_task_wake_phase_state VALUES('second-claim',42,'wake','second','claimed',34,33,NULL,NULL,'second-message','second-run','2026-11-16T00:00:03Z')`;
+          yield* sql`UPDATE work_task_wake_reservations SET message_id='second-message',run_id='second-run',claimed_at='2026-11-16T00:00:03Z' WHERE reservation_id='second'`;
+        }),
+      );
+      for (const [generation, sequence, event] of [
+        [35, 43, "refresh-1"],
+        [36, 46, "refresh-2"],
+      ] as const) {
+        yield* sql`INSERT INTO work_task_wake_sources VALUES('wake','custom-kind',${String(generation)},NULL,NULL)`;
+        yield* sql`INSERT INTO work_task_wake_source_state VALUES('wake','custom-kind',${String(generation)},${`source-${generation}`},${sequence},${generation},1,NULL,NULL)`;
+        yield* sql`INSERT INTO work_task_wake_phase_state VALUES(${event},${sequence + 1},'wake','second','claimed',${generation},33,NULL,NULL,'second-message','second-run','2026-11-16T00:00:03Z')`;
+        if (generation === 35)
+          yield* sql`INSERT INTO work_task_wake_phase_state VALUES('second-uncertain',45,'wake','second','uncertain',35,33,NULL,NULL,NULL,NULL,NULL)`;
+      }
+      for (const [id, sequence, ack, previous] of [
+        ["second-ack-1", 48, 35, 33],
+        ["second-ack-2", 49, 36, 35],
+      ] as const)
+        yield* sql`INSERT INTO work_task_wake_phase_state VALUES(${id},${sequence},'wake','second','acknowledged',36,${ack},${previous},36,NULL,NULL,NULL)`;
+      assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_wake_state`, [
+        {
+          task_id: "wake",
+          dirty_generation: 36,
+          acknowledged_generation: 36,
+          overflow_through_generation: null,
+        },
+      ]);
+      assert.deepStrictEqual(
+        (yield* sql<{
+          event_id: string;
+        }>`SELECT event_id FROM work_task_wake_phase_state WHERE reservation_id='second' AND kind='claimed' ORDER BY sequence`).map(
+          (row) => row.event_id,
+        ),
+        ["second-claim", "refresh-1", "refresh-2"],
+      );
+      const snapshot = yield* sql`SELECT * FROM work_task_wake_phase_state ORDER BY sequence`;
+      assert.deepStrictEqual(yield* runMigrations(), []);
+      assert.deepStrictEqual(
+        yield* sql`SELECT * FROM work_task_wake_phase_state ORDER BY sequence`,
+        snapshot,
+      );
+      for (const [query, index] of [
+        [
+          "SELECT dirty_generation FROM work_task_wake_source_state WHERE task_id='wake' ORDER BY dirty_generation DESC LIMIT 1",
+          "sqlite_autoindex_work_task_wake_source_state",
+        ],
+        [
+          "SELECT count(*) FROM work_task_wake_source_state WHERE task_id='wake' AND retained_pending=1",
+          "work_task_wake_retained_idx",
+        ],
+        [
+          "SELECT dirty_generation FROM work_task_wake_source_state WHERE task_id='wake' AND retained_pending=0 AND dirty_generation>16 ORDER BY dirty_generation DESC LIMIT 1",
+          "work_task_wake_overflow_idx",
+        ],
+        [
+          "SELECT source_sequence FROM work_task_wake_source_state WHERE task_id='wake' ORDER BY source_sequence DESC LIMIT 1",
+          "work_task_wake_source_sequence_idx",
+        ],
+        [
+          "SELECT sequence FROM work_task_wake_phase_state WHERE task_id='wake' ORDER BY sequence DESC LIMIT 1",
+          "work_task_wake_phase_task_sequence_idx",
+        ],
+        [
+          "SELECT acknowledged_generation FROM work_task_wake_phase_state WHERE task_id='wake' AND kind='acknowledged' ORDER BY acknowledged_generation DESC LIMIT 1",
+          "work_task_wake_ack_max_idx",
+        ],
+        ...["ASC", "DESC"].map((order) => [
+          `SELECT event_id FROM work_task_wake_phase_state WHERE reservation_id='second' AND kind='claimed' ORDER BY sequence ${order} LIMIT 1`,
+          "work_task_wake_phase_latest_idx",
+        ]),
+      ]) {
+        const plan = JSON.stringify(yield* sql.unsafe(`EXPLAIN QUERY PLAN ${query}`));
+        assert.include(plan, index!);
+        assert.include(plan, "SEARCH");
+        assert.notInclude(plan, "TEMP B-TREE");
+      }
+      for (const trigger of ["work_task_wake_state_update", "work_task_wake_phase_insert"]) {
+        const installed = (yield* sql<{
+          sql: string;
+        }>`SELECT sql FROM sqlite_master WHERE name=${trigger}`)[0]!.sql;
+        for (const match of installed.matchAll(
+          /SELECT (?:dirty_generation|acknowledged_generation|source_sequence|sequence|event_id|message_id|run_id|first_claimed_at) FROM work_task_wake_(?:source|phase)_state WHERE [^()]+? LIMIT 1/g,
+        )) {
+          const query = match[0]
+            .replaceAll("NEW.task_id", "'wake'")
+            .replaceAll("NEW.reservation_id", "'second'")
+            .replaceAll("NEW.acknowledged_generation", "16");
+          const plan = JSON.stringify(yield* sql.unsafe(`EXPLAIN QUERY PLAN ${query}`));
+          assert.include(plan, "SEARCH");
+          assert.notMatch(plan, /TEMP B-TREE|SCAN work_task/);
+        }
+      }
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+    }).pipe(Effect.provide(db)),
+);
+
+it.effect("closes wake parent tuples and rejects replacement aliases without partial writes", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations();
+    for (const task of ["a", "b"]) {
+      yield* sql`INSERT INTO work_task_projections VALUES(${task},NULL,1,1,1,1,'{}','t','t')`;
+      yield* sql`INSERT INTO work_task_manager_bindings VALUES(${task},1,${`manager-${task}`},'t',NULL)`;
+      yield* sql`INSERT INTO work_task_allowances VALUES(${task},10,2)`;
+      yield* sql`INSERT INTO work_task_wake_state VALUES(${task},0,0,NULL)`;
+    }
+    yield* sql`INSERT INTO work_task_wake_sources(rowid,task_id,source_kind,source_id) VALUES(-1,'a','kind','source')`;
+    yield* sql`INSERT INTO work_task_wake_source_state VALUES('a','kind','source','source-event',1,1,1,NULL,NULL)`;
+    yield* sql`INSERT INTO work_task_wake_reservations(rowid,reservation_id,task_id,manager_generation,command_id,allowance_unit,dirty_generation,acknowledged_generation,created_at)
+      VALUES(-1,'r','a',1,'command',1,1,0,'2026-11-16T00:00:00Z')`;
+    yield* sql`INSERT INTO work_task_wake_phase_state VALUES('reserved',2,'a','r','reserved',1,0,NULL,NULL,NULL,NULL,NULL)`;
+    yield* sql`INSERT INTO work_task_wake_sources(task_id,source_kind,source_id) VALUES('b','kind','source')`;
+    yield* sql`INSERT INTO work_task_wake_source_state VALUES('b','kind','source','b-source',3,1,1,NULL,NULL)`;
+    yield* sql`INSERT INTO work_task_wake_reservations VALUES('other','b',1,'other-command',NULL,NULL,1,1,0,'2026-11-16T00:00:00Z',NULL)`;
+    const tables = [
+      "work_task_wake_state",
+      "work_task_wake_source_state",
+      "work_task_wake_phase_state",
+      "work_task_wake_reservations",
+      "work_task_wake_sources",
+      "work_task_allowances",
+    ];
+    const snapshot = Effect.fn("PersistentTasks.captureWakeState")(function* () {
+      return yield* Effect.forEach(tables, (table) => sql.unsafe(`SELECT * FROM ${table}`));
+    });
+    const reject = Effect.fn("PersistentTasks.rejectWakeWrite")(function* (
+      effect: Effect.Effect<unknown, SqlError>,
+    ) {
+      const before = yield* snapshot();
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(effect)));
+      assert.deepStrictEqual(yield* snapshot(), before);
+    });
+    for (const recursive of [0, 1]) {
+      yield* sql.unsafe(`PRAGMA recursive_triggers=${recursive}`);
+      for (const statement of [
+        sql`INSERT OR REPLACE INTO work_task_wake_state VALUES('a',0,0,NULL)`,
+        sql`UPDATE work_task_wake_state SET dirty_generation=2 WHERE task_id='a'`,
+        sql`UPDATE work_task_wake_state SET acknowledged_generation=1 WHERE task_id='a'`,
+        sql`UPDATE work_task_wake_state SET overflow_through_generation=1 WHERE task_id='a'`,
+        sql`DELETE FROM work_task_wake_state WHERE task_id='a'`,
+        sql`INSERT OR REPLACE INTO work_task_wake_source_state VALUES('a','kind','source','new',4,2,1,NULL,NULL)`,
+        sql`UPDATE work_task_wake_source_state SET retained_pending=0 WHERE task_id='a'`,
+        sql`UPDATE work_task_wake_source_state SET source_event_id='new' WHERE task_id='a'`,
+        sql`DELETE FROM work_task_wake_source_state WHERE task_id='a'`,
+        sql`INSERT OR REPLACE INTO work_task_wake_phase_state VALUES('reserved',4,'a','r','uncertain',1,0,NULL,NULL,NULL,NULL,NULL)`,
+        sql`INSERT OR REPLACE INTO work_task_wake_phase_state VALUES('fresh',2,'a','r','uncertain',1,0,NULL,NULL,NULL,NULL,NULL)`,
+        sql`INSERT INTO work_task_wake_phase_state VALUES('source-event',4,'a','r','uncertain',1,0,NULL,NULL,NULL,NULL,NULL)`,
+        sql`INSERT INTO work_task_wake_phase_state VALUES('fresh',3,'a','r','uncertain',1,0,NULL,NULL,NULL,NULL,NULL)`,
+        sql`UPDATE work_task_wake_phase_state SET sequence=4 WHERE event_id='reserved'`,
+        sql`DELETE FROM work_task_wake_phase_state WHERE event_id='reserved'`,
+        sql`INSERT OR REPLACE INTO work_task_wake_sources VALUES('a','kind','source',NULL,'changed')`,
+        sql`UPDATE work_task_wake_sources SET result_ref='changed' WHERE task_id='a'`,
+        sql`UPDATE OR REPLACE work_task_wake_sources SET task_id='a' WHERE task_id='b'`,
+        sql`DELETE FROM work_task_wake_sources WHERE task_id='a'`,
+        sql`INSERT OR REPLACE INTO work_task_wake_reservations SELECT * FROM work_task_wake_reservations WHERE reservation_id='r'`,
+        sql`UPDATE work_task_wake_reservations SET created_at='changed' WHERE reservation_id='r'`,
+        sql`UPDATE work_task_wake_reservations SET message_id='message',run_id='run',claimed_at='2026-11-16T00:00:01Z' WHERE reservation_id='r'`,
+        sql`UPDATE OR REPLACE work_task_wake_reservations SET reservation_id='r' WHERE reservation_id='other'`,
+        sql`UPDATE OR REPLACE work_task_wake_reservations SET command_id='command' WHERE reservation_id='other'`,
+        sql`UPDATE OR REPLACE work_task_wake_reservations SET task_id='a' WHERE reservation_id='other'`,
+        sql`DELETE FROM work_task_wake_reservations WHERE reservation_id='r'`,
+      ])
+        yield* reject(statement);
+      yield* sql`UPDATE work_task_wake_reservations SET rowid=100 WHERE reservation_id='other'`;
+      yield* sql`UPDATE work_task_wake_sources SET rowid=100 WHERE task_id='b'`;
+      for (const occupied of [-1, 0, 17]) {
+        yield* sql`UPDATE work_task_wake_reservations SET rowid=${occupied} WHERE reservation_id='r'`;
+        yield* sql`UPDATE work_task_wake_sources SET rowid=${occupied} WHERE task_id='a'`;
+        for (const alias of ["rowid", "oid", "_rowid_"]) {
+          yield* reject(
+            sql.unsafe(
+              `UPDATE OR REPLACE work_task_wake_reservations SET ${alias}=${occupied} WHERE reservation_id='other'`,
+            ),
+          );
+          yield* reject(
+            sql.unsafe(
+              `UPDATE OR REPLACE work_task_wake_sources SET ${alias}=${occupied} WHERE task_id='b'`,
+            ),
+          );
+          yield* reject(
+            sql.unsafe(`INSERT OR REPLACE INTO work_task_wake_reservations(${alias},reservation_id,task_id,manager_generation,command_id,allowance_unit,dirty_generation,acknowledged_generation,created_at,claimed_at)
+          VALUES(${occupied},'fresh','b',1,'fresh-command',2,1,0,'2026-11-16T00:00:00Z','2026-11-16T00:00:01Z')`),
+          );
+          yield* reject(
+            sql.unsafe(
+              `INSERT OR REPLACE INTO work_task_wake_sources(${alias},task_id,source_kind,source_id) VALUES(${occupied},'b','kind','fresh')`,
+            ),
+          );
+        }
+      }
+      yield* reject(
+        sql.withTransaction(
+          sql`INSERT INTO work_task_wake_phase_state VALUES('half',4,'a','r','claimed',1,0,NULL,NULL,'message','run','2026-11-16T00:00:01Z')`,
+        ),
+      );
+      yield* sql.withTransaction(sql`SELECT 1`);
+      for (const [message, run, time] of [
+        [null, "run", "2026-11-16T00:00:01Z"],
+        ["message", null, "2026-11-16T00:00:01Z"],
+        ["message", "run", null],
+      ] as const)
+        yield* reject(
+          sql`INSERT INTO work_task_wake_phase_state VALUES('partial',4,'a','r','claimed',1,0,NULL,NULL,${message},${run},${time})`,
+        );
+    }
+    yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* sql`INSERT INTO work_task_wake_phase_state VALUES('claim',4,'a','r','claimed',1,0,NULL,NULL,'message','run','2026-11-16T00:00:01Z')`;
+        yield* sql`UPDATE work_task_wake_reservations SET message_id='message',run_id='run',claimed_at='2026-11-16T00:00:01Z' WHERE reservation_id='r'`;
+      }),
+    );
+    for (const recursive of [0, 1]) {
+      yield* sql.unsafe(`PRAGMA recursive_triggers=${recursive}`);
+      for (const statement of [
+        sql`UPDATE work_task_wake_reservations SET message_id='other' WHERE reservation_id='r'`,
+        sql`UPDATE OR REPLACE work_task_wake_reservations SET message_id='message' WHERE reservation_id='other'`,
+        sql`UPDATE OR REPLACE work_task_wake_reservations SET run_id='run' WHERE reservation_id='other'`,
+        sql`INSERT INTO work_task_wake_phase_state VALUES('same-dirty',5,'a','r','claimed',1,0,NULL,NULL,'message','run','2026-11-16T00:00:01Z')`,
+        sql`INSERT INTO work_task_wake_phase_state VALUES('bad-ack',5,'a','r','acknowledged',1,0,0,1,NULL,NULL,NULL)`,
+        sql`INSERT INTO work_task_wake_phase_state VALUES('bad-ack',5,'a','r','acknowledged',1,1,1,1,NULL,NULL,NULL)`,
+      ])
+        yield* reject(statement);
+      yield* reject(
+        sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`INSERT INTO work_task_wake_phase_state VALUES('rollback-ack',5,'a','r','acknowledged',1,1,0,1,NULL,NULL,NULL)`;
+            yield* sql`INSERT INTO work_task_wake_state VALUES('a',0,0,NULL)`;
+          }),
+        ),
+      );
+    }
+    yield* sql`INSERT INTO work_task_wake_phase_state VALUES('ack',5,'a','r','acknowledged',1,1,0,1,NULL,NULL,NULL)`;
+    for (const statement of [
+      sql`INSERT INTO work_task_wake_phase_state VALUES('again',6,'a','r','acknowledged',1,1,1,1,NULL,NULL,NULL)`,
+      sql`INSERT INTO work_task_wake_phase_state VALUES('late',6,'a','r','uncertain',1,1,NULL,NULL,NULL,NULL,NULL)`,
+      sql`UPDATE work_task_wake_source_state SET retained_pending=1 WHERE task_id='a'`,
+    ])
+      yield* reject(statement);
+    yield* sql`INSERT INTO work_task_wake_sources(task_id,source_kind,source_id) VALUES('a','kind','fresh')`;
+    for (const [id, sequence] of [
+      ["claim", 6],
+      ["fresh", 4],
+    ] as const)
+      yield* reject(
+        sql`INSERT INTO work_task_wake_source_state VALUES('a','kind','fresh',${id},${sequence},2,1,NULL,NULL)`,
+      );
+    yield* sql.withTransaction(
+      sql`INSERT INTO work_task_wake_source_state VALUES('a','kind','fresh','fresh',6,2,1,NULL,NULL)`,
+    );
+    assert.strictEqual(
+      (yield* sql<{
+        n: number;
+      }>`SELECT dirty_generation AS n FROM work_task_wake_state WHERE task_id='a'`)[0]!.n,
+      2,
+    );
+    assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect(
+  "upgrades wake metadata without adopting legacy partial claims and preserves bounded identities",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: 103 });
+      for (let shape = 0; shape < 8; shape++) {
+        const id = `legacy-${shape}`;
+        yield* sql`INSERT INTO work_task_projections VALUES(${id},NULL,1,1,1,1,'{}','t','t')`;
+        yield* sql`INSERT INTO work_task_manager_bindings VALUES(${id},1,${id},'t',NULL)`;
+        yield* sql`INSERT INTO work_task_allowances VALUES(${id},1,1)`;
+        yield* sql`INSERT INTO work_task_wake_reservations VALUES(${id},${id},1,${id},${shape & 1 ? `${id}-message` : null},${shape & 2 ? `${id}-run` : null},1,1,0,'2026-11-16T00:00:00Z',${shape & 4 ? "2026-11-16T00:00:01Z" : null})`;
+        yield* sql`INSERT INTO work_task_wake_sources VALUES(${id},'legacy','source',NULL,NULL)`;
+      }
+      const tables = yield* sql<{
+        name: string;
+      }>`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`;
+      const capture = Effect.fn("PersistentTasks.captureWakePredecessor")(function* () {
+        return Object.fromEntries(
+          yield* Effect.forEach(tables, ({ name }) =>
+            sql.unsafe(`SELECT * FROM "${name}"`).pipe(Effect.map((rows) => [name, rows] as const)),
+          ),
+        );
+      });
+      const before = yield* capture();
+      yield* sql`CREATE INDEX work_task_wake_phase_latest_idx ON work_task_projections(task_id)`;
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(runMigrations())));
+      assert.deepStrictEqual(yield* capture(), before);
+      assert.deepStrictEqual(
+        yield* sql`SELECT name FROM sqlite_master WHERE name IN('work_task_wake_state','work_task_wake_parent_claim_tuple_idx')`,
+        [],
+      );
+      yield* sql`DROP INDEX work_task_wake_phase_latest_idx`;
+      assert.deepStrictEqual(yield* runMigrations(), [[104, "WorkTaskWakeState"]]);
+      const after = yield* capture();
+      for (const { name } of tables.filter((row) => row.name !== "effect_sql_migrations"))
+        assert.deepStrictEqual(after[name], before[name]);
+      for (const table of [
+        "work_task_wake_state",
+        "work_task_wake_source_state",
+        "work_task_wake_phase_state",
+      ])
+        assert.deepStrictEqual(yield* sql.unsafe(`SELECT * FROM ${table}`), []);
+      for (let shape = 0; shape < 8; shape++) {
+        const id = `legacy-${shape}`;
+        yield* sql`INSERT INTO work_task_wake_state VALUES(${id},0,0,NULL)`;
+        yield* sql`INSERT INTO work_task_wake_source_state VALUES(${id},'legacy','source',${`${id}-source`},${shape * 2},1,1,NULL,NULL)`;
+        const insert = sql`INSERT INTO work_task_wake_phase_state VALUES(${`${id}-reserved`},${shape * 2 + 1},${id},${id},'reserved',1,0,NULL,NULL,NULL,NULL,NULL)`;
+        if (shape === 0) yield* insert;
+        else assert.isTrue(Exit.isFailure(yield* Effect.exit(insert)));
+      }
+      const task = "\u0000task\ud800";
+      const source = "\u0000source\ud800";
+      const kind = "😀".repeat(1000);
+      const encodedTask = JSON.stringify(task);
+      yield* sql`INSERT INTO work_task_projections VALUES(json_extract(${encodedTask},'$'),NULL,1,1,1,1,'{}','t','t')`;
+      yield* sql`INSERT INTO work_task_wake_state VALUES(json_extract(${encodedTask},'$'),0,0,NULL)`;
+      yield* sql`INSERT INTO work_task_wake_sources VALUES(json_extract(${encodedTask},'$'),${kind},json_extract(${JSON.stringify(source)},'$'),NULL,json_extract(${JSON.stringify(source)},'$'))`;
+      for (const invalid of [
+        "",
+        "\t",
+        "\u00a0",
+        "\ufeff",
+        " x ",
+        "😀".repeat(1001),
+        "x".repeat(2001),
+      ]) {
+        yield* sql`INSERT INTO work_task_wake_sources VALUES(json_extract(${encodedTask},'$'),${kind},${invalid},NULL,NULL)`;
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              sql`INSERT INTO work_task_wake_source_state VALUES(json_extract(${encodedTask},'$'),${kind},${invalid},'invalid',20,1,1,NULL,NULL)`,
+            ),
+          ),
+        );
+      }
+      for (const [sequence, generation, pending] of [
+        [-1, 1, 1],
+        [0.5, 1, 1],
+        [9007199254740992, 1, 1],
+        [20, 0, 1],
+        [20, 9007199254740992, 1],
+        [20, 1, 2],
+        [20, 1, 0],
+      ] as const)
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              sql`INSERT INTO work_task_wake_source_state VALUES(json_extract(${encodedTask},'$'),${kind},json_extract(${JSON.stringify(source)},'$'),'valid',${sequence},${generation},${pending},NULL,json_extract(${JSON.stringify(source)},'$'))`,
+            ),
+          ),
+        );
+      yield* sql`INSERT INTO work_task_wake_source_state VALUES(json_extract(${encodedTask},'$'),${kind},json_extract(${JSON.stringify(source)},'$'),json_extract(${JSON.stringify(source)},'$'),20,1,1,NULL,json_extract(${JSON.stringify(source)},'$'))`;
+      assert.strictEqual(
+        (yield* sql<{
+          same: number;
+        }>`SELECT hex(source_id)=hex(json_extract(${JSON.stringify(source)},'$')) AND hex(original_result_ref)=hex(json_extract(${JSON.stringify(source)},'$')) AS same FROM work_task_wake_source_state WHERE task_id=json_extract(${encodedTask},'$')`)[0]!
+          .same,
+        1,
+      );
+      const stable =
+        yield* sql`SELECT hex(task_id),dirty_generation,acknowledged_generation,overflow_through_generation FROM work_task_wake_state ORDER BY task_id`;
+      assert.deepStrictEqual(yield* runMigrations(), []);
+      assert.deepStrictEqual(
+        yield* sql`SELECT hex(task_id),dirty_generation,acknowledged_generation,overflow_through_generation FROM work_task_wake_state ORDER BY task_id`,
+        stable,
+      );
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
     }).pipe(Effect.provide(db)),
 );
