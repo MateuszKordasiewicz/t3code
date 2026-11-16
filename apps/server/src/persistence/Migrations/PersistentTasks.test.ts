@@ -4999,6 +4999,11 @@ it.effect("rejects contradictory accepted ownership and deferred legacy interlea
     }
     yield* insertAcceptedRun(base);
     const automatic = automaticOwnershipFixture("guarded", 20);
+    const debit = insertAcceptedDebit(
+      automatic.event.ownership.run.runId,
+      automatic.debit.event,
+      automatic.debit.context.sequence,
+    );
     for (const [path, value] of [
       [
         "$.ownership.origin.pending.sources",
@@ -5014,20 +5019,23 @@ it.effect("rejects contradictory accepted ownership and deferred legacy interlea
       ["$.ownership.origin.pending.sources", [{ kind: "r", sourceId: "missing", extra: null }]],
       ["$.ownership.origin.pending.overflowThroughGeneration", 4],
       ["$.ownership.origin.debitEvent.allowanceUnit", 2],
+      ["$.ownership.origin.debitEvent.allowanceUnit", true],
       ["$.ownership.origin.debitEvent.taskId", "other"],
     ] as ReadonlyArray<readonly [string, unknown]>) {
       const [row] = yield* sql<{
         value: string;
       }>`SELECT json_set(${JSON.stringify(automatic.event)},${path},json(${JSON.stringify(value)})) value`;
       const malformed: unknown = JSON.parse(row!.value);
-      yield* reject(insertAcceptedRun(malformed));
+      yield* reject(
+        sql.withTransaction(
+          Effect.gen(function* () {
+            yield* insertAcceptedRun(malformed);
+            yield* debit;
+          }),
+        ),
+      );
     }
     const owner = insertAcceptedRun(automatic.event);
-    const debit = insertAcceptedDebit(
-      automatic.event.ownership.run.runId,
-      automatic.debit.event,
-      automatic.debit.context.sequence,
-    );
     const origin = automatic.event.ownership.origin;
     if (origin.type !== "automatic_followup") throw new Error("Expected automatic origin");
     yield* sql`INSERT INTO work_task_manager_bindings VALUES ('a',1,'legacy-manager','raw',NULL)`;
@@ -5218,6 +5226,18 @@ it.effect(
           .join(" ");
         assert.include(plan, "SEARCH");
         assert.notInclude(plan, "TEMP B-TREE");
+      }
+      for (const operation of ["insert", "update"]) {
+        const [trigger] = yield* sql<{
+          sql: string;
+        }>`SELECT sql FROM sqlite_master WHERE type='trigger' AND name=${`work_task_wake_reservations_accepted_${operation}`}`;
+        const predicate = trigger!.sql.split("SELECT CASE WHEN ")[1]!.split(" THEN RAISE")[0]!;
+        const plan = (yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN SELECT ${predicate}
+          FROM (SELECT 'a' task_id,1 allowance_unit,'r' run_id,'m' message_id,'c' command_id,'v' reservation_id) NEW`))
+          .map((row) => row.detail)
+          .join(" ");
+        assert.include(plan, "work_task_accepted_debit_command_idx");
+        assert.notInclude(plan, "SCAN work_task_accepted_run_debits");
       }
       assert.deepStrictEqual(
         (yield* sql<{

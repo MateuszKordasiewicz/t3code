@@ -80,6 +80,7 @@ export default Effect.gen(function* () {
     UNIQUE(task_id,allowance_unit),UNIQUE(${debitTuple}),
     FOREIGN KEY(${debitTuple}) REFERENCES work_task_accepted_runs(${ownerTuple}) DEFERRABLE INITIALLY DEFERRED
   ) WITHOUT ROWID`);
+  yield* sql`CREATE INDEX work_task_accepted_debit_command_idx ON work_task_accepted_run_debits(command_id)`;
   yield* sql`CREATE INDEX work_task_accepted_task_idx ON work_task_accepted_runs(task_id,recorded_sequence DESC,run_id)`;
   yield* sql`CREATE INDEX work_task_accepted_definition_idx ON work_task_accepted_runs(task_id,accepted_definition_revision)`;
   yield* sql`CREATE INDEX work_task_accepted_group_idx ON work_task_accepted_runs(environment_id,group_id,recorded_sequence,run_id)`;
@@ -155,7 +156,7 @@ export default Effect.gen(function* () {
     AND ${integer("ownership.origin.observedDirtyGeneration", 1)} AND ${integer("ownership.origin.acknowledgedGeneration")}
     AND ${get("ownership.origin.acknowledgedGeneration")}<=${get("ownership.origin.observedDirtyGeneration")}
     AND ${get("ownership.origin.debitEvent.type")} IS 'task.allowance-debited' AND ${get("ownership.origin.debitEvent.taskId")} IS NEW.task_id
-    AND ${get("ownership.origin.debitEvent.commandId")} IS NEW.reservation_command_id AND ${get("ownership.origin.debitEvent.allowanceUnit")} IS NEW.allowance_unit
+    AND ${get("ownership.origin.debitEvent.commandId")} IS NEW.reservation_command_id AND ${get("ownership.origin.debitEvent.allowanceUnit")} IS NEW.allowance_unit AND ${integer("ownership.origin.debitEvent.allowanceUnit", 1)}
     AND ${["definitionRevision", "lifecycleRevision", "completionPolicyRevision", "actionPolicyRevision"].map((key) => `${get("ownership.origin.debitEvent." + key)} IS ${get("ownership.run.taskRevisions." + key)} AND ${integer("ownership.origin.debitEvent." + key, 1)}`).join(" AND ")}
     AND ${Object.entries(columns)
       .filter(([, v]) => v[2])
