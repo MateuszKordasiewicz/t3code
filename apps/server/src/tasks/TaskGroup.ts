@@ -43,7 +43,30 @@ type Claim = {
   readonly latestSequence: number;
   readonly release?: ReleaseFact;
 };
-type Record = ControlRecord | RootRecord | OwnerRecord | WorkRecord;
+type ReconciliationRecord = WorkTaskPersistedCoordinationEvent & {
+  readonly event: Extract<
+    WorkTaskPersistedCoordinationEvent["event"],
+    {
+      type:
+        | "task.dirty-source-recorded"
+        | "task.dirty-acknowledged"
+        | "task.reconciliation-progressed";
+    }
+  >;
+};
+type DirtyRecord = ReconciliationRecord & {
+  readonly event: Extract<
+    ReconciliationRecord["event"],
+    { type: "task.dirty-source-recorded" | "task.dirty-acknowledged" }
+  >;
+};
+type ScanRecord = ReconciliationRecord & {
+  readonly event: Extract<
+    ReconciliationRecord["event"],
+    { type: "task.reconciliation-progressed" }
+  >;
+};
+type Record = ControlRecord | RootRecord | OwnerRecord | WorkRecord | ReconciliationRecord;
 type Companion = ControlRecord & {
   readonly event: Extract<ControlRecord["event"], { type: "task-group.membership-changed" }>;
 };
@@ -66,6 +89,9 @@ type Manager = {
   readonly retired?: ControlRecord;
 };
 type State = {
+  readonly dirty: HashMap.HashMap<string, DirtyRecord>;
+  readonly dirtySources: HashMap.HashMap<string, DirtyRecord>;
+  readonly scans: HashMap.HashMap<string, ScanRecord>;
   readonly owners: HashMap.HashMap<string, Owner>;
   readonly ownerAliases: HashMap.HashMap<string, string>;
   readonly claims: HashMap.HashMap<string, Claim>;
@@ -95,6 +121,7 @@ export class GroupReplayConflict extends Schema.TaggedError<GroupReplayConflict>
   "GroupReplayConflict",
   {
     code: Schema.Literals([
+      "reconciliation",
       "ownership",
       "custody",
       "phase",
@@ -125,6 +152,9 @@ const decodeRoot = Schema.decodeUnknownSync(WorkTaskPersistedMembershipEvent);
 const decodeBatch = Schema.decodeUnknownSync(WorkTaskMembershipEventBatch);
 
 export const emptyTaskGroupControl = (environmentId: EnvironmentId): State => ({
+  dirty: HashMap.empty(),
+  dirtySources: HashMap.empty(),
+  scans: HashMap.empty(),
   owners: HashMap.empty(),
   ownerAliases: HashMap.empty(),
   claims: HashMap.empty(),
@@ -183,10 +213,10 @@ const recordFacts = (
         ? event.ownership.run.task.taskId
         : "claim" in event
           ? event.claim.binding.task.taskId
-          : event.type === "task.membership-changed"
-            ? event.snapshot.task.taskId
-            : event.type === "task-group.membership-changed"
-              ? event.task.taskId
+          : "task" in event
+            ? event.task.taskId
+            : event.type === "task.membership-changed"
+              ? event.snapshot.task.taskId
               : undefined;
     return [
       event.id,
@@ -876,4 +906,161 @@ export const reduceTaskWork = (
       release,
     }),
   };
+};
+
+export const compareTaskIdentifiers = (left: string, right: string) => {
+  let a = 0,
+    b = 0;
+  while (a < left.length && b < right.length) {
+    const x = left.codePointAt(a)!,
+      y = right.codePointAt(b)!;
+    if (x !== y) return x < y ? -1 : 1;
+    a += x > 0xffff ? 2 : 1;
+    b += y > 0xffff ? 2 : 1;
+  }
+  return a < left.length ? 1 : b < right.length ? -1 : 0;
+};
+const sourceKey = (task: string, source: string) => JSON.stringify([task, source]);
+const retainedMembership = (
+  state: State,
+  task: string,
+  generation: number,
+  group: string,
+  eventId: string,
+) => {
+  const member = get(state.memberships, key(task, generation));
+  if (!member || member.joined.group.groupId !== group) conflict("membership", eventId);
+};
+const scanTasks = (event: ScanRecord["event"]) => {
+  const tasks: string[] = [];
+  for (const row of event.visited) tasks.push("task" in row ? row.task.taskId : row.taskId);
+  return tasks;
+};
+const scanPosition = (position: ScanRecord["event"]["position"]) =>
+  position === null
+    ? null
+    : "taskId" in position
+      ? [position.taskId]
+      : [position.dependentTaskId, position.edgeId];
+const comparePosition = (a: readonly string[], b: readonly string[]) =>
+  compareTaskIdentifiers(a[0]!, b[0]!) || compareTaskIdentifiers(a[1] ?? "", b[1] ?? "");
+export const reduceTaskReconciliation = (
+  state: State,
+  inputs: readonly ReconciliationRecord[],
+): State => {
+  let candidate = state;
+  const visits: ScanRecord[] = [];
+  for (const input of inputs) {
+    let record: ReconciliationRecord;
+    try {
+      const decoded = decodeCoordination(input);
+      if (
+        decoded.event.type !== "task.dirty-source-recorded" &&
+        decoded.event.type !== "task.dirty-acknowledged" &&
+        decoded.event.type !== "task.reconciliation-progressed"
+      )
+        return conflict("envelope", input.context.eventId);
+      record = { ...decoded, event: decoded.event };
+    } catch {
+      return conflict("envelope", input.context.eventId);
+    }
+    if (preflight(candidate, [record])) continue;
+    const event = record.event;
+    if (event.type !== "task.reconciliation-progressed") {
+      const task = event.task.taskId,
+        prior = get(candidate.dirty, task),
+        currentDirty = prior?.event.dirtyGeneration ?? 0,
+        currentAck = prior?.event.acknowledgedGeneration ?? 0;
+      if (prior && prior.context.sequence >= record.context.sequence)
+        conflict("sequence", event.id);
+      if (event.membership !== null)
+        retainedMembership(
+          candidate,
+          task,
+          event.membership.membershipGeneration,
+          event.membership.group.groupId,
+          event.id,
+        );
+      const source = sourceKey(task, event.sourceEventId);
+      if (event.type === "task.dirty-source-recorded") {
+        if (
+          event.previousDirtyGeneration !== currentDirty ||
+          event.acknowledgedGeneration !== currentAck ||
+          HashMap.has(candidate.dirtySources, source)
+        )
+          conflict("reconciliation", event.id);
+      } else if (
+        event.previousAcknowledgedGeneration !== currentAck ||
+        event.dirtyGeneration !== currentDirty
+      )
+        conflict("reconciliation", event.id);
+      candidate = recordFacts(
+        candidate,
+        [record],
+        [ref(event.sourceEventId, event.sourceSequence)],
+      );
+      const narrowed = { ...record, event };
+      candidate = {
+        ...candidate,
+        dirty: HashMap.set(candidate.dirty, task, narrowed),
+        dirtySources:
+          event.type === "task.dirty-source-recorded"
+            ? HashMap.set(candidate.dirtySources, source, narrowed)
+            : candidate.dirtySources,
+      };
+      continue;
+    }
+    const scan = event.scan,
+      target = "group" in scan ? scan.group.groupId : scan.blocker.taskId;
+    const job = JSON.stringify([scan.kind, event.environmentId, target, scan.sourceEventId]),
+      prior = get(candidate.scans, job);
+    if (
+      prior &&
+      (prior.context.sequence >= record.context.sequence ||
+        prior.event.completed ||
+        !equal(prior.event.scan, scan) ||
+        prior.event.observedRevision > event.observedRevision)
+    )
+      conflict("reconciliation", event.id);
+    if (!equal(prior?.event.position ?? null, event.previousPosition))
+      conflict("reconciliation", event.id);
+    const tasks = scanTasks(event),
+      previous = scanPosition(event.previousPosition),
+      position = scanPosition(event.position);
+    for (let i = 1; i < tasks.length; i++)
+      if (compareTaskIdentifiers(tasks[i - 1]!, tasks[i]!) >= 0)
+        conflict("reconciliation", event.id);
+    if (
+      tasks.length &&
+      previous &&
+      (!position ||
+        comparePosition(position, previous) <= 0 ||
+        compareTaskIdentifiers(tasks[0]!, previous[0]!) < (scan.kind === "group_members" ? 1 : 0))
+    )
+      conflict("reconciliation", event.id);
+    if ("group" in scan) {
+      if (!HashMap.has(candidate.groups, scan.group.groupId)) conflict("group", event.id);
+      for (const row of event.visited) {
+        if (!("task" in row)) return conflict("envelope", event.id);
+        retainedMembership(
+          candidate,
+          row.task.taskId,
+          row.membershipGeneration,
+          scan.group.groupId,
+          event.id,
+        );
+      }
+    }
+    const narrowed = { ...record, event };
+    candidate = recordFacts(candidate, [record], [ref(scan.sourceEventId, scan.sourceSequence)]);
+    candidate = { ...candidate, scans: HashMap.set(candidate.scans, job, narrowed) };
+    visits.push(narrowed);
+  }
+  for (const { event } of visits)
+    for (const task of scanTasks(event)) {
+      const source = get(candidate.dirtySources, sourceKey(task, event.scan.sourceEventId));
+      if (!source || source.event.sourceSequence !== event.scan.sourceSequence)
+        conflict("reconciliation", event.id);
+    }
+  return candidate;
 };

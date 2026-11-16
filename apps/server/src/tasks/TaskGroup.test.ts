@@ -17,6 +17,8 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { runMigrations } from "../persistence/Migrations.ts";
 import {
+  reduceTaskReconciliation,
+  compareTaskIdentifiers,
   reduceTaskRunOwnership,
   reduceTaskWork,
   reconcileTaskWorkReleaseEvidence,
@@ -1547,4 +1549,290 @@ it.effect(
       assert.strictEqual(get(learned.references, "future-hold").kind, "task-group.hold-changed");
       assert.strictEqual(reduceTaskRunOwnership(learned, knownSource), learned);
     }).pipe(Effect.provide(db)),
+);
+
+const dirtyFact = (
+  taskId: string,
+  id: string,
+  sequence: number,
+  previous = 0,
+  source = "source",
+  sourceSequence = 40,
+) => {
+  const event = {
+    ...fields(id),
+    type: "task.dirty-source-recorded",
+    attribution: { type: "server" },
+    task: { environmentId: env, taskId },
+    membership: null,
+    sourceEventId: source,
+    sourceSequence,
+    previousDirtyGeneration: previous,
+    dirtyGeneration: previous + 1,
+    acknowledgedGeneration: 0,
+  };
+  const record = decodeWork({ event, context: context(event, sequence) });
+  if (record.event.type !== "task.dirty-source-recorded") throw new Error("dirty fixture");
+  return { ...record, event: record.event };
+};
+const graphProgress = (
+  id: string,
+  sequence: number,
+  visited: readonly string[],
+  patch: object = {},
+) => {
+  const event = {
+    ...fields(id),
+    type: "task.reconciliation-progressed",
+    attribution: { type: "server" },
+    scan: {
+      kind: "graph_dependents",
+      blocker: { environmentId: env, taskId: "blocker" },
+      sourceEventId: "source",
+      sourceSequence: 40,
+      capturedRevision: 1,
+    },
+    observedRevision: 1,
+    previousPosition: null,
+    position: visited.length
+      ? { dependentTaskId: visited[visited.length - 1], edgeId: "edge" }
+      : null,
+    visited: visited.map((taskId) => ({ environmentId: env, taskId })),
+    completed: true,
+    ...patch,
+  };
+  const record = decodeWork({ event, context: context(event, sequence) });
+  if (record.event.type !== "task.reconciliation-progressed") throw new Error("scan fixture");
+  return { ...record, event: record.event };
+};
+it("closes actual dirty sources atomically without treating references as records", () => {
+  const empty = emptyTaskGroupControl(env),
+    dirty = dirtyFact("task", "dirty", 60),
+    progress = graphProgress("progress", 50, ["task"]);
+  assert.throws(() => reduceTaskReconciliation(empty, [progress]), GroupReplayConflict);
+  const result = reduceTaskReconciliation(empty, [progress, dirty]);
+  assert.strictEqual(HashMap.size(empty.events), 0);
+  assert.strictEqual(HashMap.size(result.events), 2);
+  assert.deepStrictEqual(reduceTaskReconciliation(empty, [dirty, progress]), result);
+  assert.strictEqual(reduceTaskReconciliation(result, [progress, dirty]), result);
+  assert.strictEqual(compareTaskIdentifiers("\uE000", "\u{10000}"), -1);
+});
+
+const ackFact = (
+  id: string,
+  sequence: number,
+  previous: number,
+  acknowledged: number,
+  observed: number,
+  dirty: number,
+) => {
+  const event = {
+    ...fields(id),
+    type: "task.dirty-acknowledged",
+    attribution: { type: "server" },
+    task: { environmentId: env, taskId: "task" },
+    membership: null,
+    sourceEventId: "ack-source",
+    sourceSequence: 41,
+    previousAcknowledgedGeneration: previous,
+    acknowledgedGeneration: acknowledged,
+    observedDirtyGeneration: observed,
+    dirtyGeneration: dirty,
+  };
+  const record = decodeWork({ event, context: context(event, sequence) });
+  if (record.event.type !== "task.dirty-acknowledged") throw new Error("ack fixture");
+  return { ...record, event: record.event };
+};
+const writeReconciliation = Effect.fn("TaskGroupTest.writeReconciliation")(function* (
+  record: Parameters<typeof reduceTaskReconciliation>[1][number],
+) {
+  const sql = yield* SqlClient.SqlClient,
+    encoded = JSON.stringify(record.event);
+  if (record.event.type === "task.reconciliation-progressed")
+    yield* sql`INSERT INTO work_task_reconciliation_events(event_id,sequence,event_json) SELECT json_extract(${encoded},'$.id'),${record.context.sequence},${encoded}`;
+  else
+    yield* sql`INSERT INTO work_task_dirty_events(event_id,sequence,event_json) SELECT json_extract(${encoded},'$.id'),${record.context.sequence},${encoded}`;
+});
+it("preserves dirty generations across observed acknowledgements and rejects conflicting source replay", () => {
+  const empty = emptyTaskGroupControl(env),
+    first = dirtyFact("task", "dirty-1", 60),
+    second = dirtyFact("task", "dirty-2", 61, 1, "source-2", 42);
+  const two = reduceTaskReconciliation(empty, [first, second]);
+  const ack = ackFact("ack", 62, 0, 1, 1, 2),
+    partial = reduceTaskReconciliation(two, [ack]);
+  assert.strictEqual(get(partial.dirty, "task").event.dirtyGeneration, 2);
+  assert.strictEqual(get(partial.dirty, "task").event.acknowledgedGeneration, 1);
+  assert.throws(
+    () => reduceTaskReconciliation(two, [dirtyFact("task", "duplicate", 63, 2)]),
+    GroupReplayConflict,
+  );
+  assert.throws(
+    () => reduceTaskReconciliation(partial, [ackFact("stale", 63, 0, 2, 2, 2)]),
+    GroupReplayConflict,
+  );
+  const finished = reduceTaskReconciliation(partial, [ackFact("finish", 64, 1, 2, 2, 2)]);
+  assert.strictEqual(get(two.dirty, "task").event.acknowledgedGeneration, 0);
+  assert.strictEqual(reduceTaskReconciliation(finished, [first, ack]), finished);
+  const independent = reduceTaskReconciliation(finished, [dirtyFact("other", "other-dirty", 59)]);
+  assert.strictEqual(get(independent.dirty, "other").event.dirtyGeneration, 1);
+  assert.strictEqual(get(independent.dirty, "task").event.acknowledgedGeneration, 2);
+  const unfulfilled = graphProgress("ack-not-dirty", 70, ["task"], {
+    scan: {
+      kind: "graph_dependents",
+      blocker: { environmentId: env, taskId: "blocker" },
+      sourceEventId: "ack-source",
+      sourceSequence: 41,
+      capturedRevision: 1,
+    },
+  });
+  assert.throws(() => reduceTaskReconciliation(finished, [unfulfilled]), GroupReplayConflict);
+  const changed = dirtyFact("task", "dirty-1", 60, 0, "changed", 42);
+  assert.throws(() => reduceTaskReconciliation(finished, [changed]), GroupReplayConflict);
+});
+it.effect.each([false, true])(
+  "matches actual deferred scan closure with progressFirst=%s",
+  (progressFirst) =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      const ids = ["a\0\ud800", "b"],
+        group = created("g-scan", 1);
+      yield* writeControl(group);
+      let state = reduceTaskGroupControl(emptyTaskGroupControl(env), group);
+      for (const [i, id] of [...ids, "blocker"].entries()) {
+        const encoded = JSON.stringify(id);
+        yield* sql`INSERT INTO work_task_projections VALUES(json_extract(${encoded},'$'),NULL,1,1,1,1,'{}','raw','raw')`;
+        yield* sql`INSERT INTO work_task_accepted_definitions VALUES(json_extract(${encoded},'$'),1,1,'{}','{}',${`definition-scan-${i}`},'raw')`;
+        if (id === "blocker") continue;
+        const join = membership(
+          initialTask(id),
+          [get(state.groups, "g-scan").control],
+          "g-scan",
+          `scan-join-${i}`,
+          2 + i * 2,
+          [3 + i * 2],
+        );
+        yield* sql.withTransaction(writeJoin(join));
+        state = reduceTaskMembership(state, join);
+      }
+      const original = state,
+        dirty = ids.map((id, i) => dirtyFact(id, `source-${i}`, 60 + i));
+      const progress = graphProgress("members-progress", 50, ids, {
+        scan: {
+          kind: "group_members",
+          group: { environmentId: env, groupId: "g-scan" },
+          sourceEventId: "source",
+          sourceSequence: 40,
+          capturedRevision: 2,
+        },
+        observedRevision: 2,
+        position: { taskId: "b" },
+        visited: ids.map((taskId) => ({
+          task: { environmentId: env, taskId },
+          membershipGeneration: 1,
+        })),
+        completed: false,
+      });
+      assert.throws(() => reduceTaskReconciliation(state, [progress]), GroupReplayConflict);
+      const failure = yield* Effect.exit(sql.withTransaction(writeReconciliation(progress)));
+      assert.strictEqual(failure._tag, "Failure");
+      assert.deepStrictEqual(yield* sql`SELECT event_id FROM work_task_reconciliation_events`, []);
+      const batch = progressFirst ? [progress, ...dirty] : [...dirty, progress];
+      yield* sql.withTransaction(Effect.forEach(batch, writeReconciliation, { discard: true }));
+      state = reduceTaskReconciliation(state, batch);
+      assert.strictEqual(HashMap.size(original.dirtySources), 0);
+      const rows = yield* sql<{
+        event_json: string;
+      }>`SELECT event_json FROM work_task_dirty_events ORDER BY sequence`;
+      assert.deepStrictEqual(
+        rows.map((row) => JSON.parse(row.event_json)),
+        dirty.map((record) => record.event),
+      );
+      assert.strictEqual(
+        (yield* sql<{ n: number }>`SELECT count(*) n FROM work_task_reconciliation_visits`)[0]!.n,
+        2,
+      );
+      const complete = graphProgress("members-complete", 51, [], {
+        scan: progress.event.scan,
+        previousPosition: progress.event.position,
+        position: progress.event.position,
+        observedRevision: 3,
+      });
+      yield* writeReconciliation(complete);
+      state = reduceTaskReconciliation(state, [...dirty, complete]);
+      assert.strictEqual(reduceTaskReconciliation(state, batch), state);
+      const resumed = graphProgress("members-resume", 52, [], {
+        scan: progress.event.scan,
+        previousPosition: progress.event.position,
+        position: progress.event.position,
+        observedRevision: 3,
+      });
+      assert.throws(() => reduceTaskReconciliation(state, [resumed]), GroupReplayConflict);
+      assert.strictEqual((yield* Effect.exit(writeReconciliation(resumed)))._tag, "Failure");
+      const graph = graphProgress("graph-progress", 53, ids);
+      yield* writeReconciliation(graph);
+      state = reduceTaskReconciliation(state, [graph]);
+      const histories = yield* sql<{
+        event_json: string;
+      }>`SELECT event_json FROM work_task_reconciliation_events ORDER BY sequence`;
+      for (const row of histories) {
+        const event = JSON.parse(row.event_json);
+        assert.deepStrictEqual(get(state.events, event.id).event, event);
+      }
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+    }).pipe(Effect.provide(db)),
+);
+it.effect("matches SQLite lossless identifier order and source-backed graph cursor rules", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations();
+    const ids = ["x", "x\0", "\ud800", "\udfff", "\ue000", "\u{10000}", "\0x"];
+    const ordered = [...ids].sort(compareTaskIdentifiers);
+    const rows = yield* sql<{
+      value: string;
+    }>`SELECT value FROM json_each(${JSON.stringify(ids.map((id) => JSON.stringify(id)))}) ORDER BY json_extract(value,'$') COLLATE BINARY`;
+    assert.deepStrictEqual(
+      rows.map((row) => JSON.parse(row.value)),
+      ordered,
+    );
+    for (const [i, id] of [...ids, "blocker"].entries()) {
+      yield* sql`INSERT INTO work_task_projections VALUES(json_extract(${JSON.stringify(id)},'$'),NULL,1,1,1,1,'{}','raw','raw')`;
+      if (id !== "blocker") yield* writeReconciliation(dirtyFact(id, `order-dirty-${i}`, 60 + i));
+    }
+    let state = reduceTaskReconciliation(
+      emptyTaskGroupControl(env),
+      ids.map((id, i) => dirtyFact(id, `order-dirty-${i}`, 60 + i)),
+    );
+    const progress = graphProgress("ordered", 50, ordered, { completed: false });
+    yield* writeReconciliation(progress);
+    state = reduceTaskReconciliation(state, [progress]);
+    const sameTaskNextEdge = graphProgress("next-edge", 51, [ordered[ordered.length - 1]!], {
+      previousPosition: progress.event.position,
+      position: { dependentTaskId: ordered[ordered.length - 1], edgeId: "edge-z" },
+      completed: false,
+    });
+    yield* writeReconciliation(sameTaskNextEdge);
+    state = reduceTaskReconciliation(state, [sameTaskNextEdge]);
+    const bad = graphProgress("reverse-edge", 52, [ordered[ordered.length - 1]!], {
+      previousPosition: sameTaskNextEdge.event.position,
+      position: { dependentTaskId: ordered[ordered.length - 1], edgeId: "edge-a" },
+    });
+    assert.throws(() => reduceTaskReconciliation(state, [bad]), GroupReplayConflict);
+    assert.strictEqual((yield* Effect.exit(writeReconciliation(bad)))._tag, "Failure");
+    const unordered = graphProgress("unordered", 49, [...ordered].reverse());
+    assert.throws(
+      () => reduceTaskReconciliation(emptyTaskGroupControl(env), [unordered]),
+      GroupReplayConflict,
+    );
+    assert.strictEqual((yield* Effect.exit(writeReconciliation(unordered)))._tag, "Failure");
+    const changedCaptured = graphProgress("changed-captured", 53, [], {
+      scan: { ...sameTaskNextEdge.event.scan, capturedRevision: 2 },
+      observedRevision: 2,
+      previousPosition: sameTaskNextEdge.event.position,
+      position: sameTaskNextEdge.event.position,
+    });
+    assert.throws(() => reduceTaskReconciliation(state, [changedCaptured]), GroupReplayConflict);
+    assert.strictEqual((yield* Effect.exit(writeReconciliation(changedCaptured)))._tag, "Failure");
+    assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+  }).pipe(Effect.provide(db)),
 );
