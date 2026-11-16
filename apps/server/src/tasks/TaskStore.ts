@@ -245,9 +245,84 @@ const allowanceTypes = [
 ] as const;
 const custodyTypes = ["task.manager-bound", "task.manager-retired", ...allowanceTypes];
 
+const WakeState = Schema.Struct({
+  taskId: WorkTaskId,
+  dirtyGeneration: natural,
+  acknowledgedGeneration: natural,
+  overflowThroughGeneration: Schema.NullOr(positive),
+});
+const decodeWakeState = Schema.decodeEffect(WakeState);
+const WakeSource = Schema.Struct({
+  taskId: WorkTaskId,
+  kind: Schema.String,
+  sourceId: Schema.String,
+  eventId: Schema.String,
+  sequence: natural,
+  dirtyGeneration: positive,
+  retained: Schema.Literals([0, 1]),
+  reservationId: Schema.NullOr(Schema.String),
+  resultRef: Schema.NullOr(Schema.String),
+});
+const WakeParent = Schema.Struct({
+  taskId: WorkTaskId,
+  reservationId: Schema.String,
+  managerGeneration: positive,
+  reservationCommandId: Schema.String,
+  allowanceUnit: positive,
+  dirtyGeneration: positive,
+  acknowledgedGeneration: natural,
+  messageId: Schema.NullOr(Schema.String),
+  runId: Schema.NullOr(Schema.String),
+  createdAt: Schema.String,
+  claimedAt: Schema.NullOr(Schema.String),
+});
+const WakePhase = Schema.Struct({
+  taskId: WorkTaskId,
+  reservationId: Schema.String,
+  eventId: Schema.String,
+  sequence: natural,
+  kind: Schema.Literals(["reserved", "claimed", "uncertain", "acknowledged"]),
+  dirtyGeneration: positive,
+  acknowledgedGeneration: natural,
+  previousAcknowledgedGeneration: Schema.NullOr(natural),
+  observedDirtyGeneration: Schema.NullOr(positive),
+  messageId: Schema.NullOr(Schema.String),
+  runId: Schema.NullOr(Schema.String),
+  firstClaimedAt: Schema.NullOr(Schema.String),
+});
+const wakeKinds = {
+  reserved: "task.wake-reserved",
+  claimed: "task.wake-claimed",
+  uncertain: "task.wake-claim-uncertain",
+  acknowledged: "task.wake-acknowledged",
+} as const;
+const wakeTypes = ["task.wake-source-recorded", ...Object.values(wakeKinds)];
+type WakeSourceRead = typeof WakeSource.Type & { readonly source: Native };
+type WakeReservationRead = typeof WakeParent.Type & {
+  readonly reserved: Native;
+  readonly firstClaim: Native | undefined;
+  readonly latestClaim: Native | undefined;
+  readonly uncertain: Native | undefined;
+  readonly latestAcknowledged: Native | undefined;
+};
+type WakeRead = typeof WakeState.Type & {
+  readonly checkpointSequence: number;
+  readonly pending: ReadonlyArray<WakeSourceRead>;
+};
+
 export class TaskStore extends Context.Service<
   TaskStore,
   {
+    readonly readWake: (taskId: string) => Effect.Effect<WakeRead | undefined, ProjectionFailure>;
+    readonly readWakeSource: (input: {
+      taskId: string;
+      kind: string;
+      sourceId: string;
+    }) => Effect.Effect<WakeSourceRead | undefined, ProjectionFailure>;
+    readonly readWakeReservation: (input: {
+      taskId: string;
+      reservationId: string;
+    }) => Effect.Effect<WakeReservationRead | undefined, ProjectionFailure>;
     readonly applyManagerAllowance: (
       recorded: WorkTaskPersistedEvent,
     ) => Effect.Effect<
@@ -1243,6 +1318,379 @@ const make = Effect.gen(function* () {
       }),
     ).pipe(NodeSqliteClient.readOnly),
   );
+  const wakePhaseRow = Effect.fn("TaskStore.readWakePhaseRow")(function* (
+    taskId: string,
+    reservationId: string,
+    kind: (typeof WakePhase.Type)["kind"],
+    first = false,
+  ) {
+    const rows = yield* sql<{ payload: string; valid: number }>`SELECT
+      typeof(sequence)='integer' AND typeof(dirty_generation)='integer' AND typeof(acknowledged_generation)='integer' AS valid,
+      hex(json_object('taskId',task_id,'reservationId',reservation_id,'eventId',event_id,'sequence',sequence,'kind',kind,
+      'dirtyGeneration',dirty_generation,'acknowledgedGeneration',acknowledged_generation,
+      'previousAcknowledgedGeneration',previous_acknowledged_generation,'observedDirtyGeneration',observed_dirty_generation,
+      'messageId',message_id,'runId',run_id,'firstClaimedAt',first_claimed_at)) AS payload
+      FROM work_task_wake_phase_state WHERE reservation_id=json_extract(${yield* encodeProjectionJson(reservationId)},'$')
+      AND task_id=json_extract(${yield* encodeProjectionJson(taskId)},'$') AND kind=${kind}
+      ORDER BY sequence ${first ? sql.literal("ASC") : sql.literal("DESC")} LIMIT 1`;
+    return yield* stored(WakePhase, rows[0]);
+  });
+  const wakePhaseAt = Effect.fn("TaskStore.readWakePhaseAt")(function* (
+    parent: typeof WakeParent.Type,
+    row: typeof WakePhase.Type,
+    through: number,
+  ) {
+    yield* guard(
+      row.sequence <= through &&
+        row.taskId === parent.taskId &&
+        row.reservationId === parent.reservationId,
+      "legacy",
+    );
+    const native = yield* readNativeSequence({
+      taskId: row.taskId,
+      sequence: row.sequence,
+      eventId: row.eventId,
+    });
+    const event = native.recorded.event;
+    if (!("reservationCommandId" in event) || event.type !== wakeKinds[row.kind])
+      return yield* new TaskProjectionError({ code: "legacy" });
+    yield* guard(
+      event.reservationId === parent.reservationId &&
+        event.reservationCommandId === parent.reservationCommandId &&
+        event.managerGeneration === parent.managerGeneration &&
+        event.allowanceUnit === parent.allowanceUnit &&
+        event.dirtyGeneration === row.dirtyGeneration &&
+        event.acknowledgedGeneration === row.acknowledgedGeneration,
+      "legacy",
+    );
+    if (event.type === "task.wake-reserved")
+      yield* guard(
+        event.occurredAt === parent.createdAt &&
+          event.dirtyGeneration === parent.dirtyGeneration &&
+          event.acknowledgedGeneration === parent.acknowledgedGeneration,
+        "legacy",
+      );
+    if (event.type === "task.wake-claimed")
+      yield* guard(
+        event.messageId === row.messageId &&
+          event.runId === row.runId &&
+          row.messageId === parent.messageId &&
+          row.runId === parent.runId &&
+          row.firstClaimedAt === parent.claimedAt,
+        "legacy",
+      );
+    else
+      yield* guard(
+        row.messageId === null && row.runId === null && row.firstClaimedAt === null,
+        "legacy",
+      );
+    if (event.type === "task.wake-acknowledged")
+      yield* guard(
+        event.previousAcknowledgedGeneration === row.previousAcknowledgedGeneration &&
+          event.observedDirtyGeneration === row.observedDirtyGeneration,
+        "legacy",
+      );
+    else
+      yield* guard(
+        row.previousAcknowledgedGeneration === null && row.observedDirtyGeneration === null,
+        "legacy",
+      );
+    return native;
+  });
+  const wakeReservationAt = Effect.fn("TaskStore.readWakeReservationAt")(function* (
+    taskId: string,
+    reservationId: string,
+    through: number,
+  ) {
+    const rows = yield* sql<{ payload: string; valid: number }>`SELECT
+      typeof(manager_generation)='integer' AND typeof(allowance_unit)='integer' AND typeof(dirty_generation)='integer' AND typeof(acknowledged_generation)='integer' AS valid,
+      hex(json_object('taskId',task_id,'reservationId',reservation_id,'managerGeneration',manager_generation,
+      'reservationCommandId',command_id,'allowanceUnit',allowance_unit,'dirtyGeneration',dirty_generation,
+      'acknowledgedGeneration',acknowledged_generation,'messageId',message_id,'runId',run_id,'createdAt',created_at,'claimedAt',claimed_at)) AS payload
+      FROM work_task_wake_reservations WHERE reservation_id=json_extract(${yield* encodeProjectionJson(reservationId)},'$')
+      AND task_id=json_extract(${yield* encodeProjectionJson(taskId)},'$')`;
+    const parent = yield* stored(WakeParent, rows[0]);
+    const reserved = yield* wakePhaseRow(taskId, reservationId, "reserved");
+    const first = yield* wakePhaseRow(taskId, reservationId, "claimed", true);
+    const latest = yield* wakePhaseRow(taskId, reservationId, "claimed");
+    const uncertain = yield* wakePhaseRow(taskId, reservationId, "uncertain");
+    const ack = yield* wakePhaseRow(taskId, reservationId, "acknowledged");
+    if (!parent && !reserved && !first && !latest && !uncertain && !ack) return undefined;
+    if (!parent || !reserved) return yield* new TaskProjectionError({ code: "legacy" });
+    const birth = yield* wakePhaseAt(parent, reserved, through);
+    const firstClaim = first ? yield* wakePhaseAt(parent, first, through) : undefined;
+    const latestClaim = latest ? yield* wakePhaseAt(parent, latest, through) : undefined;
+    const uncertainty = uncertain ? yield* wakePhaseAt(parent, uncertain, through) : undefined;
+    const latestAcknowledged = ack ? yield* wakePhaseAt(parent, ack, through) : undefined;
+    for (const row of [first, latest, uncertain, ack])
+      if (row) yield* guard(row.sequence > reserved.sequence, "legacy");
+    if (first && latest && firstClaim) {
+      yield* guard(
+        firstClaim.recorded.event.occurredAt === parent.claimedAt &&
+          latest.sequence >= first.sequence &&
+          (latest.sequence === first.sequence || latest.dirtyGeneration > first.dirtyGeneration),
+        "legacy",
+      );
+    } else
+      yield* guard(
+        !first &&
+          !latest &&
+          parent.messageId === null &&
+          parent.runId === null &&
+          parent.claimedAt === null,
+        "legacy",
+      );
+    if (ack)
+      yield* guard(
+        latest !== undefined &&
+          ack.sequence > latest.sequence &&
+          ack.observedDirtyGeneration === latest.dirtyGeneration &&
+          ack.acknowledgedGeneration <= latest.dirtyGeneration &&
+          (uncertain === undefined || ack.sequence > uncertain.sequence),
+        "legacy",
+      );
+    return {
+      ...parent,
+      reserved: birth,
+      firstClaim,
+      latestClaim,
+      uncertain: uncertainty,
+      latestAcknowledged,
+    };
+  });
+  const wakeSourceAt = Effect.fn("TaskStore.readWakeSourceAt")(function* (
+    taskId: string,
+    kind: string,
+    sourceId: string,
+    through: number,
+  ) {
+    const task = yield* encodeProjectionJson(taskId),
+      key = yield* encodeProjectionJson(sourceId),
+      sourceKind = yield* encodeProjectionJson(kind);
+    const rows = yield* sql<{ payload: string; valid: number }>`SELECT
+      typeof(source_sequence)='integer' AND typeof(dirty_generation)='integer' AND typeof(retained_pending)='integer' AS valid,
+      hex(json_object('taskId',task_id,'kind',source_kind,'sourceId',source_id,'eventId',source_event_id,'sequence',source_sequence,
+      'dirtyGeneration',dirty_generation,'retained',retained_pending,'reservationId',original_reservation_id,'resultRef',original_result_ref)) AS payload
+      FROM work_task_wake_source_state WHERE task_id=json_extract(${task},'$') AND source_kind=json_extract(${sourceKind},'$') AND source_id=json_extract(${key},'$')`;
+    const original = yield* sql<{ payload: string; valid: number }>`SELECT 1 AS valid,
+      hex(json_object('reservationId',reservation_id,'resultRef',result_ref)) AS payload FROM work_task_wake_sources
+      WHERE task_id=json_extract(${task},'$') AND source_kind=json_extract(${sourceKind},'$') AND source_id=json_extract(${key},'$')`;
+    const row = yield* stored(WakeSource, rows[0]);
+    const parent = yield* stored(
+      Schema.Struct({
+        reservationId: Schema.NullOr(Schema.String),
+        resultRef: Schema.NullOr(Schema.String),
+      }),
+      original[0],
+    );
+    if (!row && !parent) return undefined;
+    if (!row || !parent) return yield* new TaskProjectionError({ code: "legacy" });
+    yield* guard(
+      row.sequence <= through &&
+        row.reservationId === parent.reservationId &&
+        row.resultRef === parent.resultRef,
+      "legacy",
+    );
+    const source = yield* readNativeSequence({
+      taskId,
+      sequence: row.sequence,
+      eventId: row.eventId,
+    });
+    const event = source.recorded.event;
+    if (event.type !== "task.wake-source-recorded")
+      return yield* new TaskProjectionError({ code: "legacy" });
+    yield* guard(
+      event.source.kind === kind &&
+        event.source.sourceId === sourceId &&
+        event.source.resultRef === row.resultRef &&
+        event.reservationId === row.reservationId &&
+        event.dirtyGeneration === row.dirtyGeneration,
+      "legacy",
+    );
+    if (row.reservationId !== null) {
+      const reservation = yield* wakeReservationAt(taskId, row.reservationId, through);
+      yield* guard(
+        reservation !== undefined && reservation.reserved.recorded.context.sequence < row.sequence,
+        "legacy",
+      );
+    }
+    return { ...row, source };
+  });
+  const wakePresence = Effect.fn("TaskStore.readWakePresence")(function* (
+    taskId: string,
+    includeNative: boolean,
+  ) {
+    const task = yield* encodeProjectionJson(taskId);
+    if (includeNative) {
+      const native =
+        yield* sql`SELECT 1 FROM orchestration_events WHERE aggregate_kind='task' AND stream_id=json_extract(${task},'$') LIMIT 1`;
+      if (native.length) return true;
+    }
+    for (const table of [
+      "work_task_wake_reservations",
+      "work_task_wake_sources",
+      "work_task_wake_source_state",
+      "work_task_wake_phase_state",
+      ...(includeNative
+        ? ["work_task_wake_state", "work_task_allowances", "work_task_manager_bindings"]
+        : []),
+    ]) {
+      const found =
+        yield* sql`SELECT 1 FROM ${sql(table)} WHERE task_id=json_extract(${task},'$') LIMIT 1`;
+      if (found.length) return true;
+    }
+    return false;
+  });
+  const wakeViewAt = Effect.fn("TaskStore.readWakeViewAt")(function* (taskId: string) {
+    const through = yield* projectedCheckpoint(taskId);
+    if (through === undefined) {
+      yield* guard(!(yield* wakePresence(taskId, true)), "legacy");
+      return undefined;
+    }
+    const task = yield* encodeProjectionJson(taskId);
+    const rows = yield* sql<{ payload: string; valid: number }>`SELECT
+      typeof(dirty_generation)='integer' AND typeof(acknowledged_generation)='integer' AS valid,
+      hex(json_object('taskId',task_id,'dirtyGeneration',dirty_generation,'acknowledgedGeneration',acknowledged_generation,'overflowThroughGeneration',overflow_through_generation)) AS payload
+      FROM work_task_wake_state WHERE task_id=json_extract(${task},'$')`;
+    const state = yield* stored(WakeState, rows[0]);
+    const latest: Native[] = [];
+    for (const type of wakeTypes) {
+      const value = yield* latestType(taskId, type, through);
+      if (value) latest.push(value);
+    }
+    if (!state || state.dirtyGeneration === 0) {
+      yield* guard(latest.length === 0 && !(yield* wakePresence(taskId, false)), "legacy");
+      yield* guard(
+        !state || (state.acknowledgedGeneration === 0 && state.overflowThroughGeneration === null),
+        "legacy",
+      );
+      const zero = yield* decodeWakeState({
+        taskId,
+        dirtyGeneration: 0,
+        acknowledgedGeneration: 0,
+        overflowThroughGeneration: null,
+      }).pipe(Effect.mapError(() => new TaskProjectionError({ code: "invalid" })));
+      return { ...zero, checkpointSequence: through, pending: [] };
+    }
+    const heads = yield* sql<{
+      dirty: number;
+      ack: number;
+      overflow: number | null;
+      sourceSequence: number;
+      phaseSequence: number;
+    }>`SELECT
+      COALESCE((SELECT dirty_generation FROM work_task_wake_source_state WHERE task_id=json_extract(${task},'$') ORDER BY dirty_generation DESC LIMIT 1),0) AS dirty,
+      COALESCE((SELECT acknowledged_generation FROM work_task_wake_phase_state WHERE task_id=json_extract(${task},'$') AND kind='acknowledged' ORDER BY acknowledged_generation DESC LIMIT 1),0) AS ack,
+      (SELECT dirty_generation FROM work_task_wake_source_state WHERE task_id=json_extract(${task},'$') AND retained_pending=0 AND dirty_generation>${state.acknowledgedGeneration} ORDER BY dirty_generation DESC LIMIT 1) AS overflow,
+      COALESCE((SELECT source_sequence FROM work_task_wake_source_state WHERE task_id=json_extract(${task},'$') ORDER BY source_sequence DESC LIMIT 1),0) AS sourceSequence,
+      COALESCE((SELECT sequence FROM work_task_wake_phase_state WHERE task_id=json_extract(${task},'$') ORDER BY sequence DESC LIMIT 1),0) AS phaseSequence`;
+    const head = heads[0]!;
+    yield* guard(
+      state.dirtyGeneration === head.dirty &&
+        state.acknowledgedGeneration === head.ack &&
+        state.overflowThroughGeneration === head.overflow &&
+        head.sourceSequence <= through &&
+        head.phaseSequence <= through,
+      "legacy",
+    );
+    const selected = [
+      ...(yield* sql<{ payload: string; valid: number }>`SELECT 1 AS valid,
+      hex(json_object('kind',source_kind,'sourceId',source_id)) AS payload FROM work_task_wake_source_state
+      WHERE task_id=json_extract(${task},'$') AND retained_pending=1 ORDER BY dirty_generation LIMIT 33`),
+    ];
+    for (const generation of new Set([head.dirty, head.overflow])) {
+      if (generation === null) continue;
+      const extra = yield* sql<{
+        payload: string;
+        valid: number;
+      }>`SELECT 1 AS valid, hex(json_object('kind',source_kind,'sourceId',source_id)) AS payload
+        FROM work_task_wake_source_state WHERE task_id=json_extract(${task},'$') AND dirty_generation=${generation} AND retained_pending=0`;
+      selected.push(...extra);
+    }
+    const pending: WakeSourceRead[] = [];
+    for (const raw of selected) {
+      const key = (yield* stored(
+        Schema.Struct({ kind: Schema.String, sourceId: Schema.String }),
+        raw,
+      ))!;
+      const value = yield* wakeSourceAt(taskId, key.kind, key.sourceId, through);
+      if (!value) return yield* new TaskProjectionError({ code: "legacy" });
+      if (value.retained === 1) {
+        yield* guard(value.dirtyGeneration > state.acknowledgedGeneration, "legacy");
+        pending.push(value);
+      }
+    }
+    yield* guard(pending.length <= 32 && latest.length > 0, "legacy");
+    for (const value of latest) {
+      const event = value.recorded.event;
+      if (event.type === "task.wake-source-recorded") {
+        const original = yield* wakeSourceAt(
+          taskId,
+          event.source.kind,
+          event.source.sourceId,
+          through,
+        );
+        yield* guard(
+          original !== undefined &&
+            original.sequence <= value.recorded.context.sequence &&
+            (original.sequence !== value.recorded.context.sequence ||
+              original.eventId === event.id) &&
+            original.resultRef === event.source.resultRef &&
+            original.reservationId === event.reservationId &&
+            original.dirtyGeneration === event.dirtyGeneration,
+          "legacy",
+        );
+      } else if ("reservationCommandId" in event) {
+        const reservation = yield* wakeReservationAt(taskId, event.reservationId, through);
+        if (!reservation) return yield* new TaskProjectionError({ code: "legacy" });
+        const witnesses = [
+          reservation.reserved,
+          reservation.latestClaim,
+          reservation.uncertain,
+          reservation.latestAcknowledged,
+        ];
+        yield* guard(
+          witnesses.some(
+            (witness) => witness !== undefined && NodeUtil.isDeepStrictEqual(witness, value),
+          ),
+          "legacy",
+        );
+      }
+    }
+    if (head.phaseSequence > 0) {
+      const phaseHead = yield* readNativeSequence({ taskId, sequence: head.phaseSequence });
+      yield* guard(
+        latest.some((value) => NodeUtil.isDeepStrictEqual(value, phaseHead)),
+        "legacy",
+      );
+    }
+    return { ...state, checkpointSequence: through, pending };
+  });
+  const readWake = Effect.fn("TaskStore.readWake")((taskId: string) =>
+    projectTransaction(wakeViewAt(taskId)).pipe(NodeSqliteClient.readOnly),
+  );
+  const readWakeSource = Effect.fn("TaskStore.readWakeSource")(
+    (input: { taskId: string; kind: string; sourceId: string }) =>
+      projectTransaction(
+        Effect.gen(function* () {
+          const view = yield* wakeViewAt(input.taskId);
+          return view
+            ? yield* wakeSourceAt(input.taskId, input.kind, input.sourceId, view.checkpointSequence)
+            : undefined;
+        }),
+      ).pipe(NodeSqliteClient.readOnly),
+  );
+  const readWakeReservation = Effect.fn("TaskStore.readWakeReservation")(
+    (input: { taskId: string; reservationId: string }) =>
+      projectTransaction(
+        Effect.gen(function* () {
+          const view = yield* wakeViewAt(input.taskId);
+          return view
+            ? yield* wakeReservationAt(input.taskId, input.reservationId, view.checkpointSequence)
+            : undefined;
+        }),
+      ).pipe(NodeSqliteClient.readOnly),
+  );
   const applyProjection = Effect.fn("TaskStore.applyProjection")(
     (input: WorkTaskPersistedEvent, family: "foundation" | "managerAllowance") =>
       projectTransaction(
@@ -1558,6 +2006,9 @@ const make = Effect.gen(function* () {
 
   return TaskStore.of({
     applyManagerAllowance,
+    readWake,
+    readWakeSource,
+    readWakeReservation,
     readManagerCustody,
     readManagerBinding,
     readAllowance,
