@@ -233,12 +233,12 @@ export default Effect.gen(function* () {
       WHEN 'run_settled' THEN ${object(evidence, 3)} OR ${object(evidence, 4)} OR ${object(evidence, 5)} ELSE 0 END
     ) IS NOT TRUE THEN RAISE(ABORT,'invalid physical release witness') END;
     SELECT CASE WHEN ${get(`${evidence}.type`)}='run_settled' AND (
-      ${get("run.status", "NEW.native_json")} IN ('completed','cancelled','failed','interrupted')
+      ${get("run.status", "NEW.native_json")} IN ('completed','cancelled','failed','interrupted','rolled_back')
       AND ${object(`${evidence}.attempt`, 4)} AND ${type(`${evidence}.attempt.attemptId`, "text")} AND ${type(`${evidence}.attempt.providerThreadId`, "text")}
       AND (${type(`${evidence}.attempt.providerTurnId`, "null")} OR ${type(`${evidence}.attempt.providerTurnId`, "text")})
       AND ${object(`${evidence}.attempt.terminalAttemptEvent`, 3)} AND ${get(`${evidence}.attempt.terminalAttemptEvent.type`)} IS 'run-attempt.updated'
       AND ${type(`${evidence}.attempt.terminalAttemptEvent.eventId`, "text")} AND ${integer(`${evidence}.attempt.terminalAttemptEvent.sequence`)}
-      AND ${get(`${evidence}.attempt.terminalAttemptEvent.sequence`)}<=${get("observedSequence")}
+      AND ${get(`${evidence}.attempt.terminalAttemptEvent.sequence`)} BETWEEN (SELECT accepted_sequence FROM work_task_executable_claims WHERE work_claim_id=NEW.work_claim_id) AND ${get("observedSequence")}
       AND ${witness("attempt", 9, `${evidence}.attempt.terminalAttemptEvent`, "run-attempt.updated")}
       AND ${["attemptId", "providerThreadId", "providerTurnId"].map((p) => same(get(`attempt.${p}`, "NEW.native_json"), get(`${evidence}.attempt.${p}`))).join(" AND ")}
       AND ${validTimestampSql(get("attempt.occurredAt", "NEW.native_json"))} AND ${get("attempt.status", "NEW.native_json")} IN ('completed','interrupted','failed','cancelled','superseded')
@@ -247,7 +247,7 @@ export default Effect.gen(function* () {
       AND CASE WHEN json_type(NEW.event_json,'$.releaseEvidence.interruptResult') IS NULL THEN (SELECT count(*) FROM json_each(NEW.native_json))=2
         ELSE (SELECT count(*) FROM json_each(NEW.native_json))=3 AND ${object(`${evidence}.interruptResult`, 4)} AND ${get(`${evidence}.interruptResult.type`)} IS 'turn-item.updated'
           AND ${type(`${evidence}.interruptResult.eventId`, "text")} AND ${integer(`${evidence}.interruptResult.sequence`)} AND ${type(`${evidence}.interruptResult.turnItemId`, "text")}
-          AND ${get(`${evidence}.interruptResult.sequence`)}<=${get("observedSequence")} AND ${witness("interrupt", 8, `${evidence}.interruptResult`, "turn-item.updated")}
+          AND ${get(`${evidence}.interruptResult.sequence`)} BETWEEN (SELECT accepted_sequence FROM work_task_executable_claims WHERE work_claim_id=NEW.work_claim_id) AND ${get("observedSequence")} AND ${witness("interrupt", 8, `${evidence}.interruptResult`, "turn-item.updated")}
           AND ${get("interrupt.turnItemId", "NEW.native_json")} IS ${get(`${evidence}.interruptResult.turnItemId`)} AND ${get("interrupt.itemType", "NEW.native_json")} IS 'run_interrupt_result'
           AND ${get("interrupt.threadId", "NEW.native_json")} IS (SELECT manager_thread_id FROM work_task_executable_claims WHERE work_claim_id=NEW.work_claim_id)
           AND ${validTimestampSql(get("interrupt.occurredAt", "NEW.native_json"))} END

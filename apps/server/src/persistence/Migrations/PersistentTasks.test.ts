@@ -5971,6 +5971,16 @@ const closePhysicalClaim = Effect.fn("PersistentTasks.closePhysicalClaim")(funct
   const sql = yield* SqlClient.SqlClient;
   yield* sql`UPDATE work_task_executable_claims SET release_event_id=json_extract(${JSON.stringify(release.event.id)},'$') WHERE work_claim_id=json_extract(${JSON.stringify(release.event.claim.binding.workClaimId)},'$')`;
 });
+const rejectPhysicalRelease = Effect.fn("PersistentTasks.rejectPhysicalRelease")(function* (
+  release: ReturnType<typeof physicalReleaseFixture>,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`BEGIN`;
+  yield* closePhysicalClaim(release);
+  const result = yield* Effect.exit(insertPhysicalRelease(release));
+  yield* sql`ROLLBACK`;
+  assert.isTrue(Exit.isFailure(result));
+});
 const physicalUncertainty = (
   claim: ReturnType<typeof physicalClaimFixture>,
   id: string,
@@ -6109,9 +6119,7 @@ it.effect("rejects malformed physical evidence and immutable identity replacemen
       const rows = yield* sql<{
         value: string;
       }>`SELECT json_set(${JSON.stringify(release.native)},${path},json(${JSON.stringify(value)})) value`;
-      yield* rejectOwnershipWrite(
-        insertPhysicalRelease({ ...release, native: JSON.parse(rows[0]!.value) }),
-      );
+      yield* rejectPhysicalRelease({ ...release, native: JSON.parse(rows[0]!.value) });
     }
     const settled = physicalReleaseFixture(claim, "settled", 4000, true);
     for (const [path, value] of [
@@ -6125,10 +6133,51 @@ it.effect("rejects malformed physical evidence and immutable identity replacemen
       const rows = yield* sql<{
         value: string;
       }>`SELECT json_set(${JSON.stringify(settled.native)},${path},json(${JSON.stringify(value)})) value`;
-      yield* rejectOwnershipWrite(
-        insertPhysicalRelease({ ...settled, native: JSON.parse(rows[0]!.value) }),
-      );
+      yield* rejectPhysicalRelease({ ...settled, native: JSON.parse(rows[0]!.value) });
     }
+    for (const witness of ["attempt", "interrupt"] as const) {
+      const event = JSON.parse(JSON.stringify(settled.event));
+      const native = JSON.parse(JSON.stringify(settled.native));
+      if (witness === "attempt") {
+        event.releaseEvidence.attempt.terminalAttemptEvent.sequence = 2500;
+        native.attempt.sequence = 2500;
+      } else {
+        const ref = {
+          type: "turn-item.updated",
+          eventId: "interrupt",
+          sequence: 2501,
+          turnItemId: "interrupt-item",
+        };
+        event.releaseEvidence.interruptResult = ref;
+        native.interrupt = {
+          ...ref,
+          runId: claim.claim.binding.runId,
+          threadId: claim.claim.binding.manager.threadId,
+          itemType: "run_interrupt_result",
+          occurredAt: claim.occurredAt,
+        };
+      }
+      assert.throws(() =>
+        decodePhysical({
+          event,
+          context: {
+            eventId: event.id,
+            sequence: settled.sequence,
+            commandId: event.commandId,
+            occurredAt: event.occurredAt,
+          },
+        }),
+      );
+      yield* rejectPhysicalRelease({ ...settled, event, native });
+    }
+    yield* sql`BEGIN`;
+    yield* closePhysicalClaim(settled);
+    yield* insertPhysicalRelease({
+      ...settled,
+      native: { ...settled.native, run: { ...settled.native.run, status: "rolled_back" } },
+    });
+    assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+    yield* sql`ROLLBACK`;
     for (const recursive of ["OFF", "ON"]) {
       yield* sql.unsafe(`PRAGMA recursive_triggers=${recursive}`);
       for (const operation of ["INSERT OR REPLACE", "INSERT OR IGNORE"]) {
