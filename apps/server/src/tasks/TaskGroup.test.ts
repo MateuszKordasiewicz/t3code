@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  WorkTaskPersistedEvent,
   WorkTaskPersistedCoordinationEvent,
   WorkTaskPersistedAcceptedRunOwnershipEvent,
   WorkTaskMembershipSnapshot,
@@ -16,6 +17,8 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { runMigrations } from "../persistence/Migrations.ts";
 import {
+  reduceTaskRunOwnership,
+  reduceTaskWork,
   reconcileTaskWorkReleaseEvidence,
   emptyTaskGroupControl,
   reduceTaskGroupControl,
@@ -556,6 +559,8 @@ it.effect.each([false, true])("matches actual SQL domain order with holdFirst=%s
 
 const decodeWork = Schema.decodeUnknownSync(WorkTaskPersistedCoordinationEvent);
 const decodeOwner = Schema.decodeUnknownEffect(WorkTaskPersistedAcceptedRunOwnershipEvent);
+const ownerRecord = Schema.decodeUnknownSync(WorkTaskPersistedAcceptedRunOwnershipEvent);
+const decodeDebit = Schema.decodeUnknownSync(WorkTaskPersistedEvent);
 const releaseFixture = (settled = false, interrupt = false) => {
   const binding = {
     version: 2,
@@ -768,6 +773,32 @@ const insertAcceptedRun = Effect.fn("TaskGroupTest.insertAcceptedRun")(function*
   );
 });
 
+const insertPhysicalWork = Effect.fn("TaskGroupTest.insertPhysicalWork")(function* (
+  event: unknown,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const columns = {
+    work_claim_id: "claim.binding.workClaimId",
+    run_id: "claim.binding.runId",
+    environment_id: "environmentId",
+    task_id: "claim.binding.task.taskId",
+    group_id: "claim.binding.group.groupId",
+    manager_generation: "claim.binding.manager.managerGeneration",
+    manager_thread_id: "claim.binding.manager.threadId",
+    membership_generation: "claim.binding.membershipGeneration",
+    accepted_event_id: "id",
+    accepted_sequence: "claim.acceptedSequence",
+    effect_id: "claim.binding.effectId",
+    accepted_definition_revision: "claim.binding.taskRevisions.acceptedDefinitionRevision",
+  };
+  yield* sql.unsafe(
+    `INSERT INTO work_task_executable_claims (${Object.keys(columns).join(",")},event_json)
+    SELECT ${Object.values(columns)
+      .map((path) => `json_extract(value,'$.${path}')`)
+      .join(",")},value FROM (SELECT ? value)`,
+    [JSON.stringify(event)],
+  );
+});
 const seedReleaseClaim = Effect.fn("TaskGroupTest.seedReleaseClaim")(function* (
   input: ReturnType<typeof releaseFixture>,
 ) {
@@ -869,27 +900,19 @@ const seedReleaseClaim = Effect.fn("TaskGroupTest.seedReleaseClaim")(function* (
       membership: join.root.event.snapshot,
     },
   });
-  const columns = {
-    work_claim_id: "claim.binding.workClaimId",
-    run_id: "claim.binding.runId",
-    environment_id: "environmentId",
-    task_id: "claim.binding.task.taskId",
-    group_id: "claim.binding.group.groupId",
-    manager_generation: "claim.binding.manager.managerGeneration",
-    manager_thread_id: "claim.binding.manager.threadId",
-    membership_generation: "claim.binding.membershipGeneration",
-    accepted_event_id: "id",
-    accepted_sequence: "claim.acceptedSequence",
-    effect_id: "claim.binding.effectId",
-    accepted_definition_revision: "claim.binding.taskRevisions.acceptedDefinitionRevision",
+  yield* insertPhysicalWork(claim.event);
+  if (
+    owner.event.type !== "task.run-ownership-accepted" ||
+    claim.event.type !== "task-group.work-accepted"
+  )
+    throw new Error("Expected acceptance");
+  return {
+    group,
+    join,
+    manager,
+    owner: { ...owner, event: owner.event },
+    claim: { ...claim, event: claim.event },
   };
-  yield* sql.unsafe(
-    `INSERT INTO work_task_executable_claims (${Object.keys(columns).join(",")},event_json)
-    SELECT ${Object.values(columns)
-      .map((path) => `json_extract(value,'$.${path}')`)
-      .join(",")},value FROM (SELECT ? value)`,
-    [JSON.stringify(claim.event)],
-  );
 });
 const writeReleaseEvidence = Effect.fn("TaskGroupTest.writeReleaseEvidence")(function* (
   recorded: ReturnType<typeof releaseFixture>["recorded"],
@@ -901,7 +924,7 @@ const writeReleaseEvidence = Effect.fn("TaskGroupTest.writeReleaseEvidence")(fun
     SELECT json_extract(value,'$.id'),?,json_extract(value,'$.claim.binding.workClaimId'),json_extract(value,'$.claim.binding.runId'),json_extract(value,'$.claim.binding.effectId'),json_extract(value,'$.releaseEvidence.terminalRunEvent.eventId'),json_extract(value,'$.releaseEvidence.terminalRunEvent.sequence'),value,? FROM (SELECT ? value)`,
     [recorded.context.sequence, JSON.stringify(native), JSON.stringify(recorded.event)],
   );
-  yield* sql`UPDATE work_task_executable_claims SET release_event_id='release' WHERE work_claim_id='claim'`;
+  yield* sql`UPDATE work_task_executable_claims SET release_event_id=json_extract(${JSON.stringify(recorded.event.id)},'$') WHERE work_claim_id=json_extract(${JSON.stringify(recorded.event.claim.binding.workClaimId)},'$')`;
 });
 it.effect.each([false, true])(
   "matches actual retained release evidence with settled=%s",
@@ -947,5 +970,581 @@ it.effect.each([false, true])(
       assert.deepStrictEqual(JSON.parse(row!.event_json), result.recorded.event);
       assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
       assert.deepStrictEqual(yield* runMigrations(), []);
+    }).pipe(Effect.provide(db)),
+);
+
+const workRecord = (input: unknown) => {
+  const value = decodeWork(input);
+  if (
+    value.event.type !== "task-group.work-accepted" &&
+    value.event.type !== "task-group.work-uncertain" &&
+    value.event.type !== "task-group.work-released"
+  )
+    throw new Error("Expected physical fact");
+  return { ...value, event: value.event };
+};
+const ownerRef = (record: ReturnType<typeof ownerRecord>) => {
+  if (record.event.type !== "task.run-ownership-accepted") throw new Error("Expected owner");
+  const owner = record.event.ownership,
+    origin = owner.origin;
+  return {
+    run: owner.run,
+    recorded: owner.recorded,
+    nativeRunEvent: owner.nativeAcceptance.runEvent,
+    origin:
+      origin.type === "initial_start"
+        ? origin
+        : {
+            type: origin.type,
+            reservationId: origin.reservationId,
+            reservationCommandId: origin.reservationCommandId,
+            allowanceUnit: origin.allowanceUnit,
+            debitEvent: origin.debitEvent,
+          },
+  };
+};
+const ownerObservation = (
+  owner: ReturnType<typeof ownerRecord>,
+  id: string,
+  sequence: number,
+  patch: object,
+) =>
+  ownerRecord({
+    event: {
+      id,
+      environmentId: env,
+      commandId: id,
+      occurredAt: time,
+      attribution: { type: "server" },
+      ownership: ownerRef(owner),
+      ...patch,
+    },
+    context: { eventId: id, commandId: id, occurredAt: time, sequence },
+  });
+const activateAgain = (record: ReturnType<typeof workRecord>, id: string, sequence: number) => {
+  if (record.event.type !== "task-group.work-accepted") throw new Error("Expected claim");
+  const claim = record.event.claim;
+  return workRecord({
+    event: {
+      ...record.event,
+      id,
+      commandId: id,
+      claim: {
+        ...claim,
+        acceptedEventId: id,
+        acceptedSequence: sequence,
+        binding: { ...claim.binding, workClaimId: id, effectId: id, commandId: id },
+      },
+    },
+    context: { eventId: id, commandId: id, occurredAt: time, sequence },
+  });
+};
+const releaseFor = (claim: ReturnType<typeof workRecord>, sequence: number) => {
+  if (claim.event.type !== "task-group.work-accepted") throw new Error("Expected claim");
+  const input = releaseFixture(),
+    id = `release-${claim.event.id}`,
+    terminal = {
+      type: "run.updated",
+      eventId: `terminal-${claim.event.id}`,
+      sequence: sequence - 2,
+    };
+  const recorded = workRecord({
+    event: {
+      ...input.recorded.event,
+      id,
+      claim: {
+        binding: claim.event.claim.binding,
+        acceptedEventId: claim.event.id,
+        acceptedSequence: claim.context.sequence,
+        acceptedAt: time,
+      },
+      observedSequence: sequence - 1,
+      releaseEvidence: {
+        type: "not_started",
+        terminalRunEvent: terminal,
+        settlementCommandId: "settle",
+      },
+    },
+    context: { ...input.recorded.context, eventId: id, sequence },
+  });
+  if (recorded.event.type !== "task-group.work-released") throw new Error("Expected release");
+  return {
+    recorded: { ...recorded, event: recorded.event },
+    native: {
+      run: {
+        ...input.native.run,
+        ...terminal,
+        runId: claim.event.claim.binding.runId,
+        threadId: claim.event.claim.binding.manager.threadId,
+      },
+    },
+  };
+};
+const terminateAfter = (
+  owner: ReturnType<typeof ownerRecord>,
+  release: Pick<ReturnType<typeof releaseFor>, "recorded">,
+  id: string,
+  sequence: number,
+  status = "cancelled",
+) => {
+  if (release.recorded.event.type !== "task-group.work-released")
+    throw new Error("Expected release");
+  return ownerObservation(owner, id, sequence, {
+    type: "task.run-ownership-terminated",
+    observedSequence: sequence - 1,
+    terminationEvidence: {
+      kind: "after_executable_claim",
+      terminalRunEvent: release.recorded.event.releaseEvidence.terminalRunEvent,
+      terminalStatus: status,
+      workClaimId: release.recorded.event.claim.binding.workClaimId,
+      workReleaseEvent: {
+        type: "task-group.work-released",
+        eventId: release.recorded.event.id,
+        sequence: release.recorded.context.sequence,
+      },
+    },
+  });
+};
+const pureSeed = (fixture: Effect.Success<ReturnType<typeof seedReleaseClaim>>) =>
+  reduceTaskGroupControl(
+    reduceTaskMembership(
+      reduceTaskGroupControl(emptyTaskGroupControl(env), fixture.group),
+      fixture.join,
+    ),
+    fixture.manager,
+  );
+const insertOwnerObservation = Effect.fn("TaskGroupTest.insertOwnerObservation")(function* (
+  record: ReturnType<typeof ownerRecord>,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const columns = {
+    event_id: "id",
+    run_id: "ownership.run.runId",
+    environment_id: "environmentId",
+    task_id: "ownership.run.task.taskId",
+    group_id: "ownership.run.group.groupId",
+    manager_thread_id: "ownership.run.manager.threadId",
+    kind: "type",
+    command_id: "commandId",
+    occurred_at: "occurredAt",
+    source_event_id: "sourceEventId",
+    source_sequence: "sourceSequence",
+    observed_sequence: "observedSequence",
+    terminal_event_id: "terminationEvidence.terminalRunEvent.eventId",
+    terminal_sequence: "terminationEvidence.terminalRunEvent.sequence",
+    terminal_status: "terminationEvidence.terminalStatus",
+    settlement_command_id: "terminationEvidence.settlementCommandId",
+  };
+  yield* sql.unsafe(
+    `INSERT INTO work_task_run_ownership_observations(${Object.keys(columns).join(",")},sequence,event_json,after_release_companion_id) SELECT ${Object.values(
+      columns,
+    )
+      .map((p) => `json_extract(value,'$.${p}')`)
+      .join(
+        ",",
+      )},?,value,CASE WHEN json_extract(value,'$.terminationEvidence.kind')='after_executable_claim' THEN json_extract(value,'$.id') END FROM(SELECT ? value)`,
+    [record.context.sequence, JSON.stringify(record.event)],
+  );
+});
+const insertOwnerBridge = Effect.fn("TaskGroupTest.insertOwnerBridge")(function* (
+  record: ReturnType<typeof ownerRecord>,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`INSERT INTO work_task_run_ownership_release_bridges SELECT json_extract(value,'$.id'),json_extract(value,'$.terminationEvidence.workClaimId'),json_extract(value,'$.terminationEvidence.workReleaseEvent.eventId'),json_extract(value,'$.ownership.run.runId'),json_extract(value,'$.terminationEvidence.terminalRunEvent.eventId'),json_extract(value,'$.terminationEvidence.terminalRunEvent.sequence') FROM(SELECT ${JSON.stringify(record.event)} value)`;
+});
+it.effect.each([false, true])(
+  "retains complete custody and actual closure with bridgeFirst=%s",
+  (bridgeFirst) =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient,
+        release = releaseFixture();
+      const fixture = yield* seedReleaseClaim(release);
+      let state = reduceTaskRunOwnership(pureSeed(fixture), fixture.owner);
+      const beforePhysical = state;
+      state = reduceTaskWork(state, fixture.claim);
+      const uncertain = workRecord({
+        event: {
+          ...release.recorded.event,
+          id: "uncertain",
+          type: "task-group.work-uncertain",
+          observedSequence: undefined,
+          releaseEvidence: undefined,
+          sourceEventId: "owner",
+          sourceSequence: 20,
+          reason: "lost reply",
+        },
+        context: { ...release.recorded.context, eventId: "uncertain", sequence: 31 },
+      });
+      state = reduceTaskWork(state, uncertain);
+      const occupied = state,
+        closure = terminateAfter(fixture.owner, release, "owner-terminal", 35);
+      assert.throws(() => reduceTaskRunOwnership(state, closure), GroupReplayConflict);
+      assert.strictEqual(reduceTaskWork(state, fixture.claim), state);
+      state = reduceTaskWork(state, release);
+      assert.throws(
+        () =>
+          reduceTaskRunOwnership(
+            state,
+            terminateAfter(fixture.owner, release, "wrong-status", 35, "failed"),
+          ),
+        GroupReplayConflict,
+      );
+      state = reduceTaskRunOwnership(state, closure);
+      assert.strictEqual(reduceTaskRunOwnership(state, fixture.owner), state);
+      assert.strictEqual(reduceTaskWork(state, release), state);
+      assert.strictEqual(HashMap.size(occupied.activeWork), 3);
+      assert.strictEqual(HashMap.size(state.activeWork), 0);
+      assert.strictEqual(HashMap.size(beforePhysical.claims), 0);
+      assert.strictEqual(HashMap.size(state.claims), 1);
+      assert.throws(
+        () =>
+          reduceTaskWork(state, {
+            ...release,
+            native: { run: { ...release.native.run, status: "failed" } },
+          }),
+        GroupReplayConflict,
+      );
+      assert.throws(
+        () => reduceTaskWork(state, activateAgain(fixture.claim, "after-terminal", 40)),
+        GroupReplayConflict,
+      );
+      yield* sql.withTransaction(writeReleaseEvidence(release.recorded, release.native));
+      yield* sql.withTransaction(insertOwnerObservation(closure)).pipe(Effect.flip);
+      assert.deepStrictEqual(
+        yield* sql`SELECT event_id FROM work_task_run_ownership_observations`,
+        [],
+      );
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          if (bridgeFirst) yield* insertOwnerBridge(closure);
+          yield* insertOwnerObservation(closure);
+          if (!bridgeFirst) yield* insertOwnerBridge(closure);
+        }),
+      );
+      const [row] = yield* sql<{
+        event_json: string;
+      }>`SELECT event_json FROM work_task_run_ownership_observations`;
+      assert.deepStrictEqual(JSON.parse(row!.event_json), closure.event);
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+    }).pipe(Effect.provide(db)),
+);
+it.effect("rejects stale same-run closure and preserves historical basis and source roles", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const fixture = yield* seedReleaseClaim(releaseFixture());
+    const base = reduceTaskRunOwnership(pureSeed(fixture), fixture.owner);
+    const first = reduceTaskWork(base, fixture.claim),
+      r1 = releaseFor(fixture.claim, 40);
+    const closed1 = reduceTaskWork(first, r1),
+      c2 = activateAgain(fixture.claim, "claim2", 50),
+      r2 = releaseFor(c2, 60);
+    const active2 = reduceTaskWork(closed1, c2);
+    yield* sql.withTransaction(writeReleaseEvidence(r1.recorded, r1.native));
+    yield* insertPhysicalWork(c2.event);
+    yield* insertOwnerBridge(terminateAfter(fixture.owner, r1, "sql-stale-active", 70)).pipe(
+      Effect.flip,
+    );
+    assert.throws(
+      () => reduceTaskRunOwnership(active2, terminateAfter(fixture.owner, r1, "stale", 70)),
+      GroupReplayConflict,
+    );
+    const closed2 = reduceTaskWork(active2, r2);
+    yield* sql.withTransaction(writeReleaseEvidence(r2.recorded, r2.native));
+    yield* insertOwnerBridge(terminateAfter(fixture.owner, r1, "sql-stale-closed", 70)).pipe(
+      Effect.flip,
+    );
+    const finalRecord = terminateAfter(fixture.owner, r2, "sql-final", 70);
+    yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* insertOwnerObservation(finalRecord);
+        yield* insertOwnerBridge(finalRecord);
+      }),
+    );
+    assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+    assert.throws(
+      () => reduceTaskRunOwnership(closed2, terminateAfter(fixture.owner, r1, "stale", 70)),
+      GroupReplayConflict,
+    );
+    const done = reduceTaskRunOwnership(closed2, terminateAfter(fixture.owner, r2, "done", 70));
+    assert.strictEqual(HashMap.size(done.claims), 2);
+    assert.throws(
+      () => reduceTaskWork(closed1, activateAgain(fixture.claim, "overlap", 35)),
+      GroupReplayConflict,
+    );
+    assert.throws(() => reduceTaskWork(first, c2), GroupReplayConflict);
+    const held = controlChange(
+      fixture.manager.event.control,
+      "hold",
+      100,
+      { dispatchHold: "paused" },
+      "task-group.hold-changed",
+    );
+    const moved = membership(
+      fixture.join.root.event.snapshot,
+      [held.event.control],
+      null,
+      "remove",
+      110,
+      [111],
+    );
+    const later = reduceTaskMembership(reduceTaskGroupControl(base, held), moved);
+    const historical = reduceTaskWork(later, fixture.claim);
+    assert.deepStrictEqual(historical.groups, later.groups);
+    assert.deepStrictEqual(historical.tasks, later.tasks);
+    assert.strictEqual(HashMap.size(historical.activeWork), 3);
+    const ownerUncertain = ownerObservation(fixture.owner, "owner-uncertain", 25, {
+      type: "task.run-ownership-uncertain",
+      sourceEventId: "owner",
+      sourceSequence: 20,
+      reason: "pending",
+    });
+    const observed = reduceTaskRunOwnership(later, ownerUncertain);
+    assert.strictEqual(get(observed.owners, "run").latestSequence, 25);
+    assert.strictEqual(observed.observedMaximum, 111);
+    const sourceOwner = ownerRecord({
+      ...fixture.owner,
+      event: {
+        ...fixture.owner.event,
+        ownership: {
+          ...fixture.owner.event.ownership,
+          sourceEventId: "future-control",
+          origin: {
+            type: "initial_start",
+            startCommandId: "start",
+            startEventId: "future-control",
+            startSequence: 10,
+          },
+        },
+      },
+    });
+    const sourceState = reduceTaskRunOwnership(pureSeed(fixture), sourceOwner);
+    const futureControl = controlChange(
+      fixture.manager.event.control,
+      "future-control",
+      10,
+      { dispatchHold: "paused" },
+      "task-group.hold-changed",
+    );
+    const enriched = reduceTaskGroupControl(sourceState, futureControl);
+    assert.strictEqual(get(enriched.references, "future-control").taskId, "task");
+    assert.strictEqual(get(enriched.references, "future-control").kind, "task-group.hold-changed");
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect(
+  "preserves original automatic debit and before-claim termination without a new charge",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient,
+        fixture = yield* seedReleaseClaim(releaseFixture());
+      const debit = decodeDebit({
+        event: {
+          id: "debit",
+          type: "task.allowance-debited",
+          taskId: "task",
+          commandId: "reservation-command",
+          occurredAt: time,
+          definitionRevision: 1,
+          lifecycleRevision: 1,
+          completionPolicyRevision: 1,
+          actionPolicyRevision: 1,
+          attribution: { type: "server" },
+          previous: { type: "configured", cap: 1, consumed: 0 },
+          resulting: { type: "configured", cap: 1, consumed: 1 },
+          allowanceUnit: 1,
+        },
+        context: {
+          eventId: "debit",
+          commandId: "reservation-command",
+          occurredAt: time,
+          sequence: 23,
+        },
+      });
+      const original = fixture.owner.event.ownership;
+      const owner = ownerRecord({
+        event: {
+          ...fixture.owner.event,
+          id: "automatic-owner",
+          commandId: "record-auto",
+          ownership: {
+            ...original,
+            run: { ...original.run, runId: "auto-run", messageId: "auto-message" },
+            recorded: {
+              eventId: "automatic-owner",
+              commandId: "record-auto",
+              occurredAt: time,
+              sequence: 25,
+            },
+            nativeAcceptance: {
+              ...original.nativeAcceptance,
+              receipt: {
+                ...original.nativeAcceptance.receipt,
+                commandId: "auto-native",
+                resultSequence: 22,
+              },
+              runEvent: { type: "run.created", eventId: "auto-run-event", sequence: 21 },
+              messageEvent: {
+                type: "message.updated",
+                eventId: "auto-message-event",
+                sequence: 22,
+              },
+            },
+            origin: {
+              type: "automatic_followup",
+              reservationId: "reservation",
+              reservationCommandId: "reservation-command",
+              allowanceUnit: 1,
+              observedDirtyGeneration: 1,
+              acknowledgedGeneration: 0,
+              pending: { sources: [], overflowThroughGeneration: null },
+              debitEvent: {
+                type: "task.allowance-debited",
+                eventId: "debit",
+                sequence: 23,
+                commandId: "reservation-command",
+                taskId: "task",
+                definitionRevision: 1,
+                lifecycleRevision: 1,
+                completionPolicyRevision: 1,
+                actionPolicyRevision: 1,
+                allowanceUnit: 1,
+              },
+            },
+          },
+        },
+        context: {
+          eventId: "automatic-owner",
+          commandId: "record-auto",
+          occurredAt: time,
+          sequence: 25,
+        },
+      });
+      if (owner.event.type !== "task.run-ownership-accepted") throw new Error("Expected owner");
+      const input = freeze(owner),
+        snapshot = structuredClone(input);
+      let state = reduceTaskRunOwnership(
+        reduceTaskRunOwnership(pureSeed(fixture), fixture.owner),
+        input,
+      );
+      assert.deepStrictEqual(input, snapshot);
+      assert.strictEqual(HashMap.size(state.activeWork), 0);
+      const duplicate = ownerRecord({
+        event: {
+          ...owner.event,
+          id: "second-owner",
+          commandId: "second-owner",
+          ownership: {
+            ...owner.event.ownership,
+            recorded: {
+              eventId: "second-owner",
+              commandId: "second-owner",
+              occurredAt: time,
+              sequence: 29,
+            },
+            run: { ...owner.event.ownership.run, runId: "second-run", messageId: "second-message" },
+            nativeAcceptance: {
+              ...owner.event.ownership.nativeAcceptance,
+              runEvent: { type: "run.created", eventId: "second-run-event", sequence: 26 },
+              messageEvent: {
+                type: "message.updated",
+                eventId: "second-message-event",
+                sequence: 27,
+              },
+              receipt: { ...owner.event.ownership.nativeAcceptance.receipt, resultSequence: 27 },
+            },
+          },
+        },
+        context: {
+          eventId: "second-owner",
+          commandId: "second-owner",
+          occurredAt: time,
+          sequence: 29,
+        },
+      });
+      assert.throws(() => reduceTaskRunOwnership(state, duplicate), GroupReplayConflict);
+      const before = ownerObservation(owner, "before-terminal", 29, {
+        type: "task.run-ownership-terminated",
+        observedSequence: 28,
+        terminationEvidence: {
+          kind: "before_executable_claim",
+          terminalRunEvent: { type: "run.updated", eventId: "auto-terminal", sequence: 24 },
+          terminalStatus: "cancelled",
+          settlementCommandId: "settle",
+        },
+      });
+      const terminated = reduceTaskRunOwnership(state, before);
+      assert.strictEqual(HashMap.size(terminated.claims), 0);
+      assert.strictEqual(HashMap.size(state.terminalOwners), 0);
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* insertAcceptedRun(owner.event);
+          yield* sql`INSERT INTO work_task_accepted_run_debits(event_id,run_id,sequence,task_id,command_id,allowance_unit,definition_revision,lifecycle_revision,completion_policy_revision,action_policy_revision,occurred_at,event_json)
+      SELECT json_extract(value,'$.id'),'auto-run',23,json_extract(value,'$.taskId'),json_extract(value,'$.commandId'),json_extract(value,'$.allowanceUnit'),1,1,1,1,json_extract(value,'$.occurredAt'),value FROM(SELECT ${JSON.stringify(debit.event)} value)`;
+        }),
+      );
+      yield* insertOwnerObservation(before);
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+      const autoClaim = workRecord({
+        event: {
+          ...fixture.claim.event,
+          id: "auto-claim",
+          commandId: "activate-auto",
+          claim: {
+            ...fixture.claim.event.claim,
+            acceptedEventId: "auto-claim",
+            acceptedSequence: 40,
+            sourceEventId: "automatic-owner",
+            sourceSequence: 25,
+            observedWorkSequence: 25,
+            binding: {
+              ...fixture.claim.event.claim.binding,
+              runId: "auto-run",
+              messageId: "auto-message",
+              workClaimId: "auto-claim",
+              effectId: "auto-effect",
+              commandId: "activate-auto",
+            },
+            launchOrigin: {
+              type: "automatic_followup",
+              reservationId: "reservation",
+              reservationCommandId: "reservation-command",
+              allowanceUnit: 1,
+              observedDirtyGeneration: 1,
+              acknowledgedGeneration: 0,
+            },
+          },
+        },
+        context: {
+          eventId: "auto-claim",
+          commandId: "activate-auto",
+          occurredAt: time,
+          sequence: 40,
+        },
+      });
+      assert.throws(() => reduceTaskWork(terminated, autoClaim), GroupReplayConflict);
+      state = reduceTaskWork(state, autoClaim);
+      assert.strictEqual(HashMap.size(state.activeWork), 3);
+      assert.strictEqual(
+        get(state.owners, "auto-run").record.event.ownership.origin.type,
+        "automatic_followup",
+      );
+      assert.throws(() => reduceTaskRunOwnership(state, before), GroupReplayConflict);
+      const knownSource = ownerObservation(fixture.owner, "known-source", 60, {
+        type: "task.run-ownership-uncertain",
+        sourceEventId: "future-hold",
+        sourceSequence: 50,
+        reason: "source only",
+      });
+      const known = reduceTaskRunOwnership(state, knownSource);
+      const hold = controlChange(
+        fixture.manager.event.control,
+        "future-hold",
+        50,
+        { dispatchHold: "paused" },
+        "task-group.hold-changed",
+      );
+      const learned = reduceTaskGroupControl(known, hold);
+      assert.strictEqual(get(learned.references, "future-hold").kind, "task-group.hold-changed");
+      assert.strictEqual(reduceTaskRunOwnership(learned, knownSource), learned);
     }).pipe(Effect.provide(db)),
 );

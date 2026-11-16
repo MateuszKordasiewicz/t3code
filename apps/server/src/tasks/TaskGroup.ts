@@ -1,5 +1,7 @@
 import * as NodeUtil from "node:util";
 import {
+  WorkTaskPersistedAcceptedRunOwnershipEvent,
+  type WorkTaskAcceptedRunIdentityV2,
   WorkTaskAcceptedWorkClaim,
   WorkTaskPersistedCoordinationEvent,
   WorkTaskMembershipEventBatch,
@@ -14,14 +16,45 @@ import * as Option from "effect/Option";
 
 type ControlRecord = WorkTaskPersistedGroupControlEvent;
 type RootRecord = WorkTaskPersistedMembershipEvent;
-type Record = ControlRecord | RootRecord;
+type OwnerRecord = WorkTaskPersistedAcceptedRunOwnershipEvent;
+type OwnerAccepted = OwnerRecord & {
+  readonly event: Extract<OwnerRecord["event"], { type: "task.run-ownership-accepted" }>;
+};
+type OwnerTerminal = OwnerRecord & {
+  readonly event: Extract<OwnerRecord["event"], { type: "task.run-ownership-terminated" }>;
+};
+type WorkRecord = WorkTaskPersistedCoordinationEvent & {
+  readonly event: Extract<
+    WorkTaskPersistedCoordinationEvent["event"],
+    { type: "task-group.work-accepted" | "task-group.work-uncertain" | "task-group.work-released" }
+  >;
+};
+type WorkAccepted = WorkRecord & {
+  readonly event: Extract<WorkRecord["event"], { type: "task-group.work-accepted" }>;
+};
+type ReleaseFact = ReturnType<typeof reconcileTaskWorkReleaseEvidence>;
+type Owner = {
+  readonly record: OwnerAccepted;
+  readonly latestSequence: number;
+  readonly terminal?: OwnerTerminal;
+};
+type Claim = {
+  readonly record: WorkAccepted;
+  readonly latestSequence: number;
+  readonly release?: ReleaseFact;
+};
+type Record = ControlRecord | RootRecord | OwnerRecord | WorkRecord;
 type Companion = ControlRecord & {
   readonly event: Extract<ControlRecord["event"], { type: "task-group.membership-changed" }>;
 };
 type Batch = { readonly root: RootRecord; readonly companions: readonly Companion[] };
 type CurrentMember = NonNullable<WorkTaskMembershipSnapshot["currentMembership"]>;
 type RetiredMember = NonNullable<RootRecord["event"]["retiredMembership"]>;
-type Reference = { readonly sequence: number; readonly kind?: string; readonly taskId?: string };
+type Reference = {
+  readonly sequence: number;
+  readonly kind?: string | undefined;
+  readonly taskId?: string | undefined;
+};
 type Group = {
   readonly control: ControlRecord["event"]["control"];
   readonly sequence: number;
@@ -33,6 +66,15 @@ type Manager = {
   readonly retired?: ControlRecord;
 };
 type State = {
+  readonly owners: HashMap.HashMap<string, Owner>;
+  readonly ownerAliases: HashMap.HashMap<string, string>;
+  readonly claims: HashMap.HashMap<string, Claim>;
+  readonly effects: HashMap.HashMap<string, string>;
+  readonly activeWork: HashMap.HashMap<string, string>;
+  readonly latestWork: HashMap.HashMap<string, string>;
+  readonly latestRunWork: HashMap.HashMap<string, string>;
+  readonly terminalOwners: HashMap.HashMap<string, string>;
+  readonly nativeEvidence: HashMap.HashMap<string, unknown>;
   readonly environmentId: EnvironmentId;
   readonly groups: HashMap.HashMap<string, Group>;
   readonly managers: HashMap.HashMap<string, Manager>;
@@ -53,6 +95,9 @@ export class GroupReplayConflict extends Schema.TaggedError<GroupReplayConflict>
   "GroupReplayConflict",
   {
     code: Schema.Literals([
+      "ownership",
+      "custody",
+      "phase",
       "native_evidence",
       "envelope",
       "environment",
@@ -80,6 +125,15 @@ const decodeRoot = Schema.decodeUnknownSync(WorkTaskPersistedMembershipEvent);
 const decodeBatch = Schema.decodeUnknownSync(WorkTaskMembershipEventBatch);
 
 export const emptyTaskGroupControl = (environmentId: EnvironmentId): State => ({
+  owners: HashMap.empty(),
+  ownerAliases: HashMap.empty(),
+  claims: HashMap.empty(),
+  effects: HashMap.empty(),
+  activeWork: HashMap.empty(),
+  latestWork: HashMap.empty(),
+  latestRunWork: HashMap.empty(),
+  terminalOwners: HashMap.empty(),
+  nativeEvidence: HashMap.empty(),
   environmentId,
   groups: HashMap.empty(),
   managers: HashMap.empty(),
@@ -113,37 +167,56 @@ const preflight = (state: State, records: readonly Record[]) => {
   return known === records.length;
 };
 
-const recordFacts = (state: State, records: readonly Record[]): State => {
+type SourceReference = readonly [string, Reference];
+const recordFacts = (
+  state: State,
+  records: readonly Record[],
+  extra: readonly SourceReference[] = [],
+): State => {
   let events = state.events,
     references = state.references,
     referenceSequences = state.referenceSequences;
   let observedMaximum = state.observedMaximum;
-  for (const record of records) {
-    const { event, context } = record;
+  const own: SourceReference[] = records.map(({ event, context }) => {
     const taskId =
-      event.type === "task.membership-changed"
-        ? event.snapshot.task.taskId
-        : event.type === "task-group.membership-changed"
-          ? event.task.taskId
-          : undefined;
-    const prior = get(references, event.id),
-      alias = get(referenceSequences, context.sequence);
+      "ownership" in event
+        ? event.ownership.run.task.taskId
+        : "claim" in event
+          ? event.claim.binding.task.taskId
+          : event.type === "task.membership-changed"
+            ? event.snapshot.task.taskId
+            : event.type === "task-group.membership-changed"
+              ? event.task.taskId
+              : undefined;
+    return [
+      event.id,
+      { sequence: context.sequence, kind: event.type, ...(taskId === undefined ? {} : { taskId }) },
+    ];
+  });
+  for (const [id, ref] of [...own, ...extra]) {
+    const prior = get(references, id),
+      alias = get(referenceSequences, ref.sequence);
     if (
       (prior &&
-        (prior.sequence !== context.sequence ||
-          (prior.kind !== undefined && prior.kind !== event.type) ||
-          (prior.taskId !== undefined && prior.taskId !== taskId))) ||
-      (alias !== undefined && alias !== event.id)
+        (prior.sequence !== ref.sequence ||
+          (prior.kind !== undefined && ref.kind !== undefined && prior.kind !== ref.kind) ||
+          (prior.taskId !== undefined &&
+            ref.taskId !== undefined &&
+            prior.taskId !== ref.taskId))) ||
+      (alias !== undefined && alias !== id)
     )
-      conflict("reference", event.id);
-    references = HashMap.set(references, event.id, {
-      sequence: context.sequence,
-      kind: event.type,
-      ...(taskId === undefined ? {} : { taskId }),
+      conflict("reference", id);
+    references = HashMap.set(references, id, {
+      ...prior,
+      ...ref,
+      kind: ref.kind ?? prior?.kind,
+      taskId: ref.taskId ?? prior?.taskId,
     });
-    referenceSequences = HashMap.set(referenceSequences, context.sequence, event.id);
-    events = HashMap.set(events, event.id, record);
-    observedMaximum = Math.max(observedMaximum ?? context.sequence, context.sequence);
+    referenceSequences = HashMap.set(referenceSequences, ref.sequence, id);
+  }
+  for (const record of records) {
+    events = HashMap.set(events, record.event.id, record);
+    observedMaximum = Math.max(observedMaximum ?? record.context.sequence, record.context.sequence);
   }
   return { ...state, events, references, referenceSequences, observedMaximum };
 };
@@ -418,4 +491,389 @@ export const reconcileTaskWorkReleaseEvidence = (
     } else if (native.interrupt !== undefined) return conflict("native_evidence", event.id);
   }
   return { recorded: { ...recorded, event }, native };
+};
+
+const decodeOwnership = Schema.decodeUnknownSync(WorkTaskPersistedAcceptedRunOwnershipEvent);
+const equal = NodeUtil.isDeepStrictEqual;
+const ref = (
+  eventId: string,
+  sequence: number,
+  kind?: string,
+  taskId?: string,
+): SourceReference => [eventId, { sequence, kind, taskId }];
+const journalRef = (
+  value: { readonly eventId: string; readonly sequence: number; readonly type: string },
+  taskId: string,
+) => ref(value.eventId, value.sequence, value.type, taskId);
+const ownerReference = (owner: OwnerAccepted["event"]["ownership"]) => {
+  const origin = owner.origin;
+  return {
+    run: owner.run,
+    recorded: owner.recorded,
+    nativeRunEvent: owner.nativeAcceptance.runEvent,
+    origin:
+      origin.type === "initial_start"
+        ? origin
+        : {
+            type: origin.type,
+            reservationId: origin.reservationId,
+            reservationCommandId: origin.reservationCommandId,
+            allowanceUnit: origin.allowanceUnit,
+            debitEvent: origin.debitEvent,
+          },
+  };
+};
+const ownershipRefs = (record: OwnerRecord): SourceReference[] => {
+  const event = record.event,
+    value = event.ownership,
+    task = value.run.task.taskId,
+    origin = value.origin;
+  const refs: SourceReference[] = [
+    ref(value.recorded.eventId, value.recorded.sequence, "task.run-ownership-accepted", task),
+  ];
+  refs.push(
+    journalRef(
+      event.type === "task.run-ownership-accepted"
+        ? event.ownership.nativeAcceptance.runEvent
+        : event.ownership.nativeRunEvent,
+      task,
+    ),
+  );
+  refs.push(
+    origin.type === "initial_start"
+      ? ref(origin.startEventId, origin.startSequence, undefined, task)
+      : journalRef(origin.debitEvent, task),
+  );
+  if (event.type === "task.run-ownership-accepted") {
+    refs.push(
+      journalRef(event.ownership.nativeAcceptance.messageEvent, task),
+      ref(event.ownership.sourceEventId, event.ownership.sourceSequence),
+    );
+    for (const witness of event.ownership.prerequisites)
+      refs.push(
+        ref(
+          witness.completionEventId,
+          witness.completionSequence,
+          "task.completed",
+          witness.blocker.taskId,
+        ),
+      );
+  } else if (event.type === "task.run-ownership-uncertain")
+    refs.push(ref(event.sourceEventId, event.sourceSequence));
+  else {
+    refs.push(journalRef(event.terminationEvidence.terminalRunEvent, task));
+    if (event.terminationEvidence.kind === "after_executable_claim")
+      refs.push(journalRef(event.terminationEvidence.workReleaseEvent, task));
+  }
+  return refs;
+};
+const retainedBasis = (state: State, run: WorkTaskAcceptedRunIdentityV2, id: string) => {
+  const manager = get(state.managers, key(run.group.groupId, run.manager.managerGeneration));
+  const member = get(state.memberships, key(run.task.taskId, run.membershipGeneration));
+  if (
+    !manager ||
+    manager.threadId !== run.manager.threadId ||
+    !member ||
+    !equal(member.joined.group, run.group)
+  )
+    return conflict("ownership", id);
+  return member.joined;
+};
+const originalAliases = (owner: OwnerAccepted["event"]["ownership"]) => {
+  const native = owner.nativeAcceptance,
+    origin = owner.origin;
+  return [
+    JSON.stringify(["message", owner.run.messageId]),
+    JSON.stringify(["native_run", native.runEvent.eventId]),
+    JSON.stringify(["native_message", native.messageEvent.eventId]),
+    ...(origin.type === "initial_start"
+      ? []
+      : [
+          JSON.stringify(["reservation", origin.reservationId]),
+          JSON.stringify(["reservation_command", origin.reservationCommandId]),
+          JSON.stringify(["debit", origin.debitEvent.eventId]),
+          JSON.stringify(["unit", owner.run.task.taskId, origin.allowanceUnit]),
+        ]),
+  ];
+};
+export const reduceTaskRunOwnership = (state: State, input: OwnerRecord): State => {
+  let record: OwnerRecord;
+  try {
+    record = decodeOwnership(input);
+  } catch {
+    return conflict("envelope", input.context.eventId);
+  }
+  if (preflight(state, [record])) return state;
+  let candidate = recordFacts(state, [record], ownershipRefs(record));
+  const event = record.event,
+    runId = event.ownership.run.runId,
+    owner = get(state.owners, runId);
+  if (event.type === "task.run-ownership-accepted") {
+    if (owner) return conflict("ownership", event.id);
+    retainedBasis(state, event.ownership.run, event.id);
+    let aliases = state.ownerAliases;
+    for (const alias of originalAliases(event.ownership)) {
+      if (HashMap.has(aliases, alias)) conflict("ownership", event.id);
+      aliases = HashMap.set(aliases, alias, runId);
+    }
+    return {
+      ...candidate,
+      ownerAliases: aliases,
+      owners: HashMap.set(state.owners, runId, {
+        record: { ...record, event },
+        latestSequence: record.context.sequence,
+      }),
+    };
+  }
+  if (
+    !owner ||
+    owner.terminal ||
+    record.context.sequence <= owner.latestSequence ||
+    !equal(event.ownership, ownerReference(owner.record.event.ownership))
+  )
+    return conflict("ownership", event.id);
+  if (event.type === "task.run-ownership-uncertain")
+    return {
+      ...candidate,
+      owners: HashMap.set(state.owners, runId, {
+        ...owner,
+        latestSequence: record.context.sequence,
+      }),
+    };
+  const evidence = event.terminationEvidence,
+    latestId = get(state.latestRunWork, runId);
+  if (HashMap.has(state.terminalOwners, evidence.terminalRunEvent.eventId))
+    return conflict("ownership", event.id);
+  if (evidence.kind === "before_executable_claim") {
+    if (latestId !== undefined) return conflict("custody", event.id);
+  } else {
+    const latest = latestId === undefined ? undefined : get(state.claims, latestId),
+      release = latest?.release;
+    if (
+      !latest ||
+      latestId !== evidence.workClaimId ||
+      !release ||
+      release.recorded.event.id !== evidence.workReleaseEvent.eventId ||
+      release.recorded.context.sequence !== evidence.workReleaseEvent.sequence ||
+      !equal(release.recorded.event.releaseEvidence.terminalRunEvent, evidence.terminalRunEvent) ||
+      release.native.run.status !== evidence.terminalStatus ||
+      resources(latest.record.event.claim.binding).some(
+        (resource) => get(state.activeWork, resource) === latestId,
+      )
+    )
+      return conflict("custody", event.id);
+  }
+  candidate = {
+    ...candidate,
+    terminalOwners: HashMap.set(state.terminalOwners, evidence.terminalRunEvent.eventId, runId),
+  };
+  return {
+    ...candidate,
+    owners: HashMap.set(state.owners, runId, {
+      ...owner,
+      latestSequence: record.context.sequence,
+      terminal: { ...record, event },
+    }),
+  };
+};
+const resources = (binding: WorkAccepted["event"]["claim"]["binding"]) => [
+  JSON.stringify(["group", binding.group.groupId]),
+  JSON.stringify(["task", binding.task.taskId]),
+  JSON.stringify(["thread", binding.manager.threadId]),
+];
+const claimReference = (claim: WorkAccepted["event"]["claim"]) => ({
+  binding: claim.binding,
+  acceptedEventId: claim.acceptedEventId,
+  acceptedSequence: claim.acceptedSequence,
+  acceptedAt: claim.acceptedAt,
+});
+const physicalRefs = (record: WorkRecord, owner: Owner): SourceReference[] => {
+  const event = record.event,
+    task = event.claim.binding.task.taskId;
+  const refs: SourceReference[] = [
+    ref(
+      event.claim.acceptedEventId,
+      event.claim.acceptedSequence,
+      "task-group.work-accepted",
+      task,
+    ),
+  ];
+  if (event.type === "task-group.work-accepted") {
+    refs.push(
+      ref(event.claim.sourceEventId, event.claim.sourceSequence),
+      ref(
+        owner.record.event.id,
+        owner.record.context.sequence,
+        "task.run-ownership-accepted",
+        task,
+      ),
+    );
+    const origin = owner.record.event.ownership.origin;
+    refs.push(
+      origin.type === "initial_start"
+        ? ref(origin.startEventId, origin.startSequence, undefined, task)
+        : journalRef(origin.debitEvent, task),
+    );
+    for (const witness of event.claim.prerequisites)
+      refs.push(
+        ref(
+          witness.completionEventId,
+          witness.completionSequence,
+          "task.completed",
+          witness.blocker.taskId,
+        ),
+      );
+  } else if (event.type === "task-group.work-uncertain")
+    refs.push(ref(event.sourceEventId, event.sourceSequence));
+  else {
+    refs.push(journalRef(event.releaseEvidence.terminalRunEvent, task));
+    if (event.releaseEvidence.type === "run_settled") {
+      refs.push(journalRef(event.releaseEvidence.attempt.terminalAttemptEvent, task));
+      if (event.releaseEvidence.interruptResult)
+        refs.push(journalRef(event.releaseEvidence.interruptResult, task));
+    }
+  }
+  return refs;
+};
+export const reduceTaskWork = (
+  state: State,
+  input: WorkRecord | { readonly recorded: WorkRecord; readonly native: unknown },
+): State => {
+  const source = "recorded" in input ? input.recorded : input;
+  let record: WorkRecord, release: ReleaseFact | undefined;
+  try {
+    const decoded = decodeCoordination(source);
+    if (
+      decoded.event.type !== "task-group.work-accepted" &&
+      decoded.event.type !== "task-group.work-uncertain" &&
+      decoded.event.type !== "task-group.work-released"
+    )
+      return conflict("envelope", source.context.eventId);
+    record = { ...decoded, event: decoded.event };
+    if (decoded.event.type === "task-group.work-released") {
+      if (!("native" in input)) return conflict("native_evidence", source.context.eventId);
+      release = reconcileTaskWorkReleaseEvidence(
+        { ...decoded, event: decoded.event },
+        input.native,
+      );
+    }
+  } catch {
+    return conflict("envelope", source.context.eventId);
+  }
+  const event = record.event,
+    binding = event.claim.binding,
+    existing = get(state.claims, binding.workClaimId);
+  if (preflight(state, [record])) {
+    if (release && !equal(existing?.release, release)) conflict("native_evidence", event.id);
+    return state;
+  }
+  const owner = get(state.owners, binding.runId);
+  if (!owner) return conflict("ownership", event.id);
+  let candidate = recordFacts(state, [record], physicalRefs(record, owner));
+  if (event.type === "task-group.work-accepted") {
+    if (
+      existing ||
+      HashMap.has(state.effects, binding.effectId) ||
+      owner.terminal ||
+      owner.record.context.sequence >= record.context.sequence
+    )
+      return conflict("custody", event.id);
+    const original = owner.record.event.ownership;
+    for (const field of [
+      "version",
+      "task",
+      "group",
+      "manager",
+      "membershipGeneration",
+      "projectId",
+      "providerInstanceId",
+      "runId",
+      "messageId",
+    ] as const)
+      if (!equal(binding[field], original.run[field])) conflict("ownership", event.id);
+    const origin = original.origin;
+    const expected =
+      origin.type === "initial_start"
+        ? origin
+        : {
+            type: origin.type,
+            reservationId: origin.reservationId,
+            reservationCommandId: origin.reservationCommandId,
+            allowanceUnit: origin.allowanceUnit,
+            observedDirtyGeneration: origin.observedDirtyGeneration,
+            acknowledgedGeneration: origin.acknowledgedGeneration,
+          };
+    if (!equal(event.claim.launchOrigin, expected)) return conflict("ownership", event.id);
+    const member = retainedBasis(state, original.run, event.id);
+    if (
+      !equal(member, event.membership.currentMembership) ||
+      member.acceptedDefinitionRevisionAtJoin > binding.taskRevisions.acceptedDefinitionRevision ||
+      event.membership.highestMembershipGeneration !== binding.membershipGeneration
+    )
+      return conflict("membership", event.id);
+    let active = state.activeWork,
+      latest = state.latestWork;
+    for (const resource of resources(binding)) {
+      const previousId = get(latest, resource),
+        previous = previousId === undefined ? undefined : get(state.claims, previousId);
+      if (
+        HashMap.has(active, resource) ||
+        (previous &&
+          (!previous.release ||
+            previous.release.recorded.context.sequence >= record.context.sequence ||
+            previous.record.context.sequence >= record.context.sequence))
+      )
+        return conflict("custody", event.id);
+      active = HashMap.set(active, resource, binding.workClaimId);
+      latest = HashMap.set(latest, resource, binding.workClaimId);
+    }
+    return {
+      ...candidate,
+      activeWork: active,
+      latestWork: latest,
+      latestRunWork: HashMap.set(state.latestRunWork, binding.runId, binding.workClaimId),
+      effects: HashMap.set(state.effects, binding.effectId, binding.workClaimId),
+      claims: HashMap.set(state.claims, binding.workClaimId, {
+        record: { ...record, event },
+        latestSequence: record.context.sequence,
+      }),
+    };
+  }
+  if (
+    !existing ||
+    existing.release ||
+    record.context.sequence <= existing.latestSequence ||
+    !equal(event.claim, claimReference(existing.record.event.claim))
+  )
+    return conflict("phase", event.id);
+  if (event.type === "task-group.work-uncertain")
+    return {
+      ...candidate,
+      claims: HashMap.set(state.claims, binding.workClaimId, {
+        ...existing,
+        latestSequence: record.context.sequence,
+      }),
+    };
+  if (!release) return conflict("native_evidence", event.id);
+  let active = state.activeWork,
+    native = state.nativeEvidence;
+  for (const value of [release.native.run, release.native.attempt, release.native.interrupt])
+    if (value) {
+      const prior = get(native, value.eventId);
+      if (prior && !equal(prior, value)) conflict("native_evidence", event.id);
+      native = HashMap.set(native, value.eventId, value);
+    }
+  for (const resource of resources(binding)) {
+    if (get(active, resource) !== binding.workClaimId) conflict("custody", event.id);
+    active = HashMap.remove(active, resource);
+  }
+  candidate = { ...candidate, activeWork: active, nativeEvidence: native };
+  return {
+    ...candidate,
+    claims: HashMap.set(state.claims, binding.workClaimId, {
+      ...existing,
+      latestSequence: record.context.sequence,
+      release,
+    }),
+  };
 };
