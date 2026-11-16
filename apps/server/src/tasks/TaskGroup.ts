@@ -1,5 +1,7 @@
 import * as NodeUtil from "node:util";
 import {
+  WorkTaskAcceptedWorkClaim,
+  WorkTaskPersistedCoordinationEvent,
   WorkTaskMembershipEventBatch,
   WorkTaskPersistedGroupControlEvent,
   WorkTaskPersistedMembershipEvent,
@@ -51,6 +53,7 @@ export class GroupReplayConflict extends Schema.TaggedError<GroupReplayConflict>
   "GroupReplayConflict",
   {
     code: Schema.Literals([
+      "native_evidence",
       "envelope",
       "environment",
       "event_identity",
@@ -296,4 +299,123 @@ export const reduceTaskMembership = (state: State, input: Batch): State => {
     groupMembers,
     tasks: HashMap.set(candidate.tasks, taskId, next),
   };
+};
+
+const nativeText = Schema.String.check(
+  Schema.makeFilter((value) => value.length > 0 && value.length <= 2000 && value === value.trim()),
+);
+const nativeSequence = Schema.Number.check(
+  Schema.isInt(),
+  Schema.isGreaterThanOrEqualTo(0),
+  Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
+);
+const nativeFields = {
+  eventId: nativeText,
+  sequence: nativeSequence,
+  runId: nativeText,
+  occurredAt: WorkTaskAcceptedWorkClaim.fields.acceptedAt,
+};
+const nativeRun = Schema.Struct({
+  ...nativeFields,
+  type: Schema.Literal("run.updated"),
+  threadId: nativeText,
+  status: Schema.Literals(["completed", "cancelled", "failed", "interrupted", "rolled_back"]),
+});
+const nativeAttempt = Schema.Struct({
+  ...nativeFields,
+  type: Schema.Literal("run-attempt.updated"),
+  attemptId: nativeText,
+  providerThreadId: nativeText,
+  providerTurnId: Schema.NullOr(nativeText),
+  status: Schema.Literals(["completed", "interrupted", "failed", "cancelled", "superseded"]),
+});
+const nativeInterrupt = Schema.Struct({
+  ...nativeFields,
+  type: Schema.Literal("turn-item.updated"),
+  threadId: nativeText,
+  turnItemId: nativeText,
+  itemType: Schema.Literal("run_interrupt_result"),
+});
+const nativeRelease = Schema.Struct({
+  run: nativeRun,
+  attempt: Schema.optional(nativeAttempt),
+  interrupt: Schema.optional(nativeInterrupt),
+});
+const decodeNativeRelease = Schema.decodeUnknownSync(nativeRelease, { onExcessProperty: "error" });
+const decodeCoordination = Schema.decodeUnknownSync(WorkTaskPersistedCoordinationEvent);
+type WorkReleaseRecord = WorkTaskPersistedCoordinationEvent & {
+  readonly event: Extract<
+    WorkTaskPersistedCoordinationEvent["event"],
+    { type: "task-group.work-released" }
+  >;
+};
+
+export const reconcileTaskWorkReleaseEvidence = (
+  input: WorkReleaseRecord,
+  nativeInput: unknown,
+) => {
+  let recorded: WorkTaskPersistedCoordinationEvent;
+  let native: typeof nativeRelease.Type;
+  try {
+    recorded = decodeCoordination(input);
+    native = decodeNativeRelease(nativeInput);
+  } catch {
+    return conflict("native_evidence", input.context.eventId);
+  }
+  if (recorded.event.type !== "task-group.work-released")
+    return conflict("native_evidence", recorded.context.eventId);
+  const event = recorded.event,
+    evidence = event.releaseEvidence,
+    claim = event.claim;
+  const matches = (
+    actual: {
+      readonly type: string;
+      readonly eventId: string;
+      readonly sequence: number;
+      readonly runId: string;
+    },
+    reference: { readonly type: string; readonly eventId: string; readonly sequence: number },
+  ) =>
+    actual.type === reference.type &&
+    actual.eventId === reference.eventId &&
+    actual.sequence === reference.sequence &&
+    actual.runId === claim.binding.runId &&
+    actual.sequence >= claim.acceptedSequence &&
+    actual.sequence <= event.observedSequence;
+  if (
+    !matches(native.run, evidence.terminalRunEvent) ||
+    native.run.sequence <= claim.acceptedSequence ||
+    native.run.threadId !== claim.binding.manager.threadId ||
+    event.observedSequence >= recorded.context.sequence
+  )
+    return conflict("native_evidence", event.id);
+  if (evidence.type === "not_started") {
+    if (
+      native.attempt !== undefined ||
+      native.interrupt !== undefined ||
+      !["cancelled", "failed", "interrupted"].includes(native.run.status)
+    )
+      return conflict("native_evidence", event.id);
+  } else {
+    const attempt = native.attempt;
+    if (
+      !attempt ||
+      !matches(attempt, evidence.attempt.terminalAttemptEvent) ||
+      attempt.attemptId !== evidence.attempt.attemptId ||
+      attempt.providerThreadId !== evidence.attempt.providerThreadId ||
+      attempt.providerTurnId !== evidence.attempt.providerTurnId
+    )
+      return conflict("native_evidence", event.id);
+    if (evidence.interruptResult) {
+      const interruption = native.interrupt;
+      if (
+        !interruption ||
+        !matches(interruption, evidence.interruptResult) ||
+        interruption.threadId !== claim.binding.manager.threadId ||
+        interruption.turnItemId !== evidence.interruptResult.turnItemId
+      )
+        return conflict("native_evidence", event.id);
+    } else if (native.interrupt !== undefined) return conflict("native_evidence", event.id);
+  }
+  return { recorded: { ...recorded, event }, native };
 };

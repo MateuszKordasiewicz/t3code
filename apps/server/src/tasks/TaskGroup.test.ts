@@ -1,6 +1,8 @@
 import { assert, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  WorkTaskPersistedCoordinationEvent,
+  WorkTaskPersistedAcceptedRunOwnershipEvent,
   WorkTaskMembershipSnapshot,
   WorkTaskMembershipEventBatch,
   WorkTaskPersistedGroupControlEvent,
@@ -14,6 +16,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { runMigrations } from "../persistence/Migrations.ts";
 import {
+  reconcileTaskWorkReleaseEvidence,
   emptyTaskGroupControl,
   reduceTaskGroupControl,
   reduceTaskMembership,
@@ -453,7 +456,7 @@ const writeControl = Effect.fn("TaskGroupTest.writeControl")(function* (
     yield* sql`INSERT INTO work_task_manager_groups (environment_id,group_id,control_revision,membership_revision,highest_manager_generation,current_manager_generation,current_manager_thread_id,dispatch_hold,created_event_id,created_sequence,created_event_json,control_event_id,control_sequence,control_event_json)
     SELECT json_extract(value,'$.environmentId'),json_extract(value,'$.control.group.groupId'),0,0,0,NULL,NULL,'none',json_extract(value,'$.id'),${record.context.sequence},value,json_extract(value,'$.id'),${record.context.sequence},value FROM (SELECT ${encoded} value)`;
   } else {
-    yield* sql`UPDATE work_task_manager_groups SET control_revision=json_extract(${encoded},'$.control.controlRevision'),membership_revision=json_extract(${encoded},'$.control.membershipRevision'),dispatch_hold=json_extract(${encoded},'$.control.dispatchHold'),control_event_id=json_extract(${encoded},'$.id'),control_sequence=${record.context.sequence},control_event_json=${encoded},latest_membership_event_id=CASE WHEN json_extract(${encoded},'$.type')='task-group.membership-changed' THEN json_extract(${encoded},'$.id') ELSE latest_membership_event_id END WHERE group_id=json_extract(${encoded},'$.control.group.groupId')`;
+    yield* sql`UPDATE work_task_manager_groups SET highest_manager_generation=json_extract(${encoded},'$.control.highestManagerGeneration'),current_manager_generation=json_extract(${encoded},'$.control.currentManager.managerGeneration'),current_manager_thread_id=json_extract(${encoded},'$.control.currentManager.threadId'),control_revision=json_extract(${encoded},'$.control.controlRevision'),membership_revision=json_extract(${encoded},'$.control.membershipRevision'),dispatch_hold=json_extract(${encoded},'$.control.dispatchHold'),control_event_id=json_extract(${encoded},'$.id'),control_sequence=${record.context.sequence},control_event_json=${encoded},latest_membership_event_id=CASE WHEN json_extract(${encoded},'$.type')='task-group.membership-changed' THEN json_extract(${encoded},'$.id') ELSE latest_membership_event_id END WHERE group_id=json_extract(${encoded},'$.control.group.groupId')`;
   }
 });
 const writeJoin = Effect.fn("TaskGroupTest.writeJoin")(function* (
@@ -549,4 +552,400 @@ it.effect.each([false, true])("matches actual SQL domain order with holdFirst=%s
     }
     assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
   }).pipe(Effect.provide(db)),
+);
+
+const decodeWork = Schema.decodeUnknownSync(WorkTaskPersistedCoordinationEvent);
+const decodeOwner = Schema.decodeUnknownEffect(WorkTaskPersistedAcceptedRunOwnershipEvent);
+const releaseFixture = (settled = false, interrupt = false) => {
+  const binding = {
+    version: 2,
+    workClaimId: "claim",
+    task: { environmentId: env, taskId: "task" },
+    group: { environmentId: env, groupId: "g" },
+    manager: { managerGeneration: 1, threadId: "manager" },
+    membershipGeneration: 1,
+    membershipRevision: 1,
+    controlRevision: 1,
+    graphRevision: 0,
+    projectId: "project",
+    providerInstanceId: "codex",
+    commandId: "activate",
+    runId: "run",
+    messageId: "message",
+    effectId: "effect",
+    taskRevisions: {
+      definitionRevision: 1,
+      acceptedDefinitionRevision: 1,
+      lifecycleRevision: 1,
+      completionPolicyRevision: 1,
+      actionPolicyRevision: 1,
+    },
+  };
+  const run = {
+    type: "run.updated",
+    eventId: "native-terminal",
+    sequence: 32,
+    runId: "run",
+    threadId: "manager",
+    status: settled ? "rolled_back" : "cancelled",
+    occurredAt: time,
+  };
+  const attempt = {
+    type: "run-attempt.updated",
+    eventId: "attempt-terminal",
+    sequence: 31,
+    runId: "run",
+    attemptId: "attempt",
+    providerThreadId: "provider-thread",
+    providerTurnId: null,
+    status: "superseded",
+    occurredAt: time,
+  };
+  const interruption = {
+    type: "turn-item.updated",
+    eventId: "interrupt",
+    sequence: 33,
+    runId: "run",
+    threadId: "manager",
+    turnItemId: "item",
+    itemType: "run_interrupt_result",
+    occurredAt: time,
+  };
+  const event = {
+    id: "release",
+    type: "task-group.work-released",
+    environmentId: env,
+    commandId: "settle",
+    occurredAt: time,
+    attribution: { type: "server" },
+    claim: { binding, acceptedEventId: "accepted", acceptedSequence: 30, acceptedAt: time },
+    observedSequence: 33,
+    releaseEvidence: settled
+      ? {
+          type: "run_settled",
+          terminalRunEvent: { type: run.type, eventId: run.eventId, sequence: run.sequence },
+          attempt: {
+            attemptId: attempt.attemptId,
+            providerThreadId: attempt.providerThreadId,
+            providerTurnId: null,
+            terminalAttemptEvent: {
+              type: attempt.type,
+              eventId: attempt.eventId,
+              sequence: attempt.sequence,
+            },
+          },
+          ...(interrupt
+            ? {
+                interruptResult: {
+                  type: interruption.type,
+                  eventId: interruption.eventId,
+                  sequence: interruption.sequence,
+                  turnItemId: interruption.turnItemId,
+                },
+              }
+            : {}),
+        }
+      : {
+          type: "not_started",
+          terminalRunEvent: { type: run.type, eventId: run.eventId, sequence: run.sequence },
+          settlementCommandId: "settle",
+        },
+  };
+  const recorded = decodeWork({
+    event,
+    context: { eventId: event.id, commandId: event.commandId, occurredAt: time, sequence: 34 },
+  });
+  if (recorded.event.type !== "task-group.work-released") throw new Error("Expected release");
+  return {
+    recorded: { ...recorded, event: recorded.event },
+    native: {
+      run,
+      ...(settled ? { attempt } : {}),
+      ...(interrupt ? { interrupt: interruption } : {}),
+    },
+  };
+};
+it("reconciles retained native release evidence without claiming physical custody", () => {
+  for (const input of [releaseFixture(), releaseFixture(true), releaseFixture(true, true)]) {
+    const before = structuredClone(input);
+    const result = reconcileTaskWorkReleaseEvidence(input.recorded, input.native);
+    assert.deepStrictEqual<unknown>(result.native, input.native);
+    assert.deepStrictEqual(result.recorded, input.recorded);
+    assert.deepStrictEqual(input, before);
+    for (const patch of [
+      { run: { ...input.native.run, runId: "other" } },
+      { run: { ...input.native.run, threadId: "other" } },
+      { run: { ...input.native.run, eventId: "other" } },
+      { run: { ...input.native.run, sequence: 30 } },
+      { run: { ...input.native.run, status: "running" } },
+      { run: { ...input.native.run, occurredAt: "not-time" } },
+      { run: { ...input.native.run, extra: true } },
+      { run: { ...input.native.run, occurredAt: "2026-11-16T00:00:00." + "1".repeat(1980) + "Z" } },
+      { run: { ...input.native.run, eventId: "\t" } },
+      { run: { ...input.native.run, sequence: "32" } },
+      { extra: true },
+    ])
+      assert.throws(
+        () => reconcileTaskWorkReleaseEvidence(input.recorded, { ...input.native, ...patch }),
+        GroupReplayConflict,
+      );
+  }
+  for (const occurredAt of [
+    "0001-01-01T00:00:00.00000001+23:59",
+    "2026-11-16T00:00:00." + "1".repeat(1979) + "Z",
+  ]) {
+    const input = releaseFixture();
+    const native = { run: { ...input.native.run, occurredAt } };
+    assert.strictEqual(
+      reconcileTaskWorkReleaseEvidence(input.recorded, native).native.run.occurredAt,
+      occurredAt,
+    );
+  }
+  const input = releaseFixture(true, true);
+  for (const patch of [
+    { attempt: undefined },
+    { interrupt: undefined },
+    { attempt: { ...input.native.attempt, providerTurnId: undefined } },
+    { attempt: { ...input.native.attempt, providerThreadId: "other" } },
+    { attempt: { ...input.native.attempt, sequence: 29 } },
+    { interrupt: { ...input.native.interrupt, sequence: 34 } },
+    { interrupt: { ...input.native.interrupt, turnItemId: "other" } },
+  ])
+    assert.throws(
+      () => reconcileTaskWorkReleaseEvidence(input.recorded, { ...input.native, ...patch }),
+      GroupReplayConflict,
+    );
+  assert.throws(
+    () => reconcileTaskWorkReleaseEvidence(releaseFixture().recorded, input.native),
+    GroupReplayConflict,
+  );
+});
+
+const acceptedRunPaths = {
+  run_id: "ownership.run.runId",
+  message_id: "ownership.run.messageId",
+  environment_id: "environmentId",
+  task_id: "ownership.run.task.taskId",
+  group_id: "ownership.run.group.groupId",
+  manager_generation: "ownership.run.manager.managerGeneration",
+  manager_thread_id: "ownership.run.manager.threadId",
+  membership_generation: "ownership.run.membershipGeneration",
+  project_id: "ownership.run.projectId",
+  provider_instance_id: "ownership.run.providerInstanceId",
+  definition_revision: "ownership.run.taskRevisions.definitionRevision",
+  accepted_definition_revision: "ownership.run.taskRevisions.acceptedDefinitionRevision",
+  lifecycle_revision: "ownership.run.taskRevisions.lifecycleRevision",
+  completion_policy_revision: "ownership.run.taskRevisions.completionPolicyRevision",
+  action_policy_revision: "ownership.run.taskRevisions.actionPolicyRevision",
+  graph_revision: "ownership.run.graphRevision",
+  control_revision: "ownership.run.controlRevision",
+  membership_revision: "ownership.run.membershipRevision",
+  recorded_event_id: "id",
+  recorded_sequence: "ownership.recorded.sequence",
+  recorded_command_id: "commandId",
+  recorded_at: "occurredAt",
+  native_run_event_id: "ownership.nativeAcceptance.runEvent.eventId",
+  native_run_sequence: "ownership.nativeAcceptance.runEvent.sequence",
+  native_message_event_id: "ownership.nativeAcceptance.messageEvent.eventId",
+  native_message_sequence: "ownership.nativeAcceptance.messageEvent.sequence",
+  native_receipt_command_id: "ownership.nativeAcceptance.receipt.commandId",
+  native_receipt_result_sequence: "ownership.nativeAcceptance.receipt.resultSequence",
+  origin_type: "ownership.origin.type",
+  reservation_id: "ownership.origin.reservationId",
+  reservation_command_id: "ownership.origin.reservationCommandId",
+  allowance_unit: "ownership.origin.allowanceUnit",
+  debit_event_id: "ownership.origin.debitEvent.eventId",
+  debit_sequence: "ownership.origin.debitEvent.sequence",
+};
+const insertAcceptedRun = Effect.fn("TaskGroupTest.insertAcceptedRun")(function* (event: unknown) {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql.unsafe(
+    `INSERT INTO work_task_accepted_runs (${Object.keys(acceptedRunPaths).join(",")},event_json)
+    SELECT ${Object.values(acceptedRunPaths)
+      .map((p) => `json_extract(value,'$.${p}')`)
+      .join(",")},value FROM (SELECT ? AS value)`,
+    [JSON.stringify(event)],
+  );
+});
+
+const seedReleaseClaim = Effect.fn("TaskGroupTest.seedReleaseClaim")(function* (
+  input: ReturnType<typeof releaseFixture>,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  yield* runMigrations();
+  yield* sql`INSERT INTO work_task_projections VALUES ('task',NULL,1,1,1,1,'{}','raw','raw')`;
+  yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('task',1,1,'{}','{}','definition','raw')`;
+  const group = created("g", 1);
+  yield* writeControl(group);
+  const join = membership(initialTask(), [group.event.control], "g", "join", 2, [3]);
+  yield* sql.withTransaction(writeJoin(join));
+  const manager = controlChange(join.companions[0]!.event.control, "manager-bound", 4, {
+    highestManagerGeneration: 1,
+    currentManager: { managerGeneration: 1, threadId: "manager" },
+  });
+  yield* sql.withTransaction(
+    Effect.gen(function* () {
+      yield* writeControl(manager);
+      const encoded = JSON.stringify(manager.event);
+      yield* sql`INSERT INTO work_task_group_managers (environment_id,group_id,generation,manager_thread_id,bound_event_id,bound_sequence,bound_event_json,current_generation,current_manager_thread_id)
+      SELECT json_extract(value,'$.environmentId'),json_extract(value,'$.control.group.groupId'),1,'manager',json_extract(value,'$.id'),4,value,1,'manager' FROM (SELECT ${encoded} value)`;
+    }),
+  );
+  const recorded = { eventId: "owner", sequence: 20, commandId: "record-owner", occurredAt: time };
+  const origin = {
+    type: "initial_start",
+    startCommandId: "start",
+    startEventId: "start-event",
+    startSequence: 10,
+  };
+  const owner = yield* decodeOwner({
+    context: recorded,
+    event: {
+      id: recorded.eventId,
+      type: "task.run-ownership-accepted",
+      environmentId: env,
+      commandId: recorded.commandId,
+      occurredAt: time,
+      attribution: { type: "server" },
+      ownership: {
+        recorded,
+        run: {
+          version: 2,
+          task: input.recorded.event.claim.binding.task,
+          group: input.recorded.event.claim.binding.group,
+          manager: input.recorded.event.claim.binding.manager,
+          membershipGeneration: 1,
+          membershipRevision: 1,
+          controlRevision: 1,
+          graphRevision: 0,
+          projectId: "project",
+          providerInstanceId: "codex",
+          runId: "run",
+          messageId: "message",
+          taskRevisions: input.recorded.event.claim.binding.taskRevisions,
+        },
+        nativeAcceptance: {
+          receipt: {
+            commandId: "native",
+            threadId: "manager",
+            commandType: "thread.message.send",
+            acceptedAt: time,
+            resultSequence: 12,
+            status: "accepted",
+            error: null,
+          },
+          runEvent: { type: "run.created", eventId: "native-run", sequence: 11 },
+          messageEvent: { type: "message.updated", eventId: "native-message", sequence: 12 },
+          runStatus: "queued",
+        },
+        sourceEventId: "start-event",
+        sourceSequence: 10,
+        observedWorkSequence: 10,
+        prerequisites: [],
+        origin,
+      },
+    },
+  });
+  yield* insertAcceptedRun(owner.event);
+  const claim = decodeWork({
+    context: { eventId: "accepted", sequence: 30, commandId: "activate", occurredAt: time },
+    event: {
+      id: "accepted",
+      type: "task-group.work-accepted",
+      environmentId: env,
+      commandId: "activate",
+      occurredAt: time,
+      attribution: { type: "server" },
+      previousActiveClaimId: null,
+      claim: {
+        ...input.recorded.event.claim,
+        sourceEventId: "owner",
+        sourceSequence: 20,
+        observedWorkSequence: 20,
+        prerequisites: [],
+        launchOrigin: origin,
+      },
+      control: manager.event.control,
+      membership: join.root.event.snapshot,
+    },
+  });
+  const columns = {
+    work_claim_id: "claim.binding.workClaimId",
+    run_id: "claim.binding.runId",
+    environment_id: "environmentId",
+    task_id: "claim.binding.task.taskId",
+    group_id: "claim.binding.group.groupId",
+    manager_generation: "claim.binding.manager.managerGeneration",
+    manager_thread_id: "claim.binding.manager.threadId",
+    membership_generation: "claim.binding.membershipGeneration",
+    accepted_event_id: "id",
+    accepted_sequence: "claim.acceptedSequence",
+    effect_id: "claim.binding.effectId",
+    accepted_definition_revision: "claim.binding.taskRevisions.acceptedDefinitionRevision",
+  };
+  yield* sql.unsafe(
+    `INSERT INTO work_task_executable_claims (${Object.keys(columns).join(",")},event_json)
+    SELECT ${Object.values(columns)
+      .map((path) => `json_extract(value,'$.${path}')`)
+      .join(",")},value FROM (SELECT ? value)`,
+    [JSON.stringify(claim.event)],
+  );
+});
+const writeReleaseEvidence = Effect.fn("TaskGroupTest.writeReleaseEvidence")(function* (
+  recorded: ReturnType<typeof releaseFixture>["recorded"],
+  native: unknown,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql.unsafe(
+    `INSERT INTO work_task_claim_releases(event_id,sequence,work_claim_id,run_id,effect_id,terminal_event_id,terminal_sequence,event_json,native_json)
+    SELECT json_extract(value,'$.id'),?,json_extract(value,'$.claim.binding.workClaimId'),json_extract(value,'$.claim.binding.runId'),json_extract(value,'$.claim.binding.effectId'),json_extract(value,'$.releaseEvidence.terminalRunEvent.eventId'),json_extract(value,'$.releaseEvidence.terminalRunEvent.sequence'),value,? FROM (SELECT ? value)`,
+    [recorded.context.sequence, JSON.stringify(native), JSON.stringify(recorded.event)],
+  );
+  yield* sql`UPDATE work_task_executable_claims SET release_event_id='release' WHERE work_claim_id='claim'`;
+});
+it.effect.each([false, true])(
+  "matches actual retained release evidence with settled=%s",
+  (settled) =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const input = releaseFixture(settled, settled);
+      yield* seedReleaseClaim(input);
+      const changes: readonly unknown[] = [
+        { ...input.native, run: { ...input.native.run, runId: "other" } },
+        { ...input.native, run: { ...input.native.run, threadId: "other" } },
+        { ...input.native, run: { ...input.native.run, status: "running" } },
+        { ...input.native, run: { ...input.native.run, sequence: 30 } },
+        { ...input.native, run: { ...input.native.run, occurredAt: "bad" } },
+        { ...input.native, run: { ...input.native.run, eventId: " padded " } },
+        { ...input.native, run: { ...input.native.run, extra: null } },
+        ...(settled
+          ? [
+              { ...input.native, attempt: { ...input.native.attempt, providerTurnId: "changed" } },
+              { ...input.native, attempt: { ...input.native.attempt, providerTurnId: undefined } },
+              { ...input.native, attempt: { ...input.native.attempt, sequence: 29 } },
+              { ...input.native, interrupt: { ...input.native.interrupt, turnItemId: "other" } },
+            ]
+          : [{ ...input.native, attempt: releaseFixture(true).native.attempt }]),
+      ];
+      for (const native of changes) {
+        assert.throws(
+          () => reconcileTaskWorkReleaseEvidence(input.recorded, native),
+          GroupReplayConflict,
+        );
+        yield* sql`BEGIN`;
+        const failed = yield* writeReleaseEvidence(input.recorded, native).pipe(Effect.flip);
+        assert.isDefined(failed);
+        yield* sql`ROLLBACK`;
+      }
+      const result = reconcileTaskWorkReleaseEvidence(input.recorded, input.native);
+      yield* sql.withTransaction(writeReleaseEvidence(result.recorded, result.native));
+      const [row] = yield* sql<{
+        native_json: string;
+        event_json: string;
+      }>`SELECT native_json,event_json FROM work_task_claim_releases`;
+      assert.deepStrictEqual(JSON.parse(row!.native_json), result.native);
+      assert.deepStrictEqual(JSON.parse(row!.event_json), result.recorded.event);
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+      assert.deepStrictEqual(yield* runMigrations(), []);
+    }).pipe(Effect.provide(db)),
 );
