@@ -4,6 +4,7 @@ import {
   WorkTaskAcceptedDefinition,
   WorkTaskCallerContext,
   WorkTaskCompletionPolicyOverride,
+  WorkTaskAllowanceState,
   WorkTaskId,
   ProjectId,
   ThreadId,
@@ -130,6 +131,9 @@ export class TaskProjectionError extends Schema.TaggedError<TaskProjectionError>
       "cas",
       "fence",
       "qualification",
+      "allowance",
+      "command",
+      "unit",
       "sql",
     ]),
     conflictingEventIds: Schema.optional(Schema.Array(Schema.String)),
@@ -215,10 +219,51 @@ type ProjectionRead = {
   readonly accepted: typeof Accepted.Type | undefined;
 };
 type ProjectionFailure = TaskProjectionError | TaskSourceError;
+const ManagerBinding = Schema.Struct({
+  taskId: WorkTaskId,
+  managerGeneration: positive,
+  managerThreadId: ThreadId,
+  boundAt: Schema.String,
+  retiredAt: Schema.NullOr(Schema.String),
+});
+type ManagerRead = typeof ManagerBinding.Type & {
+  readonly bound: Native;
+  readonly retired: Native | undefined;
+};
+type CustodyRead = {
+  readonly current: ManagerRead | undefined;
+  readonly highestGeneration: number;
+};
+type AllowanceRead = {
+  readonly allowance: WorkTaskAllowanceState;
+  readonly source: Native | undefined;
+};
+const allowanceTypes = [
+  "task.allowance-configured",
+  "task.allowance-topped-up",
+  "task.allowance-debited",
+] as const;
+const custodyTypes = ["task.manager-bound", "task.manager-retired", ...allowanceTypes];
 
 export class TaskStore extends Context.Service<
   TaskStore,
   {
+    readonly applyManagerAllowance: (
+      recorded: WorkTaskPersistedEvent,
+    ) => Effect.Effect<
+      { readonly applied: boolean; readonly lastSequence: number; readonly viewGeneration: number },
+      ProjectionFailure
+    >;
+    readonly readManagerCustody: (
+      taskId: string,
+    ) => Effect.Effect<CustodyRead | undefined, ProjectionFailure>;
+    readonly readManagerBinding: (input: {
+      readonly taskId: string;
+      readonly generation: number;
+    }) => Effect.Effect<ManagerRead | undefined, ProjectionFailure>;
+    readonly readAllowance: (
+      taskId: string,
+    ) => Effect.Effect<AllowanceRead | undefined, ProjectionFailure>;
     readonly auditManagerReferences: (input: {
       readonly taskId: string;
       readonly expectedCheckpointSequence: number;
@@ -1038,214 +1083,462 @@ const make = Effect.gen(function* () {
         }),
       ).pipe(NodeSqliteClient.readOnly),
   );
-  const applyFoundation = Effect.fn("TaskStore.applyFoundation")((input: WorkTaskPersistedEvent) =>
+  const bindingRow = Effect.fn("TaskStore.readBindingRow")(function* (
+    taskId: string,
+    generation?: number,
+    current = false,
+  ) {
+    const found = yield* sql<{
+      payload: string;
+      valid: number;
+    }>`SELECT typeof(generation)='integer' AS valid,
+      hex(json_object('taskId',task_id,'managerGeneration',generation,'managerThreadId',thread_id,'boundAt',bound_at,'retiredAt',retired_at)) AS payload
+      FROM work_task_manager_bindings WHERE task_id=json_extract(${yield* encodeProjectionJson(taskId)},'$')
+      ${generation === undefined ? (current ? sql.literal("AND retired_at IS NULL") : sql.literal("")) : sql`AND generation=${generation}`}
+      ORDER BY generation DESC LIMIT 1`;
+    const value = yield* stored(ManagerBinding, found[0]);
+    if (value) yield* guard(value.taskId === taskId, "legacy");
+    return value;
+  });
+  const managerSource = (taskId: string, generation: number, type: string, through: number) =>
+    one(
+      taskId,
+      `${referencePredicate} AND stream_id=json_extract(?,'$') AND ${referenceExpression("managerGeneration")}=? AND event_type=? AND sequence<=? ORDER BY sequence DESC LIMIT 1`,
+      [JSON.stringify(taskId), generation, type, through],
+      "idx_task_reference_generation",
+    );
+  const bindingAt = Effect.fn("TaskStore.readBindingAt")(function* (
+    taskId: string,
+    generation: number,
+    through: number,
+  ) {
+    yield* guard(Number.isSafeInteger(generation) && generation > 0, "invalid");
+    const row = yield* bindingRow(taskId, generation);
+    const bound = yield* managerSource(taskId, generation, "task.manager-bound", through);
+    const retired = yield* managerSource(taskId, generation, "task.manager-retired", through);
+    if (!row && !bound && !retired) return undefined;
+    yield* guard(
+      row !== undefined && bound?.recorded.event.type === "task.manager-bound",
+      "legacy",
+    );
+    const birth = bound!.recorded.event;
+    yield* guard(
+      "managerThreadId" in birth &&
+        row!.managerThreadId === birth.managerThreadId &&
+        row!.boundAt === birth.occurredAt,
+      "legacy",
+    );
+    if (retired) {
+      const end = retired.recorded.event;
+      yield* guard(
+        end.type === "task.manager-retired" &&
+          end.managerThreadId === row!.managerThreadId &&
+          retired.recorded.context.sequence > bound!.recorded.context.sequence &&
+          row!.retiredAt === end.occurredAt,
+        "legacy",
+      );
+    } else yield* guard(row!.retiredAt === null, "legacy");
+    return { ...row!, bound: bound!, retired };
+  });
+  const custodyAt = Effect.fn("TaskStore.readCustodyAt")(function* (
+    taskId: string,
+    through: number,
+  ) {
+    const highest = yield* bindingRow(taskId);
+    const current = yield* bindingRow(taskId, undefined, true);
+    const birth = yield* latestType(taskId, "task.manager-bound", through);
+    const retirement = yield* latestType(taskId, "task.manager-retired", through);
+    if (!highest && !current && !birth && !retirement)
+      return { current: undefined, highestGeneration: 0 };
+    yield* guard(
+      highest !== undefined && birth?.recorded.event.type === "task.manager-bound",
+      "legacy",
+    );
+    const event = birth!.recorded.event;
+    yield* guard(
+      "managerGeneration" in event && event.managerGeneration === highest!.managerGeneration,
+      "legacy",
+    );
+    const checked = yield* bindingAt(taskId, highest!.managerGeneration, through);
+    yield* guard(checked !== undefined, "legacy");
+    if (retirement && retirement.recorded.context.sequence > birth!.recorded.context.sequence)
+      yield* guard(
+        retirement.recorded.event.type === "task.manager-retired" &&
+          retirement.recorded.event.managerGeneration === highest!.managerGeneration,
+        "legacy",
+      );
+    yield* guard(
+      checked!.retiredAt === null
+        ? NodeUtil.isDeepStrictEqual(current, highest)
+        : current === undefined,
+      "legacy",
+    );
+    return {
+      current: checked!.retiredAt === null ? checked : undefined,
+      highestGeneration: highest!.managerGeneration,
+    };
+  });
+  const allowanceAt = Effect.fn("TaskStore.readAllowanceAt")(function* (
+    taskId: string,
+    through: number,
+  ) {
+    const found = yield* sql<{
+      payload: string;
+      valid: number;
+    }>`SELECT typeof(configured_cap)='integer' AND typeof(consumed)='integer' AS valid,
+      hex(json_object('type','configured','cap',configured_cap,'consumed',consumed)) AS payload FROM work_task_allowances WHERE task_id=json_extract(${yield* encodeProjectionJson(taskId)},'$')`;
+    const allowance = yield* stored(WorkTaskAllowanceState, found[0]);
+    let source: Native | undefined;
+    for (const type of allowanceTypes) {
+      const next = yield* latestType(taskId, type, through);
+      if (next && (!source || next.recorded.context.sequence > source.recorded.context.sequence))
+        source = next;
+    }
+    if (!allowance && !source)
+      return { allowance: { type: "unconfigured" as const, consumed: 0 }, source: undefined };
+    const event = source?.recorded.event;
+    yield* guard(
+      allowance !== undefined &&
+        event !== undefined &&
+        "resulting" in event &&
+        NodeUtil.isDeepStrictEqual(allowance, event.resulting),
+      "legacy",
+    );
+    return { allowance: allowance!, source };
+  });
+  const projectedCheckpoint = Effect.fn("TaskStore.readProjectedCheckpoint")(function* (
+    taskId: string,
+  ) {
+    const current = yield* readProjection(taskId);
+    if (!current) return undefined;
+    yield* guard(current.current?.lastSequence != null, "legacy");
+    const sequence = current.current!.lastSequence!;
+    yield* readFoundationSource({ taskId, checkpointSequence: sequence });
+    return sequence;
+  });
+  const readManagerCustody = Effect.fn("TaskStore.readManagerCustody")((taskId: string) =>
     projectTransaction(
       Effect.gen(function* () {
-        const recorded = yield* decodeRecorded(input).pipe(
-          Effect.mapError(() => new TaskProjectionError({ code: "invalid" })),
-        );
-        const { event, context } = recorded;
-        yield* guard(
-          [
-            "task.created",
-            "task.definition-updated",
-            "task.definition-accepted",
-            "task.configuration-updated",
-            "task.execution-updated",
-            "task.thread-linked",
-            "task.thread-unlinked",
-          ].includes(event.type),
-          "unsupported",
-        );
-        const original = yield* readNativeEvent({ taskId: event.taskId, eventId: event.id });
-        yield* guard(NodeUtil.isDeepStrictEqual(original.recorded, recorded), "replay");
-        const current = yield* readProjection(event.taskId);
-        if (current) yield* guard(current.current?.lastSequence != null, "legacy");
-        const checkpoint = current?.current?.lastSequence ?? null;
-        const source = yield* readFoundationSource({
-          taskId: event.taskId,
-          checkpointSequence: checkpoint,
-          incomingEventId: event.id,
-          ...(event.type === "task.execution-updated" && event.manager
-            ? { managerGeneration: event.manager.managerGeneration }
-            : {}),
-          ...(event.type === "task.definition-accepted" && context.commandId !== null
-            ? { acceptanceCommandId: context.commandId }
-            : {}),
-        });
-        const view = yield* fence();
-        if (source.checkpoint && original.streamVersion <= source.checkpoint.streamVersion)
-          return { applied: false, lastSequence: checkpoint!, viewGeneration: view.generation };
-        const checked = yield* referenceCheckpoint(event.taskId);
-        if (source.checkpoint) {
-          yield* guard(
-            checked !== undefined &&
-              checked.creationEventId === source.creation.recorded.event.id &&
-              checked.creationSequence === source.creation.recorded.context.sequence &&
-              checked.eventId === source.checkpoint.recorded.event.id &&
-              checked.sequence === checkpoint &&
-              checked.streamVersion === source.checkpoint.streamVersion,
-            "qualification",
+        const sequence = yield* projectedCheckpoint(taskId);
+        return sequence === undefined ? undefined : yield* custodyAt(taskId, sequence);
+      }),
+    ).pipe(NodeSqliteClient.readOnly),
+  );
+  const readManagerBinding = Effect.fn("TaskStore.readManagerBinding")(
+    (input: { taskId: string; generation: number }) =>
+      projectTransaction(
+        Effect.gen(function* () {
+          const sequence = yield* projectedCheckpoint(input.taskId);
+          return sequence === undefined
+            ? undefined
+            : yield* bindingAt(input.taskId, input.generation, sequence);
+        }),
+      ).pipe(NodeSqliteClient.readOnly),
+  );
+  const readAllowance = Effect.fn("TaskStore.readAllowance")((taskId: string) =>
+    projectTransaction(
+      Effect.gen(function* () {
+        const sequence = yield* projectedCheckpoint(taskId);
+        return sequence === undefined ? undefined : yield* allowanceAt(taskId, sequence);
+      }),
+    ).pipe(NodeSqliteClient.readOnly),
+  );
+  const applyProjection = Effect.fn("TaskStore.applyProjection")(
+    (input: WorkTaskPersistedEvent, family: "foundation" | "managerAllowance") =>
+      projectTransaction(
+        Effect.gen(function* () {
+          const recorded = yield* decodeRecorded(input).pipe(
+            Effect.mapError(() => new TaskProjectionError({ code: "invalid" })),
           );
-          yield* checkReference(event, checkpoint!);
-        } else yield* guard(checked === undefined, "qualification");
-        yield* guard(source.next?.recorded.event.id === event.id, "replay");
-        yield* guard(view.generation < Number.MAX_SAFE_INTEGER, "fence");
-        const keys = [
-          "definitionRevision",
-          "lifecycleRevision",
-          "completionPolicyRevision",
-          "actionPolicyRevision",
-        ] as const;
-        if (current) for (const key of keys) yield* guard(event[key] >= current[key], "revision");
-        yield* guard(
-          current ? event.type !== "task.created" : event.type === "task.created",
-          "replay",
-        );
-        let effective = current?.definition;
-        let activeLink: string | undefined;
-        switch (event.type) {
-          case "task.created":
-            effective = event.definition;
-            break;
-          case "task.definition-updated":
-          case "task.definition-accepted": {
-            const draft = source.latestDefinition?.recorded.event;
-            if (
-              draft &&
-              "definition" in draft &&
-              draft.definition.revision === event.definitionRevision
-            )
-              yield* guard(
-                NodeUtil.isDeepStrictEqual(draft.definition, event.definition),
-                "definition",
-              );
-            const previous = yield* acceptedRow({
-              taskId: event.taskId,
-              revision: event.definitionRevision,
-            });
-            if (event.type === "task.definition-updated") {
-              if (previous)
+          const { event, context } = recorded;
+          yield* guard(
+            (family === "managerAllowance"
+              ? custodyTypes
+              : [
+                  "task.created",
+                  "task.definition-updated",
+                  "task.definition-accepted",
+                  "task.configuration-updated",
+                  "task.execution-updated",
+                  "task.thread-linked",
+                  "task.thread-unlinked",
+                ]
+            ).includes(event.type),
+            "unsupported",
+          );
+          const original = yield* readNativeEvent({ taskId: event.taskId, eventId: event.id });
+          yield* guard(NodeUtil.isDeepStrictEqual(original.recorded, recorded), "replay");
+          const current = yield* readProjection(event.taskId);
+          if (current) yield* guard(current.current?.lastSequence != null, "legacy");
+          const checkpoint = current?.current?.lastSequence ?? null;
+          const source = yield* readFoundationSource({
+            taskId: event.taskId,
+            checkpointSequence: checkpoint,
+            incomingEventId: event.id,
+            ...(event.type === "task.execution-updated" && event.manager
+              ? { managerGeneration: event.manager.managerGeneration }
+              : {}),
+            ...(event.type === "task.definition-accepted" && context.commandId !== null
+              ? { acceptanceCommandId: context.commandId }
+              : {}),
+          });
+          const view = yield* fence();
+          if (source.checkpoint && original.streamVersion <= source.checkpoint.streamVersion) {
+            if (family === "managerAllowance") {
+              if (event.type === "task.manager-bound" || event.type === "task.manager-retired") {
+                yield* custodyAt(event.taskId, checkpoint!);
+                const binding = yield* bindingAt(
+                  event.taskId,
+                  event.managerGeneration,
+                  checkpoint!,
+                );
                 yield* guard(
-                  NodeUtil.isDeepStrictEqual(previous.definition, event.definition),
+                  binding !== undefined &&
+                    (event.type !== "task.manager-retired" || binding.retiredAt !== null),
+                  "legacy",
+                );
+              } else yield* allowanceAt(event.taskId, checkpoint!);
+            }
+            return { applied: false, lastSequence: checkpoint!, viewGeneration: view.generation };
+          }
+          const checked = yield* referenceCheckpoint(event.taskId);
+          if (source.checkpoint) {
+            yield* guard(
+              checked !== undefined &&
+                checked.creationEventId === source.creation.recorded.event.id &&
+                checked.creationSequence === source.creation.recorded.context.sequence &&
+                checked.eventId === source.checkpoint.recorded.event.id &&
+                checked.sequence === checkpoint &&
+                checked.streamVersion === source.checkpoint.streamVersion,
+              "qualification",
+            );
+            yield* checkReference(event, checkpoint!);
+          } else yield* guard(checked === undefined, "qualification");
+          yield* guard(source.next?.recorded.event.id === event.id, "replay");
+          yield* guard(view.generation < Number.MAX_SAFE_INTEGER, "fence");
+          const keys = [
+            "definitionRevision",
+            "lifecycleRevision",
+            "completionPolicyRevision",
+            "actionPolicyRevision",
+          ] as const;
+          if (current) for (const key of keys) yield* guard(event[key] >= current[key], "revision");
+          yield* guard(
+            current ? event.type !== "task.created" : event.type === "task.created",
+            "replay",
+          );
+          let effective = current?.definition;
+          let activeLink: string | undefined;
+          switch (event.type) {
+            case "task.manager-bound":
+            case "task.manager-retired": {
+              const custody = yield* custodyAt(event.taskId, checkpoint!);
+              if (event.type === "task.manager-bound") {
+                yield* guard(
+                  !custody.current && event.managerGeneration > custody.highestGeneration,
+                  "manager",
+                );
+                const reused =
+                  yield* sql`SELECT 1 FROM work_task_manager_bindings WHERE task_id=json_extract(${yield* encodeProjectionJson(event.taskId)},'$') AND thread_id=json_extract(${yield* encodeProjectionJson(event.managerThreadId)},'$') LIMIT 1`;
+                yield* guard(reused.length === 0, "manager");
+                yield* sql`INSERT INTO work_task_manager_bindings(task_id,generation,thread_id,bound_at,retired_at) VALUES(json_extract(${yield* encodeProjectionJson(event.taskId)},'$'),${event.managerGeneration},json_extract(${yield* encodeProjectionJson(event.managerThreadId)},'$'),${event.occurredAt},NULL)`;
+              } else {
+                yield* guard(
+                  custody.current?.managerGeneration === event.managerGeneration &&
+                    custody.current.managerThreadId === event.managerThreadId,
+                  "manager",
+                );
+                const changed =
+                  yield* sql`UPDATE work_task_manager_bindings SET retired_at=${event.occurredAt} WHERE task_id=json_extract(${yield* encodeProjectionJson(event.taskId)},'$') AND generation=${event.managerGeneration} AND thread_id=json_extract(${yield* encodeProjectionJson(event.managerThreadId)},'$') AND retired_at IS NULL RETURNING 1`;
+                yield* guard(changed.length === 1, "cas");
+              }
+              break;
+            }
+            case "task.allowance-configured":
+            case "task.allowance-topped-up":
+            case "task.allowance-debited": {
+              const previous = (yield* allowanceAt(event.taskId, checkpoint!)).allowance;
+              yield* guard(NodeUtil.isDeepStrictEqual(previous, event.previous), "allowance");
+              const command = yield* one(
+                event.taskId,
+                "aggregate_kind='task' AND application_event_version=2 AND stream_id=json_extract(?,'$') AND command_id=json_extract(?,'$') AND event_type IN ('task.allowance-configured','task.allowance-topped-up','task.allowance-debited') AND sequence<=? ORDER BY sequence DESC LIMIT 1",
+                [
+                  yield* encodeProjectionJson(event.taskId),
+                  yield* encodeProjectionJson(event.commandId),
+                  checkpoint!,
+                ],
+                "idx_orch_events_command_id",
+              );
+              yield* guard(command === undefined, "command");
+              if (event.type === "task.allowance-debited")
+                yield* guard(
+                  (yield* readAllowanceDebitSource({
+                    taskId: event.taskId,
+                    allowanceUnit: event.allowanceUnit,
+                    checkpointSequence: checkpoint!,
+                  })) === undefined,
+                  "unit",
+                );
+              if (previous.type === "unconfigured") {
+                yield* guard(
+                  event.type === "task.allowance-configured" && previous.consumed === 0,
+                  "allowance",
+                );
+                yield* sql`INSERT INTO work_task_allowances(task_id,configured_cap,consumed) VALUES(json_extract(${yield* encodeProjectionJson(event.taskId)},'$'),${event.resulting.cap},${event.resulting.consumed})`;
+              } else {
+                const changed =
+                  yield* sql`UPDATE work_task_allowances SET configured_cap=${event.resulting.cap},consumed=${event.resulting.consumed} WHERE task_id=json_extract(${yield* encodeProjectionJson(event.taskId)},'$') AND configured_cap=${previous.cap} AND consumed=${previous.consumed} RETURNING 1`;
+                yield* guard(changed.length === 1, "cas");
+              }
+              break;
+            }
+            case "task.created":
+              effective = event.definition;
+              break;
+            case "task.definition-updated":
+            case "task.definition-accepted": {
+              const draft = source.latestDefinition?.recorded.event;
+              if (
+                draft &&
+                "definition" in draft &&
+                draft.definition.revision === event.definitionRevision
+              )
+                yield* guard(
+                  NodeUtil.isDeepStrictEqual(draft.definition, event.definition),
                   "definition",
                 );
-            } else {
-              yield* guard(
-                !previous && !source.acceptance && context.commandId !== null,
-                "definition",
-              );
-              const latest = yield* acceptedRow({ taskId: event.taskId });
-              if (latest?.actionPolicyRevision === event.actionPolicyRevision)
+              const previous = yield* acceptedRow({
+                taskId: event.taskId,
+                revision: event.definitionRevision,
+              });
+              if (event.type === "task.definition-updated") {
+                if (previous)
+                  yield* guard(
+                    NodeUtil.isDeepStrictEqual(previous.definition, event.definition),
+                    "definition",
+                  );
+              } else {
                 yield* guard(
-                  NodeUtil.isDeepStrictEqual(
-                    latest.definition.actionPolicy,
-                    event.definition.actionPolicy,
-                  ),
+                  !previous && !source.acceptance && context.commandId !== null,
+                  "definition",
+                );
+                const latest = yield* acceptedRow({ taskId: event.taskId });
+                if (latest?.actionPolicyRevision === event.actionPolicyRevision)
+                  yield* guard(
+                    NodeUtil.isDeepStrictEqual(
+                      latest.definition.actionPolicy,
+                      event.definition.actionPolicy,
+                    ),
+                    "policy",
+                  );
+              }
+              effective = event.definition;
+              break;
+            }
+            case "task.configuration-updated": {
+              const previous = source.configuration?.recorded.event;
+              if (
+                previous?.type === "task.configuration-updated" &&
+                previous.completionPolicyRevision === event.completionPolicyRevision
+              )
+                yield* guard(
+                  NodeUtil.isDeepStrictEqual(previous.completionPolicy, event.completionPolicy),
                   "policy",
                 );
+              break;
             }
-            effective = event.definition;
-            break;
-          }
-          case "task.configuration-updated": {
-            const previous = source.configuration?.recorded.event;
-            if (
-              previous?.type === "task.configuration-updated" &&
-              previous.completionPolicyRevision === event.completionPolicyRevision
-            )
-              yield* guard(
-                NodeUtil.isDeepStrictEqual(previous.completionPolicy, event.completionPolicy),
-                "policy",
-              );
-            break;
-          }
-          case "task.execution-updated": {
-            const known = source.manager?.recorded.event;
-            const highest = source.highestManager?.recorded.event;
-            if (event.manager) {
-              if (known?.type === "task.execution-updated" && known.manager)
-                yield* guard(
-                  known.manager.managerThreadId === event.manager.managerThreadId,
-                  "manager",
-                );
-              if (highest?.type === "task.execution-updated" && highest.manager)
-                yield* guard(
-                  event.manager.managerGeneration >= highest.manager.managerGeneration,
-                  "manager",
-                );
+            case "task.execution-updated": {
+              const known = source.manager?.recorded.event;
+              const highest = source.highestManager?.recorded.event;
+              if (event.manager) {
+                if (known?.type === "task.execution-updated" && known.manager)
+                  yield* guard(
+                    known.manager.managerThreadId === event.manager.managerThreadId,
+                    "manager",
+                  );
+                if (highest?.type === "task.execution-updated" && highest.manager)
+                  yield* guard(
+                    event.manager.managerGeneration >= highest.manager.managerGeneration,
+                    "manager",
+                  );
+              }
+              break;
             }
-            break;
-          }
-          case "task.thread-linked":
-          case "task.thread-unlinked": {
-            const links = yield* sql<{
-              id: string;
-            }>`SELECT hex(link_event_id) AS id FROM work_task_thread_links
+            case "task.thread-linked":
+            case "task.thread-unlinked": {
+              const links = yield* sql<{
+                id: string;
+              }>`SELECT hex(link_event_id) AS id FROM work_task_thread_links
           WHERE task_id=json_extract(${yield* encodeProjectionJson(event.taskId)},'$') AND thread_id=json_extract(${yield* encodeProjectionJson(event.threadId)},'$') AND unlink_event_id IS NULL`;
-            activeLink = links[0] ? yield* attempt(() => decodeHex(links[0]!.id)) : undefined;
-            yield* guard(
-              event.type === "task.thread-linked" ? !activeLink : activeLink !== undefined,
-              "link",
-            );
-            break;
+              activeLink = links[0] ? yield* attempt(() => decodeHex(links[0]!.id)) : undefined;
+              yield* guard(
+                event.type === "task.thread-linked" ? !activeLink : activeLink !== undefined,
+                "link",
+              );
+              break;
+            }
           }
-        }
-        yield* guard(effective !== undefined, "definition");
-        if (current) {
-          const changed =
-            yield* sql`UPDATE work_task_current_state SET last_applied_sequence=${context.sequence}
+          yield* guard(effective !== undefined, "definition");
+          if (current) {
+            const changed =
+              yield* sql`UPDATE work_task_current_state SET last_applied_sequence=${context.sequence}
         WHERE task_id=json_extract(${yield* encodeProjectionJson(event.taskId)},'$') AND last_applied_sequence=${checkpoint}
         AND EXISTS(SELECT 1 FROM work_task_projections p WHERE p.task_id=work_task_current_state.task_id
           AND definition_revision=${current.definitionRevision} AND lifecycle_revision=${current.lifecycleRevision}
           AND completion_policy_revision=${current.completionPolicyRevision} AND action_policy_revision=${current.actionPolicyRevision}) RETURNING 1`;
-          yield* guard(changed.length === 1, "cas");
-          const updated =
-            yield* sql`UPDATE work_task_projections SET definition_revision=${event.definitionRevision},lifecycle_revision=${event.lifecycleRevision},
+            yield* guard(changed.length === 1, "cas");
+            const updated =
+              yield* sql`UPDATE work_task_projections SET definition_revision=${event.definitionRevision},lifecycle_revision=${event.lifecycleRevision},
         completion_policy_revision=${event.completionPolicyRevision},action_policy_revision=${event.actionPolicyRevision},definition_json=${yield* encodeProjectionJson(effective)},updated_at=${event.occurredAt}
         WHERE task_id=json_extract(${yield* encodeProjectionJson(event.taskId)},'$') AND definition_revision=${current.definitionRevision} AND lifecycle_revision=${current.lifecycleRevision}
         AND completion_policy_revision=${current.completionPolicyRevision} AND action_policy_revision=${current.actionPolicyRevision} RETURNING 1`;
-          yield* guard(updated.length === 1, "cas");
-        } else if (event.type === "task.created") {
-          yield* sql`INSERT INTO work_task_projections VALUES(json_extract(${yield* encodeProjectionJson(event.taskId)},'$'),json_extract(${yield* encodeProjectionJson(event.projectId ?? null)},'$'),
+            yield* guard(updated.length === 1, "cas");
+          } else if (event.type === "task.created") {
+            yield* sql`INSERT INTO work_task_projections VALUES(json_extract(${yield* encodeProjectionJson(event.taskId)},'$'),json_extract(${yield* encodeProjectionJson(event.projectId ?? null)},'$'),
         ${event.definitionRevision},${event.lifecycleRevision},${event.completionPolicyRevision},${event.actionPolicyRevision},${yield* encodeProjectionJson(event.definition)},${event.occurredAt},${event.occurredAt})`;
-          yield* sql`INSERT INTO work_task_current_state(task_id,last_applied_sequence) VALUES(json_extract(${yield* encodeProjectionJson(event.taskId)},'$'),${context.sequence})`;
-        }
-        switch (event.type) {
-          case "task.definition-accepted":
-            yield* sql`INSERT INTO work_task_accepted_definitions VALUES(json_extract(${yield* encodeProjectionJson(event.taskId)},'$'),${event.definitionRevision},${event.actionPolicyRevision},
-          ${yield* encodeProjectionJson(event.definition)},${yield* encodeProjectionJson(event.attribution)},json_extract(${yield* encodeProjectionJson(event.id)},'$'),${event.occurredAt})`;
-            break;
-          case "task.configuration-updated":
-            yield* sql`UPDATE work_task_current_state SET configuration_json=${yield* encodeProjectionJson({ allowanceOverride: event.allowanceOverride, completionPolicy: event.completionPolicy })} WHERE task_id=json_extract(${yield* encodeProjectionJson(event.taskId)},'$')`;
-            break;
-          case "task.execution-updated":
-            yield* sql`UPDATE work_task_current_state SET desired_mode=${event.desiredMode},manager_thread_id=json_extract(${yield* encodeProjectionJson(event.manager?.managerThreadId ?? null)},'$'),
-          manager_generation=${event.manager?.managerGeneration ?? null} WHERE task_id=json_extract(${yield* encodeProjectionJson(event.taskId)},'$')`;
-            break;
-          case "task.thread-linked":
-            yield* sql`INSERT INTO work_task_thread_links(link_event_id,task_id,thread_id,linked_at,linked_attribution_json) VALUES(json_extract(${yield* encodeProjectionJson(event.id)},'$'),json_extract(${yield* encodeProjectionJson(event.taskId)},'$'),json_extract(${yield* encodeProjectionJson(event.threadId)},'$'),${event.occurredAt},${yield* encodeProjectionJson(event.attribution)})`;
-            break;
-          case "task.thread-unlinked": {
-            const changed =
-              yield* sql`UPDATE work_task_thread_links SET unlink_event_id=json_extract(${yield* encodeProjectionJson(event.id)},'$'),unlinked_at=${event.occurredAt},unlinked_attribution_json=${yield* encodeProjectionJson(event.attribution)}
-          WHERE link_event_id=json_extract(${yield* encodeProjectionJson(activeLink)},'$') AND task_id=json_extract(${yield* encodeProjectionJson(event.taskId)},'$') AND unlink_event_id IS NULL RETURNING 1`;
-            yield* guard(changed.length === 1, "cas");
-            break;
+            yield* sql`INSERT INTO work_task_current_state(task_id,last_applied_sequence) VALUES(json_extract(${yield* encodeProjectionJson(event.taskId)},'$'),${context.sequence})`;
           }
-        }
-        yield* publishReferenceCheckpoint(source.creation, original, checked);
-        const advanced =
-          yield* sql`UPDATE work_task_view_fence SET generation=${view.generation + 1},high_water_sequence=${Math.max(view.high, context.sequence)}
+          switch (event.type) {
+            case "task.definition-accepted":
+              yield* sql`INSERT INTO work_task_accepted_definitions VALUES(json_extract(${yield* encodeProjectionJson(event.taskId)},'$'),${event.definitionRevision},${event.actionPolicyRevision},
+          ${yield* encodeProjectionJson(event.definition)},${yield* encodeProjectionJson(event.attribution)},json_extract(${yield* encodeProjectionJson(event.id)},'$'),${event.occurredAt})`;
+              break;
+            case "task.configuration-updated":
+              yield* sql`UPDATE work_task_current_state SET configuration_json=${yield* encodeProjectionJson({ allowanceOverride: event.allowanceOverride, completionPolicy: event.completionPolicy })} WHERE task_id=json_extract(${yield* encodeProjectionJson(event.taskId)},'$')`;
+              break;
+            case "task.execution-updated":
+              yield* sql`UPDATE work_task_current_state SET desired_mode=${event.desiredMode},manager_thread_id=json_extract(${yield* encodeProjectionJson(event.manager?.managerThreadId ?? null)},'$'),
+          manager_generation=${event.manager?.managerGeneration ?? null} WHERE task_id=json_extract(${yield* encodeProjectionJson(event.taskId)},'$')`;
+              break;
+            case "task.thread-linked":
+              yield* sql`INSERT INTO work_task_thread_links(link_event_id,task_id,thread_id,linked_at,linked_attribution_json) VALUES(json_extract(${yield* encodeProjectionJson(event.id)},'$'),json_extract(${yield* encodeProjectionJson(event.taskId)},'$'),json_extract(${yield* encodeProjectionJson(event.threadId)},'$'),${event.occurredAt},${yield* encodeProjectionJson(event.attribution)})`;
+              break;
+            case "task.thread-unlinked": {
+              const changed =
+                yield* sql`UPDATE work_task_thread_links SET unlink_event_id=json_extract(${yield* encodeProjectionJson(event.id)},'$'),unlinked_at=${event.occurredAt},unlinked_attribution_json=${yield* encodeProjectionJson(event.attribution)}
+          WHERE link_event_id=json_extract(${yield* encodeProjectionJson(activeLink)},'$') AND task_id=json_extract(${yield* encodeProjectionJson(event.taskId)},'$') AND unlink_event_id IS NULL RETURNING 1`;
+              yield* guard(changed.length === 1, "cas");
+              break;
+            }
+          }
+          yield* publishReferenceCheckpoint(source.creation, original, checked);
+          const advanced =
+            yield* sql`UPDATE work_task_view_fence SET generation=${view.generation + 1},high_water_sequence=${Math.max(view.high, context.sequence)}
       WHERE singleton_id=1 AND generation=${view.generation} AND high_water_sequence=${view.high} RETURNING 1`;
-        yield* guard(advanced.length === 1, "cas");
-        return {
-          applied: true,
-          lastSequence: context.sequence,
-          viewGeneration: view.generation + 1,
-        };
-      }),
-    ),
+          yield* guard(advanced.length === 1, "cas");
+          return {
+            applied: true,
+            lastSequence: context.sequence,
+            viewGeneration: view.generation + 1,
+          };
+        }),
+      ),
+  );
+  const applyFoundation = Effect.fn("TaskStore.applyFoundation")((input: WorkTaskPersistedEvent) =>
+    applyProjection(input, "foundation"),
+  );
+  const applyManagerAllowance = Effect.fn("TaskStore.applyManagerAllowance")(
+    (input: WorkTaskPersistedEvent) => applyProjection(input, "managerAllowance"),
   );
   const rebuildFoundation = Effect.fn("TaskStore.rebuildFoundation")(
     (input: { taskId: string; throughSequence: number }) =>
@@ -1264,6 +1557,10 @@ const make = Effect.gen(function* () {
   );
 
   return TaskStore.of({
+    applyManagerAllowance,
+    readManagerCustody,
+    readManagerBinding,
+    readAllowance,
     auditManagerReferences,
     readAllowanceDebitSource,
     applyFoundation,

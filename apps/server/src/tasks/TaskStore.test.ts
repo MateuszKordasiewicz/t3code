@@ -13,7 +13,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import { runMigrations } from "../persistence/Migrations.ts";
 import * as TaskStore from "./TaskStore.ts";
-import { reduceTaskFoundation } from "./TaskLifecycle.ts";
+import { reduceTaskCustody, reduceTaskFoundation } from "./TaskLifecycle.ts";
 
 const decode = Schema.decodeUnknownEffect(WorkTaskPersistedEvent);
 const timestamp = "2026-11-16T00:00:00.000Z";
@@ -76,6 +76,457 @@ const execution = (generation: number | null) => ({
       : { managerThreadId: `manager-${generation}`, managerGeneration: generation },
   reason: "recorded",
 });
+
+it.effect(
+  "persists manager custody and finite allowance independently of execution observations",
+  () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const store = yield* TaskStore.TaskStore;
+      const sql = yield* SqlClient.SqlClient;
+      const created = yield* record(1);
+      yield* insert(created, 0);
+      yield* store.applyFoundation(created);
+      assert.isUndefined(yield* store.readAllowance("missing"));
+      assert.deepStrictEqual((yield* store.readAllowance("task"))?.allowance, {
+        type: "unconfigured",
+        consumed: 0,
+      });
+      const observed = yield* record(2, execution(1));
+      yield* insert(observed, 1);
+      yield* store.applyFoundation(observed);
+      assert.isUndefined((yield* store.readManagerCustody("task"))?.current);
+      const events = [
+        { type: "task.manager-bound", managerThreadId: "manager-1", managerGeneration: 1 },
+        {
+          type: "task.allowance-configured",
+          commandId: "command-4",
+          previous: { type: "unconfigured", consumed: 0 },
+          resulting: { type: "configured", cap: 2, consumed: 0 },
+        },
+        {
+          type: "task.allowance-debited",
+          commandId: "command-5",
+          previous: { type: "configured", cap: 2, consumed: 0 },
+          resulting: { type: "configured", cap: 2, consumed: 1 },
+          allowanceUnit: 1,
+        },
+        {
+          type: "task.allowance-topped-up",
+          commandId: "command-6",
+          attribution: { type: "user", subject: "owner", sessionId: "human" },
+          previous: { type: "configured", cap: 2, consumed: 1 },
+          resulting: { type: "configured", cap: 3, consumed: 1 },
+        },
+        {
+          type: "task.allowance-configured",
+          commandId: "command-7",
+          previous: { type: "configured", cap: 3, consumed: 1 },
+          resulting: { type: "configured", cap: 2, consumed: 1 },
+        },
+        {
+          type: "task.allowance-debited",
+          commandId: "command-8",
+          previous: { type: "configured", cap: 2, consumed: 1 },
+          resulting: { type: "configured", cap: 2, consumed: 2 },
+          allowanceUnit: 2,
+        },
+        { type: "task.manager-retired", managerThreadId: "manager-1", managerGeneration: 1 },
+        { type: "task.manager-bound", managerThreadId: "manager-2", managerGeneration: 3 },
+      ];
+      let pure: ReturnType<typeof reduceTaskCustody> | undefined;
+      const applied: WorkTaskPersistedEvent[] = [];
+      for (const [index, event] of events.entries()) {
+        const value = yield* record(index + 3, event);
+        yield* insert(value, index + 2);
+        const typed = value.event;
+        switch (typed.type) {
+          case "task.manager-bound":
+          case "task.manager-retired":
+          case "task.allowance-configured":
+          case "task.allowance-topped-up":
+          case "task.allowance-debited":
+            pure = reduceTaskCustody(pure, { event: typed, context: value.context });
+        }
+        assert.isTrue((yield* store.applyManagerAllowance(value)).applied);
+        applied.push(value);
+        const custody = yield* store.readManagerCustody("task");
+        assert.strictEqual(custody?.highestGeneration, pure?.highestManagerGeneration);
+        assert.strictEqual(custody?.current?.managerGeneration, pure?.currentManagerGeneration);
+        assert.deepStrictEqual((yield* store.readAllowance("task"))?.allowance, pure?.allowance);
+      }
+      assert.strictEqual(
+        (yield* store.readFoundation("task"))?.projection.current?.managerGeneration,
+        1,
+      );
+      assert.strictEqual(
+        (yield* store.readManagerBinding({ taskId: "task", generation: 1 }))?.retiredAt,
+        timestamp,
+      );
+      const cleared = yield* record(11, configuration);
+      yield* insert(cleared, 10);
+      yield* store.applyFoundation(cleared);
+      const before = JSON.stringify(yield* sql`SELECT * FROM work_task_view_fence`);
+      for (const event of applied)
+        assert.isFalse((yield* store.applyManagerAllowance(event)).applied);
+      assert.strictEqual(JSON.stringify(yield* sql`SELECT * FROM work_task_view_fence`), before);
+      const restarted = yield* Effect.gen(function* () {
+        const fresh = yield* TaskStore.TaskStore;
+        return {
+          custody: yield* fresh.readManagerCustody("task"),
+          allowance: yield* fresh.readAllowance("task"),
+        };
+      }).pipe(Effect.provide(Layer.fresh(TaskStore.layer)));
+      assert.strictEqual(restarted.custody?.current?.managerThreadId, "manager-2");
+      assert.deepStrictEqual(restarted.allowance?.allowance, {
+        type: "configured",
+        cap: 2,
+        consumed: 2,
+      });
+      assert.strictEqual((yield* sql`SELECT * FROM work_task_accepted_run_debits`).length, 0);
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+      const rebuilt = yield* Effect.gen(function* () {
+        yield* runMigrations();
+        const fresh = yield* TaskStore.TaskStore;
+        const freshSql = yield* SqlClient.SqlClient;
+        assert.strictEqual((yield* freshSql`SELECT * FROM work_task_projections`).length, 0);
+        assert.isUndefined(yield* fresh.readFoundation("task"));
+        const history = [created, observed, ...applied, cleared];
+        for (const [version, value] of history.entries()) yield* insert(value, version);
+        const wake = yield* record(12, {
+          type: "task.wake-source-recorded",
+          commandId: "command-12",
+          source: { kind: "result", sourceId: "source", resultRef: null },
+          reservationId: null,
+          dirtyGeneration: 1,
+        });
+        yield* insert(wake, 11);
+        const replay = Effect.gen(function* () {
+          for (const value of history) {
+            if (applied.includes(value)) yield* fresh.applyManagerAllowance(value);
+            else yield* fresh.applyFoundation(value);
+          }
+        });
+        const error = yield* freshSql
+          .withTransaction(replay.pipe(Effect.andThen(fresh.applyManagerAllowance(wake))))
+          .pipe(Effect.flip);
+        assert.strictEqual("code" in error ? error.code : undefined, "unsupported");
+        assert.isUndefined(yield* fresh.readFoundation("task"));
+        assert.strictEqual(
+          (yield* freshSql<{ generation: number }>`SELECT generation FROM work_task_view_fence`)[0]
+            ?.generation,
+          0,
+        );
+        yield* freshSql.withTransaction(replay);
+        return {
+          custody: yield* fresh.readManagerCustody("task"),
+          allowance: yield* fresh.readAllowance("task"),
+        };
+      }).pipe(
+        Effect.provide(
+          Layer.fresh(TaskStore.layer).pipe(
+            Layer.provideMerge(NodeSqliteClient.layer({ filename: ":memory:" })),
+          ),
+        ),
+      );
+      assert.deepStrictEqual(rebuilt, restarted);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "rejects custody and allowance conflicts without partial checkpoint or counter writes",
+  () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const store = yield* TaskStore.TaskStore;
+      const sql = yield* SqlClient.SqlClient;
+      const created = yield* record(1);
+      yield* insert(created, 0);
+      yield* store.applyFoundation(created);
+      const bound = yield* record(2, {
+        type: "task.manager-bound",
+        managerThreadId: "manager",
+        managerGeneration: 1,
+      });
+      yield* insert(bound, 1);
+      yield* store.applyManagerAllowance(bound);
+      const configured = yield* record(3, {
+        type: "task.allowance-configured",
+        commandId: "command-3",
+        previous: { type: "unconfigured", consumed: 0 },
+        resulting: { type: "configured", cap: 1, consumed: 0 },
+      });
+      yield* insert(configured, 2);
+      yield* store.applyManagerAllowance(configured);
+      const debit = yield* record(4, {
+        type: "task.allowance-debited",
+        commandId: "command-4",
+        previous: { type: "configured", cap: 1, consumed: 0 },
+        resulting: { type: "configured", cap: 1, consumed: 1 },
+        allowanceUnit: 1,
+      });
+      yield* insert(debit, 3);
+      yield* store.applyManagerAllowance(debit);
+      const snapshot = Effect.gen(function* () {
+        const tables = [
+          "work_task_projections",
+          "work_task_current_state",
+          "work_task_manager_bindings",
+          "work_task_allowances",
+          "work_task_manager_reference_checkpoints",
+          "work_task_view_fence",
+          "orchestration_events",
+        ];
+        const values = [];
+        for (const table of tables) values.push(yield* sql.unsafe(`SELECT * FROM ${table}`));
+        return JSON.stringify(values);
+      });
+      const reject = Effect.fn("TaskStoreTest.rejectCustody")(function* (
+        event: Record<string, unknown>,
+        code: string,
+        sequence = 5,
+        commandId = "command-5",
+      ) {
+        const before = yield* snapshot;
+        const value = yield* record(sequence, event, commandId);
+        const error = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* insert(value, sequence - 1);
+              return yield* store.applyManagerAllowance(value);
+            }),
+          )
+          .pipe(Effect.flip);
+        assert.strictEqual("code" in error ? error.code : undefined, code);
+        assert.strictEqual(yield* snapshot, before);
+      });
+      yield* reject(
+        { type: "task.manager-bound", managerThreadId: "other", managerGeneration: 2 },
+        "manager",
+      );
+      yield* reject(
+        { type: "task.manager-retired", managerThreadId: "other", managerGeneration: 1 },
+        "manager",
+      );
+      yield* reject(
+        {
+          type: "task.allowance-configured",
+          commandId: "command-5",
+          previous: { type: "unconfigured", consumed: 0 },
+          resulting: { type: "configured", cap: 3, consumed: 0 },
+        },
+        "allowance",
+      );
+      const topup = {
+        type: "task.allowance-topped-up",
+        attribution: { type: "user", subject: "owner", sessionId: "human" },
+        commandId: "command-5",
+        previous: { type: "configured", cap: 1, consumed: 1 },
+        resulting: { type: "configured", cap: 2, consumed: 1 },
+      };
+      yield* reject({ ...topup, commandId: "command-3" }, "command", 5, "command-3");
+      yield* sql`CREATE TEMP TRIGGER ignore_allowance BEFORE UPDATE ON work_task_allowances BEGIN SELECT RAISE(IGNORE); END`;
+      yield* reject(topup, "cas");
+      yield* sql`DROP TRIGGER ignore_allowance`;
+      yield* sql`CREATE TEMP TRIGGER ignore_custody_fence BEFORE UPDATE ON work_task_view_fence BEGIN SELECT RAISE(IGNORE); END`;
+      yield* reject(topup, "cas");
+      yield* sql`DROP TRIGGER ignore_custody_fence`;
+      yield* sql`CREATE TEMP TRIGGER ignore_custody_marker BEFORE UPDATE ON work_task_manager_reference_checkpoints BEGIN SELECT RAISE(IGNORE); END`;
+      yield* reject(topup, "cas");
+      yield* sql`DROP TRIGGER ignore_custody_marker`;
+      const beforeCorruption = yield* snapshot;
+      const rollback = yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* sql`UPDATE work_task_allowances SET consumed=0`;
+            assert.strictEqual(
+              (yield* store.applyManagerAllowance(debit).pipe(Effect.flip)).code,
+              "legacy",
+            );
+            assert.strictEqual(
+              (yield* store.readAllowance("task").pipe(Effect.flip)).code,
+              "legacy",
+            );
+            return yield* Effect.fail("rollback");
+          }),
+        )
+        .pipe(Effect.flip);
+      assert.strictEqual(rollback, "rollback");
+      assert.strictEqual(yield* snapshot, beforeCorruption);
+      const retired = yield* record(5, {
+        type: "task.manager-retired",
+        managerThreadId: "manager",
+        managerGeneration: 1,
+      });
+      yield* insert(retired, 4);
+      yield* store.applyManagerAllowance(retired);
+      yield* reject(
+        { type: "task.manager-bound", managerThreadId: "manager", managerGeneration: 2 },
+        "manager",
+        6,
+        "command-6",
+      );
+      yield* reject(
+        { type: "task.manager-bound", managerThreadId: "manager", managerGeneration: 1 },
+        "manager",
+        6,
+        "command-6",
+      );
+      yield* reject(
+        { type: "task.manager-retired", managerThreadId: "manager", managerGeneration: 1 },
+        "manager",
+        6,
+        "command-6",
+      );
+      const next = yield* record(6, { ...topup, commandId: "command-6" });
+      yield* insert(next, 5);
+      assert.isTrue((yield* store.applyManagerAllowance(next)).applied);
+      assert.deepStrictEqual((yield* store.readAllowance("task"))?.allowance, {
+        type: "configured",
+        cap: 2,
+        consumed: 1,
+      });
+      assert.isUndefined((yield* store.readManagerCustody("task"))?.current);
+      assert.isFalse((yield* store.applyManagerAllowance(bound)).applied);
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("keeps shared-thread custody task-local and refuses unmaterialized native history", () =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    const store = yield* TaskStore.TaskStore;
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = "\0manager\ud800";
+    for (const [index, taskId] of ["\0task\ud800", "second"].entries()) {
+      const offset = index * 10;
+      const creation = yield* record(offset + 1, { taskId });
+      yield* insert(creation, 0);
+      yield* store.applyFoundation(creation);
+      const bound = yield* record(
+        offset + 2,
+        {
+          taskId,
+          type: "task.manager-bound",
+          managerThreadId: threadId,
+          managerGeneration: index + 1,
+        },
+        "shared-command",
+      );
+      yield* insert(bound, 1);
+      yield* store.applyManagerAllowance(bound);
+      const configured = yield* record(
+        offset + 3,
+        {
+          taskId,
+          type: "task.allowance-configured",
+          commandId: "shared-command",
+          previous: { type: "unconfigured", consumed: 0 },
+          resulting: { type: "configured", cap: index + 1, consumed: 0 },
+        },
+        "shared-command",
+      );
+      yield* insert(configured, 2);
+      yield* store.applyManagerAllowance(configured);
+      const observation = yield* record(offset + 4, {
+        ...execution(index + 1),
+        taskId,
+        manager: { managerThreadId: threadId, managerGeneration: index + 1 },
+      });
+      yield* insert(observation, 3);
+      yield* store.applyFoundation(observation);
+      assert.strictEqual(
+        (yield* store.readManagerCustody(taskId))?.current?.managerThreadId,
+        threadId,
+      );
+      assert.strictEqual(
+        (yield* store.readManagerBinding({ taskId, generation: index + 1 }))?.taskId,
+        taskId,
+      );
+      assert.deepStrictEqual((yield* store.readAllowance(taskId))?.allowance, {
+        type: "configured",
+        cap: index + 1,
+        consumed: 0,
+      });
+      assert.isUndefined(yield* store.readManagerBinding({ taskId, generation: 99 }));
+    }
+    for (const [index, type] of ["task.manager-bound", "task.allowance-configured"].entries()) {
+      const taskId = `unmaterialized-${index}`;
+      const sequence = 30 + index * 10;
+      const creation = yield* record(sequence, { taskId });
+      yield* insert(creation, 0);
+      yield* store.applyFoundation(creation);
+      const value = yield* record(
+        sequence + 1,
+        type === "task.manager-bound"
+          ? { taskId, type, managerThreadId: "old", managerGeneration: 1 }
+          : {
+              taskId,
+              type,
+              commandId: `command-${sequence + 1}`,
+              previous: { type: "unconfigured", consumed: 0 },
+              resulting: { type: "configured", cap: 1, consumed: 0 },
+            },
+      );
+      yield* insert(value, 1);
+      yield* sql`UPDATE work_task_current_state SET last_applied_sequence=${sequence + 1} WHERE task_id=${taskId}`;
+      yield* store.auditManagerReferences({ taskId, expectedCheckpointSequence: sequence + 1 });
+      assert.strictEqual(
+        (yield* store.applyManagerAllowance(value).pipe(Effect.flip)).code,
+        "legacy",
+      );
+      assert.isFalse((yield* store.applyFoundation(creation)).applied);
+    }
+    const unsafe = yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          yield* sql`UPDATE work_task_allowances SET configured_cap=9007199254740992 WHERE task_id='second'`;
+          assert.strictEqual(
+            (yield* store.readAllowance("second").pipe(Effect.flip)).code,
+            "invalid",
+          );
+          return yield* Effect.fail("rollback");
+        }),
+      )
+      .pipe(Effect.flip);
+    assert.strictEqual(unsafe, "rollback");
+    const plans = [
+      [
+        "SELECT * FROM work_task_manager_bindings WHERE task_id=? AND retired_at IS NULL ORDER BY generation DESC LIMIT 1",
+        ["second"],
+        "work_task_manager_current_idx",
+      ],
+      [
+        "SELECT * FROM work_task_manager_bindings WHERE task_id=? ORDER BY generation DESC LIMIT 1",
+        ["second"],
+        "PRIMARY KEY",
+      ],
+      [
+        "SELECT * FROM work_task_manager_bindings WHERE task_id=? AND thread_id=?",
+        ["second", "manager"],
+        "INDEX",
+      ],
+      [
+        "SELECT * FROM work_task_allowances WHERE task_id=?",
+        ["second"],
+        "sqlite_autoindex_work_task_allowances",
+      ],
+      [
+        "SELECT * FROM orchestration_events INDEXED BY idx_orch_events_command_id WHERE aggregate_kind='task' AND application_event_version=2 AND stream_id=json_extract(?,'$') AND command_id=json_extract(?,'$') AND event_type IN ('task.allowance-configured','task.allowance-topped-up','task.allowance-debited') AND sequence<=? ORDER BY sequence DESC LIMIT 1",
+        ['"second"', '"shared-command"', 14],
+        "idx_orch_events_command_id",
+      ],
+    ] as const;
+    for (const [query, parameters, index] of plans) {
+      const rows = yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`, parameters);
+      const plan = rows.map((row) => row.detail).join(" ");
+      assert.include(plan, "SEARCH");
+      assert.include(plan, index);
+      assert.notInclude(plan, "TEMP B-TREE");
+    }
+    assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+  }).pipe(Effect.provide(testLayer)),
+);
 
 it.effect("reads real native records and rejects published pruning before physical deletion", () =>
   Effect.gen(function* () {
