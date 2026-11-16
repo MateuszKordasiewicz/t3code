@@ -76,6 +76,9 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
         "work_task_manager_groups",
         "work_task_membership_companions",
         "work_task_projections",
+        "work_task_ready_events",
+        "work_task_ready_references",
+        "work_task_ready_state",
         "work_task_reconciliation_events",
         "work_task_reconciliation_visits",
         "work_task_results",
@@ -139,6 +142,7 @@ it.effect("upgrades predecessor rows and events without changing their bytes or 
       [98, "WorkTaskAcceptedRunObservations"],
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
+      [101, "WorkTaskReadyState"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM projection_projects ORDER BY project_id`,
@@ -189,6 +193,7 @@ it.effect("rolls back a failed migration and succeeds on rerun", () =>
       [98, "WorkTaskAcceptedRunObservations"],
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
+      [101, "WorkTaskReadyState"],
     ]);
     assert.deepStrictEqual(yield* runMigrations(), []);
   }).pipe(Effect.provide(db)),
@@ -320,6 +325,7 @@ it.effect(
         [98, "WorkTaskAcceptedRunObservations"],
         [99, "WorkTaskManagerClaims"],
         [100, "WorkTaskOwnershipReleaseBridge"],
+        [101, "WorkTaskReadyState"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -493,6 +499,7 @@ it.effect("preserves task custody through validation upgrade and rolls back migr
       [98, "WorkTaskAcceptedRunObservations"],
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
+      [101, "WorkTaskReadyState"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -639,6 +646,7 @@ it.effect("upgrades validation data atomically to action reviews and preserves p
       [98, "WorkTaskAcceptedRunObservations"],
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
+      [101, "WorkTaskReadyState"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -861,6 +869,7 @@ it.effect("upgrades existing tasks without inventing state and rolls back migrat
       [98, "WorkTaskAcceptedRunObservations"],
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
+      [101, "WorkTaskReadyState"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -968,6 +977,7 @@ it.effect("upgrades waits atomically while preserving task state and link proven
       [98, "WorkTaskAcceptedRunObservations"],
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
+      [101, "WorkTaskReadyState"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM work_task_thread_links ORDER BY link_event_id`,
@@ -1102,6 +1112,7 @@ it.effect("upgrades result history atomically without changing predecessor data"
       [98, "WorkTaskAcceptedRunObservations"],
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
+      [101, "WorkTaskReadyState"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_current_state`, state);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_thread_links`, links);
@@ -1252,6 +1263,7 @@ it.effect("upgrades claim history atomically and preserves prior task and ordina
       [98, "WorkTaskAcceptedRunObservations"],
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
+      [101, "WorkTaskReadyState"],
     ]);
     assert.deepStrictEqual(
       yield* Effect.forEach(tables, (name) => sql.unsafe(`SELECT * FROM ${name}`)),
@@ -1598,6 +1610,7 @@ it.effect("preserves legacy validation rows and rolls replay migration back befo
       [98, "WorkTaskAcceptedRunObservations"],
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
+      [101, "WorkTaskReadyState"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_attempts`, before);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_claims`, claims);
@@ -2718,6 +2731,7 @@ it.effect("preserves review evidence on upgrade and binds append-only outcomes a
       [98, "WorkTaskAcceptedRunObservations"],
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
+      [101, "WorkTaskReadyState"],
     ]);
     assert.deepStrictEqual(yield* snapshot(), before);
     assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
@@ -3122,6 +3136,7 @@ it.effect(
         [98, "WorkTaskAcceptedRunObservations"],
         [99, "WorkTaskManagerClaims"],
         [100, "WorkTaskOwnershipReleaseBridge"],
+        [101, "WorkTaskReadyState"],
       ]);
       const after = yield* snapshot();
       assert.deepStrictEqual(
@@ -3486,6 +3501,7 @@ it.effect(
         [98, "WorkTaskAcceptedRunObservations"],
         [99, "WorkTaskManagerClaims"],
         [100, "WorkTaskOwnershipReleaseBridge"],
+        [101, "WorkTaskReadyState"],
       ]);
       const after = yield* capture();
       assert.deepStrictEqual(
@@ -4123,6 +4139,7 @@ it.effect(
         [98, "WorkTaskAcceptedRunObservations"],
         [99, "WorkTaskManagerClaims"],
         [100, "WorkTaskOwnershipReleaseBridge"],
+        [101, "WorkTaskReadyState"],
       ]);
       const after = yield* capture();
       assert.deepStrictEqual(
@@ -4538,6 +4555,7 @@ it.effect("preserves dirty scan membership observations and rolls back migration
       [98, "WorkTaskAcceptedRunObservations"],
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
+      [101, "WorkTaskReadyState"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_group_memberships`, before);
     const member = batch.event.snapshot.currentMembership!;
@@ -5239,6 +5257,7 @@ it.effect(
         [98, "WorkTaskAcceptedRunObservations"],
         [99, "WorkTaskManagerClaims"],
         [100, "WorkTaskOwnershipReleaseBridge"],
+        [101, "WorkTaskReadyState"],
       ]);
       const after = yield* capture();
       for (const name of names.filter((name) => name !== "effect_sql_migrations"))
@@ -5727,6 +5746,7 @@ it.effect(
         [98, "WorkTaskAcceptedRunObservations"],
         [99, "WorkTaskManagerClaims"],
         [100, "WorkTaskOwnershipReleaseBridge"],
+        [101, "WorkTaskReadyState"],
       ]);
       const after = yield* capture();
       for (const name of names.filter((name) => name !== "effect_sql_migrations"))
@@ -5815,7 +5835,7 @@ it.effect(
     }).pipe(Effect.provide(db)),
 );
 
-const decodePhysical = Schema.decodeSync(WorkTaskPersistedCoordinationEvent);
+const decodePhysical = Schema.decodeUnknownSync(WorkTaskPersistedCoordinationEvent);
 const physicalClaimPaths = {
   work_claim_id: "claim.binding.workClaimId",
   run_id: "claim.binding.runId",
@@ -5847,8 +5867,8 @@ const physicalClaimFixture = (
   owner: ReturnType<typeof acceptedOwnershipFixture>,
   suffix = "one",
   sequence = 3000,
+  membership = membershipJoin().event.snapshot,
 ) => {
-  const membership = membershipJoin().event.snapshot;
   const occurredAt = owner.occurredAt;
   const binding = {
     ...owner.ownership.run,
@@ -5890,7 +5910,7 @@ const physicalClaimFixture = (
       },
       control: {
         ...emptyGroupControl(),
-        membershipRevision: 1,
+        membershipRevision: binding.membershipRevision,
         controlRevision: 1,
         highestManagerGeneration: 1,
         currentManager: binding.manager,
@@ -6280,6 +6300,7 @@ it.effect(
       assert.deepStrictEqual(yield* runMigrations(), [
         [99, "WorkTaskManagerClaims"],
         [100, "WorkTaskOwnershipReleaseBridge"],
+        [101, "WorkTaskReadyState"],
       ]);
       const after = yield* capture();
       for (const name of names.filter((n) => n !== "effect_sql_migrations"))
@@ -6861,7 +6882,10 @@ it.effect(
         [],
       );
       yield* sql`DROP INDEX work_task_ownership_bridge_release_idx`;
-      assert.deepStrictEqual(yield* runMigrations(), [[100, "WorkTaskOwnershipReleaseBridge"]]);
+      assert.deepStrictEqual(yield* runMigrations(), [
+        [100, "WorkTaskOwnershipReleaseBridge"],
+        [101, "WorkTaskReadyState"],
+      ]);
       const after = yield* capture();
       for (const { name } of tables.filter((r) => r.name !== "effect_sql_migrations"))
         assert.deepStrictEqual(after[name], before[name]);
@@ -6887,4 +6911,531 @@ it.effect(
       );
       assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
     }).pipe(Effect.provide(db)),
+);
+
+const readyFixture = (sequence: number, previous: number | null = null) => {
+  const owner = acceptedOwnershipFixture();
+  const occurredAt = owner.occurredAt;
+  const event = decodePhysical({
+    context: { eventId: `ready-${sequence}`, sequence, commandId: `ready-${sequence}`, occurredAt },
+    event: {
+      id: `ready-${sequence}`,
+      type: "task.ready-sequence-updated",
+      environmentId: "env",
+      commandId: `ready-${sequence}`,
+      occurredAt,
+      attribution: { type: "server" },
+      task: { environmentId: "env", taskId: "a" },
+      group: { environmentId: "env", groupId: "group" },
+      membershipGeneration: 1,
+      sourceEventId: owner.id,
+      sourceSequence: owner.ownership.recorded.sequence,
+      basis: {
+        taskRevisions: owner.ownership.run.taskRevisions,
+        graphRevision: 0,
+        controlRevision: 1,
+        membershipRevision: 1,
+        managerGeneration: 1,
+      },
+      kind: "qualified",
+      previousOldestReadySequence: previous,
+      oldestReadySequence: previous ?? sequence,
+    },
+  }).event;
+  if (event.type !== "task.ready-sequence-updated") throw new Error("Expected ready event");
+  return event;
+};
+const insertReady = Effect.fn("PersistentTasks.insertReady")(function* (
+  event: unknown,
+  sequence: number,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql.unsafe(
+    `INSERT INTO work_task_ready_events(event_id,sequence,event_json)
+    SELECT json_extract(value,'$.id'),?,value FROM(SELECT ? value)`,
+    [sequence, JSON.stringify(event)],
+  );
+});
+it.effect("retains earned ready age and derives exact latest task membership state", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations();
+    yield* seedAcceptedOwnership();
+    yield* insertAcceptedRun(acceptedOwnershipFixture());
+    yield* insertReady(readyFixture(2000), 2000);
+    yield* insertReady(readyFixture(2001, 2000), 2001);
+    const rows =
+      yield* sql`SELECT oldest_ready_sequence,latest_sequence FROM work_task_ready_state`;
+    assert.deepStrictEqual(
+      rows.map((r) => ({ ...r })),
+      [{ oldest_ready_sequence: 2000, latest_sequence: 2001 }],
+    );
+    yield* rejectOwnershipWrite(insertReady(readyFixture(2002), 2002));
+  }).pipe(Effect.provide(db)),
+);
+
+const decodeReady = (event: unknown, sequence: number) => {
+  const value = event as ReturnType<typeof readyFixture>;
+  return decodePhysical({
+    event,
+    context: {
+      eventId: value.id,
+      sequence,
+      commandId: value.commandId,
+      occurredAt: value.occurredAt,
+    },
+  }).event;
+};
+const settledReady = (release: ReturnType<typeof physicalReleaseFixture>, sequence: number) =>
+  decodeReady(
+    {
+      ...readyFixture(sequence),
+      kind: "settled",
+      claim: release.event.claim,
+      releaseEventId: release.event.id,
+      releaseSequence: release.sequence,
+      sourceEventId: release.event.id,
+      sourceSequence: release.sequence,
+    },
+    sequence,
+  );
+it.effect("consumes and settles ready epochs without erasing pending custody or rebilling", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations();
+    yield* seedAcceptedOwnership();
+    const owner = acceptedOwnershipFixture();
+    yield* insertAcceptedRun(owner);
+    yield* insertReady(readyFixture(2000), 2000);
+    for (let i = 1; i <= 32; i++) yield* insertReady(readyFixture(2000 + i, 2000), 2000 + i);
+    const refresh = readyFixture(2100, 2000);
+    yield* insertReady(
+      decodeReady(
+        {
+          ...refresh,
+          basis: {
+            ...refresh.basis,
+            taskRevisions: { ...refresh.basis.taskRevisions, definitionRevision: 4 },
+          },
+        },
+        2100,
+      ),
+      2100,
+    );
+    assert.strictEqual(
+      (yield* sql`SELECT oldest_ready_sequence FROM work_task_ready_state`)[0]!
+        .oldest_ready_sequence,
+      2000,
+    );
+    const claim = physicalClaimFixture(owner);
+    yield* insertPhysicalClaim(claim);
+    const accepted = decodeReady(
+      {
+        ...readyFixture(3001, 2000),
+        kind: "accepted",
+        oldestReadySequence: null,
+        claim: retainedPhysicalClaim(claim),
+        sourceEventId: claim.id,
+        sourceSequence: 3000,
+      },
+      3001,
+    );
+    yield* insertReady(accepted, 3001);
+    yield* rejectOwnershipWrite(insertReady(readyFixture(3100), 3100));
+    yield* insertReady(
+      decodeReady(
+        {
+          ...readyFixture(3101),
+          kind: "disqualified",
+          oldestReadySequence: null,
+          reason: "task_pause",
+        },
+        3101,
+      ),
+      3101,
+    );
+    yield* rejectOwnershipWrite(insertReady(readyFixture(3102), 3102));
+    const release = physicalReleaseFixture(claim);
+    yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* closePhysicalClaim(release);
+        yield* insertPhysicalRelease(release);
+      }),
+    );
+    yield* insertReady(settledReady(release, 4001), 4001);
+    const expected = yield* sql`SELECT * FROM work_task_ready_state`;
+    assert.strictEqual(expected[0]!.oldest_ready_sequence, 4001);
+    assert.isNull(expected[0]!.pending_claim_id);
+    assert.strictEqual(expected[0]!.last_served_claim_id, claim.claim.binding.workClaimId);
+    for (const query of [
+      "UPDATE work_task_ready_state SET oldest_ready_sequence=2000",
+      "UPDATE work_task_ready_state SET pending_claim_id='physical-one'",
+      "UPDATE work_task_ready_state SET last_served_claim_id=NULL",
+      "UPDATE work_task_ready_state SET latest_event_id='ready-2000',latest_sequence=2000",
+      "INSERT OR REPLACE INTO work_task_ready_state SELECT * FROM work_task_ready_state",
+      "DELETE FROM work_task_ready_state",
+      "INSERT OR REPLACE INTO work_task_ready_events(event_id,sequence,event_json) SELECT event_id,sequence,event_json FROM work_task_ready_events",
+      "DELETE FROM work_task_ready_references",
+    ])
+      yield* rejectOwnershipWrite(sql.unsafe(query));
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_ready_state`, expected);
+    yield* insertReady(
+      decodeReady(
+        {
+          ...readyFixture(4002, 4001),
+          kind: "disqualified",
+          oldestReadySequence: null,
+          reason: "done",
+        },
+        4002,
+      ),
+      4002,
+    );
+    yield* rejectOwnershipWrite(insertReady(settledReady(release, 4003), 4003));
+    yield* insertReady(readyFixture(4004), 4004);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_allowances`, []);
+    assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+    for (const query of [
+      "SELECT * FROM work_task_ready_state WHERE environment_id='env' AND group_id='group' AND oldest_ready_sequence IS NOT NULL ORDER BY oldest_ready_sequence,task_id,membership_generation LIMIT 50",
+      "SELECT event_id FROM work_task_ready_events WHERE task_id='a' AND membership_generation=1 AND kind='accepted' ORDER BY sequence DESC LIMIT 1",
+      "SELECT event_id FROM work_task_ready_events WHERE release_event_id='release-one' AND kind='settled'",
+      "SELECT claim_id FROM work_task_ready_events WHERE task_id='a' AND membership_generation=1 AND kind IN ('accepted','settled') ORDER BY sequence DESC LIMIT 1",
+      "SELECT event_id FROM work_task_ready_events WHERE task_id='a' AND sequence>3000",
+    ]) {
+      const plan = (yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`))
+        .map((r) => r.detail)
+        .join(" ");
+      assert.include(plan, "SEARCH");
+      assert.notInclude(plan, "TEMP B-TREE");
+      assert.notInclude(plan, "SCAN work_task_ready");
+    }
+    for (const name of ["work_task_ready_physical_reverse", "work_task_ready_state_update"]) {
+      const trigger = (yield* sql<{
+        sql: string;
+      }>`SELECT sql FROM sqlite_master WHERE name=${name}`)[0]!;
+      const predicate = trigger.sql.split("SELECT CASE WHEN ")[1]!.split(" THEN RAISE")[0]!;
+      const from = name.includes("physical")
+        ? "work_task_executable_claims"
+        : "work_task_ready_state";
+      const plan = (yield* sql.unsafe<{ detail: string }>(
+        `EXPLAIN QUERY PLAN SELECT ${predicate} FROM ${from} NEW${name.includes("state") ? " CROSS JOIN work_task_ready_state OLD" : ""}`,
+      ))
+        .map((r) => r.detail)
+        .join(" ");
+      assert.include(plan, "SEARCH");
+      assert.notMatch(plan, /SCAN [ers]\b/, plan);
+      assert.include(
+        plan,
+        name.includes("state") ? "work_task_ready_accepted_idx" : "work_task_ready_task_idx",
+      );
+    }
+  }).pipe(Effect.provide(db)),
+);
+it.effect("bootstraps only real settled claims and rejects reverse ready chronology", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations();
+    yield* seedAcceptedOwnership();
+    const owner = acceptedOwnershipFixture();
+    yield* insertAcceptedRun(owner);
+    const first = physicalClaimFixture(owner);
+    yield* insertPhysicalClaim(first);
+    const release = physicalReleaseFixture(first);
+    yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* insertPhysicalRelease(release);
+        yield* closePhysicalClaim(release);
+      }),
+    );
+    yield* insertReady(settledReady(release, 5000), 5000);
+    const later = physicalClaimFixture(owner, "later", 4500);
+    yield* rejectOwnershipWrite(insertPhysicalClaim(later));
+    const valid = physicalClaimFixture(owner, "future", 6000);
+    yield* insertPhysicalClaim(valid);
+    yield* rejectOwnershipWrite(insertReady(readyFixture(6001, 5000), 6001));
+    const before = yield* sql`SELECT * FROM work_task_ready_state`;
+    for (const patch of [
+      {
+        sequence: 5001,
+        event: {
+          ...readyFixture(5001, 5000),
+          sourceEventId: release.event.id,
+          sourceSequence: 4001,
+        },
+      },
+      { sequence: 5001, event: { ...readyFixture(5001, 5000), id: release.event.id } },
+      {
+        sequence: 5001,
+        event: {
+          ...readyFixture(5001, 5000),
+          basis: { ...readyFixture(5001).basis, managerGeneration: null },
+        },
+      },
+      { sequence: 5001, event: { ...readyFixture(5001, 5000), membershipGeneration: 2 } },
+      { sequence: 5001, event: { ...readyFixture(5001, 5000), occurredAt: "invalid" } },
+      { sequence: 5001, event: { ...readyFixture(5001, 5000), sourceSequence: true } },
+    ])
+      yield* rejectOwnershipWrite(insertReady(patch.event, patch.sequence));
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_ready_state`, before);
+    const unusual = decodeReady(
+      {
+        ...readyFixture(5200, 5000),
+        id: "ready-\0😀\ud800",
+        commandId: "ready-command-\0😀\ud800",
+        unknownField: "stripped",
+      },
+      5200,
+    );
+    yield* insertReady(unusual, 5200);
+    assert.strictEqual(
+      (yield* sql`SELECT hex(latest_event_id) encoded FROM work_task_ready_state`)[0]!.encoded,
+      (yield* sql`SELECT hex(json_extract(${JSON.stringify(unusual)},'$.id')) encoded`)[0]!.encoded,
+    );
+    for (const changed of [
+      { sourceEventId: "\t" },
+      { id: "x".repeat(2001) },
+      { unknownField: "not decoded" },
+      { oldestReadySequence: null },
+      { previousOldestReadySequence: 4999 },
+    ])
+      yield* rejectOwnershipWrite(insertReady({ ...readyFixture(5300, 5000), ...changed }, 5300));
+    yield* rejectOwnershipWrite(
+      sql`UPDATE work_task_accepted_definitions SET definition_json='{"changed":true}' WHERE task_id='a' AND definition_revision=2`,
+    );
+    yield* rejectOwnershipWrite(
+      sql`INSERT OR REPLACE INTO work_task_accepted_definitions SELECT * FROM work_task_accepted_definitions WHERE task_id='a' AND definition_revision=2`,
+    );
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect(
+  "preserves ready age across shared holds and keeps moved membership pending evidence local",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      const seed = yield* seedAcceptedOwnership();
+      const owner = acceptedOwnershipFixture();
+      yield* insertAcceptedRun(owner);
+      yield* insertReady(readyFixture(2000), 2000);
+      const claim = physicalClaimFixture(owner);
+      yield* insertPhysicalClaim(claim);
+      yield* insertReady(
+        decodeReady(
+          {
+            ...readyFixture(3001, 2000),
+            kind: "accepted",
+            oldestReadySequence: null,
+            claim: retainedPhysicalClaim(claim),
+            sourceEventId: claim.id,
+            sourceSequence: 3000,
+          },
+          3001,
+        ),
+        3001,
+      );
+      const removed = membershipTransition(
+        { ...seed.join.event.snapshot, taskRevisions: owner.ownership.run.taskRevisions },
+        [seed.bound.control],
+        null,
+        "ready-remove",
+      );
+      yield* sql.withTransaction(applyMembership(removed, 3100));
+      const rejoined = membershipTransition(
+        removed.event.snapshot,
+        [removed.companions[0]!.control],
+        "group",
+        "ready-rejoin",
+      );
+      yield* sql.withTransaction(applyMembership(rejoined, 3200));
+      const fresh = (sequence: number, previous: number | null = null) =>
+        decodeReady(
+          {
+            ...readyFixture(sequence, previous),
+            membershipGeneration: 2,
+            basis: { ...readyFixture(sequence).basis, membershipRevision: 3 },
+          },
+          sequence,
+        );
+      yield* rejectOwnershipWrite(insertReady(fresh(3300), 3300));
+      const release = physicalReleaseFixture(claim);
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* closePhysicalClaim(release);
+          yield* insertPhysicalRelease(release);
+        }),
+      );
+      yield* insertReady(fresh(4100), 4100);
+      const retained =
+        yield* sql`SELECT membership_generation,oldest_ready_sequence,pending_claim_id FROM work_task_ready_state ORDER BY membership_generation`;
+      assert.deepStrictEqual(
+        retained.map((r) => ({ ...r })),
+        [
+          {
+            membership_generation: 1,
+            oldest_ready_sequence: null,
+            pending_claim_id: claim.claim.binding.workClaimId,
+          },
+          { membership_generation: 2, oldest_ready_sequence: 4100, pending_claim_id: null },
+        ],
+      );
+      yield* sql`INSERT INTO work_task_projections VALUES ('b',NULL,3,1,2,3,'{}','raw','raw')`;
+      yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('b',1,1,'{}','{}','b-definition-one','raw')`;
+      yield* sql`INSERT INTO work_task_accepted_definitions VALUES ('b',2,1,'{}','{}','b-definition-two','raw')`;
+      const bJoin = membershipTransition(
+        {
+          ...membershipJoin().event.previousSnapshot,
+          taskRevisions: owner.ownership.run.taskRevisions,
+          task: {
+            environmentId: owner.environmentId,
+            taskId: "b" as typeof owner.ownership.run.task.taskId,
+          },
+        },
+        [rejoined.companions[0]!.control],
+        "group",
+        "b-join",
+      );
+      yield* sql.withTransaction(applyMembership(bJoin, 4200));
+      const bBase = acceptedOwnershipFixture("b", 3300);
+      const bOwner = decodeAcceptedOwnership({
+        event: {
+          ...bBase,
+          ownership: {
+            ...bBase.ownership,
+            sourceEventId: "b-start",
+            sourceSequence: 150,
+            observedWorkSequence: 150,
+            origin: {
+              type: "initial_start",
+              startCommandId: "b-start-command",
+              startEventId: "b-start",
+              startSequence: 150,
+            },
+            nativeAcceptance: {
+              ...bBase.ownership.nativeAcceptance,
+              runEvent: { ...bBase.ownership.nativeAcceptance.runEvent, sequence: 4251 },
+              messageEvent: { ...bBase.ownership.nativeAcceptance.messageEvent, sequence: 4252 },
+              receipt: { ...bBase.ownership.nativeAcceptance.receipt, resultSequence: 4252 },
+            },
+            run: { ...bBase.ownership.run, task: bJoin.event.snapshot.task, membershipRevision: 4 },
+          },
+        },
+        context: bBase.ownership.recorded,
+      }).event;
+      if (bOwner.type !== "task.run-ownership-accepted") throw new Error("Expected B ownership");
+      yield* insertAcceptedRun(bOwner);
+      const bClaim = physicalClaimFixture(bOwner, "b", 4400, bJoin.event.snapshot);
+      yield* insertPhysicalClaim(bClaim);
+      yield* insertReady(fresh(4500, 4100), 4500);
+      const bReady = decodeReady(
+        {
+          ...readyFixture(4350),
+          id: "b-ready",
+          commandId: "b-ready",
+          task: bJoin.event.snapshot.task,
+          sourceEventId: bOwner.id,
+          sourceSequence: 4300,
+          basis: { ...readyFixture(4350).basis, membershipRevision: 4 },
+        },
+        4350,
+      );
+      yield* insertReady(bReady, 4350);
+      const selected = yield* sql<{
+        task_id: string;
+      }>`SELECT s.task_id FROM work_task_ready_state s JOIN work_task_group_memberships m ON m.task_id=s.task_id AND m.membership_generation=s.membership_generation
+      WHERE s.environment_id='env' AND s.group_id='group' AND s.oldest_ready_sequence IS NOT NULL AND m.retired_event_id IS NULL ORDER BY s.oldest_ready_sequence,s.task_id,s.membership_generation`;
+      assert.deepStrictEqual(
+        selected.map((r) => r.task_id),
+        ["a", "b"],
+      );
+      yield* insertCoordination(dirtyEvent("ready-dirty", "a", bOwner.id, 4300), 4600);
+      const scan = {
+        ...scanEvent("ready-scan"),
+        scan: {
+          kind: "group_members",
+          sourceEventId: bOwner.id,
+          sourceSequence: 4300,
+          group: { environmentId: "env", groupId: "group" },
+          capturedRevision: 4,
+        },
+        observedRevision: 4,
+        visited: [{ task: { environmentId: "env", taskId: "a" }, membershipGeneration: 2 }],
+        position: { taskId: "a" },
+      };
+      yield* insertCoordination(scan, 4603);
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(insertCoordination({ ...scan, id: "stale-ready-scan" }, 4604)),
+        ),
+      );
+      const dirty = dirtyEvent("ready-dirty", "a", bOwner.id, 4300);
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(insertCoordination({ ...dirty, id: "duplicate-dirty" }, 4601)),
+        ),
+      );
+      assert.strictEqual(
+        (yield* sql`SELECT oldest_ready_sequence FROM work_task_ready_state WHERE task_id='a' AND membership_generation=2`)[0]!
+          .oldest_ready_sequence,
+        4100,
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            insertCoordination(
+              { ...dirtyEvent("bad-alias"), sourceEventId: "b-ready", sourceSequence: 4351 },
+              4602,
+            ),
+          ),
+        ),
+      );
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+    }).pipe(Effect.provide(db)),
+);
+it.effect("upgrades ready storage preserving every predecessor row and rolls back DDL", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations({ toMigrationInclusive: 100 });
+    yield* seedAcceptedOwnership();
+    const owner = acceptedOwnershipFixture();
+    yield* insertAcceptedRun(owner);
+    const claim = physicalClaimFixture(owner);
+    yield* insertPhysicalClaim(claim);
+    const release = physicalReleaseFixture(claim);
+    yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* closePhysicalClaim(release);
+        yield* insertPhysicalRelease(release);
+      }),
+    );
+    const tables = yield* sql<{
+      name: string;
+    }>`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`;
+    const capture = Effect.fn("PersistentTasks.captureReadyPredecessor")(function* () {
+      return Object.fromEntries(
+        yield* Effect.forEach(tables, ({ name }) =>
+          sql.unsafe(`SELECT * FROM "${name}"`).pipe(Effect.map((rows) => [name, rows] as const)),
+        ),
+      );
+    });
+    const before = yield* capture();
+    yield* sql`CREATE INDEX work_task_ready_latest_idx ON work_task_projections(task_id)`;
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(runMigrations())));
+    assert.deepStrictEqual(yield* capture(), before);
+    assert.deepStrictEqual(
+      yield* sql`SELECT name FROM sqlite_master WHERE name='work_task_ready_events'`,
+      [],
+    );
+    yield* sql`DROP INDEX work_task_ready_latest_idx`;
+    assert.deepStrictEqual(yield* runMigrations(), [[101, "WorkTaskReadyState"]]);
+    const after = yield* capture();
+    for (const { name } of tables.filter((t) => t.name !== "effect_sql_migrations"))
+      assert.deepStrictEqual(after[name], before[name]);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_ready_events`, []);
+    yield* insertReady(settledReady(release, 5000), 5000);
+    const state = yield* sql`SELECT * FROM work_task_ready_state`;
+    assert.deepStrictEqual(yield* runMigrations(), []);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_ready_state`, state);
+    assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+  }).pipe(Effect.provide(db)),
 );

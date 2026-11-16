@@ -80,6 +80,7 @@ describe("V2 preview upgrade", () => {
         [98, "WorkTaskAcceptedRunObservations"],
         [99, "WorkTaskManagerClaims"],
         [100, "WorkTaskOwnershipReleaseBridge"],
+        [101, "WorkTaskReadyState"],
       ]);
       assert.deepStrictEqual(yield* runMigrations(), []);
       assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_legacy_imports`, imports);
@@ -209,6 +210,7 @@ describe("V2 preview upgrade", () => {
         [98, "WorkTaskAcceptedRunObservations"],
         [99, "WorkTaskManagerClaims"],
         [100, "WorkTaskOwnershipReleaseBridge"],
+        [101, "WorkTaskReadyState"],
       ]);
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
   );
