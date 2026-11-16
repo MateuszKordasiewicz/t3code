@@ -41,6 +41,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
     assert.deepInclude(migrations, [95, "WorkTaskManagerMemberships"]);
     assert.deepInclude(migrations, [96, "WorkTaskDirtyReconciliation"]);
     assert.deepInclude(migrations, [97, "WorkTaskAcceptedRuns"]);
+    assert.deepInclude(migrations, [98, "WorkTaskAcceptedRunObservations"]);
     const tables = yield* sql<{ readonly name: string }>`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'work_task_%' ORDER BY name
     `;
@@ -72,6 +73,8 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
         "work_task_review_outcomes",
         "work_task_review_rowids",
         "work_task_review_status",
+        "work_task_run_observation_references",
+        "work_task_run_ownership_observations",
         "work_task_thread_links",
         "work_task_validation_attempts",
         "work_task_validation_identity",
@@ -122,6 +125,7 @@ it.effect("upgrades predecessor rows and events without changing their bytes or 
       [95, "WorkTaskManagerMemberships"],
       [96, "WorkTaskDirtyReconciliation"],
       [97, "WorkTaskAcceptedRuns"],
+      [98, "WorkTaskAcceptedRunObservations"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM projection_projects ORDER BY project_id`,
@@ -169,6 +173,7 @@ it.effect("rolls back a failed migration and succeeds on rerun", () =>
       [95, "WorkTaskManagerMemberships"],
       [96, "WorkTaskDirtyReconciliation"],
       [97, "WorkTaskAcceptedRuns"],
+      [98, "WorkTaskAcceptedRunObservations"],
     ]);
     assert.deepStrictEqual(yield* runMigrations(), []);
   }).pipe(Effect.provide(db)),
@@ -297,6 +302,7 @@ it.effect(
         [95, "WorkTaskManagerMemberships"],
         [96, "WorkTaskDirtyReconciliation"],
         [97, "WorkTaskAcceptedRuns"],
+        [98, "WorkTaskAcceptedRunObservations"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -467,6 +473,7 @@ it.effect("preserves task custody through validation upgrade and rolls back migr
       [95, "WorkTaskManagerMemberships"],
       [96, "WorkTaskDirtyReconciliation"],
       [97, "WorkTaskAcceptedRuns"],
+      [98, "WorkTaskAcceptedRunObservations"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -610,6 +617,7 @@ it.effect("upgrades validation data atomically to action reviews and preserves p
       [95, "WorkTaskManagerMemberships"],
       [96, "WorkTaskDirtyReconciliation"],
       [97, "WorkTaskAcceptedRuns"],
+      [98, "WorkTaskAcceptedRunObservations"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -829,6 +837,7 @@ it.effect("upgrades existing tasks without inventing state and rolls back migrat
       [95, "WorkTaskManagerMemberships"],
       [96, "WorkTaskDirtyReconciliation"],
       [97, "WorkTaskAcceptedRuns"],
+      [98, "WorkTaskAcceptedRunObservations"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -933,6 +942,7 @@ it.effect("upgrades waits atomically while preserving task state and link proven
       [95, "WorkTaskManagerMemberships"],
       [96, "WorkTaskDirtyReconciliation"],
       [97, "WorkTaskAcceptedRuns"],
+      [98, "WorkTaskAcceptedRunObservations"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM work_task_thread_links ORDER BY link_event_id`,
@@ -1064,6 +1074,7 @@ it.effect("upgrades result history atomically without changing predecessor data"
       [95, "WorkTaskManagerMemberships"],
       [96, "WorkTaskDirtyReconciliation"],
       [97, "WorkTaskAcceptedRuns"],
+      [98, "WorkTaskAcceptedRunObservations"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_current_state`, state);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_thread_links`, links);
@@ -1211,6 +1222,7 @@ it.effect("upgrades claim history atomically and preserves prior task and ordina
       [95, "WorkTaskManagerMemberships"],
       [96, "WorkTaskDirtyReconciliation"],
       [97, "WorkTaskAcceptedRuns"],
+      [98, "WorkTaskAcceptedRunObservations"],
     ]);
     assert.deepStrictEqual(
       yield* Effect.forEach(tables, (name) => sql.unsafe(`SELECT * FROM ${name}`)),
@@ -1554,6 +1566,7 @@ it.effect("preserves legacy validation rows and rolls replay migration back befo
       [95, "WorkTaskManagerMemberships"],
       [96, "WorkTaskDirtyReconciliation"],
       [97, "WorkTaskAcceptedRuns"],
+      [98, "WorkTaskAcceptedRunObservations"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_attempts`, before);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_claims`, claims);
@@ -2671,6 +2684,7 @@ it.effect("preserves review evidence on upgrade and binds append-only outcomes a
       [95, "WorkTaskManagerMemberships"],
       [96, "WorkTaskDirtyReconciliation"],
       [97, "WorkTaskAcceptedRuns"],
+      [98, "WorkTaskAcceptedRunObservations"],
     ]);
     assert.deepStrictEqual(yield* snapshot(), before);
     assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
@@ -3072,6 +3086,7 @@ it.effect(
         [95, "WorkTaskManagerMemberships"],
         [96, "WorkTaskDirtyReconciliation"],
         [97, "WorkTaskAcceptedRuns"],
+        [98, "WorkTaskAcceptedRunObservations"],
       ]);
       const after = yield* snapshot();
       assert.deepStrictEqual(
@@ -3433,6 +3448,7 @@ it.effect(
         [95, "WorkTaskManagerMemberships"],
         [96, "WorkTaskDirtyReconciliation"],
         [97, "WorkTaskAcceptedRuns"],
+        [98, "WorkTaskAcceptedRunObservations"],
       ]);
       const after = yield* capture();
       assert.deepStrictEqual(
@@ -4067,6 +4083,7 @@ it.effect(
         [95, "WorkTaskManagerMemberships"],
         [96, "WorkTaskDirtyReconciliation"],
         [97, "WorkTaskAcceptedRuns"],
+        [98, "WorkTaskAcceptedRunObservations"],
       ]);
       const after = yield* capture();
       assert.deepStrictEqual(
@@ -4479,6 +4496,7 @@ it.effect("preserves dirty scan membership observations and rolls back migration
     assert.deepStrictEqual(yield* runMigrations(), [
       [96, "WorkTaskDirtyReconciliation"],
       [97, "WorkTaskAcceptedRuns"],
+      [98, "WorkTaskAcceptedRunObservations"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_group_memberships`, before);
     const member = batch.event.snapshot.currentMembership!;
@@ -5175,7 +5193,10 @@ it.effect(
         [],
       );
       yield* sql`DROP INDEX work_task_accepted_thread_idx`;
-      assert.deepStrictEqual(yield* runMigrations(), [[97, "WorkTaskAcceptedRuns"]]);
+      assert.deepStrictEqual(yield* runMigrations(), [
+        [97, "WorkTaskAcceptedRuns"],
+        [98, "WorkTaskAcceptedRunObservations"],
+      ]);
       const after = yield* capture();
       for (const name of names.filter((name) => name !== "effect_sql_migrations"))
         assert.deepStrictEqual(after[name], before[name]);
@@ -5249,5 +5270,497 @@ it.effect(
       );
       assert.deepStrictEqual(yield* runMigrations(), []);
       assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+    }).pipe(Effect.provide(db)),
+);
+
+const retainedOwnership = (owner: ReturnType<typeof acceptedOwnershipFixture>) => {
+  const { run, recorded, nativeAcceptance, origin } = owner.ownership;
+  return {
+    run,
+    recorded,
+    nativeRunEvent: nativeAcceptance.runEvent,
+    origin:
+      origin.type === "initial_start"
+        ? origin
+        : {
+            type: origin.type,
+            reservationId: origin.reservationId,
+            reservationCommandId: origin.reservationCommandId,
+            allowanceUnit: origin.allowanceUnit,
+            debitEvent: origin.debitEvent,
+          },
+  };
+};
+const ownershipObservation = (
+  owner = acceptedOwnershipFixture(),
+  id = "uncertain",
+  sequence = 2000,
+) => {
+  const context = {
+    eventId: id,
+    sequence,
+    commandId: `observe-${id}`,
+    occurredAt: "2026-11-16T00:00:00.0001Z",
+  };
+  const decoded = decodeAcceptedOwnership({
+    context,
+    event: {
+      id,
+      type: "task.run-ownership-uncertain",
+      environmentId: owner.environmentId,
+      commandId: context.commandId,
+      occurredAt: context.occurredAt,
+      attribution: { type: "server" },
+      ownership: retainedOwnership(owner),
+      sourceEventId: owner.ownership.sourceEventId,
+      sourceSequence: owner.ownership.sourceSequence,
+      reason: "Native response not yet reconciled",
+    },
+  });
+  if (decoded.event.type !== "task.run-ownership-uncertain")
+    throw new Error("Expected uncertain ownership");
+  return { event: decoded.event, context: decoded.context };
+};
+const ownershipTermination = (
+  owner = acceptedOwnershipFixture(),
+  id = "terminated",
+  sequence = 2002,
+) => {
+  const { context } = ownershipObservation(owner, id, sequence);
+  const decoded = decodeAcceptedOwnership({
+    context,
+    event: {
+      id,
+      type: "task.run-ownership-terminated",
+      environmentId: owner.environmentId,
+      commandId: context.commandId,
+      occurredAt: context.occurredAt,
+      attribution: { type: "server" },
+      ownership: retainedOwnership(owner),
+      observedSequence: 500,
+      terminationEvidence: {
+        kind: "before_executable_claim",
+        terminalRunEvent: { type: "run.updated", eventId: "native-terminal", sequence: 500 },
+        terminalStatus: "cancelled",
+        settlementCommandId: "settlement",
+      },
+    },
+  });
+  if (decoded.event.type !== "task.run-ownership-terminated")
+    throw new Error("Expected terminated ownership");
+  return { event: decoded.event, context: decoded.context };
+};
+const rejectOwnershipWrite = Effect.fn("PersistentTasks.rejectOwnershipWrite")(function* (
+  effect: Effect.Effect<unknown, SqlError, SqlClient.SqlClient>,
+) {
+  assert.isTrue(Exit.isFailure(yield* Effect.exit(effect)));
+});
+const observationPaths = {
+  event_id: "id",
+  run_id: "ownership.run.runId",
+  environment_id: "environmentId",
+  task_id: "ownership.run.task.taskId",
+  group_id: "ownership.run.group.groupId",
+  manager_thread_id: "ownership.run.manager.threadId",
+  kind: "type",
+  command_id: "commandId",
+  occurred_at: "occurredAt",
+  source_event_id: "sourceEventId",
+  source_sequence: "sourceSequence",
+  observed_sequence: "observedSequence",
+  terminal_event_id: "terminationEvidence.terminalRunEvent.eventId",
+  terminal_sequence: "terminationEvidence.terminalRunEvent.sequence",
+  terminal_status: "terminationEvidence.terminalStatus",
+  settlement_command_id: "terminationEvidence.settlementCommandId",
+};
+const insertOwnershipObservation = Effect.fn("PersistentTasks.insertOwnershipObservation")(
+  function* (event: unknown, sequence: number) {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql.unsafe(
+      `INSERT INTO work_task_run_ownership_observations (${Object.keys(observationPaths).join(",")},sequence,event_json)
+    SELECT ${Object.values(observationPaths)
+      .map((p) => `json_extract(value,'$.${p}')`)
+      .join(",")},?,value FROM (SELECT ? value)`,
+      [sequence, JSON.stringify(event)],
+    );
+  },
+);
+it.effect("retains monotonic ownership observations without changing accepted debit evidence", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations();
+    yield* seedAcceptedOwnership();
+    const owner = acceptedOwnershipFixture();
+    yield* insertAcceptedRun(owner);
+    const observed = ownershipObservation(owner);
+    const reference = retainedOwnership(owner);
+    yield* insertOwnershipObservation(
+      {
+        ...observed.event,
+        ownership: {
+          origin: reference.origin,
+          nativeRunEvent: reference.nativeRunEvent,
+          recorded: reference.recorded,
+          run: reference.run,
+        },
+      },
+      observed.context.sequence,
+    );
+    assert.deepStrictEqual(
+      (yield* sql<{
+        event_json: string;
+      }>`SELECT event_json FROM work_task_run_ownership_observations`).map((r) =>
+        JSON.parse(r.event_json),
+      ),
+      [observed.event],
+    );
+    const again = ownershipObservation(owner, "uncertain-again", 2001);
+    yield* insertOwnershipObservation(again.event, again.context.sequence);
+    const terminal = ownershipTermination(owner);
+    yield* insertOwnershipObservation(terminal.event, terminal.context.sequence);
+    const late = ownershipObservation(owner, "late", 2003);
+    yield* rejectOwnershipWrite(insertOwnershipObservation(late.event, late.context.sequence));
+    const unicodeOwner = acceptedOwnershipFixture("unicode\0😀\ud800", 40);
+    yield* insertAcceptedRun(unicodeOwner);
+    const unicodeObservation = ownershipObservation(unicodeOwner, "uncertain\0😀\ud800", 2150);
+    yield* insertOwnershipObservation(
+      unicodeObservation.event,
+      unicodeObservation.context.sequence,
+    );
+    const [unicodeRow] = yield* sql<{
+      event_json: string;
+    }>`SELECT event_json FROM work_task_run_ownership_observations WHERE run_id=json_extract(${JSON.stringify(unicodeOwner.ownership.run.runId)},'$')`;
+    assert.deepStrictEqual(JSON.parse(unicodeRow!.event_json), unicodeObservation.event);
+    for (const debitFirst of [false, true]) {
+      const automatic = automaticOwnershipFixture(
+        `observed-${debitFirst}`,
+        debitFirst ? 80 : 60,
+        debitFirst ? 2 : 1,
+      );
+      const next = ownershipObservation(
+        automatic.event,
+        `automatic-${debitFirst}`,
+        debitFirst ? 2201 : 2200,
+      );
+      const debit = insertAcceptedDebit(
+        automatic.event.ownership.run.runId,
+        automatic.debit.event,
+        automatic.debit.context.sequence,
+      );
+      const insertOwner = insertAcceptedRun(automatic.event);
+      const insertObservation = insertOwnershipObservation(next.event, next.context.sequence);
+      yield* sql`BEGIN`;
+      yield* insertOwner;
+      yield* insertObservation;
+      yield* rejectOwnershipWrite(sql`COMMIT`);
+      yield* sql`ROLLBACK`;
+      assert.deepStrictEqual(
+        yield* sql`SELECT event_id FROM work_task_run_ownership_observations WHERE event_id=${next.event.id}`,
+        [],
+      );
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          if (debitFirst) yield* debit;
+          yield* insertOwner;
+          yield* insertObservation;
+          if (!debitFirst) yield* debit;
+        }),
+      );
+    }
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_allowances`, []);
+    assert.equal((yield* sql`SELECT event_id FROM work_task_accepted_run_debits`).length, 2);
+    assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect(
+  "rejects ownership observation contradictions and preserves shared source references",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      yield* seedAcceptedOwnership();
+      const owner = acceptedOwnershipFixture();
+      const second = acceptedOwnershipFixture("second", 20);
+      const third = acceptedOwnershipFixture("third", 40);
+      for (const value of [owner, second, third]) yield* insertAcceptedRun(value);
+      const observation = ownershipObservation(owner);
+      for (const [path, value] of [
+        ["$.id", "x".repeat(2001)],
+        ["$.attribution.type", "human"],
+        ["$.environmentId", "other"],
+        ["$.occurredAt", "2026-02-30T00:00:00Z"],
+        ["$.sourceSequence", 2000],
+        ["$.sourceSequence", true],
+        ["$.reason", "\t\ufeff"],
+        ["$.ownership.run.runId", second.ownership.run.runId],
+        ["$.ownership.run.messageId", "different"],
+        ["$.ownership.run.taskRevisions.definitionRevision", 4],
+        ["$.ownership.run.taskRevisions.acceptedDefinitionRevision", 1],
+        ["$.ownership.run.taskRevisions.actionPolicyRevision", true],
+        ["$.ownership.recorded.commandId", "different"],
+        ["$.ownership.nativeRunEvent.sequence", 200],
+        ["$.ownership.origin.startCommandId", "different"],
+        ["$.observedSequence", null],
+      ] as ReadonlyArray<readonly [string, unknown]>) {
+        const [row] = yield* sql<{
+          value: string;
+        }>`SELECT json_set(${JSON.stringify(observation.event)},${path},json(${JSON.stringify(value)})) value`;
+        const malformed: unknown = JSON.parse(row!.value);
+        yield* rejectOwnershipWrite(
+          insertOwnershipObservation(malformed, observation.context.sequence),
+        );
+      }
+      yield* insertOwnershipObservation(observation.event, observation.context.sequence);
+      for (const sequence of [1999, 2000]) {
+        const older = ownershipObservation(owner, `older-${sequence}`, sequence);
+        yield* rejectOwnershipWrite(insertOwnershipObservation(older.event, sequence));
+      }
+      const terminal = ownershipTermination(owner);
+      for (const [path, value] of [
+        ["$.terminationEvidence.terminalStatus", "completed"],
+        ["$.terminationEvidence.terminalRunEvent.type", "run.created"],
+        ["$.terminationEvidence.terminalRunEvent.sequence", 200],
+        ["$.terminationEvidence.terminalRunEvent.sequence", true],
+        ["$.terminationEvidence.settlementCommandId", "\u00a0"],
+        ["$.terminationEvidence.workClaimId", null],
+        ["$.observedSequence", 2002],
+        ["$.observedSequence", 499],
+        ["$.reason", "extra"],
+      ] as ReadonlyArray<readonly [string, unknown]>) {
+        const [row] = yield* sql<{
+          value: string;
+        }>`SELECT json_set(${JSON.stringify(terminal.event)},${path},json(${JSON.stringify(value)})) value`;
+        const malformed: unknown = JSON.parse(row!.value);
+        yield* rejectOwnershipWrite(
+          insertOwnershipObservation(malformed, terminal.context.sequence),
+        );
+      }
+      const afterClaim = {
+        ...terminal.event,
+        observedSequence: 600,
+        terminationEvidence: {
+          kind: "after_executable_claim",
+          terminalRunEvent: { type: "run.updated", eventId: "native-terminal", sequence: 500 },
+          terminalStatus: "completed",
+          workClaimId: "physical-claim",
+          workReleaseEvent: {
+            type: "task-group.work-released",
+            eventId: "physical-release",
+            sequence: 600,
+          },
+        },
+      };
+      yield* decodeAcceptedOwnershipEffect({ event: afterClaim, context: terminal.context });
+      yield* rejectOwnershipWrite(
+        insertOwnershipObservation(afterClaim, terminal.context.sequence),
+      );
+      for (const bFirst of [false, true]) {
+        const future = acceptedOwnershipFixture("future", 200);
+        const source = {
+          ...ownershipObservation(owner, `future-${bFirst}`, 2100).event,
+          sourceEventId: future.ownership.nativeAcceptance.runEvent.eventId,
+          sourceSequence: future.ownership.nativeAcceptance.runEvent.sequence,
+        };
+        yield* sql`BEGIN`;
+        if (bFirst) {
+          yield* insertOwnershipObservation(source, 2100);
+          const wrong = {
+            ...future,
+            ownership: {
+              ...future.ownership,
+              nativeAcceptance: {
+                ...future.ownership.nativeAcceptance,
+                runEvent: { ...future.ownership.nativeAcceptance.runEvent, sequence: 400 },
+              },
+            },
+          };
+          yield* rejectOwnershipWrite(insertAcceptedRun(wrong));
+          yield* insertAcceptedRun(future);
+        } else {
+          yield* insertAcceptedRun(future);
+          yield* rejectOwnershipWrite(
+            insertOwnershipObservation({ ...source, sourceSequence: 400 }, 2100),
+          );
+          yield* insertOwnershipObservation(source, 2100);
+        }
+        assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+        yield* sql`ROLLBACK`;
+      }
+      yield* insertOwnershipObservation(terminal.event, terminal.context.sequence);
+      for (const [value, sequence] of [
+        [second, 2200],
+        [third, 2300],
+      ] as const) {
+        const shared = {
+          ...ownershipObservation(value, `shared-${sequence}`, sequence).event,
+          sourceEventId: "native-terminal",
+          sourceSequence: 500,
+        };
+        yield* insertOwnershipObservation(shared, sequence);
+      }
+      const reused = ownershipTermination(second, "reused-terminal", 2400);
+      yield* rejectOwnershipWrite(
+        insertOwnershipObservation(reused.event, reused.context.sequence),
+      );
+      const before =
+        yield* sql`SELECT * FROM work_task_run_ownership_observations ORDER BY event_id`;
+      for (const recursive of [0, 1]) {
+        yield* sql.unsafe(`PRAGMA recursive_triggers=${recursive}`);
+        yield* rejectOwnershipWrite(sql`INSERT OR REPLACE INTO work_task_run_ownership_observations
+        SELECT 'replacement',run_id,environment_id,task_id,group_id,manager_thread_id,kind,command_id,occurred_at,source_event_id,source_sequence,observed_sequence,terminal_event_id,terminal_sequence,terminal_status,settlement_command_id,2500,json_set(event_json,'$.id','replacement') FROM work_task_run_ownership_observations WHERE event_id='terminated'`);
+        for (const table of [
+          "work_task_run_ownership_observations",
+          "work_task_run_observation_references",
+        ]) {
+          yield* rejectOwnershipWrite(
+            sql.unsafe(`INSERT OR REPLACE INTO ${table} SELECT * FROM ${table}`),
+          );
+          yield* rejectOwnershipWrite(
+            sql.unsafe(`UPDATE OR REPLACE ${table} SET event_id=event_id`),
+          );
+          yield* rejectOwnershipWrite(sql.unsafe(`DELETE FROM ${table}`));
+        }
+        yield* rejectOwnershipWrite(
+          sql`INSERT INTO work_task_run_observation_references VALUES ('uncertain','fabricated',0,'source',1,NULL,NULL)`,
+        );
+      }
+      assert.deepStrictEqual(
+        yield* sql`SELECT * FROM work_task_run_ownership_observations ORDER BY event_id`,
+        before,
+      );
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+    }).pipe(Effect.provide(db)),
+);
+
+it.effect(
+  "preserves ownership history through observation upgrade, journal deletion and retired-manager queries",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: 97 });
+      const { bound, join } = yield* seedAcceptedOwnership();
+      const owner = acceptedOwnershipFixture();
+      const automatic = automaticOwnershipFixture("retained", 20);
+      yield* insertAcceptedRun(owner);
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* insertAcceptedRun(automatic.event);
+          yield* insertAcceptedDebit(
+            automatic.event.ownership.run.runId,
+            automatic.debit.event,
+            automatic.debit.context.sequence,
+          );
+        }),
+      );
+      yield* sql`INSERT INTO orchestration_events(sequence,event_id,aggregate_kind,stream_id,stream_version,event_type,occurred_at,actor_kind,payload_json,metadata_json)
+      VALUES (500,'native-terminal','thread','manager',1,'run.updated','2026-11-16T00:00:00Z','server','{"id":"run-one","status":"cancelled"}','{}'),
+      (501,'ordinary-preserved','thread','ordinary',1,'thread.created','raw','client','{ "preserved": true }','{}')`;
+      const names = (yield* sql<{
+        name: string;
+      }>`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`).map(
+        (r) => r.name,
+      );
+      const capture = Effect.fn("PersistentTasks.captureObservationPredecessor")(function* () {
+        return Object.fromEntries(
+          yield* Effect.forEach(names, (name) =>
+            sql.unsafe(`SELECT * FROM "${name}"`).pipe(Effect.map((rows) => [name, rows] as const)),
+          ),
+        );
+      });
+      const before = yield* capture();
+      yield* sql`CREATE INDEX work_task_run_observation_task_idx ON work_task_accepted_runs(task_id)`;
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(runMigrations())));
+      assert.deepStrictEqual(yield* capture(), before);
+      assert.deepStrictEqual(
+        yield* sql`SELECT name FROM sqlite_master WHERE name='work_task_run_ownership_observations'`,
+        [],
+      );
+      yield* sql`DROP INDEX work_task_run_observation_task_idx`;
+      assert.deepStrictEqual(yield* runMigrations(), [[98, "WorkTaskAcceptedRunObservations"]]);
+      const after = yield* capture();
+      for (const name of names.filter((name) => name !== "effect_sql_migrations"))
+        assert.deepStrictEqual(after[name], before[name]);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_run_ownership_observations`, []);
+      const uncertainty = ownershipObservation(owner);
+      const terminal = ownershipTermination(owner);
+      const pending = ownershipObservation(automatic.event, "pending", 2200);
+      for (const value of [uncertainty, terminal, pending])
+        yield* insertOwnershipObservation(value.event, value.context.sequence);
+      const retained =
+        yield* sql`SELECT * FROM work_task_run_ownership_observations ORDER BY event_id`;
+      yield* sql`DELETE FROM orchestration_events WHERE event_id='native-terminal'`;
+      assert.equal(
+        (yield* sql`SELECT * FROM orchestration_events WHERE event_id='ordinary-preserved'`).length,
+        1,
+      );
+      const retired = membershipTransition(
+        { ...join.event.snapshot, taskRevisions: owner.ownership.run.taskRevisions },
+        [bound.control],
+        null,
+        "retire-observed-member",
+      );
+      yield* sql.withTransaction(applyMembership(retired, 5000));
+      const previousControl = retired.companions[0]!.control;
+      const stopped = decodeGroupControlEvent({
+        ...groupContext("retire-observed-manager"),
+        occurredAt: retired.event.occurredAt,
+        type: "task-group.manager-changed",
+        previousControl,
+        control: {
+          ...previousControl,
+          controlRevision: previousControl.controlRevision + 1,
+          currentManager: null,
+        },
+      });
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* writeGroupControl(stopped, 5002);
+          yield* retireGroupManager(stopped, 5002);
+        }),
+      );
+      assert.deepStrictEqual(
+        yield* sql`SELECT * FROM work_task_run_ownership_observations ORDER BY event_id`,
+        retained,
+      );
+      const unclosed = `NOT EXISTS(SELECT 1 FROM work_task_run_ownership_observations o WHERE o.run_id=a.run_id AND o.kind='task.run-ownership-terminated')`;
+      for (const query of [
+        "SELECT a.run_id,(SELECT event_id FROM work_task_run_ownership_observations WHERE run_id=a.run_id ORDER BY sequence DESC LIMIT 1) FROM work_task_accepted_runs a WHERE a.run_id='run-one'",
+        `SELECT a.run_id FROM work_task_accepted_runs a WHERE a.task_id='a' AND ${unclosed} ORDER BY a.recorded_sequence DESC,a.run_id LIMIT 50`,
+        `SELECT a.run_id FROM work_task_accepted_runs a WHERE a.environment_id='env' AND a.group_id='group' AND ${unclosed} ORDER BY a.recorded_sequence,a.run_id LIMIT 50`,
+        `SELECT a.run_id FROM work_task_accepted_runs a WHERE a.manager_thread_id='manager' AND ${unclosed} ORDER BY a.run_id LIMIT 50`,
+        "SELECT event_id FROM work_task_run_ownership_observations WHERE task_id='a' AND (sequence,event_id)<(3000,'z') ORDER BY sequence DESC,event_id LIMIT 50",
+      ]) {
+        const plan = (yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`))
+          .map((r) => r.detail)
+          .join(" ");
+        assert.include(plan, "SEARCH");
+        assert.notInclude(plan, "TEMP B-TREE");
+      }
+      assert.deepStrictEqual(
+        (yield* sql.unsafe<{ run_id: string }>(
+          `SELECT a.run_id FROM work_task_accepted_runs a WHERE a.manager_thread_id='manager' AND ${unclosed} ORDER BY a.run_id`,
+        )).map((r) => r.run_id),
+        [automatic.event.ownership.run.runId],
+      );
+      for (const name of [
+        "work_task_accepted_reference_observation",
+        "work_task_run_observation_reference_valid",
+      ]) {
+        const [trigger] = yield* sql<{
+          sql: string;
+        }>`SELECT sql FROM sqlite_master WHERE name=${name} AND type='trigger'`;
+        const predicate = trigger!.sql.split("SELECT CASE WHEN ").at(-1)!.split(" THEN RAISE")[0]!;
+        const plan = (yield* sql.unsafe<{ detail: string }>(
+          `EXPLAIN QUERY PLAN SELECT ${predicate} FROM (SELECT 'source' event_id,100 sequence,'run.updated' known_kind,'a' known_task_id) NEW`,
+        ))
+          .map((r) => r.detail)
+          .join(" ");
+        assert.include(plan, "SEARCH r USING INDEX");
+        assert.notInclude(plan, "SCAN r");
+      }
+      assert.deepStrictEqual(yield* runMigrations(), []);
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_allowances`, []);
     }).pipe(Effect.provide(db)),
 );
