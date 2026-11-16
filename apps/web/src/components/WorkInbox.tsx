@@ -12,6 +12,7 @@ import { liveShellEnvironmentIdsAtom } from "../state/shell";
 import { buildThreadRouteParams } from "../threadRoutes";
 import { Button } from "./ui/button";
 import { WorkspacePageContainer } from "./WorkspacePageContainer";
+import { NativeTaskCreatePanel } from "./NativeTaskCreatePanel";
 
 const labels: Record<WorkInboxStatus, string> = {
   approval: "Needs approval",
@@ -89,6 +90,7 @@ export function WorkInbox() {
             Requests and observed activity. Open the original conversation to respond.
           </p>
         </div>
+        <NativeTaskCreatePanel projects={projects} threads={threads} />
         {!isReady && <p role="status">Loading environments. Requests may not be loaded yet.</p>}
         {unavailable.length > 0 && (
           <div role="status" className="rounded-lg border p-4 text-sm">

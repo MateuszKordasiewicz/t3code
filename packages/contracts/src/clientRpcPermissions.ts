@@ -19,6 +19,7 @@ import { WS_METHODS } from "./rpc.ts";
 export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.workTasksCreateDraft]: AuthOrchestrationOperateScope,
   [WS_METHODS.workTasksAcceptDraft]: AuthOrchestrationOperateScope,
+  [WS_METHODS.workTasksCreateInitialGroup]: AuthOrchestrationOperateScope,
   [WS_METHODS.workTasksInspectDraft]: AuthOrchestrationReadScope,
   [WS_METHODS.providerAuthRemoveMethod]: AuthProvidersManageScope,
   [WS_METHODS.previewClose]: AuthPreviewOperateScope,

@@ -43,7 +43,8 @@ export const persistInitialGroup = Effect.fn("TaskGroupStore.persistInitialGroup
         const prior = yield* sql<{
           payload_json: string;
           aggregate_kind: string;
-        }>`SELECT payload_json,aggregate_kind FROM orchestration_events WHERE command_id=${input.commandId} ORDER BY sequence`;
+          sequence: number;
+        }>`SELECT payload_json,aggregate_kind,sequence FROM orchestration_events WHERE command_id=${input.commandId} ORDER BY sequence`;
         if (prior.length) {
           const events = prior.map((row) => JSON.parse(row.payload_json) as unknown);
           const same =
@@ -94,12 +95,17 @@ export const persistInitialGroup = Effect.fn("TaskGroupStore.persistInitialGroup
               code: "invalid_state",
               message: "Group replay source is incomplete",
             });
+          const control = yield* decodeControl(events[3]);
+          const rootEvent = yield* decodeRootEvent(events[2]);
           return {
+            sequence: prior[3]!.sequence,
+            control: control.control,
+            membership: rootEvent.snapshot,
             events: [
               yield* decodeControl(events[0]),
               yield* decodeControl(events[1]),
-              yield* decodeRootEvent(events[2]),
-              yield* decodeControl(events[3]),
+              rootEvent,
+              control,
             ],
           };
         }
@@ -290,7 +296,12 @@ export const persistInitialGroup = Effect.fn("TaskGroupStore.persistInitialGroup
       VALUES (${companion.event.id},${companion.context.sequence},${input.environmentId},${input.groupId},${input.taskId},1,'join',${root.event.id},${root.context.sequence},${rootJson},${companionJson},1,NULL,NULL)`;
         yield* sql`INSERT INTO work_task_group_memberships (task_id,membership_generation,environment_id,group_id,accepted_definition_revision,joined_membership_revision,joined_event_id,joined_record_json,joined_companion_id)
       VALUES (${input.taskId},1,${input.environmentId},${input.groupId},${task.accepted.definitionRevision},1,${root.event.id},${joinedJson},${companion.event.id})`;
-        return { events: [first.event, second.event, root.event, companion.event] };
+        return {
+          sequence: companion.context.sequence,
+          control: companion.event.control,
+          membership: root.event.snapshot,
+          events: [first.event, second.event, root.event, companion.event],
+        };
       }),
     );
   },

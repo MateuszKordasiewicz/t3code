@@ -5,6 +5,8 @@ import {
   WorkTaskDetailInput,
   WorkTaskInspectDraftResult,
   WorkTaskError,
+  WorkTaskCreateInitialGroupInput,
+  WorkTaskCreateInitialGroupResult,
 } from "./task.ts";
 import {
   OrchestrationV2SearchThreadError,
@@ -424,6 +426,7 @@ export const WS_METHODS = {
   workTasksCreateDraft: "workTasks.createDraft",
   workTasksInspectDraft: "workTasks.inspectDraft",
   workTasksAcceptDraft: "workTasks.acceptDraft",
+  workTasksCreateInitialGroup: "workTasks.createInitialGroup",
   projectsListEntries: "projects.listEntries",
   projectsListIgnoredFiles: "projects.listIgnoredFiles",
   projectsReadFile: "projects.readFile",
@@ -2090,11 +2093,17 @@ const WsWorkTasksAcceptDraftRpc = Rpc.make(WS_METHODS.workTasksAcceptDraft, {
   success: WorkTaskCreateDraftResult,
   error: Schema.Union([WorkTaskError, EnvironmentAuthorizationError]),
 });
+const WsWorkTasksCreateInitialGroupRpc = Rpc.make(WS_METHODS.workTasksCreateInitialGroup, {
+  payload: WorkTaskCreateInitialGroupInput,
+  success: WorkTaskCreateInitialGroupResult,
+  error: Schema.Union([WorkTaskError, EnvironmentAuthorizationError]),
+});
 
 export const WsRpcGroup = RpcGroup.make(
   WsWorkTasksCreateDraftRpc,
   WsWorkTasksInspectDraftRpc,
   WsWorkTasksAcceptDraftRpc,
+  WsWorkTasksCreateInitialGroupRpc,
   WsGuestShareCreateRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,

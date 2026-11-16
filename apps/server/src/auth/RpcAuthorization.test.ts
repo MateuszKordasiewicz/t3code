@@ -39,7 +39,11 @@ describe("RPC authorization scopes", () => {
     expect(requiredScopeForRpcMethod(WS_METHODS.workTasksInspectDraft)).toBe(
       AuthOrchestrationReadScope,
     );
-    for (const method of [WS_METHODS.workTasksCreateDraft, WS_METHODS.workTasksAcceptDraft])
+    for (const method of [
+      WS_METHODS.workTasksCreateDraft,
+      WS_METHODS.workTasksAcceptDraft,
+      WS_METHODS.workTasksCreateInitialGroup,
+    ])
       expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
   });
 

@@ -231,7 +231,7 @@ export const makeTaskService = Effect.gen(function* () {
       ...input,
       subject: caller.subject,
       sessionId: caller.sessionId,
-    });
+    }).pipe(Effect.provideService(TaskStore, store));
   });
   return {
     create,

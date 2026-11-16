@@ -14,6 +14,7 @@ const RPC_AGGREGATES = {
   [WS_METHODS.workTasksCreateDraft]: "workTasks",
   [WS_METHODS.workTasksInspectDraft]: "workTasks",
   [WS_METHODS.workTasksAcceptDraft]: "workTasks",
+  [WS_METHODS.workTasksCreateInitialGroup]: "workTasks",
   [ORCHESTRATION_V2_WS_METHODS.dispatchCommand]: "orchestrationV2",
   [ORCHESTRATION_V2_WS_METHODS.getWorkflowScript]: "orchestration",
   [ORCHESTRATION_V2_WS_METHODS.getNativeChildWork]: "orchestration",

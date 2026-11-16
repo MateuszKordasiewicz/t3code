@@ -7,6 +7,8 @@ import {
   WorkTaskDetailInput,
   WorkTaskCreateDraftResult,
   WorkTaskInspectDraftResult,
+  WorkTaskCreateInitialGroupInput,
+  WorkTaskCreateInitialGroupResult,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -17,6 +19,7 @@ import { TaskService } from "./TaskService.ts";
 const isTaskError = Schema.is(WorkTaskError);
 const decodeCommitted = Schema.decodeUnknownEffect(WorkTaskCreateDraftResult);
 const decodeInspection = Schema.decodeUnknownEffect(WorkTaskInspectDraftResult);
+const decodeGroup = Schema.decodeUnknownEffect(WorkTaskCreateInitialGroupResult);
 export const makeTaskSessionService = Effect.fn("TaskSessionService.make")(function* (
   session: AuthenticatedSession,
 ) {
@@ -84,14 +87,11 @@ export const makeTaskSessionService = Effect.fn("TaskSessionService.make")(funct
       sequence,
     });
   });
-  const createInitialGroup = Effect.fn("TaskSessionService.createInitialGroup")(function* (input: {
-    readonly taskId: string;
-    readonly groupId: string;
-    readonly managerThreadId: string;
-    readonly commandId: string;
-  }) {
+  const createInitialGroup = Effect.fn("TaskSessionService.createInitialGroup")(function* (
+    input: WorkTaskCreateInitialGroupInput,
+  ) {
     const environmentId = yield* environment.getEnvironmentId;
-    return yield* tasks.createInitialGroup({ ...input, environmentId }, caller);
+    return yield* decodeGroup(yield* tasks.createInitialGroup({ ...input, environmentId }, caller));
   });
   const mapError = (error: unknown) =>
     isTaskError(error)

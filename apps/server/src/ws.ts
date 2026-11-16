@@ -2410,6 +2410,7 @@ export const layerWsRpc = (
         [WS_METHODS.workTasksCreateDraft]: workTasks.create,
         [WS_METHODS.workTasksInspectDraft]: workTasks.inspect,
         [WS_METHODS.workTasksAcceptDraft]: workTasks.accept,
+        [WS_METHODS.workTasksCreateInitialGroup]: workTasks.createInitialGroup,
         [WS_METHODS.scheduledTasksListWebhookDeliveries]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
             Effect.andThen(scheduledTasks.listWebhookDeliveries(input)),

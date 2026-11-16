@@ -210,6 +210,7 @@ describe("command permissions", () => {
     ORCHESTRATION_V2_WS_METHODS.stopWorkflow,
     WS_METHODS.workTasksCreateDraft,
     WS_METHODS.workTasksAcceptDraft,
+    WS_METHODS.workTasksCreateInitialGroup,
   ])("uses the target grant for both availability and execution of %s", (method) =>
     Effect.scoped(
       Effect.gen(function* () {

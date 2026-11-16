@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect";
 import * as HashMap from "effect/HashMap";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as RpcTest from "effect/rpc/RpcTest";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import {
@@ -16,7 +17,15 @@ import {
   AuthOrchestrationReadScope,
   AuthSessionId,
   EnvironmentId,
+  WS_METHODS,
+  WsRpcGroup,
+  WorkTaskCreateInitialGroupInput,
+  WorkTaskId,
+  WorkTaskManagerGroupId,
+  ThreadId,
+  CommandId,
 } from "@t3tools/contracts";
+import * as RpcAuthorization from "../auth/RpcAuthorization.ts";
 import { ServerEnvironment } from "../environment/ServerEnvironment.ts";
 import * as TaskService from "./TaskService.ts";
 import { makeTaskSessionService } from "./TaskSessionService.ts";
@@ -45,6 +54,7 @@ const sessionLayer = TaskService.layer.pipe(
 const decode = Schema.decodeUnknownEffect(WorkTaskPersistedEvent);
 const decodeControl = Schema.decodeUnknownEffect(WorkTaskPersistedGroupControlEvent);
 const decodeRoot = Schema.decodeUnknownEffect(WorkTaskPersistedMembershipEvent);
+const decodeGroupInput = Schema.decodeUnknownEffect(WorkTaskCreateInitialGroupInput);
 const time = "2026-11-16T00:00:00.000Z";
 const definition = {
   revision: 1,
@@ -106,10 +116,10 @@ it.effect("requires an authenticated operator and replays only the same group co
       scopes: [AuthOrchestrationOperateScope, AuthOrchestrationReadScope],
     };
     const group = {
-      taskId: "task",
-      groupId: "group",
-      managerThreadId: "manager",
-      commandId: "join",
+      taskId: WorkTaskId.make("task"),
+      groupId: WorkTaskManagerGroupId.make("group"),
+      managerThreadId: ThreadId.make("manager"),
+      commandId: CommandId.make("join"),
     };
     const sql = yield* SqlClient.SqlClient;
     const service = yield* TaskService.TaskService;
@@ -135,13 +145,14 @@ it.effect("requires an authenticated operator and replays only the same group co
     assert.strictEqual((yield* sql`SELECT * FROM work_task_manager_groups`).length, 0);
     const operator = yield* makeTaskSessionService(session);
     const absent = yield* operator
-      .createInitialGroup({ ...group, managerThreadId: "missing" })
+      .createInitialGroup({ ...group, managerThreadId: ThreadId.make("missing") })
       .pipe(Effect.flip);
     assert.strictEqual(absent.code, "not_found");
     yield* sql`INSERT INTO orchestration_v2_projection_threads (thread_id,project_id,title,default_provider,runtime_mode,interaction_mode,created_at,updated_at,payload_json) VALUES ('other','different','Other','codex','full-access','default',${time},${time},'{}')`;
     assert.strictEqual(
-      (yield* operator.createInitialGroup({ ...group, managerThreadId: "other" }).pipe(Effect.flip))
-        .code,
+      (yield* operator
+        .createInitialGroup({ ...group, managerThreadId: ThreadId.make("other") })
+        .pipe(Effect.flip)).code,
       "not_found",
     );
     yield* sql`CREATE TRIGGER reject_group BEFORE INSERT ON work_task_manager_groups BEGIN SELECT RAISE(ABORT,'blocked'); END`;
@@ -152,7 +163,7 @@ it.effect("requires an authenticated operator and replays only the same group co
     assert.deepStrictEqual(yield* operator.createInitialGroup(group), committed);
     assert.strictEqual((yield* sql`SELECT * FROM orchestration_events`).length, 6);
     const different = yield* operator
-      .createInitialGroup({ ...group, managerThreadId: "other" })
+      .createInitialGroup({ ...group, managerThreadId: ThreadId.make("other") })
       .pipe(Effect.flip);
     assert.strictEqual(different.code, "revision_conflict");
     const otherSession = yield* makeTaskSessionService({
@@ -163,6 +174,66 @@ it.effect("requires an authenticated operator and replays only the same group co
       (yield* otherSession.createInitialGroup(group).pipe(Effect.flip)).code,
       "revision_conflict",
     );
+  }).pipe(Effect.provide(sessionLayer)),
+);
+it.effect("creates a group through authenticated typed RPC and returns its persisted state", () =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    yield* seed();
+    const session = {
+      sessionId: AuthSessionId.make("session"),
+      subject: "owner",
+      method: "browser-session-cookie" as const,
+      scopes: [AuthOrchestrationOperateScope, AuthOrchestrationReadScope],
+    };
+    const handlers = yield* makeTaskSessionService(session);
+    const group = WsRpcGroup.omit(
+      ...[...WsRpcGroup.requests.keys()].filter(
+        (
+          tag,
+        ): tag is Exclude<
+          keyof typeof RpcAuthorization.RPC_REQUIRED_SCOPES,
+          typeof WS_METHODS.workTasksCreateInitialGroup
+        > => tag !== WS_METHODS.workTasksCreateInitialGroup,
+      ),
+    );
+    const client = yield* RpcTest.makeClient(group).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          group.toLayerHandler(WS_METHODS.workTasksCreateInitialGroup, handlers.createInitialGroup),
+          RpcAuthorization.layer(session.scopes),
+        ),
+      ),
+    );
+    const input = yield* decodeGroupInput({
+      taskId: "task",
+      groupId: "group",
+      managerThreadId: "manager",
+      commandId: "join",
+      subject: "forged",
+    });
+    const created = yield* client[WS_METHODS.workTasksCreateInitialGroup](input);
+    assert.deepStrictEqual(yield* client[WS_METHODS.workTasksCreateInitialGroup](input), created);
+    assert.strictEqual(created.control.currentManager?.threadId, "manager");
+    assert.strictEqual(created.membership.currentMembership?.task.taskId, "task");
+    const sql = yield* SqlClient.SqlClient;
+    assert.strictEqual(
+      (yield* sql<{
+        sequence: number;
+      }>`SELECT MAX(sequence) sequence FROM orchestration_events`)[0]!.sequence,
+      created.sequence,
+    );
+    const tokenHandlers = yield* makeTaskSessionService({
+      ...session,
+      method: "bearer-access-token",
+    });
+    const denied = yield* tokenHandlers
+      .createInitialGroup({
+        ...input,
+        commandId: "token-command" as typeof input.commandId,
+      })
+      .pipe(Effect.flip);
+    assert.strictEqual(denied.code, "unsupported");
   }).pipe(Effect.provide(sessionLayer)),
 );
 const input = {

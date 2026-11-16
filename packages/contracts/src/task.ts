@@ -1588,6 +1588,13 @@ export const WorkTaskManagerGroupControlSnapshot = Schema.Struct({
   ),
 );
 export type WorkTaskManagerGroupControlSnapshot = typeof WorkTaskManagerGroupControlSnapshot.Type;
+export const WorkTaskCreateInitialGroupInput = Schema.Struct({
+  taskId: WorkTaskId,
+  groupId: WorkTaskManagerGroupId,
+  managerThreadId: ThreadId,
+  commandId: CommandId,
+});
+export type WorkTaskCreateInitialGroupInput = typeof WorkTaskCreateInitialGroupInput.Type;
 const groupControlGuards = {
   group: WorkTaskManagerGroupRef,
   expectedControlRevision: WorkTaskGroupControlRevision,
@@ -1689,6 +1696,12 @@ export const WorkTaskMembershipSnapshot = Schema.Struct({
   ),
 );
 export type WorkTaskMembershipSnapshot = typeof WorkTaskMembershipSnapshot.Type;
+export const WorkTaskCreateInitialGroupResult = Schema.Struct({
+  sequence: NonNegativeInt,
+  control: WorkTaskManagerGroupControlSnapshot,
+  membership: WorkTaskMembershipSnapshot,
+});
+export type WorkTaskCreateInitialGroupResult = typeof WorkTaskCreateInitialGroupResult.Type;
 const membershipPageInput = {
   limit: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(100))),
   pageToken: Schema.optional(WorkTaskPageToken),
