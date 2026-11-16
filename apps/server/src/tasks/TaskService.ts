@@ -1,7 +1,12 @@
+import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
+import * as Option from "effect/Option";
+import * as NodeUtil from "node:util";
+import type { ProjectId } from "@t3tools/contracts";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
 import {
   WorkTaskDraftDefinition,
+  WorkTaskAcceptedDefinition,
   WorkTaskEvent,
   WorkTaskPersistedEvent,
   WorkTaskCallerContext,
@@ -14,6 +19,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import { TaskStore } from "./TaskStore.ts";
 
+const decodeAcceptedDefinition = Schema.decodeEffect(WorkTaskAcceptedDefinition);
 const decodeEvent = Schema.decodeEffect(WorkTaskEvent);
 const encodeEvent = Schema.encodeEffect(Schema.fromJsonString(WorkTaskEvent));
 const decodeEventJson = Schema.decodeEffect(Schema.fromJsonString(WorkTaskEvent));
@@ -22,6 +28,7 @@ const decodeRecorded = Schema.decodeUnknownEffect(WorkTaskPersistedEvent);
 export const makeTaskService = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const store = yield* TaskStore;
+  const projects = yield* ProjectStore.make;
   const append = Effect.fn("TaskService.append")(function* (
     event: WorkTaskEvent,
     commandId: string,
@@ -44,14 +51,21 @@ export const makeTaskService = Effect.gen(function* () {
     yield* store.applyFoundation(recorded);
     return recorded;
   });
-  const create = Effect.fn("TaskService.create")(function* (input: {
-    readonly definition: WorkTaskDraftDefinition;
-  }) {
+  const create = Effect.fn("TaskService.create")(function* (
+    input: {
+      readonly definition: WorkTaskDraftDefinition;
+      readonly taskId?: string;
+      readonly commandId?: string;
+      readonly projectId?: ProjectId | undefined;
+    },
+    caller: WorkTaskCallerContext = { type: "server" },
+  ) {
     const event = yield* decodeEvent({
       id: yield* Effect.sync(() => SecureRandom.uuidV4Unsafe()),
-      taskId: yield* Effect.sync(() => SecureRandom.uuidV4Unsafe()),
+      taskId: input.taskId ?? (yield* Effect.sync(() => SecureRandom.uuidV4Unsafe())),
       occurredAt: DateTime.formatIso(yield* DateTime.now),
-      attribution: { type: "server" },
+      attribution: caller,
+      ...(input.projectId === undefined ? {} : { projectId: input.projectId }),
       definitionRevision: input.definition.revision,
       lifecycleRevision: 1,
       completionPolicyRevision: 1,
@@ -59,7 +73,47 @@ export const makeTaskService = Effect.gen(function* () {
       type: "task.created",
       definition: input.definition,
     });
-    yield* sql.withTransaction(append(event, event.id, 0));
+    const commandId = input.commandId ?? event.id;
+    yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const prior = yield* sql<{
+          payload_json: string;
+          aggregate_kind: string;
+        }>`SELECT payload_json,aggregate_kind FROM orchestration_events WHERE command_id=${commandId}`;
+        if (prior.length > 0) {
+          if (prior.length !== 1 || prior[0]!.aggregate_kind !== "task")
+            return yield* new WorkTaskError({
+              code: "revision_conflict",
+              message: "Create command already used",
+            });
+          const previous = yield* decodeEventJson(prior[0]!.payload_json);
+          if (
+            previous.type !== "task.created" ||
+            previous.taskId !== event.taskId ||
+            previous.projectId !== input.projectId ||
+            !NodeUtil.isDeepStrictEqual(previous.definition, input.definition) ||
+            !NodeUtil.isDeepStrictEqual(previous.attribution, caller)
+          )
+            return yield* new WorkTaskError({
+              code: "revision_conflict",
+              message: "Create command already used",
+            });
+          yield* store.readNativeEvent({ taskId: previous.taskId, eventId: previous.id });
+          return;
+        }
+        if (input.projectId !== undefined && Option.isNone(yield* projects.get(input.projectId)))
+          return yield* new WorkTaskError({
+            code: "not_found",
+            message: "Project not found in this environment",
+          });
+        if (yield* store.readFoundation(event.taskId))
+          return yield* new WorkTaskError({
+            code: "revision_conflict",
+            message: "Task identity already exists",
+          });
+        yield* append(event, commandId, 0);
+      }),
+    );
     return event.taskId;
   });
   // Caller context must come from an authenticated transport, never from a request payload.
@@ -92,12 +146,17 @@ export const makeTaskService = Effect.gen(function* () {
         const prior = yield* sql<{
           payload_json: string;
           sequence: number;
-        }>`SELECT payload_json,sequence FROM orchestration_events
-        WHERE command_id=${input.commandId} AND aggregate_kind='task'`;
+          aggregate_kind: string;
+        }>`SELECT payload_json,sequence,aggregate_kind FROM orchestration_events
+        WHERE command_id=${input.commandId}`;
         if (prior.length > 0) {
+          if (prior.length !== 1 || prior[0]!.aggregate_kind !== "task")
+            return yield* new WorkTaskError({
+              code: "revision_conflict",
+              message: "Acceptance command already used",
+            });
           const event = yield* decodeEventJson(prior[0]!.payload_json);
           if (
-            prior.length !== 1 ||
             event.type !== "task.definition-accepted" ||
             event.taskId !== input.taskId ||
             event.definitionRevision !== input.expectedDefinitionRevision ||
@@ -122,6 +181,16 @@ export const makeTaskService = Effect.gen(function* () {
             code: "revision_conflict",
             message: "Task definition changed or was already accepted",
           });
+        const definition = yield* decodeAcceptedDefinition(current.draft).pipe(
+          Effect.mapError(
+            () =>
+              new WorkTaskError({
+                code: "invalid_definition",
+                message:
+                  "Complete the task title, objective and acceptance criteria before accepting",
+              }),
+          ),
+        );
         const event = yield* decodeEvent({
           id: yield* Effect.sync(() => SecureRandom.uuidV4Unsafe()),
           taskId: input.taskId,
@@ -132,7 +201,7 @@ export const makeTaskService = Effect.gen(function* () {
           completionPolicyRevision: projection.completionPolicyRevision,
           actionPolicyRevision: projection.actionPolicyRevision,
           type: "task.definition-accepted",
-          definition: current.draft,
+          definition,
         });
         const versions = yield* sql<{
           version: number;
@@ -142,7 +211,13 @@ export const makeTaskService = Effect.gen(function* () {
       }),
     );
   });
-  return { create, acceptDraft, inspect: store.readFoundation, inspectResults: store.readResults };
+  return {
+    create,
+    acceptDraft,
+    inspect: store.readFoundation,
+    inspectResults: store.readResults,
+    readNativeHistory: store.readNativeHistory,
+  };
 });
 
 export class TaskService extends Context.Service<

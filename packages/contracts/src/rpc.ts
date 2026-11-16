@@ -1,4 +1,12 @@
 import {
+  WorkTaskCreateDraftInput,
+  WorkTaskCreateDraftResult,
+  WorkTaskAcceptDraftInput,
+  WorkTaskDetailInput,
+  WorkTaskInspectDraftResult,
+  WorkTaskError,
+} from "./task.ts";
+import {
   OrchestrationV2SearchThreadError,
   OrchestrationV2SearchThreadInput,
   OrchestrationV2SearchThreadResult,
@@ -413,6 +421,9 @@ import { VcsError } from "./vcs.ts";
 import { Project, ProjectMutation, ProjectMutationError } from "./project.ts";
 
 export const WS_METHODS = {
+  workTasksCreateDraft: "workTasks.createDraft",
+  workTasksInspectDraft: "workTasks.inspectDraft",
+  workTasksAcceptDraft: "workTasks.acceptDraft",
   projectsListEntries: "projects.listEntries",
   projectsListIgnoredFiles: "projects.listIgnoredFiles",
   projectsReadFile: "projects.readFile",
@@ -2064,7 +2075,26 @@ export class RpcScopeAuthorization extends RpcMiddleware.Service<RpcScopeAuthori
   { error: EnvironmentAuthorizationError },
 ) {}
 
+const WsWorkTasksCreateDraftRpc = Rpc.make(WS_METHODS.workTasksCreateDraft, {
+  payload: WorkTaskCreateDraftInput,
+  success: WorkTaskCreateDraftResult,
+  error: Schema.Union([WorkTaskError, EnvironmentAuthorizationError]),
+});
+const WsWorkTasksInspectDraftRpc = Rpc.make(WS_METHODS.workTasksInspectDraft, {
+  payload: WorkTaskDetailInput,
+  success: WorkTaskInspectDraftResult,
+  error: Schema.Union([WorkTaskError, EnvironmentAuthorizationError]),
+});
+const WsWorkTasksAcceptDraftRpc = Rpc.make(WS_METHODS.workTasksAcceptDraft, {
+  payload: WorkTaskAcceptDraftInput,
+  success: WorkTaskCreateDraftResult,
+  error: Schema.Union([WorkTaskError, EnvironmentAuthorizationError]),
+});
+
 export const WsRpcGroup = RpcGroup.make(
+  WsWorkTasksCreateDraftRpc,
+  WsWorkTasksInspectDraftRpc,
+  WsWorkTasksAcceptDraftRpc,
   WsGuestShareCreateRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,

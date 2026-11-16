@@ -1,3 +1,6 @@
+import * as TaskService from "./tasks/TaskService.ts";
+import * as TaskStore from "./tasks/TaskStore.ts";
+import { makeTaskSessionService } from "./tasks/TaskSessionService.ts";
 import { OrchestrationDispatchCommandError } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
@@ -1428,6 +1431,9 @@ export const layerWsRpc = (
   Layer.effectContext(
     Effect.gen(function* () {
       const currentSessionId = currentSession.sessionId;
+      const workTasks = yield* makeTaskSessionService(currentSession).pipe(
+        Effect.provide(TaskService.layer.pipe(Layer.provide(TaskStore.layer))),
+      );
       const sql = yield* SqlClient.SqlClient;
       const threadManagement = yield* ThreadManagementService.ThreadManagementService;
       const intakeContext = yield* Effect.context<
@@ -2401,6 +2407,9 @@ export const layerWsRpc = (
           Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
             Effect.andThen(secretRequests.answer(input)),
           ),
+        [WS_METHODS.workTasksCreateDraft]: workTasks.create,
+        [WS_METHODS.workTasksInspectDraft]: workTasks.inspect,
+        [WS_METHODS.workTasksAcceptDraft]: workTasks.accept,
         [WS_METHODS.scheduledTasksListWebhookDeliveries]: (input) =>
           Effect.annotateCurrentSpan({ "scheduled_task.id": input.id }).pipe(
             Effect.andThen(scheduledTasks.listWebhookDeliveries(input)),

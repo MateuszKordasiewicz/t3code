@@ -195,6 +195,27 @@ export type WorkTaskAdoptDefinitionInput = typeof WorkTaskAdoptDefinitionInput.T
 export const WorkTaskAdoptDefinitionResult = Schema.Struct(committed);
 export type WorkTaskAdoptDefinitionResult = typeof WorkTaskAdoptDefinitionResult.Type;
 
+export const WorkTaskAcceptDraftInput = Schema.Struct({
+  ...taskCommand,
+  ...definitionGuards,
+  expectedLifecycleRevision: PositiveInt,
+});
+export type WorkTaskAcceptDraftInput = typeof WorkTaskAcceptDraftInput.Type;
+export const WorkTaskInspectDraftResult = Schema.Struct({
+  ...committed,
+  projectId: Schema.NullOr(ProjectId),
+  completionPolicyRevision: PositiveInt,
+  definition: WorkTaskDraftDefinition,
+  accepted: Schema.NullOr(
+    Schema.Struct({
+      definition: WorkTaskAcceptedDefinition,
+      attribution: WorkTaskCallerContext,
+      eventId: EventId,
+    }),
+  ),
+});
+export type WorkTaskInspectDraftResult = typeof WorkTaskInspectDraftResult.Type;
+
 export const WorkTaskLinkThreadInput = Schema.Struct({
   ...taskCommand,
   expectedLifecycleRevision: PositiveInt,
