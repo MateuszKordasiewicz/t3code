@@ -25,6 +25,7 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.workTasksConfigureNativeAllowance]: AuthOrchestrationOperateScope,
   [WS_METHODS.workTasksStartPrepared]: AuthOrchestrationOperateScope,
   [WS_METHODS.workTasksReserveLaunch]: AuthOrchestrationOperateScope,
+  [WS_METHODS.workTasksInspectNativeRun]: AuthOrchestrationOperateScope,
   [WS_METHODS.workTasksInspectDraft]: AuthOrchestrationReadScope,
   [WS_METHODS.providerAuthRemoveMethod]: AuthProvidersManageScope,
   [WS_METHODS.previewClose]: AuthPreviewOperateScope,

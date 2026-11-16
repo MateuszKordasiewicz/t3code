@@ -214,6 +214,7 @@ describe("command permissions", () => {
     WS_METHODS.workTasksConfigureNativeAllowance,
     WS_METHODS.workTasksStartPrepared,
     WS_METHODS.workTasksReserveLaunch,
+    WS_METHODS.workTasksInspectNativeRun,
     WS_METHODS.workTasksPause,
     WS_METHODS.workTasksStop,
   ])("uses the target grant for both availability and execution of %s", (method) =>

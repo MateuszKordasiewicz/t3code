@@ -43,6 +43,7 @@ import {
   reserveNativeLaunch,
 } from "./TaskNativeLaunchBinding.ts";
 import { acceptNativeInitialRun } from "./TaskNativeAcceptedClaim.ts";
+import { recoverNativeTaskTerminal } from "./TaskNativeTerminalRecovery.ts";
 import {
   emptyTaskGroupControl,
   reduceTaskGroupControl,
@@ -729,6 +730,32 @@ it.effect("binds a reserved launch in the native event and receipt transaction",
       2,
     );
     if (run?.type !== "run.created") return yield* Effect.die("Expected native run");
+    const attemptEvent = yield* decodeNativeEvent({
+      ...run,
+      id: "native-integration-attempt-event",
+      type: "run-attempt.updated",
+      payload: {
+        id: "native-integration-attempt",
+        runId: "native-integration-run",
+        attemptOrdinal: 1,
+        rootNodeId: "native-integration-root",
+        providerInstanceId: "codex",
+        providerThreadId: "native-integration-provider-thread",
+        providerTurnId: null,
+        reason: "initial",
+        status: "completed",
+        startedAt: now,
+        completedAt: now,
+      },
+    });
+    yield* sink.commitCommand({
+      commandId: CommandId.make("native-integration-attempt-complete"),
+      threadId: command.threadId,
+      commandType: "run-attempt.complete",
+      acceptedAt: now,
+      events: [attemptEvent],
+      effects: [],
+    });
     const terminalEvent = yield* decodeNativeEvent({
       ...run,
       id: "native-integration-terminal-event",
@@ -747,6 +774,27 @@ it.effect("binds a reserved launch in the native event and receipt transaction",
     assert.strictEqual(terminal.state, "terminal");
     assert.deepStrictEqual(yield* reconcileNativeLaunch(intent.commandId), terminal);
     assert.strictEqual((yield* sql`SELECT * FROM work_task_native_live_terminals`).length, 1);
+    yield* sql`UPDATE orchestration_events SET payload_json=json_set(payload_json,'$.userMessageId','other')
+      WHERE event_id='native-integration-terminal-event'`;
+    assert.isTrue(yield* recoverNativeTaskTerminal(intent.commandId).pipe(Effect.isFailure));
+    assert.strictEqual((yield* sql`SELECT 1 FROM work_task_claim_releases`).length, 0);
+    yield* sql`UPDATE orchestration_events SET payload_json=json_set(payload_json,'$.userMessageId',${intent.messageId})
+      WHERE event_id='native-integration-terminal-event'`;
+    const released = yield* recoverNativeTaskTerminal(intent.commandId);
+    assert.strictEqual(released.state, "released");
+    assert.deepStrictEqual(yield* recoverNativeTaskTerminal(intent.commandId), released);
+    assert.strictEqual((yield* sql`SELECT 1 FROM work_task_claim_releases`).length, 1);
+    assert.strictEqual(
+      (yield* sql`SELECT 1 FROM work_task_executable_claims WHERE release_event_id IS NULL`).length,
+      0,
+    );
+    assert.strictEqual((yield* sql`SELECT 1 FROM work_task_run_ownership_observations`).length, 1);
+    const inspected = yield* service.inspectNativeRun({
+      commandId: CommandId.make(intent.commandId),
+    });
+    assert.strictEqual(inspected.state, "released");
+    assert.strictEqual(inspected.runId, "native-integration-run");
+    assert.strictEqual(inspected.releaseEventId, released.releaseEventId);
   }).pipe(Effect.provide(nativeIntegrationLayer)),
 );
 const input = {

@@ -17,6 +17,8 @@ import {
   WorkTaskStartPreparedResult,
   WorkTaskReserveNativeLaunchInput,
   WorkTaskNativeLaunchReservation,
+  WorkTaskInspectNativeRunInput,
+  WorkTaskInspectNativeRunResult,
 } from "./task.ts";
 import {
   OrchestrationV2SearchThreadError,
@@ -442,6 +444,7 @@ export const WS_METHODS = {
   workTasksConfigureNativeAllowance: "workTasks.configureNativeAllowance",
   workTasksStartPrepared: "workTasks.startPrepared",
   workTasksReserveLaunch: "workTasks.reserveLaunch",
+  workTasksInspectNativeRun: "workTasks.inspectNativeRun",
   projectsListEntries: "projects.listEntries",
   projectsListIgnoredFiles: "projects.listIgnoredFiles",
   projectsReadFile: "projects.readFile",
@@ -2141,6 +2144,11 @@ const WsWorkTasksReserveLaunchRpc = Rpc.make(WS_METHODS.workTasksReserveLaunch, 
   success: WorkTaskNativeLaunchReservation,
   error: Schema.Union([WorkTaskError, EnvironmentAuthorizationError]),
 });
+const WsWorkTasksInspectNativeRunRpc = Rpc.make(WS_METHODS.workTasksInspectNativeRun, {
+  payload: WorkTaskInspectNativeRunInput,
+  success: WorkTaskInspectNativeRunResult,
+  error: Schema.Union([WorkTaskError, EnvironmentAuthorizationError]),
+});
 
 export const WsRpcGroup = RpcGroup.make(
   WsWorkTasksCreateDraftRpc,
@@ -2152,6 +2160,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsWorkTasksConfigureNativeAllowanceRpc,
   WsWorkTasksStartPreparedRpc,
   WsWorkTasksReserveLaunchRpc,
+  WsWorkTasksInspectNativeRunRpc,
   WsGuestShareCreateRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,

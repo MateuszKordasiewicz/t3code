@@ -81,6 +81,10 @@ it.effect("rejects token callers before any task mutation", () =>
         })
         .pipe(Effect.isFailure),
     );
+    const inspection = yield* tasks
+      .inspectNativeRun({ commandId: CommandId.make("missing") })
+      .pipe(Effect.flip);
+    assert.strictEqual(inspection.code, "unsupported");
     const sql = yield* SqlClient.SqlClient;
     const rows = yield* sql<{ count: number }>`SELECT COUNT(*) AS count FROM orchestration_events`;
     assert.strictEqual(rows[0]!.count, 0);

@@ -1927,6 +1927,17 @@ export const WorkTaskReserveNativeLaunchInput = Schema.Struct({
   messageId: MessageId,
 });
 export type WorkTaskReserveNativeLaunchInput = typeof WorkTaskReserveNativeLaunchInput.Type;
+export const WorkTaskInspectNativeRunInput = Schema.Struct({ commandId: CommandId });
+export type WorkTaskInspectNativeRunInput = typeof WorkTaskInspectNativeRunInput.Type;
+export const WorkTaskInspectNativeRunResult = Schema.Struct({
+  state: Schema.Literals(["reserved", "uncertain", "rejected", "bound", "terminal", "released"]),
+  commandId: CommandId,
+  runId: Schema.NullOr(RunId),
+  status: Schema.NullOr(Schema.String),
+  sequence: Schema.NullOr(groupCounter),
+  releaseEventId: Schema.NullOr(EventId),
+});
+export type WorkTaskInspectNativeRunResult = typeof WorkTaskInspectNativeRunResult.Type;
 export const WorkTaskPrerequisiteCompletionWitness = Schema.Struct({
   edgeId: WorkTaskGraphEdgeId,
   blocker: WorkTaskGraphTaskRef,

@@ -20,6 +20,7 @@ const RPC_AGGREGATES = {
   [WS_METHODS.workTasksConfigureNativeAllowance]: "workTasks",
   [WS_METHODS.workTasksStartPrepared]: "workTasks",
   [WS_METHODS.workTasksReserveLaunch]: "workTasks",
+  [WS_METHODS.workTasksInspectNativeRun]: "workTasks",
   [ORCHESTRATION_V2_WS_METHODS.dispatchCommand]: "orchestrationV2",
   [ORCHESTRATION_V2_WS_METHODS.getWorkflowScript]: "orchestration",
   [ORCHESTRATION_V2_WS_METHODS.getNativeChildWork]: "orchestration",

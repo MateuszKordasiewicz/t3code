@@ -18,6 +18,8 @@ import {
   WorkTaskStartPreparedInput,
   WorkTaskStartPreparedResult,
   WorkTaskNativeLaunchReservation,
+  WorkTaskInspectNativeRunInput,
+  WorkTaskInspectNativeRunResult,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -26,9 +28,11 @@ import { ServerEnvironment } from "../environment/ServerEnvironment.ts";
 import { TaskService } from "./TaskService.ts";
 import {
   readNativeLaunchReservation,
+  reconcileNativeLaunch,
   reserveNativeLaunch,
   type NativeLaunchIntent,
 } from "./TaskNativeLaunchBinding.ts";
+import { recoverNativeTaskTerminal } from "./TaskNativeTerminalRecovery.ts";
 
 const isTaskError = Schema.is(WorkTaskError);
 const decodeCommitted = Schema.decodeUnknownEffect(WorkTaskCreateDraftResult);
@@ -39,6 +43,7 @@ const decodeStop = Schema.decodeUnknownEffect(WorkTaskStopResult);
 const decodeAllowance = Schema.decodeUnknownEffect(WorkTaskConfigureNativeAllowanceResult);
 const decodeStart = Schema.decodeUnknownEffect(WorkTaskStartPreparedResult);
 const decodeReservation = Schema.decodeUnknownEffect(WorkTaskNativeLaunchReservation);
+const decodeRunInspection = Schema.decodeUnknownEffect(WorkTaskInspectNativeRunResult);
 export const makeTaskSessionService = Effect.fn("TaskSessionService.make")(function* (
   session: AuthenticatedSession,
 ) {
@@ -131,6 +136,21 @@ export const makeTaskSessionService = Effect.fn("TaskSessionService.make")(funct
       });
     return yield* decodeReservation(reservation);
   });
+  const inspectNativeRun = Effect.fn("TaskSessionService.inspectNativeRun")(function* (
+    input: WorkTaskInspectNativeRunInput,
+  ) {
+    const launch = yield* reconcileNativeLaunch(input.commandId);
+    const release =
+      launch.state === "terminal" ? yield* recoverNativeTaskTerminal(input.commandId) : null;
+    return yield* decodeRunInspection({
+      state: release?.state === "released" ? "released" : launch.state,
+      commandId: input.commandId,
+      runId: "runId" in launch ? launch.runId : null,
+      status: "status" in launch ? launch.status : null,
+      sequence: "sequence" in launch ? launch.sequence : null,
+      releaseEventId: release?.state === "released" ? release.releaseEventId : null,
+    });
+  });
   const pause = Effect.fn("TaskSessionService.pause")(function* (input: WorkTaskPauseInput) {
     return yield* decodePause(yield* tasks.pause(input, caller));
   });
@@ -163,6 +183,8 @@ export const makeTaskSessionService = Effect.fn("TaskSessionService.make")(funct
       authorize(true, createInitialGroup(input)).pipe(Effect.mapError(mapError)),
     reserveLaunch: (input: Omit<NativeLaunchIntent, "environmentId">) =>
       authorize(true, reserveLaunch(input)).pipe(Effect.mapError(mapError)),
+    inspectNativeRun: (input: WorkTaskInspectNativeRunInput) =>
+      authorize(true, inspectNativeRun(input)).pipe(Effect.mapError(mapError)),
     pause: (input: WorkTaskPauseInput) =>
       authorize(true, pause(input)).pipe(Effect.mapError(mapError)),
     stop: (input: WorkTaskStopInput) =>
