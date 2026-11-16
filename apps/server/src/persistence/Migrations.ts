@@ -105,6 +105,7 @@ import Migration0099 from "./Migrations/099_WorkTaskManagerClaims.ts";
 import Migration0100 from "./Migrations/100_WorkTaskOwnershipReleaseBridge.ts";
 import Migration0101 from "./Migrations/101_WorkTaskReadyState.ts";
 import Migration0102 from "./Migrations/102_WorkTaskProjectionSource.ts";
+import Migration0103 from "./Migrations/103_WorkTaskReferenceEvidence.ts";
 
 const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
@@ -210,6 +211,7 @@ const migrationEntries = [
   [100, "WorkTaskOwnershipReleaseBridge", Migration0100],
   [101, "WorkTaskReadyState", Migration0101],
   [102, "WorkTaskProjectionSource", Migration0102],
+  [103, "WorkTaskReferenceEvidence", Migration0103],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);

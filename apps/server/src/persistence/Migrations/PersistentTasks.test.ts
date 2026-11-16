@@ -76,6 +76,7 @@ it.effect("creates the task foundation on a fresh database and reruns without ch
         "work_task_group_memberships",
         "work_task_manager_bindings",
         "work_task_manager_groups",
+        "work_task_manager_reference_checkpoints",
         "work_task_membership_companions",
         "work_task_projections",
         "work_task_ready_events",
@@ -146,6 +147,7 @@ it.effect("upgrades predecessor rows and events without changing their bytes or 
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
+      [103, "WorkTaskReferenceEvidence"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM projection_projects ORDER BY project_id`,
@@ -198,6 +200,7 @@ it.effect("rolls back a failed migration and succeeds on rerun", () =>
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
+      [103, "WorkTaskReferenceEvidence"],
     ]);
     assert.deepStrictEqual(yield* runMigrations(), []);
   }).pipe(Effect.provide(db)),
@@ -331,6 +334,7 @@ it.effect(
         [100, "WorkTaskOwnershipReleaseBridge"],
         [101, "WorkTaskReadyState"],
         [102, "WorkTaskProjectionSource"],
+        [103, "WorkTaskReferenceEvidence"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -506,6 +510,7 @@ it.effect("preserves task custody through validation upgrade and rolls back migr
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
+      [103, "WorkTaskReferenceEvidence"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -654,6 +659,7 @@ it.effect("upgrades validation data atomically to action reviews and preserves p
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
+      [103, "WorkTaskReferenceEvidence"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -878,6 +884,7 @@ it.effect("upgrades existing tasks without inventing state and rolls back migrat
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
+      [103, "WorkTaskReferenceEvidence"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -987,6 +994,7 @@ it.effect("upgrades waits atomically while preserving task state and link proven
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
+      [103, "WorkTaskReferenceEvidence"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM work_task_thread_links ORDER BY link_event_id`,
@@ -1123,6 +1131,7 @@ it.effect("upgrades result history atomically without changing predecessor data"
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
+      [103, "WorkTaskReferenceEvidence"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_current_state`, state);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_thread_links`, links);
@@ -1275,6 +1284,7 @@ it.effect("upgrades claim history atomically and preserves prior task and ordina
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
+      [103, "WorkTaskReferenceEvidence"],
     ]);
     assert.deepStrictEqual(
       yield* Effect.forEach(tables, (name) => sql.unsafe(`SELECT * FROM ${name}`)),
@@ -1623,6 +1633,7 @@ it.effect("preserves legacy validation rows and rolls replay migration back befo
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
+      [103, "WorkTaskReferenceEvidence"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_attempts`, before);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_claims`, claims);
@@ -2745,6 +2756,7 @@ it.effect("preserves review evidence on upgrade and binds append-only outcomes a
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
+      [103, "WorkTaskReferenceEvidence"],
     ]);
     assert.deepStrictEqual(yield* snapshot(), before);
     assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
@@ -3151,6 +3163,7 @@ it.effect(
         [100, "WorkTaskOwnershipReleaseBridge"],
         [101, "WorkTaskReadyState"],
         [102, "WorkTaskProjectionSource"],
+        [103, "WorkTaskReferenceEvidence"],
       ]);
       const after = yield* snapshot();
       assert.deepStrictEqual(
@@ -3517,6 +3530,7 @@ it.effect(
         [100, "WorkTaskOwnershipReleaseBridge"],
         [101, "WorkTaskReadyState"],
         [102, "WorkTaskProjectionSource"],
+        [103, "WorkTaskReferenceEvidence"],
       ]);
       const after = yield* capture();
       assert.deepStrictEqual(
@@ -4156,6 +4170,7 @@ it.effect(
         [100, "WorkTaskOwnershipReleaseBridge"],
         [101, "WorkTaskReadyState"],
         [102, "WorkTaskProjectionSource"],
+        [103, "WorkTaskReferenceEvidence"],
       ]);
       const after = yield* capture();
       assert.deepStrictEqual(
@@ -4573,6 +4588,7 @@ it.effect("preserves dirty scan membership observations and rolls back migration
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
+      [103, "WorkTaskReferenceEvidence"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_group_memberships`, before);
     const member = batch.event.snapshot.currentMembership!;
@@ -5276,6 +5292,7 @@ it.effect(
         [100, "WorkTaskOwnershipReleaseBridge"],
         [101, "WorkTaskReadyState"],
         [102, "WorkTaskProjectionSource"],
+        [103, "WorkTaskReferenceEvidence"],
       ]);
       const after = yield* capture();
       for (const name of names.filter((name) => name !== "effect_sql_migrations"))
@@ -5766,6 +5783,7 @@ it.effect(
         [100, "WorkTaskOwnershipReleaseBridge"],
         [101, "WorkTaskReadyState"],
         [102, "WorkTaskProjectionSource"],
+        [103, "WorkTaskReferenceEvidence"],
       ]);
       const after = yield* capture();
       for (const name of names.filter((name) => name !== "effect_sql_migrations"))
@@ -6321,6 +6339,7 @@ it.effect(
         [100, "WorkTaskOwnershipReleaseBridge"],
         [101, "WorkTaskReadyState"],
         [102, "WorkTaskProjectionSource"],
+        [103, "WorkTaskReferenceEvidence"],
       ]);
       const after = yield* capture();
       for (const name of names.filter((n) => n !== "effect_sql_migrations"))
@@ -6906,6 +6925,7 @@ it.effect(
         [100, "WorkTaskOwnershipReleaseBridge"],
         [101, "WorkTaskReadyState"],
         [102, "WorkTaskProjectionSource"],
+        [103, "WorkTaskReferenceEvidence"],
       ]);
       const after = yield* capture();
       for (const { name } of tables.filter((r) => r.name !== "effect_sql_migrations"))
@@ -7471,6 +7491,7 @@ it.effect("upgrades ready storage preserving every predecessor row and rolls bac
     assert.deepStrictEqual(yield* runMigrations(), [
       [101, "WorkTaskReadyState"],
       [102, "WorkTaskProjectionSource"],
+      [103, "WorkTaskReferenceEvidence"],
     ]);
     const after = yield* capture();
     for (const { name } of tables.filter((t) => t.name !== "effect_sql_migrations"))
@@ -7590,7 +7611,10 @@ it.effect("upgrades native task lookup compatibility without changing predecesso
     const retryBefore = yield* capture();
     const retryRowids =
       yield* sql`SELECT CAST(rowid AS TEXT) AS rowid,task_id,hex(manager_thread_id) AS manager_hex,hex(configuration_json) AS config_hex FROM work_task_current_state ORDER BY task_id`;
-    assert.deepStrictEqual(yield* runMigrations(), [[102, "WorkTaskProjectionSource"]]);
+    assert.deepStrictEqual(yield* runMigrations(), [
+      [102, "WorkTaskProjectionSource"],
+      [103, "WorkTaskReferenceEvidence"],
+    ]);
     const after = yield* capture();
     for (const { name } of tables.filter((t) => t.name !== "effect_sql_migrations"))
       assert.deepStrictEqual(after[name], retryBefore[name]);
@@ -7653,4 +7677,119 @@ it.effect("upgrades native task lookup compatibility without changing predecesso
     assert.deepStrictEqual(yield* capture(), preserved);
     assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
   }).pipe(Effect.provide(db)),
+);
+
+it.effect(
+  "preserves native reference history and qualifies only explicit monotone checkpoints",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: 102 });
+      yield* sql`INSERT INTO work_task_projections VALUES('legacy',NULL,1,1,1,1,'{}','1','1'),('other',NULL,1,1,1,1,'{}','1','1')`;
+      for (const [id, payload] of [
+        ["malformed", "{"],
+        [
+          "valid",
+          JSON.stringify({
+            manager: { managerThreadId: "thread", managerGeneration: 1 },
+            binding: { managerThreadId: "ignored", managerGeneration: 99 },
+          }),
+        ],
+      ])
+        yield* sql`INSERT INTO orchestration_events(event_id,aggregate_kind,stream_id,stream_version,event_type,occurred_at,actor_kind,payload_json,metadata_json,application_event_version)
+        VALUES(${id},'task',${id},0,'task.execution-updated','2026-11-16T00:00:00Z','system',${payload},'{}',2)`;
+      const tables = yield* sql<{
+        name: string;
+      }>`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`;
+      const capture = Effect.fn("PersistentTasks.captureReferencePredecessor")(function* () {
+        return Object.fromEntries(
+          yield* Effect.forEach(tables, ({ name }) =>
+            sql.unsafe(`SELECT * FROM "${name}"`).pipe(Effect.map((rows) => [name, rows] as const)),
+          ),
+        );
+      });
+      const before = yield* capture();
+      yield* sql`CREATE INDEX idx_task_reference_generation ON work_task_projections(task_id)`;
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(runMigrations())));
+      assert.deepStrictEqual(yield* capture(), before);
+      assert.deepStrictEqual(
+        yield* sql`SELECT name FROM sqlite_master WHERE name IN ('idx_task_reference_thread','work_task_manager_reference_checkpoints')`,
+        [],
+      );
+      yield* sql`DROP INDEX idx_task_reference_generation`;
+      assert.deepStrictEqual(yield* runMigrations(), [[103, "WorkTaskReferenceEvidence"]]);
+      const after = yield* capture();
+      for (const { name } of tables.filter((row) => row.name !== "effect_sql_migrations"))
+        assert.deepStrictEqual(after[name], before[name]);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_manager_reference_checkpoints`, []);
+      const longId = "\u0000" + "x".repeat(2100) + "\ud800";
+      yield* sql`INSERT INTO work_task_manager_reference_checkpoints VALUES('legacy',json_extract(${JSON.stringify(longId)},'$'),1,json_extract(${JSON.stringify(longId)},'$'),1,0)`;
+      yield* sql`INSERT INTO work_task_manager_reference_checkpoints VALUES('other','other-create',2,'other-create',2,0)`;
+      assert.strictEqual(
+        (yield* sql<{
+          same: number;
+        }>`SELECT hex(creation_event_id)=hex(json_extract(${JSON.stringify(longId)},'$')) AS same FROM work_task_manager_reference_checkpoints WHERE task_id='legacy'`)[0]!
+          .same,
+        1,
+      );
+      for (const recursive of [0, 1]) {
+        yield* sql.unsafe(`PRAGMA recursive_triggers=${recursive}`);
+        const stable =
+          yield* sql`SELECT hex(task_id),hex(creation_event_id),creation_sequence,hex(checked_event_id),checked_sequence,checked_stream_version FROM work_task_manager_reference_checkpoints`;
+        for (const statement of [
+          sql`INSERT OR REPLACE INTO work_task_manager_reference_checkpoints VALUES('legacy','changed',1,'changed',1,0)`,
+          sql`UPDATE OR REPLACE work_task_manager_reference_checkpoints SET task_id='legacy' WHERE task_id='other'`,
+          sql`UPDATE work_task_manager_reference_checkpoints SET creation_sequence=0 WHERE task_id='legacy'`,
+          sql`UPDATE work_task_manager_reference_checkpoints SET creation_event_id='changed' WHERE task_id='legacy'`,
+          sql`UPDATE work_task_manager_reference_checkpoints SET checked_event_id='changed' WHERE task_id='legacy'`,
+          sql`UPDATE work_task_manager_reference_checkpoints SET checked_sequence=0 WHERE task_id='legacy'`,
+          sql`UPDATE work_task_manager_reference_checkpoints SET checked_stream_version=1 WHERE task_id='legacy'`,
+          sql`UPDATE work_task_manager_reference_checkpoints SET checked_event_id='next',checked_sequence=2,checked_stream_version=0.5 WHERE task_id='legacy'`,
+          sql`UPDATE work_task_manager_reference_checkpoints SET checked_event_id='next',checked_sequence=9007199254740992,checked_stream_version=1 WHERE task_id='legacy'`,
+          sql`DELETE FROM work_task_manager_reference_checkpoints WHERE task_id='legacy'`,
+          sql`INSERT INTO work_task_manager_reference_checkpoints VALUES('missing','missing',0,'missing',0,0)`,
+          sql`INSERT INTO work_task_manager_reference_checkpoints(rowid,task_id,creation_event_id,creation_sequence,checked_event_id,checked_sequence,checked_stream_version) VALUES(1,'missing','missing',0,'missing',0,0)`,
+        ])
+          assert.isTrue(Exit.isFailure(yield* Effect.exit(statement)));
+        assert.deepStrictEqual(
+          yield* sql`SELECT hex(task_id),hex(creation_event_id),creation_sequence,hex(checked_event_id),checked_sequence,checked_stream_version FROM work_task_manager_reference_checkpoints`,
+          stable,
+        );
+      }
+      yield* sql`UPDATE work_task_manager_reference_checkpoints SET checked_event_id='checked',checked_sequence=50,checked_stream_version=20 WHERE task_id='legacy'`;
+      yield* sql`UPDATE work_task_manager_reference_checkpoints SET checked_event_id='checked',checked_sequence=50,checked_stream_version=20 WHERE task_id='legacy'`;
+      const preserved =
+        yield* sql`SELECT hex(creation_event_id),checked_event_id,checked_sequence,checked_stream_version FROM work_task_manager_reference_checkpoints`;
+      assert.deepStrictEqual(yield* runMigrations(), []);
+      assert.deepStrictEqual(
+        yield* sql`SELECT hex(creation_event_id),checked_event_id,checked_sequence,checked_stream_version FROM work_task_manager_reference_checkpoints`,
+        preserved,
+      );
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+      for (const name of [
+        "idx_task_reference_thread",
+        "idx_task_reference_generation",
+        "idx_task_allowance_debit_unit",
+      ]) {
+        const index = (yield* sql<{
+          sql: string;
+        }>`SELECT sql FROM sqlite_master WHERE name=${name}`)[0]!.sql;
+        const predicate = index.slice(index.indexOf("WHERE") + 5);
+        const expression = index.slice(
+          index.indexOf("stream_id,") + 10,
+          index.lastIndexOf(",sequence)"),
+        );
+        const value = name.endsWith("thread") ? "'thread'" : "1";
+        const query = `SELECT event_id FROM orchestration_events INDEXED BY ${name} WHERE ${predicate} AND stream_id='valid' AND ${expression}=${value} AND sequence<=9007199254740991 ORDER BY sequence DESC LIMIT 1`;
+        const plan = JSON.stringify(yield* sql.unsafe(`EXPLAIN QUERY PLAN ${query}`));
+        assert.include(plan, name);
+        assert.include(plan, "SEARCH");
+        assert.notMatch(plan, /TEMP B-TREE|SCAN orchestration_events/);
+        const rows = yield* sql.unsafe<{ event_id: string }>(query);
+        assert.deepStrictEqual(
+          rows.map((row) => row.event_id),
+          name.endsWith("unit") ? [] : ["valid"],
+        );
+      }
+    }).pipe(Effect.provide(db)),
 );

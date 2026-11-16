@@ -38,6 +38,56 @@ export class TaskSourceError extends Schema.TaggedError<TaskSourceError>()("Task
 }) {}
 const isSourceError = Schema.is(TaskSourceError);
 type Native = { readonly recorded: WorkTaskPersistedEvent; readonly streamVersion: number };
+type CheckedReference = {
+  readonly eventId: string;
+  readonly sequence: number;
+  readonly streamVersion: number;
+};
+const referencePaths = [
+  ["manager", ["task.execution-updated"]],
+  ["review", ["task.action-review-requested"]],
+  [
+    "binding",
+    [
+      "task.action-review-invalidated",
+      "task.action-review-cancelled",
+      "task.action-review-continuation-released",
+    ],
+  ],
+  [
+    "",
+    [
+      "task.manager-bound",
+      "task.manager-retired",
+      "task.wait-updated",
+      "task.continuation-accepted",
+      "task.completion-submitted",
+      "task.completed",
+      "task.action-review-result-recorded",
+    ],
+  ],
+] as const;
+const referencePredicate = `aggregate_kind='task' AND application_event_version=2 AND event_type IN (${referencePaths
+  .flatMap(([, names]) => names)
+  .map((name) => `'${name}'`)
+  .join(",")})`;
+const referenceExpression = (field: "managerThreadId" | "managerGeneration") =>
+  `CASE WHEN json_valid(payload_json) THEN CASE ${referencePaths.map(([path, names]) => `WHEN event_type IN (${names.map((type) => `'${type}'`).join(",")}) THEN json_extract(payload_json,'$.${path ? path + "." : ""}${field}')`).join(" ")} END END`;
+const referencePair = (event: WorkTaskPersistedEvent["event"]) =>
+  "binding" in event
+    ? event.binding
+    : "review" in event
+      ? event.review
+      : "managerThreadId" in event
+        ? event
+        : "manager" in event
+          ? event.manager
+          : null;
+const checkedReference = (value: Native): CheckedReference => ({
+  eventId: value.recorded.event.id,
+  sequence: value.recorded.context.sequence,
+  streamVersion: value.streamVersion,
+});
 type Anchor = {
   readonly eventId: string;
   readonly sequence: number;
@@ -79,8 +129,10 @@ export class TaskProjectionError extends Schema.TaggedError<TaskProjectionError>
       "link",
       "cas",
       "fence",
+      "qualification",
       "sql",
     ]),
+    conflictingEventIds: Schema.optional(Schema.Array(Schema.String)),
   },
 ) {}
 const isProjectionError = Schema.is(TaskProjectionError);
@@ -90,6 +142,14 @@ const natural = Schema.Number.check(
   Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
 );
 const positive = natural.check(Schema.isGreaterThan(0));
+const ReferenceCheckpoint = Schema.Struct({
+  taskId: WorkTaskId,
+  creationEventId: Schema.String,
+  creationSequence: natural,
+  eventId: Schema.String,
+  sequence: natural,
+  streamVersion: natural,
+});
 const revisions = {
   definitionRevision: positive,
   lifecycleRevision: positive,
@@ -159,6 +219,15 @@ type ProjectionFailure = TaskProjectionError | TaskSourceError;
 export class TaskStore extends Context.Service<
   TaskStore,
   {
+    readonly auditManagerReferences: (input: {
+      readonly taskId: string;
+      readonly expectedCheckpointSequence: number;
+    }) => Effect.Effect<CheckedReference, ProjectionFailure>;
+    readonly readAllowanceDebitSource: (input: {
+      readonly taskId: string;
+      readonly allowanceUnit: number;
+      readonly checkpointSequence: number;
+    }) => Effect.Effect<Native | undefined, ProjectionFailure>;
     readonly applyFoundation: (
       recorded: WorkTaskPersistedEvent,
     ) => Effect.Effect<
@@ -348,6 +417,9 @@ const make = Effect.gen(function* () {
   type SourceIndex =
     | "idx_task_source_type_sequence"
     | "idx_task_source_manager_sequence"
+    | "idx_task_reference_thread"
+    | "idx_task_reference_generation"
+    | "idx_task_allowance_debit_unit"
     | "idx_orch_events_command_id";
   // SQLite otherwise prefers the global application-sequence index for selective task witnesses.
   const rows = (where: string, parameters: ReadonlyArray<string | number>, index?: SourceIndex) =>
@@ -785,6 +857,187 @@ const make = Effect.gen(function* () {
       high: counter(found[0]!.high),
     })).pipe(Effect.mapError(() => new TaskProjectionError({ code: "fence" })));
   });
+  const referenceCheckpoint = Effect.fn("TaskStore.readReferenceCheckpoint")(function* (
+    taskId: string,
+  ) {
+    const found = yield* sql<{ payload: string; valid: number }>`SELECT
+      typeof(creation_sequence)='integer' AND typeof(checked_sequence)='integer' AND typeof(checked_stream_version)='integer' AS valid,
+      hex(json_object('taskId',task_id,'creationEventId',creation_event_id,'creationSequence',creation_sequence,
+        'eventId',checked_event_id,'sequence',checked_sequence,'streamVersion',checked_stream_version)) AS payload
+      FROM work_task_manager_reference_checkpoints WHERE task_id=json_extract(${yield* encodeProjectionJson(taskId)},'$')`;
+    const value = yield* stored(ReferenceCheckpoint, found[0]);
+    if (value) yield* guard(value.taskId === taskId, "qualification");
+    return value;
+  });
+  const publishReferenceCheckpoint = Effect.fn("TaskStore.publishReferenceCheckpoint")(function* (
+    creation: Native,
+    next: Native,
+    previous: typeof ReferenceCheckpoint.Type | undefined,
+  ) {
+    const taskId = next.recorded.event.taskId;
+    if (previous)
+      yield* guard(
+        previous.creationEventId === creation.recorded.event.id &&
+          previous.creationSequence === creation.recorded.context.sequence,
+        "qualification",
+      );
+    const id = yield* encodeProjectionJson(taskId);
+    const eventId = yield* encodeProjectionJson(next.recorded.event.id);
+    const sequence = next.recorded.context.sequence;
+    const changed = previous
+      ? yield* sql`UPDATE work_task_manager_reference_checkpoints SET checked_event_id=json_extract(${eventId},'$'),checked_sequence=${sequence},checked_stream_version=${next.streamVersion}
+        WHERE task_id=json_extract(${id},'$') AND creation_event_id=json_extract(${yield* encodeProjectionJson(previous.creationEventId)},'$') AND creation_sequence=${previous.creationSequence}
+          AND checked_event_id=json_extract(${yield* encodeProjectionJson(previous.eventId)},'$') AND checked_sequence=${previous.sequence} AND checked_stream_version=${previous.streamVersion}
+          AND EXISTS(SELECT 1 FROM work_task_current_state WHERE task_id=json_extract(${id},'$') AND last_applied_sequence=${sequence}) RETURNING 1`
+      : yield* sql`INSERT INTO work_task_manager_reference_checkpoints(task_id,creation_event_id,creation_sequence,checked_event_id,checked_sequence,checked_stream_version)
+        SELECT json_extract(${id},'$'),json_extract(${yield* encodeProjectionJson(creation.recorded.event.id)},'$'),${creation.recorded.context.sequence},json_extract(${eventId},'$'),${sequence},${next.streamVersion}
+        WHERE EXISTS(SELECT 1 FROM work_task_current_state WHERE task_id=json_extract(${id},'$') AND last_applied_sequence=${sequence}) RETURNING 1`;
+    yield* guard(changed.length === 1, "cas");
+  });
+  const checkReference = Effect.fn("TaskStore.checkManagerReference")(function* (
+    event: WorkTaskPersistedEvent["event"],
+    through: number,
+  ) {
+    const pair = referencePair(event);
+    if (!pair) return;
+    for (const [field, index] of [
+      ["managerThreadId", "thread"],
+      ["managerGeneration", "generation"],
+    ] as const) {
+      const known = yield* one(
+        event.taskId,
+        `${referencePredicate} AND stream_id=json_extract(?,'$') AND ${referenceExpression(field)}=json_extract(?,'$') AND sequence<=? ORDER BY sequence DESC LIMIT 1`,
+        [
+          yield* encodeProjectionJson(event.taskId),
+          yield* encodeProjectionJson(pair[field]),
+          through,
+        ],
+        `idx_task_reference_${index}`,
+      );
+      if (known) {
+        const previous = referencePair(known.recorded.event);
+        yield* guard(
+          previous?.managerThreadId === pair.managerThreadId &&
+            previous.managerGeneration === pair.managerGeneration,
+          "manager",
+        );
+      }
+    }
+  });
+  const auditManagerReferences = Effect.fn("TaskStore.auditManagerReferences")(function* (input: {
+    taskId: string;
+    expectedCheckpointSequence: number;
+  }) {
+    yield* guard(
+      Number.isSafeInteger(input.expectedCheckpointSequence) &&
+        input.expectedCheckpointSequence >= 0,
+      "invalid",
+    );
+    const captured = yield* projectTransaction(
+      Effect.gen(function* () {
+        const current = yield* readProjection(input.taskId);
+        yield* guard(current?.current?.lastSequence === input.expectedCheckpointSequence, "cas");
+        return {
+          source: yield* readFoundationSource({
+            taskId: input.taskId,
+            checkpointSequence: input.expectedCheckpointSequence,
+          }),
+          marker: yield* referenceCheckpoint(input.taskId),
+        };
+      }),
+    ).pipe(NodeSqliteClient.readOnly);
+    const threads = new Map<string, { generation: number; eventId: string }>();
+    const generations = new Map<number, { threadId: string; eventId: string }>();
+    let after: Anchor | undefined;
+    do {
+      const page = yield* readNativeHistory({
+        taskId: input.taskId,
+        throughSequence: input.expectedCheckpointSequence,
+        ...(after ? { after } : {}),
+      });
+      for (const value of page.records) {
+        const pair = referencePair(value.recorded.event);
+        if (!pair) continue;
+        const thread = threads.get(pair.managerThreadId);
+        const generation = generations.get(pair.managerGeneration);
+        const conflict =
+          thread && thread.generation !== pair.managerGeneration
+            ? thread
+            : generation && generation.threadId !== pair.managerThreadId
+              ? generation
+              : undefined;
+        if (conflict)
+          return yield* new TaskProjectionError({
+            code: "manager",
+            conflictingEventIds: [conflict.eventId, value.recorded.event.id],
+          });
+        threads.set(pair.managerThreadId, {
+          generation: pair.managerGeneration,
+          eventId: value.recorded.event.id,
+        });
+        generations.set(pair.managerGeneration, {
+          threadId: pair.managerThreadId,
+          eventId: value.recorded.event.id,
+        });
+      }
+      after = page.next;
+    } while (after);
+    return yield* projectTransaction(
+      Effect.gen(function* () {
+        const current = yield* readProjection(input.taskId);
+        yield* guard(current?.current?.lastSequence === input.expectedCheckpointSequence, "cas");
+        yield* coverage(input.taskId, captured.source.prunedThrough);
+        const source = yield* readFoundationSource({
+          taskId: input.taskId,
+          checkpointSequence: input.expectedCheckpointSequence,
+        });
+        const marker = yield* referenceCheckpoint(input.taskId);
+        yield* guard(
+          NodeUtil.isDeepStrictEqual(source.creation, captured.source.creation) &&
+            NodeUtil.isDeepStrictEqual(source.checkpoint, captured.source.checkpoint) &&
+            NodeUtil.isDeepStrictEqual(marker, captured.marker),
+          "cas",
+        );
+        yield* guard(source.checkpoint !== undefined, "qualification");
+        yield* publishReferenceCheckpoint(source.creation, source.checkpoint!, marker);
+        return checkedReference(source.checkpoint!);
+      }),
+    );
+  });
+  const readAllowanceDebitSource = Effect.fn("TaskStore.readAllowanceDebitSource")(
+    (input: { taskId: string; allowanceUnit: number; checkpointSequence: number }) =>
+      projectTransaction(
+        Effect.gen(function* () {
+          yield* guard(
+            Number.isSafeInteger(input.allowanceUnit) && input.allowanceUnit > 0,
+            "invalid",
+          );
+          const current = yield* readProjection(input.taskId);
+          yield* guard(current?.current?.lastSequence === input.checkpointSequence, "cas");
+          yield* readFoundationSource({
+            taskId: input.taskId,
+            checkpointSequence: input.checkpointSequence,
+          });
+          const value = yield* one(
+            input.taskId,
+            "aggregate_kind='task' AND application_event_version=2 AND event_type='task.allowance-debited' AND CASE WHEN json_valid(payload_json) THEN json_type(payload_json,'$.allowanceUnit') END='integer' AND stream_id=json_extract(?,'$') AND CASE WHEN json_valid(payload_json) THEN json_extract(payload_json,'$.allowanceUnit') END=? AND sequence<=? ORDER BY sequence DESC LIMIT 1",
+            [
+              yield* encodeProjectionJson(input.taskId),
+              input.allowanceUnit,
+              input.checkpointSequence,
+            ],
+            "idx_task_allowance_debit_unit",
+          );
+          if (value)
+            yield* guard(
+              value.recorded.event.type === "task.allowance-debited" &&
+                value.recorded.event.allowanceUnit === input.allowanceUnit,
+              "invalid",
+            );
+          return value;
+        }),
+      ).pipe(NodeSqliteClient.readOnly),
+  );
   const applyFoundation = Effect.fn("TaskStore.applyFoundation")((input: WorkTaskPersistedEvent) =>
     projectTransaction(
       Effect.gen(function* () {
@@ -823,6 +1076,19 @@ const make = Effect.gen(function* () {
         const view = yield* fence();
         if (source.checkpoint && original.streamVersion <= source.checkpoint.streamVersion)
           return { applied: false, lastSequence: checkpoint!, viewGeneration: view.generation };
+        const checked = yield* referenceCheckpoint(event.taskId);
+        if (source.checkpoint) {
+          yield* guard(
+            checked !== undefined &&
+              checked.creationEventId === source.creation.recorded.event.id &&
+              checked.creationSequence === source.creation.recorded.context.sequence &&
+              checked.eventId === source.checkpoint.recorded.event.id &&
+              checked.sequence === checkpoint &&
+              checked.streamVersion === source.checkpoint.streamVersion,
+            "qualification",
+          );
+          yield* checkReference(event, checkpoint!);
+        } else yield* guard(checked === undefined, "qualification");
         yield* guard(source.next?.recorded.event.id === event.id, "replay");
         yield* guard(view.generation < Number.MAX_SAFE_INTEGER, "fence");
         const keys = [
@@ -968,6 +1234,7 @@ const make = Effect.gen(function* () {
             break;
           }
         }
+        yield* publishReferenceCheckpoint(source.creation, original, checked);
         const advanced =
           yield* sql`UPDATE work_task_view_fence SET generation=${view.generation + 1},high_water_sequence=${Math.max(view.high, context.sequence)}
       WHERE singleton_id=1 AND generation=${view.generation} AND high_water_sequence=${view.high} RETURNING 1`;
@@ -997,6 +1264,8 @@ const make = Effect.gen(function* () {
   );
 
   return TaskStore.of({
+    auditManagerReferences,
+    readAllowanceDebitSource,
     applyFoundation,
     readFoundation,
     readAcceptedDefinition,

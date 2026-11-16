@@ -6,6 +6,8 @@ import * as NodeSqlite from "node:sqlite";
 import { WorkTaskPersistedEvent } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -857,6 +859,11 @@ it.effect(
       );
       assert.deepStrictEqual(yield* projectionSnapshot, before);
       yield* sql`UPDATE work_task_current_state SET last_applied_sequence=2,archived=1`;
+      assert.strictEqual(
+        (yield* store.applyFoundation(later).pipe(Effect.flip)).code,
+        "qualification",
+      );
+      yield* store.auditManagerReferences({ taskId: "task", expectedCheckpointSequence: 2 });
       yield* store.applyFoundation(later);
       assert.strictEqual((yield* store.readFoundation("task"))?.projection.current?.archived, 1);
       yield* sql`INSERT INTO orchestration_v2_projection_metadata VALUES('event-log-pruned-through',2,1,${timestamp})`;
@@ -1118,4 +1125,383 @@ it.effect(
         assert.notInclude(plan, "TEMP B-TREE");
       }
     }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "qualifies manager history explicitly and preserves the checked prefix across restart",
+  () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const store = yield* TaskStore.TaskStore;
+      const created = yield* record(1);
+      yield* insert(created, 0);
+      yield* store.applyFoundation(created);
+      assert.deepStrictEqual(
+        yield* store.auditManagerReferences({ taskId: "task", expectedCheckpointSequence: 1 }),
+        { eventId: "event-1", sequence: 1, streamVersion: 0 },
+      );
+      const sql = yield* SqlClient.SqlClient;
+      const marker = yield* sql`SELECT * FROM work_task_manager_reference_checkpoints`;
+      const first = yield* record(2, execution(1));
+      yield* insert(first, 1);
+      yield* store.applyFoundation(first);
+      const collision = yield* record(3, {
+        ...execution(2),
+        manager: { managerThreadId: "manager-1", managerGeneration: 2 },
+      });
+      yield* insert(collision, 2);
+      assert.strictEqual(
+        (yield* store.applyFoundation(collision).pipe(Effect.flip)).code,
+        "manager",
+      );
+      assert.strictEqual(
+        (yield* sql<{
+          sequence: number;
+        }>`SELECT checked_sequence AS sequence FROM work_task_manager_reference_checkpoints`)[0]!
+          .sequence,
+        2,
+      );
+      assert.strictEqual(marker.length, 1);
+      const seedLegacy = Effect.fn("TaskStoreTest.seedUncheckedPrefix")(function* (
+        taskId: string,
+        base: number,
+        repeated: boolean,
+      ) {
+        const values = [
+          yield* record(base, { taskId }),
+          yield* record(base + 1, { ...execution(1), taskId }),
+          yield* record(base + 2, {
+            ...execution(2),
+            taskId,
+            manager: {
+              managerThreadId: repeated ? "manager-1" : "manager-2",
+              managerGeneration: 2,
+            },
+          }),
+        ];
+        for (let version = 0; version < values.length; version++)
+          yield* insert(values[version]!, version);
+        yield* sql`INSERT INTO work_task_projections VALUES(json_extract(${JSON.stringify(taskId)},'$'),'project',1,1,1,1,${JSON.stringify(definition)},${timestamp},${timestamp})`;
+        yield* sql`INSERT INTO work_task_current_state(task_id,last_applied_sequence) VALUES(json_extract(${JSON.stringify(taskId)},'$'),${base + 2})`;
+        return values;
+      });
+      const bad = yield* seedLegacy("bad", 100, true);
+      const failed = yield* store
+        .auditManagerReferences({ taskId: "bad", expectedCheckpointSequence: 102 })
+        .pipe(Effect.flip);
+      assert.strictEqual(failed.code, "manager");
+      assert.deepStrictEqual(
+        "conflictingEventIds" in failed ? failed.conflictingEventIds : undefined,
+        ["event-101", "event-102"],
+      );
+      assert.deepStrictEqual(
+        yield* sql`SELECT * FROM work_task_manager_reference_checkpoints WHERE task_id='bad'`,
+        [],
+      );
+      assert.isFalse((yield* store.applyFoundation(bad[0]!)).applied);
+      const goodId = "\u0000good\ud800";
+      yield* seedLegacy(goodId, 200, false);
+      const next = yield* record(203, { ...configuration, taskId: goodId });
+      yield* insert(next, 3);
+      assert.strictEqual(
+        (yield* store.applyFoundation(next).pipe(Effect.flip)).code,
+        "qualification",
+      );
+      const before = yield* projectionSnapshot;
+      assert.deepStrictEqual(
+        yield* store.auditManagerReferences({ taskId: goodId, expectedCheckpointSequence: 202 }),
+        { eventId: "event-202", sequence: 202, streamVersion: 2 },
+      );
+      assert.deepStrictEqual(yield* projectionSnapshot, before);
+      yield* Effect.gen(function* () {
+        const restarted = yield* TaskStore.TaskStore;
+        yield* restarted.applyFoundation(next);
+        assert.isFalse((yield* restarted.applyFoundation(next)).applied);
+      }).pipe(Effect.provide(TaskStore.layer));
+      assert.strictEqual(
+        (yield* store
+          .auditManagerReferences({ taskId: goodId, expectedCheckpointSequence: 202 })
+          .pipe(Effect.flip)).code,
+        "cas",
+      );
+      const later = yield* record(204, { ...configuration, taskId: goodId });
+      yield* insert(later, 4);
+      const stable = yield* projectionSnapshot;
+      const stableMarkers =
+        yield* sql`SELECT hex(task_id),checked_event_id,checked_sequence,checked_stream_version FROM work_task_manager_reference_checkpoints`;
+      yield* sql`CREATE TEMP TRIGGER reject_reference BEFORE UPDATE ON work_task_manager_reference_checkpoints BEGIN SELECT RAISE(IGNORE); END`;
+      assert.strictEqual((yield* store.applyFoundation(later).pipe(Effect.flip)).code, "cas");
+      assert.deepStrictEqual(yield* projectionSnapshot, stable);
+      assert.deepStrictEqual(
+        yield* sql`SELECT hex(task_id),checked_event_id,checked_sequence,checked_stream_version FROM work_task_manager_reference_checkpoints`,
+        stableMarkers,
+      );
+      yield* sql`DROP TRIGGER reject_reference`;
+      yield* store.applyFoundation(later);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("checks every typed manager reference and reads actual applied debit evidence", () =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* TaskStore.TaskStore;
+    const pair = { managerThreadId: "\u0000manager\ud800", managerGeneration: 1 };
+    const payloadIdentity = {
+      action: "git.push",
+      target: "origin/main",
+      fingerprint: "sha256:payload",
+    };
+    const direct = {
+      ...pair,
+      runId: "run",
+      messageId: "message",
+      effectId: "effect",
+      sourceIds: ["source"],
+      dirtyGeneration: 1,
+      claimId: "claim",
+      evidenceId: "evidence",
+      observedWorkSequence: 0,
+      summary: "claim",
+      evidence: [{ type: "artifact", uri: "artifact:proof", hash: "hash" }],
+      waitId: "wait",
+      target: { type: "source", sourceId: "source" },
+      state: "registered",
+      reviewId: "review",
+      reviewRevision: 1,
+      payloadIdentity,
+      decision: "approve",
+      human: { subject: "human", sessionId: "session" },
+    };
+    const types = [
+      "task.execution-updated",
+      "task.action-review-requested",
+      "task.action-review-invalidated",
+      "task.action-review-cancelled",
+      "task.action-review-continuation-released",
+      "task.manager-bound",
+      "task.manager-retired",
+      "task.wait-updated",
+      "task.continuation-accepted",
+      "task.completion-submitted",
+      "task.completed",
+      "task.action-review-result-recorded",
+    ];
+    for (const [index, type] of types.entries()) {
+      const base = 1000 + index * 10;
+      const taskId = `form-${index}`;
+      const created = yield* record(base, { taskId });
+      yield* insert(created, 0);
+      yield* store.applyFoundation(created);
+      const binding = {
+        taskId,
+        reviewId: "review",
+        reviewRevision: 1,
+        definitionRevision: 1,
+        actionPolicyRevision: 1,
+        payloadIdentity,
+        ruleId: "rule",
+        runtimeRequestId: "request",
+        providerSessionId: "provider",
+        ...pair,
+        runId: "run",
+      };
+      const reference = yield* record(base + 1, {
+        ...direct,
+        ...execution(1),
+        manager: pair,
+        type,
+        taskId,
+        binding,
+        review: {
+          ...payloadIdentity,
+          ...pair,
+          taskId,
+          reviewId: "review",
+          revision: 1,
+          providerSessionId: "provider",
+          runId: "run",
+          ruleId: "rule",
+          definitionRevision: 1,
+          actionPolicyRevision: 1,
+          label: "Push",
+          preview: { content: "Exact changes", artifacts: [] },
+          state: { type: "pending" },
+          createdSequence: base + 1,
+          createdAt: timestamp,
+          runtimeRequestId: "request",
+        },
+        cause: "payload_changed",
+        reason: "recorded",
+        source: {
+          type: "task.archive",
+          commandId: `command-${base + 1}`,
+          human: { subject: "human", sessionId: "session" },
+        },
+        continuationId: "continuation",
+        decisionEventId: "decision",
+        purpose: "approved_action",
+      });
+      yield* insert(reference, 1);
+      if (type === "task.execution-updated")
+        yield* sql`UPDATE orchestration_events SET payload_json=json_set(payload_json,'$.binding',json(${JSON.stringify({ managerThreadId: "masked", managerGeneration: 99 })})) WHERE event_id=${reference.event.id}`;
+      yield* sql`UPDATE work_task_current_state SET last_applied_sequence=${base + 1} WHERE task_id=${taskId}`;
+      yield* store.auditManagerReferences({ taskId, expectedCheckpointSequence: base + 1 });
+      for (const manager of [
+        { managerThreadId: "different", managerGeneration: 1 },
+        { ...pair, managerGeneration: 2 },
+        pair,
+      ]) {
+        yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              const value = yield* record(base + 2, {
+                ...execution(manager.managerGeneration),
+                manager,
+                taskId,
+              });
+              yield* insert(value, 2);
+              if (manager === pair) assert.isTrue((yield* store.applyFoundation(value)).applied);
+              else
+                assert.strictEqual(
+                  (yield* store.applyFoundation(value).pipe(Effect.flip)).code,
+                  "manager",
+                );
+              return yield* Effect.fail("fixture rollback");
+            }),
+          )
+          .pipe(Effect.flip);
+      }
+    }
+    const created = yield* record(2000, { taskId: "debit" });
+    const configured = yield* record(2001, {
+      taskId: "debit",
+      type: "task.allowance-configured",
+      commandId: "command-2001",
+      previous: { type: "unconfigured", consumed: 0 },
+      resulting: { type: "configured", cap: 2, consumed: 0 },
+    });
+    const debit = yield* record(2002, {
+      taskId: "debit",
+      type: "task.allowance-debited",
+      commandId: "command-2002",
+      allowanceUnit: 1,
+      previous: { type: "configured", cap: 2, consumed: 0 },
+      resulting: { type: "configured", cap: 2, consumed: 1 },
+    });
+    for (const [version, value] of [created, configured, debit].entries())
+      yield* insert(value, version);
+    yield* store.applyFoundation(created);
+    yield* sql`UPDATE work_task_current_state SET last_applied_sequence=2002 WHERE task_id='debit'`;
+    const before = yield* projectionSnapshot;
+    assert.deepStrictEqual(
+      (yield* store.readAllowanceDebitSource({
+        taskId: "debit",
+        allowanceUnit: 1,
+        checkpointSequence: 2002,
+      }))?.recorded,
+      debit,
+    );
+    assert.isUndefined(
+      yield* store.readAllowanceDebitSource({
+        taskId: "debit",
+        allowanceUnit: 2,
+        checkpointSequence: 2002,
+      }),
+    );
+    assert.strictEqual(
+      (yield* store
+        .readAllowanceDebitSource({ taskId: "debit", allowanceUnit: 1, checkpointSequence: 2001 })
+        .pipe(Effect.flip)).code,
+      "cas",
+    );
+    assert.strictEqual(
+      (yield* store
+        .readAllowanceDebitSource({ taskId: "debit", allowanceUnit: 0, checkpointSequence: 2002 })
+        .pipe(Effect.flip)).code,
+      "invalid",
+    );
+    assert.deepStrictEqual(yield* projectionSnapshot, before);
+    assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_allowances`, []);
+    assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("publishes an audit only after unchanged source and checkpoint checks", () =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    const sql = yield* SqlClient.SqlClient;
+    for (const [index, mode] of ["cancel", "advance", "future", "prune"].entries()) {
+      const taskId = `audit-${mode}`;
+      const base = 3000 + index * 10;
+      const created = yield* record(base, { taskId });
+      const later = yield* record(base + 1, { ...configuration, taskId });
+      yield* insert(created, 0);
+      yield* sql`INSERT INTO work_task_projections VALUES(${taskId},'project',1,1,1,1,${JSON.stringify(definition)},${timestamp},${timestamp})`;
+      yield* sql`INSERT INTO work_task_current_state(task_id,last_applied_sequence) VALUES(${taskId},${base})`;
+      const reached = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let pageRead = false;
+      let armed = true;
+      const observed = new Proxy(sql, {
+        get(target, key, receiver) {
+          if (key === "unsafe")
+            return <A extends object>(query: string, parameters?: ReadonlyArray<unknown>) => {
+              if (query.includes("stream_version>?") && query.includes("ORDER BY stream_version"))
+                pageRead = true;
+              return target.unsafe<A>(query, parameters);
+            };
+          if (key === "withTransaction")
+            return <A, E, R>(operation: Effect.Effect<A, E, R>) =>
+              target.withTransaction(operation).pipe(
+                Effect.tap(() => {
+                  if (!armed || !pageRead) return Effect.void;
+                  armed = false;
+                  return Deferred.succeed(reached, undefined).pipe(
+                    Effect.andThen(Deferred.await(release)),
+                  );
+                }),
+              );
+          return Reflect.get(target, key, receiver);
+        },
+      });
+      const running = yield* Effect.gen(function* () {
+        const store = yield* TaskStore.TaskStore;
+        return yield* store.auditManagerReferences({ taskId, expectedCheckpointSequence: base });
+      }).pipe(
+        Effect.provide(TaskStore.layer),
+        Effect.provideService(SqlClient.SqlClient, observed),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(reached);
+      if (mode === "cancel") yield* Fiber.interrupt(running);
+      else {
+        yield* insert(later, 1);
+        if (mode === "advance")
+          yield* sql`UPDATE work_task_current_state SET last_applied_sequence=${base + 1} WHERE task_id=${taskId}`;
+        if (mode === "prune")
+          yield* sql`INSERT INTO orchestration_v2_projection_metadata VALUES('event-log-pruned-through',${base},1,${timestamp})`;
+        yield* Deferred.succeed(release, undefined);
+        if (mode === "future")
+          assert.deepStrictEqual(yield* Fiber.join(running), {
+            eventId: `event-${base}`,
+            sequence: base,
+            streamVersion: 0,
+          });
+        else
+          assert.strictEqual(
+            (yield* Fiber.join(running).pipe(Effect.flip)).code,
+            mode === "advance" ? "cas" : "source_unavailable",
+          );
+      }
+      const rows =
+        yield* sql`SELECT * FROM work_task_manager_reference_checkpoints WHERE task_id=${taskId}`;
+      assert.strictEqual(rows.length, mode === "future" ? 1 : 0);
+      assert.strictEqual(
+        (yield* sql<{ generation: number }>`SELECT generation FROM work_task_view_fence`)[0]!
+          .generation,
+        0,
+      );
+    }
+  }).pipe(Effect.provide(db)),
 );
