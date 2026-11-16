@@ -175,7 +175,8 @@ const appendTaskFact = Effect.fn("TaskStoreTest.appendTaskFact")(function* (
     COALESCE((SELECT max(stream_version) FROM orchestration_events WHERE aggregate_kind='task' AND stream_id=json_extract(${JSON.stringify(taskId)},'$')),-1)+1 AS version`;
   const value = yield* record(head!.sequence, { commandId: `command-${head!.sequence}`, ...input });
   yield* insert(value, head!.version);
-  if (value.event.type === "task.wait-updated") yield* store.applyWait(value);
+  if (value.event.type === "task.result-recorded") yield* store.applyResult(value);
+  else if (value.event.type === "task.wait-updated") yield* store.applyWait(value);
   else if (value.event.type.startsWith("task.wake-")) yield* store.applyWake(value);
   else if (
     value.event.type.startsWith("task.allowance-") ||
@@ -186,6 +187,7 @@ const appendTaskFact = Effect.fn("TaskStoreTest.appendTaskFact")(function* (
   return value;
 });
 const wakeTables = [
+  "work_task_results",
   "work_task_waits",
   "orchestration_events",
   "work_task_projections",
@@ -207,6 +209,389 @@ const wakeSnapshot = Effect.fn("TaskStoreTest.wakeSnapshot")(function* () {
     rows[table] = yield* sql`SELECT * FROM ${sql(table)} ORDER BY 1,2`;
   return rows;
 });
+
+it.effect("persists native result provenance and traverses a fixed history after new appends", () =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* TaskStore.TaskStore;
+    assert.isUndefined(yield* store.readResults({ taskId: "unused" }));
+    const history = [yield* record(1), ...(yield* seedWakeCustody())];
+    assert.deepStrictEqual(yield* store.readResults({ taskId: "task" }), {
+      records: [],
+      throughSequence: 4,
+      next: undefined,
+    });
+    const append = Effect.fn("TaskStoreTest.appendResultHistory")(function* (
+      input: Record<string, unknown>,
+    ) {
+      const value = yield* appendTaskFact(input).pipe(sql.withTransaction);
+      history.push(value);
+      return value;
+    });
+    yield* append({
+      type: "task.wake-source-recorded",
+      source: { kind: "result", sourceId: "source", resultRef: null },
+      reservationId: null,
+      dirtyGeneration: 1,
+    });
+    const wait = {
+      type: "task.wait-updated",
+      waitId: "wait",
+      managerThreadId: "manager",
+      managerGeneration: 1,
+      target: { type: "source", sourceId: "source" },
+      state: "registered",
+    };
+    yield* append(wait);
+    const result = {
+      type: "task.result-recorded",
+      sourceId: "source\0\ud800",
+      summary: "Evidence\ud800",
+      results: [
+        { type: "artifact", uri: "artifact\0\ud800", hash: "hash" },
+        { type: "run", threadId: "thread\ud800", runId: "run\0" },
+        { type: "source_revision", repository: "repo", revision: "revision" },
+      ],
+    };
+    const first = yield* append({ ...result, id: "r".repeat(2001) + "\ud800" });
+    const revisions = {
+      definitionRevision: 2,
+      lifecycleRevision: 2,
+      completionPolicyRevision: 2,
+      actionPolicyRevision: 2,
+    };
+    yield* append({
+      type: "task.definition-updated",
+      ...revisions,
+      definition: { ...definition, revision: 2, title: "New draft" },
+    });
+    yield* append({ ...configuration, ...revisions });
+    const current = yield* store.readFoundation("task");
+    const second = yield* append({
+      ...result,
+      contributorThreadId: "contributor\0\ud800",
+      attribution: {
+        type: "agent",
+        threadId: "contributor\0\ud800",
+        providerSessionId: "provider",
+        runId: "run",
+      },
+    });
+    const third = yield* append({ ...result, id: "a-third" });
+    yield* append({ ...wait, state: "cleared" });
+    const page = (yield* store.readResults({ taskId: "task", limit: 1 }))!;
+    assert.deepStrictEqual(
+      page.records.map((v) => v.recorded),
+      [third],
+    );
+    const fourth = yield* append({ ...result, id: "z-fourth" });
+    const next = (yield* store.readResults({ taskId: "task", limit: 1, after: page.next! }))!;
+    assert.deepStrictEqual(
+      next.records.map((v) => v.recorded),
+      [second],
+    );
+    assert.equal(next.throughSequence, page.throughSequence);
+    const last = (yield* store.readResults({ taskId: "task", limit: 1, after: next.next! }))!;
+    assert.deepStrictEqual(
+      last.records.map((v) => v.recorded),
+      [first],
+    );
+    assert.isUndefined(last.next);
+    assert.deepStrictEqual(
+      (yield* store.readResults({
+        taskId: "task",
+        after: {
+          taskId: "task",
+          throughSequence: last.throughSequence,
+          sequence: first.context.sequence,
+          eventId: first.event.id,
+        },
+      }))?.records,
+      [],
+    );
+    const newest = (yield* store.readResults({ taskId: "task", limit: 100 }))!;
+    assert.deepStrictEqual(
+      newest.records.map((v) => v.recorded),
+      [fourth, third, second, first],
+    );
+    for (const value of [first, second, third, fourth])
+      assert.deepStrictEqual(
+        (yield* store.readResult({ taskId: "task", eventId: value.event.id }))?.recorded,
+        value,
+      );
+    const after = (yield* store.readFoundation("task"))!;
+    assert.deepStrictEqual(after.draft, current!.draft);
+    assert.deepStrictEqual(after.projection.definition, current!.projection.definition);
+    for (const key of [
+      "definitionRevision",
+      "lifecycleRevision",
+      "completionPolicyRevision",
+      "actionPolicyRevision",
+    ] as const)
+      assert.equal(after.projection[key], 2);
+    let pure: ReturnType<typeof reduceTaskFoundation> | undefined;
+    for (const value of history) {
+      const event = value.event;
+      switch (event.type) {
+        case "task.created":
+        case "task.definition-updated":
+        case "task.configuration-updated":
+        case "task.wait-updated":
+        case "task.result-recorded":
+          pure = reduceTaskFoundation(pure, { event, context: value.context });
+      }
+    }
+    assert.deepStrictEqual(Array.from(pure!.results), [first, second, third, fourth]);
+    const snapshot = yield* wakeSnapshot();
+    for (const value of [first, second, third, fourth])
+      assert.isFalse((yield* store.applyResult(value)).applied);
+    assert.deepStrictEqual(yield* wakeSnapshot(), snapshot);
+    assert.deepStrictEqual(
+      yield* store.readResults({ taskId: "task" }).pipe(Effect.provide(TaskStore.layer)),
+      newest,
+    );
+    assert.isUndefined(yield* store.readResult({ taskId: "unused", eventId: first.event.id }));
+    const live = {
+      foundation: after,
+      results: newest,
+      wait: yield* store.readWait({ taskId: "task", waitId: "wait" }),
+      wake: yield* store.readWake("task"),
+    };
+    const rebuilt = yield* Effect.gen(function* () {
+      yield* runMigrations();
+      const target = yield* TaskStore.TaskStore;
+      const database = yield* SqlClient.SqlClient;
+      for (const [version, value] of history.entries()) yield* insert(value, version);
+      const native = yield* database`SELECT * FROM orchestration_events ORDER BY sequence`;
+      yield* target.rebuildCustodyProjection({
+        taskId: "task",
+        throughSequence: history.at(-1)!.context.sequence,
+      });
+      assert.deepStrictEqual(
+        yield* database`SELECT * FROM orchestration_events ORDER BY sequence`,
+        native,
+      );
+      return {
+        foundation: yield* target.readFoundation("task"),
+        results: yield* target.readResults({ taskId: "task" }),
+        wait: yield* target.readWait({ taskId: "task", waitId: "wait" }),
+        wake: yield* target.readWake("task"),
+      };
+    }).pipe(Effect.provide(Layer.fresh(testLayer)));
+    assert.deepStrictEqual(rebuilt, live);
+    yield* Effect.gen(function* () {
+      yield* runMigrations();
+      const target = yield* TaskStore.TaskStore;
+      for (const [version, value] of history.entries()) yield* insert(value, version);
+      const unsupported = yield* record(history.at(-1)!.context.sequence + 1, {
+        type: "task.archived",
+        archived: true,
+      });
+      yield* insert(unsupported, history.length);
+      const before = yield* wakeSnapshot();
+      assert.equal(
+        (yield* Effect.exit(
+          target.rebuildCustodyProjection({
+            taskId: "task",
+            throughSequence: unsupported.context.sequence,
+          }),
+        ))._tag,
+        "Failure",
+      );
+      assert.deepStrictEqual(yield* wakeSnapshot(), before);
+    }).pipe(Effect.provide(Layer.fresh(testLayer)));
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("rejects unproven result pages and atomically publishes exact result history", () =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    yield* seedWakeCustody();
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* TaskStore.TaskStore;
+    const result = {
+      type: "task.result-recorded",
+      sourceId: "same",
+      summary: "Evidence",
+      results: [{ type: "artifact", uri: "artifact", hash: "hash" }],
+    };
+    const append = (input: Record<string, unknown>) =>
+      appendTaskFact(input).pipe(sql.withTransaction);
+    const first = yield* append(result);
+    const second = yield* append(result);
+    const third = yield* append(result);
+    const page = (yield* store.readResults({ taskId: "task", limit: 1 }))!;
+    const cursor = page.next!;
+    const reject = Effect.fn("TaskStoreTest.rejectResultRead")(function* (
+      operation: Effect.Effect<unknown, TaskStore.TaskProjectionError | TaskStore.TaskSourceError>,
+    ) {
+      const before = yield* wakeSnapshot();
+      assert.equal((yield* Effect.exit(operation))._tag, "Failure");
+      assert.deepStrictEqual(yield* wakeSnapshot(), before);
+    });
+    for (const limit of [0, 101, 1.5, NaN, Infinity])
+      yield* reject(store.readResults({ taskId: "task", limit }));
+    for (const throughSequence of [
+      -1,
+      NaN,
+      Number.MAX_SAFE_INTEGER + 1,
+      third.context.sequence + 1,
+    ])
+      yield* reject(store.readResults({ taskId: "task", throughSequence }));
+    for (const after of [
+      { ...cursor, taskId: "other" },
+      { ...cursor, throughSequence: cursor.throughSequence - 1 },
+      { ...cursor, sequence: cursor.throughSequence + 1 },
+      { ...cursor, sequence: NaN },
+      { ...cursor, sequence: Number.MAX_SAFE_INTEGER + 1 },
+      { ...cursor, sequence: second.context.sequence },
+      { ...cursor, eventId: "missing" },
+      { ...cursor, eventId: "event-1", sequence: 1 },
+    ])
+      yield* reject(
+        store.readResults({ taskId: "task", throughSequence: page.throughSequence, after }),
+      );
+    const other = yield* append({ type: "task.created", taskId: "other\0\ud800", definition });
+    yield* reject(store.readResults({ taskId: "task", throughSequence: other.context.sequence }));
+    yield* reject(store.readResults({ taskId: "other\0\ud800", after: cursor }));
+    const otherResult = yield* append({ ...result, taskId: "other\0\ud800" });
+    assert.deepStrictEqual(
+      (yield* store.readResult({ taskId: "other\0\ud800", eventId: otherResult.event.id }))
+        ?.recorded,
+      otherResult,
+    );
+    assert.isUndefined(yield* store.readResult({ taskId: "task", eventId: otherResult.event.id }));
+    const [head] = yield* sql<{
+      sequence: number;
+      version: number;
+    }>`SELECT (SELECT max(sequence)+1 FROM orchestration_events) AS sequence,max(stream_version)+1 AS version FROM orchestration_events WHERE stream_id='task'`;
+    const pending = yield* record(head!.sequence, result);
+    yield* insert(pending, head!.version);
+    yield* reject(store.readResults({ taskId: "task", throughSequence: pending.context.sequence }));
+    yield* reject(
+      store.readResults({
+        taskId: "task",
+        after: { ...cursor, eventId: pending.event.id, sequence: pending.context.sequence },
+      }),
+    );
+    assert.deepStrictEqual(
+      (yield* store.readResults({ taskId: "task" }))?.records.map((v) => v.recorded),
+      [third, second, first],
+    );
+    const applied = yield* Effect.all([store.applyResult(pending), store.applyResult(pending)], {
+      concurrency: 2,
+    });
+    assert.equal(applied.filter((v) => v.applied).length, 1);
+    yield* reject(store.readResults({ taskId: "task", throughSequence: other.context.sequence }));
+    assert.deepStrictEqual(
+      (yield* store.readResults({
+        taskId: "task",
+        throughSequence: page.throughSequence,
+      }))?.records.map((v) => v.recorded),
+      [third, second, first],
+    );
+    const altered = yield* record(
+      first.context.sequence,
+      { ...first.event, occurredAt: "2026-11-17T00:00:00Z" },
+      first.context.commandId,
+    );
+    yield* reject(store.applyResult(altered));
+    const corrupt = Effect.fn("TaskStoreTest.corruptResult")(function* (
+      mutation: Effect.Effect<unknown, SqlError>,
+      operation: Effect.Effect<unknown, TaskStore.TaskProjectionError | TaskStore.TaskSourceError>,
+    ) {
+      const before = yield* wakeSnapshot();
+      let observed: string | undefined;
+      yield* Effect.gen(function* () {
+        yield* mutation.pipe(Effect.orDie);
+        observed = (yield* Effect.exit(operation))._tag;
+        return yield* Effect.fail("restore fixture");
+      }).pipe(sql.withTransaction, Effect.ignore);
+      assert.equal(observed, "Failure");
+      assert.deepStrictEqual(yield* wakeSnapshot(), before);
+    });
+    yield* corrupt(
+      sql`UPDATE work_task_results SET summary='changed' WHERE event_id=${third.event.id}`,
+      store.readResults({ taskId: "task", limit: 1 }),
+    );
+    yield* corrupt(
+      sql`DELETE FROM work_task_results WHERE event_id=${pending.event.id}`,
+      store.readResults({ taskId: "task" }),
+    );
+    yield* corrupt(
+      sql`UPDATE work_task_results SET results_json='[]' WHERE event_id=${first.event.id}`,
+      store.readResult({ taskId: "task", eventId: first.event.id }),
+    );
+    yield* corrupt(
+      sql`UPDATE work_task_results SET source_id='changed' WHERE event_id=${first.event.id}`,
+      store.applyResult(first),
+    );
+    yield* corrupt(
+      sql`DELETE FROM orchestration_events WHERE event_id=${first.event.id}`,
+      store.readResult({ taskId: "task", eventId: first.event.id }),
+    );
+    for (const table of [
+      "work_task_current_state",
+      "work_task_projections",
+      "work_task_manager_reference_checkpoints",
+      "work_task_view_fence",
+    ]) {
+      yield* sql.unsafe(
+        `CREATE TEMP TRIGGER fail_result_publication BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(IGNORE); END`,
+      );
+      const before = yield* wakeSnapshot();
+      assert.equal((yield* Effect.exit(append(result)))._tag, "Failure");
+      assert.deepStrictEqual(yield* wakeSnapshot(), before);
+      yield* sql`DROP TRIGGER fail_result_publication`;
+    }
+    const before = yield* wakeSnapshot();
+    assert.equal(
+      (yield* Effect.exit(
+        Effect.gen(function* () {
+          yield* appendTaskFact(result);
+          yield* appendTaskFact({ ...result, results: [] });
+        }).pipe(sql.withTransaction),
+      ))._tag,
+      "Failure",
+    );
+    assert.deepStrictEqual(yield* wakeSnapshot(), before);
+    yield* append(result);
+    for (const query of [
+      "SELECT event_id,sequence FROM work_task_results WHERE task_id='task' AND sequence<=100 ORDER BY sequence DESC,event_id DESC LIMIT 2",
+      "SELECT event_id,sequence FROM work_task_results WHERE task_id='task' AND sequence<=100 AND (sequence,event_id)<(50,'event') ORDER BY sequence DESC,event_id DESC LIMIT 2",
+      "SELECT * FROM work_task_results WHERE task_id='task' AND event_id='event'",
+    ]) {
+      const plans = yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`);
+      assert.isTrue(plans.some((row) => row.detail.includes("SEARCH work_task_results")));
+      assert.isFalse(plans.some((row) => /SCAN work_task_results|TEMP B-TREE/.test(row.detail)));
+    }
+    const empty = yield* store.readResults({ taskId: "task", throughSequence: 1 });
+    assert.deepStrictEqual(empty, { records: [], throughSequence: 1, next: undefined });
+    yield* Effect.gen(function* () {
+      yield* runMigrations();
+      const target = yield* TaskStore.TaskStore;
+      const database = yield* SqlClient.SqlClient;
+      const created = yield* record(1);
+      yield* insert(created, 0);
+      yield* target.applyFoundation(created);
+      yield* database`INSERT INTO work_task_results VALUES('legacy','task','source',NULL,'{"type":"server"}','legacy','[{"type":"artifact","uri":"a","hash":"h"}]',1,${timestamp})`;
+      const beforeLegacy = yield* wakeSnapshot();
+      assert.equal((yield* Effect.exit(target.readResults({ taskId: "task" })))._tag, "Failure");
+      assert.equal(
+        (yield* Effect.exit(target.readResult({ taskId: "task", eventId: "legacy" })))._tag,
+        "Failure",
+      );
+      assert.equal(
+        (yield* Effect.exit(
+          target.rebuildCustodyProjection({ taskId: "task", throughSequence: 1 }),
+        ))._tag,
+        "Failure",
+      );
+      assert.deepStrictEqual(yield* wakeSnapshot(), beforeLegacy);
+    }).pipe(Effect.provide(Layer.fresh(testLayer)));
+  }).pipe(Effect.provide(testLayer)),
+);
 
 it.effect(
   "persists historical waits without replacing current task state and rebuilds their lifecycle",

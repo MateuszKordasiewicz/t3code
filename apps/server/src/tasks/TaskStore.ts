@@ -6,6 +6,7 @@ import {
   WorkTaskCompletionPolicyOverride,
   WorkTaskAllowanceState,
   WorkTaskWaitTarget,
+  WorkTaskResultReference,
   WorkTaskId,
   ProjectId,
   ThreadId,
@@ -137,6 +138,7 @@ export class TaskProjectionError extends Schema.TaggedError<TaskProjectionError>
       "unit",
       "wake",
       "wait",
+      "cursor",
       "acknowledgement",
       "sql",
     ]),
@@ -330,9 +332,52 @@ const WaitRow = Schema.Struct({
 type WaitEvent = Extract<WorkTaskPersistedEvent["event"], { type: "task.wait-updated" }>;
 type WaitRead = typeof WaitRow.Type & { readonly managerThreadId: string; readonly source: Native };
 
+const ResultRow = Schema.Struct({
+  eventId: EventId,
+  taskId: WorkTaskId,
+  sourceId: Schema.String,
+  contributorThreadId: Schema.NullOr(ThreadId),
+  attribution: WorkTaskCallerContext,
+  summary: Schema.String,
+  results: Schema.Array(WorkTaskResultReference),
+  sequence: natural,
+  occurredAt: Schema.String,
+});
+const ResultAnchor = Schema.Struct({ eventId: EventId, sequence: natural });
+type ResultCursor = {
+  readonly taskId: string;
+  readonly throughSequence: number;
+  readonly sequence: number;
+  readonly eventId: string;
+};
+type ResultPageInput = {
+  readonly taskId: string;
+  readonly throughSequence?: number;
+  readonly after?: ResultCursor;
+  readonly limit?: number;
+};
+type ResultPage = {
+  readonly records: ReadonlyArray<Native>;
+  readonly throughSequence: number;
+  readonly next: ResultCursor | undefined;
+};
+
 export class TaskStore extends Context.Service<
   TaskStore,
   {
+    readonly readResult: (input: {
+      taskId: string;
+      eventId: string;
+    }) => Effect.Effect<Native | undefined, ProjectionFailure>;
+    readonly readResults: (
+      input: ResultPageInput,
+    ) => Effect.Effect<ResultPage | undefined, ProjectionFailure>;
+    readonly applyResult: (
+      recorded: WorkTaskPersistedEvent,
+    ) => Effect.Effect<
+      { readonly applied: boolean; readonly lastSequence: number; readonly viewGeneration: number },
+      ProjectionFailure
+    >;
     readonly readWait: (input: {
       taskId: string;
       waitId: string;
@@ -1864,6 +1909,163 @@ const make = Effect.gen(function* () {
       yield* guard(changed.length === 1, "cas");
     }
   });
+  const resultAt = Effect.fn("TaskStore.readResultAt")(function* (
+    taskId: string,
+    eventId: string,
+    through: number,
+  ) {
+    const rows = yield* sql<{
+      payload: string;
+      valid: number;
+    }>`SELECT typeof(sequence)='integer' AS valid,
+      hex(json_object('eventId',event_id,'taskId',task_id,'sourceId',source_id,'contributorThreadId',contributor_thread_id,
+        'attribution',json(attribution_json),'summary',summary,'results',json(results_json),'sequence',sequence,'occurredAt',recorded_at)) AS payload
+      FROM work_task_results WHERE task_id=json_extract(${yield* encodeProjectionJson(taskId)},'$') AND event_id=json_extract(${yield* encodeProjectionJson(eventId)},'$')`;
+    const row = yield* stored(ResultRow, rows[0]);
+    if (!row) return undefined;
+    yield* guard(
+      row.sequence <= through && row.taskId === taskId && row.eventId === eventId,
+      "legacy",
+    );
+    const source = yield* readNativeSequence({ taskId, sequence: row.sequence, eventId });
+    const event = source.recorded.event;
+    if (event.type !== "task.result-recorded")
+      return yield* new TaskProjectionError({ code: "legacy" });
+    yield* guard(
+      NodeUtil.isDeepStrictEqual(row, {
+        eventId: event.id,
+        taskId: event.taskId,
+        sourceId: event.sourceId,
+        contributorThreadId: event.contributorThreadId ?? null,
+        attribution: event.attribution,
+        summary: event.summary,
+        results: event.results,
+        sequence: source.recorded.context.sequence,
+        occurredAt: event.occurredAt,
+      }),
+      "legacy",
+    );
+    return source;
+  });
+  const resultViewAt = Effect.fn("TaskStore.readResultViewAt")(function* (taskId: string) {
+    const through = yield* waitViewAt(taskId);
+    const rows =
+      yield* sql`SELECT 1 FROM work_task_results WHERE task_id=json_extract(${yield* encodeProjectionJson(taskId)},'$') LIMIT 1`;
+    if (through === undefined) {
+      yield* guard(rows.length === 0, "legacy");
+      return undefined;
+    }
+    const latest = yield* latestType(taskId, "task.result-recorded", through);
+    if (latest) {
+      const own = yield* resultAt(taskId, latest.recorded.event.id, through);
+      yield* guard(own !== undefined && NodeUtil.isDeepStrictEqual(own, latest), "legacy");
+    } else yield* guard(rows.length === 0, "legacy");
+    return through;
+  });
+  const readResult = Effect.fn("TaskStore.readResult")(
+    (input: { taskId: string; eventId: string }) =>
+      projectTransaction(
+        Effect.gen(function* () {
+          const through = yield* resultViewAt(input.taskId);
+          return through === undefined
+            ? undefined
+            : yield* resultAt(input.taskId, input.eventId, through);
+        }),
+      ).pipe(NodeSqliteClient.readOnly),
+  );
+  const readResults = Effect.fn("TaskStore.readResults")((input: ResultPageInput) =>
+    projectTransaction(
+      Effect.gen(function* () {
+        const limit = input.limit ?? 50;
+        yield* guard(Number.isInteger(limit) && limit >= 1 && limit <= 100, "cursor");
+        const applied = yield* resultViewAt(input.taskId);
+        if (applied === undefined) return undefined;
+        const through = input.throughSequence ?? input.after?.throughSequence ?? applied;
+        yield* guard(Number.isSafeInteger(through) && through >= 0 && through <= applied, "cursor");
+        const boundary = yield* readNativeSequence({ taskId: input.taskId, sequence: through });
+        if (input.after) {
+          const cursor = input.after;
+          yield* guard(
+            cursor.taskId === input.taskId &&
+              cursor.throughSequence === through &&
+              Number.isSafeInteger(cursor.sequence) &&
+              cursor.sequence >= 0 &&
+              cursor.sequence <= through,
+            "cursor",
+          );
+          const anchor = yield* resultAt(input.taskId, cursor.eventId, through);
+          yield* guard(
+            anchor !== undefined &&
+              anchor.recorded.context.sequence === cursor.sequence &&
+              anchor.streamVersion <= boundary.streamVersion,
+            "cursor",
+          );
+        }
+        const selected = yield* sql.unsafe<{ payload: string; valid: number }>(
+          `SELECT typeof(sequence)='integer' AS valid,hex(json_object('eventId',event_id,'sequence',sequence)) AS payload
+      FROM work_task_results WHERE task_id=json_extract(?,'$') AND sequence<=?${input.after ? " AND (sequence,event_id)<(?,json_extract(?,'$'))" : ""}
+      ORDER BY sequence DESC,event_id DESC LIMIT ?`,
+          [
+            yield* encodeProjectionJson(input.taskId),
+            through,
+            ...(input.after
+              ? [input.after.sequence, yield* encodeProjectionJson(input.after.eventId)]
+              : []),
+            limit + 1,
+          ],
+        );
+        const records: Native[] = [];
+        for (const raw of selected) {
+          const own = (yield* stored(ResultAnchor, raw))!;
+          const value = yield* resultAt(input.taskId, own.eventId, through);
+          yield* guard(
+            value !== undefined &&
+              value.recorded.context.sequence === own.sequence &&
+              value.streamVersion <= boundary.streamVersion,
+            "legacy",
+          );
+          records.push(value!);
+        }
+        const page = records.slice(0, limit);
+        const last = page.at(-1);
+        return {
+          records: page,
+          throughSequence: through,
+          next:
+            records.length > limit && last
+              ? {
+                  taskId: input.taskId,
+                  throughSequence: through,
+                  sequence: last.recorded.context.sequence,
+                  eventId: last.recorded.event.id,
+                }
+              : undefined,
+        };
+      }),
+    ).pipe(NodeSqliteClient.readOnly),
+  );
+  const applyResultAt = Effect.fn("TaskStore.applyResultAt")(function* (
+    recorded: WorkTaskPersistedEvent,
+    replay: boolean,
+  ) {
+    const { event, context } = recorded;
+    if (event.type !== "task.result-recorded")
+      return yield* new TaskProjectionError({ code: "unsupported" });
+    const through = yield* resultViewAt(event.taskId);
+    if (through === undefined) return yield* new TaskProjectionError({ code: "legacy" });
+    const previous = yield* resultAt(event.taskId, event.id, through);
+    if (replay) {
+      yield* guard(
+        previous !== undefined && NodeUtil.isDeepStrictEqual(previous.recorded, recorded),
+        "replay",
+      );
+      return;
+    }
+    yield* guard(previous === undefined, "replay");
+    yield* sql`INSERT INTO work_task_results VALUES(json_extract(${yield* encodeProjectionJson(event.id)},'$'),json_extract(${yield* encodeProjectionJson(event.taskId)},'$'),
+      json_extract(${yield* encodeProjectionJson(event.sourceId)},'$'),json_extract(${yield* encodeProjectionJson(event.contributorThreadId ?? null)},'$'),
+      ${yield* encodeProjectionJson(event.attribution)},json_extract(${yield* encodeProjectionJson(event.summary)},'$'),${yield* encodeProjectionJson(event.results)},${context.sequence},${event.occurredAt})`;
+  });
   const wakeDebit = Effect.fn("TaskStore.checkWakeDebit")(function* (
     taskId: string,
     unit: number,
@@ -2103,7 +2305,10 @@ const make = Effect.gen(function* () {
     }
   });
   const applyProjection = Effect.fn("TaskStore.applyProjection")(
-    (input: WorkTaskPersistedEvent, family: "foundation" | "managerAllowance" | "wake" | "wait") =>
+    (
+      input: WorkTaskPersistedEvent,
+      family: "foundation" | "managerAllowance" | "wake" | "wait" | "result",
+    ) =>
       projectTransaction(
         Effect.gen(function* () {
           const recorded = yield* decodeRecorded(input).pipe(
@@ -2111,21 +2316,23 @@ const make = Effect.gen(function* () {
           );
           const { event, context } = recorded;
           yield* guard(
-            (family === "wait"
-              ? ["task.wait-updated"]
-              : family === "wake"
-                ? wakeTypes
-                : family === "managerAllowance"
-                  ? custodyTypes
-                  : [
-                      "task.created",
-                      "task.definition-updated",
-                      "task.definition-accepted",
-                      "task.configuration-updated",
-                      "task.execution-updated",
-                      "task.thread-linked",
-                      "task.thread-unlinked",
-                    ]
+            (family === "result"
+              ? ["task.result-recorded"]
+              : family === "wait"
+                ? ["task.wait-updated"]
+                : family === "wake"
+                  ? wakeTypes
+                  : family === "managerAllowance"
+                    ? custodyTypes
+                    : [
+                        "task.created",
+                        "task.definition-updated",
+                        "task.definition-accepted",
+                        "task.configuration-updated",
+                        "task.execution-updated",
+                        "task.thread-linked",
+                        "task.thread-unlinked",
+                      ]
             ).includes(event.type),
             "unsupported",
           );
@@ -2147,6 +2354,7 @@ const make = Effect.gen(function* () {
           });
           const view = yield* fence();
           if (source.checkpoint && original.streamVersion <= source.checkpoint.streamVersion) {
+            if (family === "result") yield* applyResultAt(recorded, true);
             if (family === "wait") yield* applyWaitAt(recorded, true);
             if (family === "wake") yield* applyWakeAt(recorded, true);
             if (family === "managerAllowance") {
@@ -2195,7 +2403,8 @@ const make = Effect.gen(function* () {
           };
           if (current)
             for (const key of keys) {
-              if (family === "wait") revisions[key] = Math.max(current[key], event[key]);
+              if (family === "wait" || family === "result")
+                revisions[key] = Math.max(current[key], event[key]);
               else yield* guard(event[key] >= current[key], "revision");
             }
           yield* guard(
@@ -2205,6 +2414,9 @@ const make = Effect.gen(function* () {
           let effective = current?.definition;
           let activeLink: string | undefined;
           switch (event.type) {
+            case "task.result-recorded":
+              yield* applyResultAt(recorded, false);
+              break;
             case "task.wait-updated":
               yield* applyWaitAt(recorded, false);
               break;
@@ -2411,6 +2623,7 @@ const make = Effect.gen(function* () {
             yield* sql`UPDATE work_task_view_fence SET generation=${view.generation + 1},high_water_sequence=${Math.max(view.high, context.sequence)}
       WHERE singleton_id=1 AND generation=${view.generation} AND high_water_sequence=${view.high} RETURNING 1`;
           yield* guard(advanced.length === 1, "cas");
+          if (family === "result") yield* resultViewAt(event.taskId);
           if (family === "wait") yield* waitViewAt(event.taskId);
           if (family === "wake") yield* wakeViewAt(event.taskId);
           return {
@@ -2420,6 +2633,9 @@ const make = Effect.gen(function* () {
           };
         }),
       ),
+  );
+  const applyResult = Effect.fn("TaskStore.applyResult")((input: WorkTaskPersistedEvent) =>
+    applyProjection(input, "result"),
   );
   const applyWait = Effect.fn("TaskStore.applyWait")((input: WorkTaskPersistedEvent) =>
     applyProjection(input, "wait"),
@@ -2455,6 +2671,7 @@ const make = Effect.gen(function* () {
         Effect.gen(function* () {
           const task = yield* encodeProjectionJson(input.taskId);
           for (const table of [
+            "work_task_results",
             "work_task_waits",
             "work_task_projections",
             "work_task_current_state",
@@ -2477,7 +2694,9 @@ const make = Effect.gen(function* () {
           do {
             const page = yield* readNativeHistory({ ...input, ...(after ? { after } : {}) });
             for (const value of page.records) {
-              if (value.recorded.event.type === "task.wait-updated")
+              if (value.recorded.event.type === "task.result-recorded")
+                yield* applyResult(value.recorded);
+              else if (value.recorded.event.type === "task.wait-updated")
                 yield* applyWait(value.recorded);
               else if (wakeTypes.includes(value.recorded.event.type))
                 yield* applyWake(value.recorded);
@@ -2493,6 +2712,9 @@ const make = Effect.gen(function* () {
   );
 
   return TaskStore.of({
+    readResult,
+    readResults,
+    applyResult,
     readWait,
     applyWait,
     applyWake,
