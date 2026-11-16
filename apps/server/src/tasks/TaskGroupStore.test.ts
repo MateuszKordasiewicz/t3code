@@ -509,6 +509,25 @@ it.effect("binds a reserved launch in the native event and receipt transaction",
       assert.strictEqual(run.payload.nativeTaskLaunch?.commandId, intent.commandId);
       assert.strictEqual(run.payload.nativeTaskLaunch?.allowanceUnit, 1);
     }
+    yield* sql`UPDATE orchestration_events
+      SET payload_json=json_remove(payload_json,'$.nativeTaskLaunch')
+      WHERE event_id='native-integration-run-event'`;
+    const missingClaim = yield* reconcileNativeLaunch(intent.commandId).pipe(Effect.flip);
+    assert.strictEqual(missingClaim._tag, "WorkTaskError");
+    if (missingClaim._tag === "WorkTaskError")
+      assert.strictEqual(missingClaim.code, "invalid_state");
+    assert.strictEqual((yield* sql`SELECT * FROM work_task_native_live_bindings`).length, 0);
+    yield* sql`UPDATE orchestration_events
+      SET payload_json=json_set(payload_json,'$.nativeTaskLaunch',json(${JSON.stringify(run?.type === "run.created" ? { ...run.payload.nativeTaskLaunch, allowanceUnit: 2 } : null)}))
+      WHERE event_id='native-integration-run-event'`;
+    const changedClaim = yield* reconcileNativeLaunch(intent.commandId).pipe(Effect.flip);
+    assert.strictEqual(changedClaim._tag, "WorkTaskError");
+    if (changedClaim._tag === "WorkTaskError")
+      assert.strictEqual(changedClaim.code, "invalid_state");
+    assert.strictEqual((yield* sql`SELECT * FROM work_task_native_live_bindings`).length, 0);
+    yield* sql`UPDATE orchestration_events
+      SET payload_json=json_set(payload_json,'$.nativeTaskLaunch',json(${JSON.stringify(run?.type === "run.created" ? run.payload.nativeTaskLaunch : null)}))
+      WHERE event_id='native-integration-run-event'`;
     assert.strictEqual((yield* reconcileNativeLaunch(intent.commandId)).state, "bound");
     assert.isFalse((yield* sink.commitCommand(command)).committed);
     assert.strictEqual(

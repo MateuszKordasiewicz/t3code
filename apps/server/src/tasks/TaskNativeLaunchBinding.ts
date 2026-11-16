@@ -2,6 +2,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as NodeUtil from "node:util";
 import { WorkTaskError, WorkTaskNativeLaunchReservation } from "@t3tools/contracts";
 
 export interface NativeLaunchIntent {
@@ -34,6 +35,7 @@ type TerminalRow = { event_id: string; sequence: number; status: string };
 const error = (code: WorkTaskError["code"], message: string) =>
   new WorkTaskError({ code, message });
 const decodeReservation = Schema.decodeUnknownEffect(WorkTaskNativeLaunchReservation);
+const decodeRunPayload = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 export const readNativeLaunchReservation = Effect.fn("TaskNativeLaunchBinding.readReservation")(
   function* (commandId: string) {
@@ -206,7 +208,8 @@ export const reconcileNativeLaunch = Effect.fn("TaskNativeLaunchBinding.reconcil
           sequence: number;
           run_id: string | null;
           message_id: string | null;
-        }>`SELECT event_id,sequence,json_extract(payload_json,'$.id') run_id,
+          payload_json: string;
+        }>`SELECT event_id,sequence,json_extract(payload_json,'$.id') run_id,payload_json,
             json_extract(payload_json,'$.userMessageId') message_id
           FROM orchestration_events WHERE command_id=${commandId}
             AND aggregate_kind='thread' AND stream_id=${intent.manager_thread_id}
@@ -220,6 +223,21 @@ export const reconcileNativeLaunch = Effect.fn("TaskNativeLaunchBinding.reconcil
         )
           return yield* error("invalid_state", "Native run does not match the reserved message");
         const liveRun = liveRuns[0]!;
+        const reservation = yield* readNativeLaunchReservation(commandId);
+        if (!reservation)
+          return yield* error("invalid_state", "Native run has no durable work claim");
+        const payload = yield* decodeRunPayload(liveRun.payload_json).pipe(
+          Effect.mapError(() => error("invalid_state", "Native run payload is invalid")),
+        );
+        if (
+          typeof payload !== "object" ||
+          payload === null ||
+          !NodeUtil.isDeepStrictEqual(
+            (payload as { nativeTaskLaunch?: unknown }).nativeTaskLaunch,
+            reservation,
+          )
+        )
+          return yield* error("invalid_state", "Native run does not match its durable work claim");
         const priorLive = yield* sql<BindingRow>`SELECT * FROM work_task_native_live_bindings
           WHERE command_id=${commandId}`;
         if (priorLive.length) {
