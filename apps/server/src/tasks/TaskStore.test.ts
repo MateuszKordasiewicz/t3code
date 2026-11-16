@@ -77,9 +77,8 @@ const execution = (generation: number | null) => ({
   reason: "recorded",
 });
 
-const wakeFixture = Effect.fn("TaskStoreTest.wakeFixture")(function* () {
+const seedWakeCustody = Effect.fn("TaskStoreTest.seedWakeCustody")(function* () {
   const store = yield* TaskStore.TaskStore;
-  const sql = yield* SqlClient.SqlClient;
   const created = yield* record(1);
   yield* insert(created, 0);
   yield* store.applyFoundation(created);
@@ -106,6 +105,11 @@ const wakeFixture = Effect.fn("TaskStoreTest.wakeFixture")(function* () {
     yield* store.applyManagerAllowance(value);
     recorded.push(value);
   }
+  return recorded;
+});
+const wakeFixture = Effect.fn("TaskStoreTest.wakeFixture")(function* () {
+  const recorded = yield* seedWakeCustody();
+  const sql = yield* SqlClient.SqlClient;
   yield* sql`INSERT INTO work_task_wake_state VALUES('task',0,0,NULL)`;
   let sequence = 4;
   const append = Effect.fn("TaskStoreTest.fixtureWakeProjection")(function* (
@@ -158,6 +162,609 @@ const wakeFixture = Effect.fn("TaskStoreTest.wakeFixture")(function* () {
   };
 });
 
+const appendTaskFact = Effect.fn("TaskStoreTest.appendTaskFact")(function* (
+  input: Record<string, unknown>,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const store = yield* TaskStore.TaskStore;
+  const taskId = typeof input.taskId === "string" ? input.taskId : "task";
+  const [head] = yield* sql<{ sequence: number; version: number }>`SELECT
+    COALESCE((SELECT max(sequence) FROM orchestration_events),0)+1 AS sequence,
+    COALESCE((SELECT max(stream_version) FROM orchestration_events WHERE aggregate_kind='task' AND stream_id=json_extract(${JSON.stringify(taskId)},'$')),-1)+1 AS version`;
+  const value = yield* record(head!.sequence, { commandId: `command-${head!.sequence}`, ...input });
+  yield* insert(value, head!.version);
+  if (value.event.type.startsWith("task.wake-")) yield* store.applyWake(value);
+  else if (
+    value.event.type.startsWith("task.allowance-") ||
+    value.event.type.startsWith("task.manager-")
+  )
+    yield* store.applyManagerAllowance(value);
+  else yield* store.applyFoundation(value);
+  return value;
+});
+const wakeTables = [
+  "orchestration_events",
+  "work_task_projections",
+  "work_task_current_state",
+  "work_task_view_fence",
+  "work_task_manager_bindings",
+  "work_task_allowances",
+  "work_task_manager_reference_checkpoints",
+  "work_task_wake_reservations",
+  "work_task_wake_sources",
+  "work_task_wake_state",
+  "work_task_wake_source_state",
+  "work_task_wake_phase_state",
+];
+const wakeSnapshot = Effect.fn("TaskStoreTest.wakeSnapshot")(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const rows: Record<string, unknown> = {};
+  for (const table of wakeTables)
+    rows[table] = yield* sql`SELECT * FROM ${sql(table)} ORDER BY 1,2`;
+  return rows;
+});
+
+it.effect(
+  "applies native wake facts exactly once and rebuilds the complete supported custody prefix",
+  () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* TaskStore.TaskStore;
+      const history = [yield* record(1), ...(yield* seedWakeCustody())];
+      const append = Effect.fn("TaskStoreTest.appendWakeHistory")(function* (
+        input: Record<string, unknown>,
+      ) {
+        const value = yield* appendTaskFact(input).pipe(sql.withTransaction);
+        history.push(value);
+        return value;
+      });
+      const sources = Array.from({ length: 33 }, (_, index) => ({
+        kind: "result",
+        sourceId: `source-${index + 1}`,
+        resultRef: null,
+      }));
+      for (const [index, source] of sources.entries())
+        yield* append({
+          type: "task.wake-source-recorded",
+          source,
+          reservationId: null,
+          dirtyGeneration: index + 1,
+        });
+      yield* append({
+        type: "task.wake-source-recorded",
+        source: sources[0],
+        reservationId: null,
+        dirtyGeneration: 1,
+      });
+      const base = {
+        reservationId: "reservation",
+        reservationCommandId: "reserve-command",
+        managerGeneration: 1,
+        allowanceUnit: 1,
+        dirtyGeneration: 33,
+        acknowledgedGeneration: 0,
+      };
+      const pending = { sources: sources.slice(0, 32), overflowThroughGeneration: 33 };
+      yield* append({ type: "task.wake-reserved", ...base, pending });
+      yield* append({ type: "task.wake-claim-uncertain", ...base, reason: "lost response" });
+      yield* append({
+        type: "task.manager-retired",
+        managerThreadId: "manager",
+        managerGeneration: 1,
+      });
+      const first = yield* append({
+        type: "task.wake-claimed",
+        ...base,
+        pending,
+        messageId: "message",
+        runId: "run",
+        occurredAt: "2026-11-16T00:00:00.0001Z",
+      });
+      yield* append({
+        type: "task.wake-source-recorded",
+        source: { kind: "result", sourceId: "source-34", resultRef: null },
+        reservationId: "reservation",
+        dirtyGeneration: 34,
+      });
+      const refresh = yield* append({
+        type: "task.wake-claimed",
+        ...base,
+        dirtyGeneration: 34,
+        pending: { ...pending, overflowThroughGeneration: 34 },
+        messageId: "message",
+        runId: "run",
+      });
+      yield* append({
+        type: "task.wake-acknowledged",
+        ...base,
+        dirtyGeneration: 34,
+        previousAcknowledgedGeneration: 0,
+        acknowledgedGeneration: 16,
+        observedDirtyGeneration: 34,
+      });
+      const beforeLast = yield* store.readWake("task");
+      assert.equal(beforeLast?.pending.length, 16);
+      yield* append({
+        type: "task.wake-acknowledged",
+        ...base,
+        dirtyGeneration: 34,
+        previousAcknowledgedGeneration: 16,
+        acknowledgedGeneration: 34,
+        observedDirtyGeneration: 34,
+      });
+      const before = yield* wakeSnapshot();
+      for (const value of history.filter((value) => value.event.type.startsWith("task.wake-")))
+        assert.isFalse((yield* store.applyWake(value)).applied);
+      assert.deepStrictEqual(yield* wakeSnapshot(), before);
+      const view = (yield* store.readWake("task"))!;
+      assert.equal(view.dirtyGeneration, 34);
+      assert.equal(view.acknowledgedGeneration, 34);
+      assert.isNull(view.overflowThroughGeneration);
+      assert.deepStrictEqual(view.pending, []);
+      assert.equal((yield* store.readAllowance("task"))?.allowance.consumed, 1);
+      const reservation = (yield* store.readWakeReservation({
+        taskId: "task",
+        reservationId: "reservation",
+      }))!;
+      assert.deepStrictEqual(reservation.firstClaim?.recorded, first);
+      assert.deepStrictEqual(reservation.latestClaim?.recorded, refresh);
+      let pure: ReturnType<typeof reduceTaskCustody> | undefined;
+      for (const value of history) {
+        const event = value.event;
+        switch (event.type) {
+          case "task.manager-bound":
+          case "task.manager-retired":
+          case "task.allowance-configured":
+          case "task.allowance-debited":
+          case "task.wake-source-recorded":
+          case "task.wake-reserved":
+          case "task.wake-claimed":
+          case "task.wake-claim-uncertain":
+          case "task.wake-acknowledged":
+            pure = reduceTaskCustody(pure, { event, context: value.context });
+        }
+      }
+      assert.equal(view.dirtyGeneration, pure?.dirtyGeneration);
+      assert.equal(view.acknowledgedGeneration, pure?.acknowledgedGeneration);
+      assert.equal(view.overflowThroughGeneration, pure?.overflowThroughGeneration);
+      const live = {
+        foundation: yield* store.readFoundation("task"),
+        custody: yield* store.readManagerCustody("task"),
+        allowance: yield* store.readAllowance("task"),
+        view,
+        reservation,
+      };
+      const replayed = yield* Effect.gen(function* () {
+        yield* runMigrations();
+        const rebuilt = yield* TaskStore.TaskStore;
+        const database = yield* SqlClient.SqlClient;
+        for (const [version, value] of history.entries()) yield* insert(value, version);
+        const sourceBefore = yield* database`SELECT * FROM orchestration_events ORDER BY sequence`;
+        yield* rebuilt.rebuildCustodyProjection({
+          taskId: "task",
+          throughSequence: history.at(-1)!.context.sequence,
+        });
+        assert.deepStrictEqual(
+          yield* database`SELECT * FROM orchestration_events ORDER BY sequence`,
+          sourceBefore,
+        );
+        return {
+          foundation: yield* rebuilt.readFoundation("task"),
+          custody: yield* rebuilt.readManagerCustody("task"),
+          allowance: yield* rebuilt.readAllowance("task"),
+          view: yield* rebuilt.readWake("task"),
+          reservation: yield* rebuilt.readWakeReservation({
+            taskId: "task",
+            reservationId: "reservation",
+          }),
+        };
+      }).pipe(Effect.provide(Layer.fresh(testLayer)));
+      assert.deepStrictEqual(replayed, live);
+      assert.deepStrictEqual(
+        yield* store.readWake("task").pipe(Effect.provide(TaskStore.layer)),
+        view,
+      );
+      yield* Effect.gen(function* () {
+        yield* runMigrations();
+        const rebuilt = yield* TaskStore.TaskStore;
+        for (const [version, value] of history.entries()) yield* insert(value, version);
+        const unsupported = yield* record(history.at(-1)!.context.sequence + 1, {
+          type: "task.archived",
+          archived: true,
+        });
+        yield* insert(unsupported, history.length);
+        const clean = yield* wakeSnapshot();
+        assert.equal(
+          (yield* Effect.exit(
+            rebuilt.rebuildCustodyProjection({
+              taskId: "task",
+              throughSequence: unsupported.context.sequence,
+            }),
+          ))._tag,
+          "Failure",
+        );
+        assert.deepStrictEqual(yield* wakeSnapshot(), clean);
+      }).pipe(Effect.provide(Layer.fresh(testLayer)));
+    }).pipe(Effect.provide(testLayer)),
+);
+it.effect(
+  "rolls back wake phase, allowance and source effects on conflicts and failed commits",
+  () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      yield* seedWakeCustody();
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* TaskStore.TaskStore;
+      const append = (input: Record<string, unknown>) =>
+        appendTaskFact(input).pipe(sql.withTransaction);
+      const reject = Effect.fn("TaskStoreTest.rejectWakeWrite")(function* (
+        input: Record<string, unknown>,
+      ) {
+        const before = yield* wakeSnapshot();
+        assert.equal((yield* Effect.exit(append(input)))._tag, "Failure");
+        assert.deepStrictEqual(yield* wakeSnapshot(), before);
+      });
+      const source = { kind: "result\u0000\ud800", sourceId: "one\ud800", resultRef: null };
+      yield* append({
+        type: "task.wake-source-recorded",
+        source,
+        reservationId: null,
+        dirtyGeneration: 1,
+      });
+      const base = {
+        reservationId: "r\ud800",
+        reservationCommandId: "reserved\ud800",
+        managerGeneration: 1,
+        allowanceUnit: 1,
+        dirtyGeneration: 1,
+        acknowledgedGeneration: 0,
+      };
+      const reserved = {
+        type: "task.wake-reserved",
+        ...base,
+        pending: { sources: [source], overflowThroughGeneration: null },
+      };
+      yield* reject({
+        type: "task.wake-source-recorded",
+        source: { ...source, resultRef: "changed" },
+        reservationId: null,
+        dirtyGeneration: 1,
+      });
+      yield* reject({
+        type: "task.wake-source-recorded",
+        source,
+        reservationId: null,
+        dirtyGeneration: 2,
+      });
+      yield* reject({ ...reserved, allowanceUnit: 2 });
+      yield* reject({ ...reserved, managerGeneration: 2 });
+      yield* reject({ ...reserved, pending: { sources: [], overflowThroughGeneration: null } });
+      yield* reject({
+        ...reserved,
+        pending: { sources: [{ ...source, sourceId: "unknown" }], overflowThroughGeneration: null },
+      });
+      yield* reject({ ...reserved, pending: { sources: [source], overflowThroughGeneration: 1 } });
+      yield* append(reserved);
+      yield* reject({ ...reserved, reservationId: "other" });
+      yield* reject({ ...reserved, reservationCommandId: "other" });
+      const uncertain = { type: "task.wake-claim-uncertain", ...base, reason: "lost" };
+      yield* append(uncertain);
+      yield* reject(uncertain);
+      const claim = {
+        ...reserved,
+        type: "task.wake-claimed",
+        messageId: "message\ud800",
+        runId: "run\ud800",
+      };
+      yield* reject({ ...claim, reservationCommandId: "different" });
+      const first = yield* append(claim);
+      yield* reject(claim);
+      const second = { kind: "result", sourceId: "two", resultRef: null };
+      yield* append({
+        type: "task.wake-source-recorded",
+        source: second,
+        reservationId: base.reservationId,
+        dirtyGeneration: 2,
+      });
+      const refresh = {
+        ...claim,
+        dirtyGeneration: 2,
+        pending: { sources: [source, second], overflowThroughGeneration: null },
+      };
+      yield* reject({ ...refresh, messageId: "different" });
+      yield* append(refresh);
+      const acknowledgement = {
+        type: "task.wake-acknowledged",
+        ...base,
+        dirtyGeneration: 2,
+        previousAcknowledgedGeneration: 0,
+        acknowledgedGeneration: 1,
+        observedDirtyGeneration: 2,
+      };
+      yield* reject({ ...acknowledgement, previousAcknowledgedGeneration: 1 });
+      yield* reject({ ...acknowledgement, acknowledgedGeneration: 0 });
+      yield* reject({ ...acknowledgement, observedDirtyGeneration: 1 });
+      yield* append(acknowledgement);
+      yield* reject({ ...refresh, acknowledgedGeneration: 1 });
+      yield* reject({ ...uncertain, dirtyGeneration: 2, acknowledgedGeneration: 1 });
+      const third = { kind: "result", sourceId: "three", resultRef: null };
+      yield* append({
+        type: "task.wake-source-recorded",
+        source: third,
+        reservationId: null,
+        dirtyGeneration: 3,
+      });
+      yield* append({
+        ...acknowledgement,
+        dirtyGeneration: 3,
+        previousAcknowledgedGeneration: 1,
+        acknowledgedGeneration: 2,
+      });
+      yield* reject({
+        ...acknowledgement,
+        dirtyGeneration: 3,
+        previousAcknowledgedGeneration: 2,
+        acknowledgedGeneration: 2,
+      });
+      assert.equal(
+        (yield* store.readWakeReservation({ taskId: "task", reservationId: base.reservationId }))
+          ?.firstClaim?.recorded.event.id,
+        first.event.id,
+      );
+      yield* append({
+        type: "task.manager-retired",
+        managerThreadId: "manager",
+        managerGeneration: 1,
+      });
+      yield* append({
+        type: "task.manager-bound",
+        managerThreadId: "new-manager",
+        managerGeneration: 2,
+      });
+      const debit = {
+        type: "task.allowance-debited",
+        previous: { type: "configured", cap: 2, consumed: 1 },
+        resulting: { type: "configured", cap: 2, consumed: 2 },
+        allowanceUnit: 2,
+      };
+      const nextReservation = {
+        type: "task.wake-reserved",
+        reservationId: "next",
+        reservationCommandId: "next-command",
+        managerGeneration: 2,
+        allowanceUnit: 2,
+        dirtyGeneration: 3,
+        acknowledgedGeneration: 2,
+        pending: { sources: [third], overflowThroughGeneration: null },
+      };
+      const beforeDebit = yield* wakeSnapshot();
+      assert.equal(
+        (yield* Effect.exit(
+          Effect.gen(function* () {
+            yield* appendTaskFact(debit);
+            yield* appendTaskFact({
+              ...nextReservation,
+              pending: { sources: [], overflowThroughGeneration: null },
+            });
+          }).pipe(sql.withTransaction),
+        ))._tag,
+        "Failure",
+      );
+      assert.deepStrictEqual(yield* wakeSnapshot(), beforeDebit);
+      yield* sql`CREATE TABLE wake_commit_parent(id INTEGER PRIMARY KEY)`;
+      yield* sql`CREATE TABLE wake_commit_child(id INTEGER REFERENCES wake_commit_parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+      assert.equal(
+        (yield* Effect.exit(
+          Effect.gen(function* () {
+            yield* appendTaskFact(debit);
+            yield* appendTaskFact(nextReservation);
+            yield* sql`INSERT INTO wake_commit_child VALUES(1)`;
+          }).pipe(sql.withTransaction),
+        ))._tag,
+        "Failure",
+      );
+      assert.deepStrictEqual(yield* wakeSnapshot(), beforeDebit);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM wake_commit_child`, []);
+      yield* Effect.gen(function* () {
+        yield* appendTaskFact(debit);
+        yield* appendTaskFact(nextReservation);
+      }).pipe(sql.withTransaction);
+      assert.equal((yield* store.readAllowance("task"))?.allowance.consumed, 2);
+      const fourth = { kind: "result", sourceId: "four", resultRef: null };
+      const sourceFour = {
+        type: "task.wake-source-recorded",
+        source: fourth,
+        reservationId: null,
+        dirtyGeneration: 4,
+      };
+      for (const table of [
+        "work_task_current_state",
+        "work_task_manager_reference_checkpoints",
+        "work_task_view_fence",
+      ]) {
+        yield* sql.unsafe(
+          `CREATE TRIGGER reject_wake_common BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'injected wake failure'); END`,
+        );
+        yield* reject(sourceFour);
+        yield* sql`DROP TRIGGER reject_wake_common`;
+      }
+      const beforePhase = yield* wakeSnapshot();
+      assert.equal(
+        (yield* Effect.exit(
+          Effect.gen(function* () {
+            yield* appendTaskFact(sourceFour);
+            yield* appendTaskFact({
+              ...nextReservation,
+              type: "task.wake-claimed",
+              reservationCommandId: "wrong",
+              dirtyGeneration: 4,
+              pending: { sources: [third, fourth], overflowThroughGeneration: null },
+              messageId: "next-message",
+              runId: "next-run",
+            });
+          }).pipe(sql.withTransaction),
+        ))._tag,
+        "Failure",
+      );
+      assert.deepStrictEqual(yield* wakeSnapshot(), beforePhase);
+      yield* append(sourceFour);
+      yield* append({
+        ...nextReservation,
+        type: "task.wake-claimed",
+        dirtyGeneration: 4,
+        pending: { sources: [third, fourth], overflowThroughGeneration: null },
+        messageId: "next-message",
+        runId: "next-run",
+      });
+      const [head] = yield* sql<{
+        sequence: number;
+        version: number;
+      }>`SELECT max(sequence)+1 AS sequence,max(stream_version)+1 AS version FROM orchestration_events`;
+      const fifth = yield* record(head!.sequence, {
+        type: "task.wake-source-recorded",
+        commandId: `command-${head!.sequence}`,
+        source: { kind: "result", sourceId: "five", resultRef: null },
+        reservationId: null,
+        dirtyGeneration: 5,
+      });
+      yield* insert(fifth, head!.version);
+      const outcomes = yield* Effect.all([store.applyWake(fifth), store.applyWake(fifth)], {
+        concurrency: "unbounded",
+      });
+      assert.equal(outcomes.filter((value) => value.applied).length, 1);
+      assert.equal((yield* store.readWake("task"))?.dirtyGeneration, 5);
+      assert.equal((yield* store.readAllowance("task"))?.allowance.consumed, 2);
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+    }).pipe(Effect.provide(testLayer)),
+);
+it.effect("rejects validation-owned allowance units before creating a wake reservation", () =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    yield* seedWakeCustody();
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* TaskStore.TaskStore;
+    yield* appendTaskFact({
+      type: "task.definition-accepted",
+      definition,
+      attribution: { type: "user", subject: "owner", sessionId: "human" },
+    }).pipe(sql.withTransaction);
+    yield* sql`INSERT INTO work_task_claims VALUES('legacy-claim','task','claim','evidence','manager',1,1,1,0,'{"type":"server"}','summary','[{"type":"artifact","uri":"u","hash":"h"}]',1,${timestamp})`;
+    yield* sql`INSERT INTO work_task_validation_attempts VALUES('legacy-attempt','task',1,1,1,'evidence','watermark','{}',NULL,'reserved',NULL,${timestamp},NULL,NULL)`;
+    yield* sql`INSERT INTO work_task_validation_identity VALUES('legacy-attempt','task','claim',1)`;
+    const source = { kind: "result", sourceId: "one", resultRef: null };
+    yield* appendTaskFact({
+      type: "task.wake-source-recorded",
+      source,
+      reservationId: null,
+      dirtyGeneration: 1,
+    }).pipe(sql.withTransaction);
+    const before = yield* wakeSnapshot();
+    const outcome = yield* Effect.exit(
+      appendTaskFact({
+        type: "task.wake-reserved",
+        reservationId: "r",
+        reservationCommandId: "r-command",
+        managerGeneration: 1,
+        allowanceUnit: 1,
+        dirtyGeneration: 1,
+        acknowledgedGeneration: 0,
+        pending: { sources: [source], overflowThroughGeneration: null },
+      }).pipe(sql.withTransaction),
+    );
+    assert.equal(outcome._tag, "Failure");
+    assert.deepStrictEqual(yield* wakeSnapshot(), before);
+    assert.equal((yield* store.readAllowance("task"))?.allowance.consumed, 1);
+    const plan = yield* sql<{
+      detail: string;
+    }>`EXPLAIN QUERY PLAN SELECT 1 FROM work_task_validation_identity WHERE task_id='task' AND allowance_unit=1 LIMIT 1`;
+    assert.isTrue(plan.some((row) => row.detail.includes("SEARCH")));
+    assert.isFalse(plan.some((row) => /SCAN|TEMP B-TREE/.test(row.detail)));
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("requires the exact historical phase companion instead of only a later claim", () =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    yield* seedWakeCustody();
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* TaskStore.TaskStore;
+    const one = { kind: "result", sourceId: "one", resultRef: null };
+    const two = { kind: "result", sourceId: "two", resultRef: null };
+    const three = { kind: "result", sourceId: "three", resultRef: null };
+    const append = (input: Record<string, unknown>) =>
+      appendTaskFact(input).pipe(sql.withTransaction);
+    yield* append({
+      type: "task.wake-source-recorded",
+      source: one,
+      reservationId: null,
+      dirtyGeneration: 1,
+    });
+    const base = {
+      reservationId: "r",
+      reservationCommandId: "reserve",
+      managerGeneration: 1,
+      allowanceUnit: 1,
+      dirtyGeneration: 1,
+      acknowledgedGeneration: 0,
+      pending: { sources: [one], overflowThroughGeneration: null },
+    };
+    yield* append({ type: "task.wake-reserved", ...base });
+    const first = yield* append({
+      type: "task.wake-claimed",
+      ...base,
+      messageId: "m",
+      runId: "run",
+    });
+    yield* append({
+      type: "task.wake-source-recorded",
+      source: two,
+      reservationId: null,
+      dirtyGeneration: 2,
+    });
+    const missing = yield* record(9, {
+      type: "task.wake-claimed",
+      commandId: "command-9",
+      ...base,
+      dirtyGeneration: 2,
+      pending: { sources: [one, two], overflowThroughGeneration: null },
+      messageId: "m",
+      runId: "run",
+    });
+    const source = yield* record(10, {
+      type: "task.wake-source-recorded",
+      commandId: "command-10",
+      source: three,
+      reservationId: null,
+      dirtyGeneration: 3,
+    });
+    const last = yield* record(11, {
+      type: "task.wake-claimed",
+      commandId: "command-11",
+      ...base,
+      dirtyGeneration: 3,
+      pending: { sources: [one, two, three], overflowThroughGeneration: null },
+      messageId: "m",
+      runId: "run",
+    });
+    for (const [index, value] of [missing, source, last].entries()) yield* insert(value, index + 8);
+    // Model an incomplete historical materialization with guards intact; only the current tail is complete.
+    yield* sql`INSERT INTO work_task_wake_sources VALUES('task','result','three',NULL,NULL)`;
+    yield* sql`INSERT INTO work_task_wake_source_state VALUES('task','result','three','event-10',10,3,1,NULL,NULL)`;
+    yield* sql`INSERT INTO work_task_wake_phase_state VALUES('event-11',11,'task','r','claimed',3,0,NULL,NULL,'m','run',${timestamp})`;
+    yield* sql`UPDATE work_task_current_state SET last_applied_sequence=11 WHERE task_id='task'`;
+    assert.equal((yield* store.readWake("task"))?.dirtyGeneration, 3);
+    const before = yield* wakeSnapshot();
+    assert.equal((yield* Effect.exit(store.applyWake(missing)))._tag, "Failure");
+    assert.isFalse((yield* store.applyWake(first)).applied);
+    assert.deepStrictEqual(yield* wakeSnapshot(), before);
+    const plan = yield* sql<{
+      detail: string;
+    }>`EXPLAIN QUERY PLAN SELECT * FROM work_task_wake_phase_state WHERE event_id='event-7' AND task_id='task' AND reservation_id='r' AND kind='claimed' ORDER BY sequence DESC LIMIT 1`;
+    assert.isTrue(plan.some((row) => row.detail.includes("SEARCH")));
+    assert.isFalse(plan.some((row) => /SCAN|TEMP B-TREE/.test(row.detail)));
+  }).pipe(Effect.provide(testLayer)),
+);
 it.effect(
   "reads native wake arrivals, original claims and incremental observations without writes",
   () =>

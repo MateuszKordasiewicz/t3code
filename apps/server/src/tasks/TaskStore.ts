@@ -134,6 +134,8 @@ export class TaskProjectionError extends Schema.TaggedError<TaskProjectionError>
       "allowance",
       "command",
       "unit",
+      "wake",
+      "acknowledgement",
       "sql",
     ]),
     conflictingEventIds: Schema.optional(Schema.Array(Schema.String)),
@@ -297,6 +299,10 @@ const wakeKinds = {
   acknowledged: "task.wake-acknowledged",
 } as const;
 const wakeTypes = ["task.wake-source-recorded", ...Object.values(wakeKinds)];
+type WakeEvent = Extract<
+  WorkTaskPersistedEvent["event"],
+  { type: "task.wake-source-recorded" | (typeof wakeKinds)[keyof typeof wakeKinds] }
+>;
 type WakeSourceRead = typeof WakeSource.Type & { readonly source: Native };
 type WakeReservationRead = typeof WakeParent.Type & {
   readonly reserved: Native;
@@ -323,6 +329,16 @@ export class TaskStore extends Context.Service<
       taskId: string;
       reservationId: string;
     }) => Effect.Effect<WakeReservationRead | undefined, ProjectionFailure>;
+    readonly applyWake: (
+      recorded: WorkTaskPersistedEvent,
+    ) => Effect.Effect<
+      { readonly applied: boolean; readonly lastSequence: number; readonly viewGeneration: number },
+      ProjectionFailure
+    >;
+    readonly rebuildCustodyProjection: (input: {
+      taskId: string;
+      throughSequence: number;
+    }) => Effect.Effect<ProjectionRead | undefined, ProjectionFailure>;
     readonly applyManagerAllowance: (
       recorded: WorkTaskPersistedEvent,
     ) => Effect.Effect<
@@ -1323,6 +1339,7 @@ const make = Effect.gen(function* () {
     reservationId: string,
     kind: (typeof WakePhase.Type)["kind"],
     first = false,
+    eventId?: string,
   ) {
     const rows = yield* sql<{ payload: string; valid: number }>`SELECT
       typeof(sequence)='integer' AND typeof(dirty_generation)='integer' AND typeof(acknowledged_generation)='integer' AS valid,
@@ -1332,6 +1349,7 @@ const make = Effect.gen(function* () {
       'messageId',message_id,'runId',run_id,'firstClaimedAt',first_claimed_at)) AS payload
       FROM work_task_wake_phase_state WHERE reservation_id=json_extract(${yield* encodeProjectionJson(reservationId)},'$')
       AND task_id=json_extract(${yield* encodeProjectionJson(taskId)},'$') AND kind=${kind}
+      ${eventId === undefined ? sql.literal("") : sql`AND event_id=json_extract(${yield* encodeProjectionJson(eventId)},'$')`}
       ORDER BY sequence ${first ? sql.literal("ASC") : sql.literal("DESC")} LIMIT 1`;
     return yield* stored(WakePhase, rows[0]);
   });
@@ -1691,8 +1709,246 @@ const make = Effect.gen(function* () {
         }),
       ).pipe(NodeSqliteClient.readOnly),
   );
+  const wakeDebit = Effect.fn("TaskStore.checkWakeDebit")(function* (
+    taskId: string,
+    unit: number,
+    through: number,
+    before: number,
+  ) {
+    const allowance = (yield* allowanceAt(taskId, through)).allowance;
+    const debit = yield* readAllowanceDebitSource({
+      taskId,
+      allowanceUnit: unit,
+      checkpointSequence: through,
+    });
+    yield* guard(
+      allowance.type === "configured" &&
+        allowance.consumed >= unit &&
+        debit !== undefined &&
+        debit.recorded.context.sequence < before,
+      "unit",
+    );
+    const validation =
+      yield* sql`SELECT 1 FROM work_task_validation_identity WHERE task_id=json_extract(${yield* encodeProjectionJson(taskId)},'$') AND allowance_unit=${unit} LIMIT 1`;
+    yield* guard(validation.length === 0, "unit");
+  });
+  const wakeHistory = Effect.fn("TaskStore.checkWakeHistory")(function* (
+    parent: WakeReservationRead,
+    through: number,
+  ) {
+    const binding = yield* bindingAt(parent.taskId, parent.managerGeneration, through);
+    const reservedAt = parent.reserved.recorded.context.sequence;
+    yield* guard(
+      binding !== undefined &&
+        binding.bound.recorded.context.sequence < reservedAt &&
+        (binding.retired === undefined || binding.retired.recorded.context.sequence > reservedAt),
+      "manager",
+    );
+    yield* wakeDebit(parent.taskId, parent.allowanceUnit, through, reservedAt);
+  });
+  const wakeBatch = Effect.fn("TaskStore.checkWakeBatch")(function* (
+    event: Extract<WakeEvent, { type: "task.wake-reserved" | "task.wake-claimed" }>,
+    view: WakeRead,
+  ) {
+    yield* guard(
+      event.pending.overflowThroughGeneration === view.overflowThroughGeneration,
+      "wake",
+    );
+    const keys = new Set<string>();
+    for (const source of event.pending.sources) {
+      const known = yield* wakeSourceAt(
+        event.taskId,
+        source.kind,
+        source.sourceId,
+        view.checkpointSequence,
+      );
+      yield* guard(
+        known !== undefined &&
+          known.dirtyGeneration > view.acknowledgedGeneration &&
+          known.resultRef === source.resultRef,
+        "wake",
+      );
+      keys.add(yield* encodeProjectionJson([source.kind, source.sourceId]));
+    }
+    for (const source of view.pending)
+      yield* guard(keys.has(yield* encodeProjectionJson([source.kind, source.sourceId])), "wake");
+  });
+  const appendWakePhase = Effect.fn("TaskStore.appendWakePhase")(function* (
+    event: Exclude<WakeEvent, { type: "task.wake-source-recorded" }>,
+    sequence: number,
+    firstClaimedAt: string | null,
+  ) {
+    const kind =
+      event.type === "task.wake-reserved"
+        ? "reserved"
+        : event.type === "task.wake-claimed"
+          ? "claimed"
+          : event.type === "task.wake-claim-uncertain"
+            ? "uncertain"
+            : "acknowledged";
+    yield* sql`INSERT INTO work_task_wake_phase_state VALUES(json_extract(${yield* encodeProjectionJson(event.id)},'$'),${sequence},json_extract(${yield* encodeProjectionJson(event.taskId)},'$'),
+      json_extract(${yield* encodeProjectionJson(event.reservationId)},'$'),${kind},${event.dirtyGeneration},${event.acknowledgedGeneration},
+      ${event.type === "task.wake-acknowledged" ? event.previousAcknowledgedGeneration : null},${event.type === "task.wake-acknowledged" ? event.observedDirtyGeneration : null},
+      json_extract(${yield* encodeProjectionJson(event.type === "task.wake-claimed" ? event.messageId : null)},'$'),
+      json_extract(${yield* encodeProjectionJson(event.type === "task.wake-claimed" ? event.runId : null)},'$'),${firstClaimedAt})`;
+  });
+  const applyWakeAt = Effect.fn("TaskStore.applyWakeAt")(function* (
+    recorded: WorkTaskPersistedEvent,
+    replay: boolean,
+  ) {
+    const { event, context } = recorded;
+    if (
+      event.type !== "task.wake-source-recorded" &&
+      event.type !== "task.wake-reserved" &&
+      event.type !== "task.wake-claimed" &&
+      event.type !== "task.wake-claim-uncertain" &&
+      event.type !== "task.wake-acknowledged"
+    )
+      return yield* new TaskProjectionError({ code: "unsupported" });
+    const view = yield* wakeViewAt(event.taskId);
+    if (!view) return yield* new TaskProjectionError({ code: "legacy" });
+    const task = yield* encodeProjectionJson(event.taskId);
+    if (event.type === "task.wake-source-recorded") {
+      const original = yield* wakeSourceAt(
+        event.taskId,
+        event.source.kind,
+        event.source.sourceId,
+        view.checkpointSequence,
+      );
+      if (original) {
+        yield* guard(
+          original.sequence <= context.sequence &&
+            (original.sequence !== context.sequence || original.eventId === event.id) &&
+            original.dirtyGeneration === event.dirtyGeneration &&
+            original.reservationId === event.reservationId &&
+            original.resultRef === event.source.resultRef,
+          "replay",
+        );
+        return;
+      }
+      yield* guard(
+        !replay &&
+          view.dirtyGeneration < Number.MAX_SAFE_INTEGER &&
+          event.dirtyGeneration === view.dirtyGeneration + 1,
+        "wake",
+      );
+      if (event.reservationId !== null) {
+        const parent = yield* wakeReservationAt(
+          event.taskId,
+          event.reservationId,
+          view.checkpointSequence,
+        );
+        if (!parent) return yield* new TaskProjectionError({ code: "legacy" });
+        yield* wakeHistory(parent, view.checkpointSequence);
+      }
+      const state =
+        yield* sql`SELECT 1 FROM work_task_wake_state WHERE task_id=json_extract(${task},'$')`;
+      if (!state.length)
+        yield* sql`INSERT INTO work_task_wake_state VALUES(json_extract(${task},'$'),0,0,NULL)`;
+      const kind = yield* encodeProjectionJson(event.source.kind),
+        id = yield* encodeProjectionJson(event.source.sourceId);
+      const reservation = yield* encodeProjectionJson(event.reservationId),
+        result = yield* encodeProjectionJson(event.source.resultRef);
+      yield* sql`INSERT INTO work_task_wake_sources VALUES(json_extract(${task},'$'),json_extract(${kind},'$'),json_extract(${id},'$'),json_extract(${reservation},'$'),json_extract(${result},'$'))`;
+      yield* sql`INSERT INTO work_task_wake_source_state VALUES(json_extract(${task},'$'),json_extract(${kind},'$'),json_extract(${id},'$'),
+        json_extract(${yield* encodeProjectionJson(event.id)},'$'),${context.sequence},${event.dirtyGeneration},${view.pending.length < 32 ? 1 : 0},json_extract(${reservation},'$'),json_extract(${result},'$'))`;
+      return;
+    }
+    const parent = yield* wakeReservationAt(
+      event.taskId,
+      event.reservationId,
+      view.checkpointSequence,
+    );
+    if (replay) {
+      if (!parent) return yield* new TaskProjectionError({ code: "legacy" });
+      yield* wakeHistory(parent, view.checkpointSequence);
+      const kind =
+        event.type === "task.wake-reserved"
+          ? "reserved"
+          : event.type === "task.wake-claimed"
+            ? "claimed"
+            : event.type === "task.wake-claim-uncertain"
+              ? "uncertain"
+              : "acknowledged";
+      const own = yield* wakePhaseRow(event.taskId, event.reservationId, kind, false, event.id);
+      if (!own) return yield* new TaskProjectionError({ code: "legacy" });
+      const native = yield* wakePhaseAt(parent, own, view.checkpointSequence);
+      yield* guard(NodeUtil.isDeepStrictEqual(native.recorded, recorded), "replay");
+      return;
+    }
+    yield* guard(event.dirtyGeneration === view.dirtyGeneration, "wake");
+    if (event.type !== "task.wake-acknowledged")
+      yield* guard(event.acknowledgedGeneration === view.acknowledgedGeneration, "acknowledgement");
+    if (event.type === "task.wake-reserved" || event.type === "task.wake-claimed")
+      yield* wakeBatch(event, view);
+    const reservation = yield* encodeProjectionJson(event.reservationId);
+    if (event.type === "task.wake-reserved") {
+      yield* guard(
+        parent === undefined &&
+          (yield* custodyAt(event.taskId, view.checkpointSequence)).current?.managerGeneration ===
+            event.managerGeneration,
+        "manager",
+      );
+      yield* wakeDebit(
+        event.taskId,
+        event.allowanceUnit,
+        view.checkpointSequence,
+        context.sequence,
+      );
+      yield* sql`INSERT INTO work_task_wake_reservations VALUES(json_extract(${reservation},'$'),json_extract(${task},'$'),${event.managerGeneration},
+        json_extract(${yield* encodeProjectionJson(event.reservationCommandId)},'$'),NULL,NULL,${event.allowanceUnit},${event.dirtyGeneration},${event.acknowledgedGeneration},${event.occurredAt},NULL)`;
+      yield* appendWakePhase(event, context.sequence, null);
+      return;
+    }
+    if (!parent) return yield* new TaskProjectionError({ code: "legacy" });
+    yield* wakeHistory(parent, view.checkpointSequence);
+    yield* guard(
+      parent.reservationCommandId === event.reservationCommandId &&
+        parent.managerGeneration === event.managerGeneration &&
+        parent.allowanceUnit === event.allowanceUnit,
+      "replay",
+    );
+    if (event.type === "task.wake-claimed") {
+      yield* guard(parent.latestAcknowledged === undefined, "acknowledgement");
+      if (parent.latestClaim) {
+        const previous = parent.latestClaim.recorded.event;
+        yield* guard(
+          previous.type === "task.wake-claimed" &&
+            event.dirtyGeneration > previous.dirtyGeneration &&
+            event.messageId === parent.messageId &&
+            event.runId === parent.runId,
+          "wake",
+        );
+        yield* appendWakePhase(event, context.sequence, parent.claimedAt);
+      } else {
+        yield* appendWakePhase(event, context.sequence, event.occurredAt);
+        const changed =
+          yield* sql`UPDATE work_task_wake_reservations SET message_id=json_extract(${yield* encodeProjectionJson(event.messageId)},'$'),
+          run_id=json_extract(${yield* encodeProjectionJson(event.runId)},'$'),claimed_at=${event.occurredAt}
+          WHERE task_id=json_extract(${task},'$') AND reservation_id=json_extract(${reservation},'$') AND message_id IS NULL AND run_id IS NULL AND claimed_at IS NULL RETURNING 1`;
+        yield* guard(changed.length === 1, "cas");
+      }
+    } else if (event.type === "task.wake-claim-uncertain") {
+      yield* guard(
+        parent.uncertain === undefined && parent.latestAcknowledged === undefined,
+        "wake",
+      );
+      yield* appendWakePhase(event, context.sequence, null);
+    } else {
+      const claim = parent.latestClaim?.recorded.event;
+      yield* guard(
+        claim?.type === "task.wake-claimed" &&
+          event.previousAcknowledgedGeneration === view.acknowledgedGeneration &&
+          event.acknowledgedGeneration > view.acknowledgedGeneration &&
+          event.observedDirtyGeneration === claim.dirtyGeneration &&
+          event.acknowledgedGeneration <= claim.dirtyGeneration,
+        "acknowledgement",
+      );
+      yield* appendWakePhase(event, context.sequence, null);
+    }
+  });
   const applyProjection = Effect.fn("TaskStore.applyProjection")(
-    (input: WorkTaskPersistedEvent, family: "foundation" | "managerAllowance") =>
+    (input: WorkTaskPersistedEvent, family: "foundation" | "managerAllowance" | "wake") =>
       projectTransaction(
         Effect.gen(function* () {
           const recorded = yield* decodeRecorded(input).pipe(
@@ -1700,17 +1956,19 @@ const make = Effect.gen(function* () {
           );
           const { event, context } = recorded;
           yield* guard(
-            (family === "managerAllowance"
-              ? custodyTypes
-              : [
-                  "task.created",
-                  "task.definition-updated",
-                  "task.definition-accepted",
-                  "task.configuration-updated",
-                  "task.execution-updated",
-                  "task.thread-linked",
-                  "task.thread-unlinked",
-                ]
+            (family === "wake"
+              ? wakeTypes
+              : family === "managerAllowance"
+                ? custodyTypes
+                : [
+                    "task.created",
+                    "task.definition-updated",
+                    "task.definition-accepted",
+                    "task.configuration-updated",
+                    "task.execution-updated",
+                    "task.thread-linked",
+                    "task.thread-unlinked",
+                  ]
             ).includes(event.type),
             "unsupported",
           );
@@ -1732,6 +1990,7 @@ const make = Effect.gen(function* () {
           });
           const view = yield* fence();
           if (source.checkpoint && original.streamVersion <= source.checkpoint.streamVersion) {
+            if (family === "wake") yield* applyWakeAt(recorded, true);
             if (family === "managerAllowance") {
               if (event.type === "task.manager-bound" || event.type === "task.manager-retired") {
                 yield* custodyAt(event.taskId, checkpoint!);
@@ -1778,6 +2037,13 @@ const make = Effect.gen(function* () {
           let effective = current?.definition;
           let activeLink: string | undefined;
           switch (event.type) {
+            case "task.wake-source-recorded":
+            case "task.wake-reserved":
+            case "task.wake-claimed":
+            case "task.wake-claim-uncertain":
+            case "task.wake-acknowledged":
+              yield* applyWakeAt(recorded, false);
+              break;
             case "task.manager-bound":
             case "task.manager-retired": {
               const custody = yield* custodyAt(event.taskId, checkpoint!);
@@ -1974,6 +2240,7 @@ const make = Effect.gen(function* () {
             yield* sql`UPDATE work_task_view_fence SET generation=${view.generation + 1},high_water_sequence=${Math.max(view.high, context.sequence)}
       WHERE singleton_id=1 AND generation=${view.generation} AND high_water_sequence=${view.high} RETURNING 1`;
           yield* guard(advanced.length === 1, "cas");
+          if (family === "wake") yield* wakeViewAt(event.taskId);
           return {
             applied: true,
             lastSequence: context.sequence,
@@ -1981,6 +2248,9 @@ const make = Effect.gen(function* () {
           };
         }),
       ),
+  );
+  const applyWake = Effect.fn("TaskStore.applyWake")((input: WorkTaskPersistedEvent) =>
+    applyProjection(input, "wake"),
   );
   const applyFoundation = Effect.fn("TaskStore.applyFoundation")((input: WorkTaskPersistedEvent) =>
     applyProjection(input, "foundation"),
@@ -2004,7 +2274,48 @@ const make = Effect.gen(function* () {
       ),
   );
 
+  const rebuildCustodyProjection = Effect.fn("TaskStore.rebuildCustodyProjection")(
+    (input: { taskId: string; throughSequence: number }) =>
+      projectTransaction(
+        Effect.gen(function* () {
+          const task = yield* encodeProjectionJson(input.taskId);
+          for (const table of [
+            "work_task_projections",
+            "work_task_current_state",
+            "work_task_accepted_definitions",
+            "work_task_thread_links",
+            "work_task_manager_bindings",
+            "work_task_allowances",
+            "work_task_wake_reservations",
+            "work_task_wake_sources",
+            "work_task_wake_state",
+            "work_task_wake_source_state",
+            "work_task_wake_phase_state",
+            "work_task_manager_reference_checkpoints",
+          ]) {
+            const existing =
+              yield* sql`SELECT 1 FROM ${sql(table)} WHERE task_id=json_extract(${task},'$') LIMIT 1`;
+            yield* guard(existing.length === 0, "legacy");
+          }
+          let after: Anchor | undefined;
+          do {
+            const page = yield* readNativeHistory({ ...input, ...(after ? { after } : {}) });
+            for (const value of page.records) {
+              if (wakeTypes.includes(value.recorded.event.type)) yield* applyWake(value.recorded);
+              else if (custodyTypes.includes(value.recorded.event.type))
+                yield* applyManagerAllowance(value.recorded);
+              else yield* applyFoundation(value.recorded);
+            }
+            after = page.next;
+          } while (after);
+          return yield* readFoundation(input.taskId);
+        }),
+      ),
+  );
+
   return TaskStore.of({
+    applyWake,
+    rebuildCustodyProjection,
     applyManagerAllowance,
     readWake,
     readWakeSource,
