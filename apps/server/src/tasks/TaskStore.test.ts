@@ -1479,8 +1479,17 @@ it.effect("publishes an audit only after unchanged source and checkpoint checks"
         yield* insert(later, 1);
         if (mode === "advance")
           yield* sql`UPDATE work_task_current_state SET last_applied_sequence=${base + 1} WHERE task_id=${taskId}`;
-        if (mode === "prune")
-          yield* sql`INSERT INTO orchestration_v2_projection_metadata VALUES('event-log-pruned-through',${base},1,${timestamp})`;
+        if (mode === "prune") {
+          yield* sql`INSERT INTO orchestration_v2_projection_metadata(projection_name,schema_version,last_sequence,updated_at)
+            VALUES('event-log-pruned-through',2,${base},${timestamp})`;
+          const marker = yield* sql<{
+            schema_version: number;
+            last_sequence: number;
+          }>`SELECT schema_version,last_sequence
+            FROM orchestration_v2_projection_metadata WHERE projection_name='event-log-pruned-through'`;
+          assert.strictEqual(marker[0]?.schema_version, 2);
+          assert.strictEqual(marker[0]?.last_sequence, base);
+        }
         yield* Deferred.succeed(release, undefined);
         if (mode === "future")
           assert.deepStrictEqual(yield* Fiber.join(running), {
