@@ -17,6 +17,10 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { runMigrations } from "../persistence/Migrations.ts";
 import {
+  reduceTaskReadiness,
+  recordedTaskGroupCandidate,
+  compareRecordedTaskCandidates,
+  reduceTaskGroup,
   reduceTaskReconciliation,
   compareTaskIdentifiers,
   reduceTaskRunOwnership,
@@ -1396,9 +1400,16 @@ it.effect(
               reservationId: "reservation",
               reservationCommandId: "reservation-command",
               allowanceUnit: 1,
-              observedDirtyGeneration: 1,
+              observedDirtyGeneration: 34,
               acknowledgedGeneration: 0,
-              pending: { sources: [], overflowThroughGeneration: null },
+              pending: {
+                sources: Array.from({ length: 32 }, (_, i) => ({
+                  kind: "result",
+                  sourceId: `pending-${i}`,
+                  resultRef: null,
+                })),
+                overflowThroughGeneration: 34,
+              },
               debitEvent: {
                 type: "task.allowance-debited",
                 eventId: "debit",
@@ -1511,7 +1522,7 @@ it.effect(
               reservationId: "reservation",
               reservationCommandId: "reservation-command",
               allowanceUnit: 1,
-              observedDirtyGeneration: 1,
+              observedDirtyGeneration: 34,
               acknowledgedGeneration: 0,
             },
           },
@@ -1548,6 +1559,111 @@ it.effect(
       const learned = reduceTaskGroupControl(known, hold);
       assert.strictEqual(get(learned.references, "future-hold").kind, "task-group.hold-changed");
       assert.strictEqual(reduceTaskRunOwnership(learned, knownSource), learned);
+      let combined = reduceTaskGroup(learned, owner);
+      for (let i = 0; i < 34; i++) {
+        const dirty = dirtyFact(
+          "task",
+          `combined-dirty-${i}`,
+          1000 + i,
+          i,
+          `combined-source-${i}`,
+          500 + i,
+        );
+        combined = reduceTaskGroup(combined, dirty);
+        yield* writeReconciliation(dirty);
+      }
+      const partial = ackFact("combined-ack", 1100, 0, 32, 33, 34);
+      combined = reduceTaskGroup(combined, partial);
+      yield* writeReconciliation(partial);
+      assert.strictEqual(get(combined.dirty, "task").event.dirtyGeneration, 34);
+      assert.strictEqual(get(combined.dirty, "task").event.acknowledgedGeneration, 32);
+      const origin = get(combined.owners, "auto-run").record.event.ownership.origin;
+      if (origin.type !== "automatic_followup") throw new Error("automatic origin");
+      assert.strictEqual(origin.pending.sources.length, 32);
+      assert.strictEqual(origin.pending.overflowThroughGeneration, 34);
+      assert.strictEqual(origin.allowanceUnit, 1);
+      assert.strictEqual(HashMap.size(combined.ready), 0);
+      assert.strictEqual(HashMap.size(combined.claims), HashMap.size(learned.claims));
+      assert.strictEqual(
+        (yield* sql`SELECT count(*) AS n FROM work_task_accepted_run_debits`)[0]!.n,
+        1,
+      );
+      const secondTask = initialTask("second-auto-task");
+      const secondJoin = membership(
+        secondTask,
+        [get(combined.groups, "g").control],
+        "g",
+        "second-auto-join",
+        1200,
+        [1201],
+      );
+      combined = reduceTaskGroup(combined, secondJoin);
+      const secondContext = {
+        eventId: "second-auto-owner",
+        commandId: "record-second-auto",
+        occurredAt: time,
+        sequence: 1300,
+      };
+      const secondOwner = ownerRecord({
+        context: secondContext,
+        event: {
+          ...owner.event,
+          id: secondContext.eventId,
+          commandId: secondContext.commandId,
+          ownership: {
+            ...owner.event.ownership,
+            recorded: secondContext,
+            run: {
+              ...owner.event.ownership.run,
+              task: secondTask.task,
+              membershipRevision: 2,
+              taskRevisions: { ...secondTask.taskRevisions, actionPolicyRevision: 2 },
+              runId: "second-auto-run",
+              messageId: "second-auto-message",
+            },
+            sourceEventId: "second-auto-source",
+            sourceSequence: 1202,
+            observedWorkSequence: 1202,
+            nativeAcceptance: {
+              ...owner.event.ownership.nativeAcceptance,
+              receipt: {
+                ...owner.event.ownership.nativeAcceptance.receipt,
+                commandId: "second-auto-native",
+                resultSequence: 1252,
+              },
+              runEvent: { type: "run.created", eventId: "second-auto-native-run", sequence: 1251 },
+              messageEvent: {
+                type: "message.updated",
+                eventId: "second-auto-native-message",
+                sequence: 1252,
+              },
+            },
+            origin: {
+              ...origin,
+              reservationId: "second-auto-reservation",
+              reservationCommandId: "second-auto-reservation-command",
+              debitEvent: {
+                ...origin.debitEvent,
+                eventId: "second-auto-debit",
+                sequence: 1253,
+                commandId: "second-auto-reservation-command",
+                taskId: "second-auto-task",
+                actionPolicyRevision: 2,
+              },
+            },
+          },
+        },
+      });
+      combined = reduceTaskGroup(combined, secondOwner);
+      const firstRun = get(combined.owners, "auto-run").record.event.ownership;
+      const secondRun = get(combined.owners, "second-auto-run").record.event.ownership;
+      assert.deepStrictEqual(firstRun.run.manager, secondRun.run.manager);
+      assert.notStrictEqual(firstRun.run.task.taskId, secondRun.run.task.taskId);
+      assert.strictEqual(firstRun.run.taskRevisions.actionPolicyRevision, 1);
+      assert.strictEqual(secondRun.run.taskRevisions.actionPolicyRevision, 2);
+      assert.strictEqual(HashMap.size(get(combined.unclosedOwners, "second-auto-task")), 1);
+      assert.strictEqual(HashMap.size(combined.activeWork), 3);
+      assert.strictEqual(HashMap.size(combined.ready), 0);
     }).pipe(Effect.provide(db)),
 );
 
@@ -1835,4 +1951,360 @@ it.effect("matches SQLite lossless identifier order and source-backed graph curs
     assert.strictEqual((yield* Effect.exit(writeReconciliation(changedCaptured)))._tag, "Failure");
     assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
   }).pipe(Effect.provide(db)),
+);
+
+const readyFact = (
+  claim: ReturnType<typeof workRecord>,
+  id: string,
+  sequence: number,
+  kind: "qualified" | "accepted" | "settled" | "disqualified",
+  previous: number | null,
+  patch: object = {},
+) => {
+  const binding = claim.event.claim.binding;
+  const event = {
+    ...fields(id),
+    type: "task.ready-sequence-updated",
+    attribution: { type: "server" },
+    task: binding.task,
+    group: binding.group,
+    membershipGeneration: binding.membershipGeneration,
+    basis: {
+      taskRevisions: binding.taskRevisions,
+      graphRevision: binding.graphRevision,
+      controlRevision: binding.controlRevision,
+      membershipRevision: binding.membershipRevision,
+      managerGeneration: binding.manager.managerGeneration,
+    },
+    kind,
+    previousOldestReadySequence: previous,
+    oldestReadySequence:
+      kind === "qualified" ? (previous ?? sequence) : kind === "settled" ? sequence : null,
+    sourceEventId: kind === "accepted" ? claim.event.claim.acceptedEventId : "ready-source",
+    sourceSequence: kind === "accepted" ? claim.event.claim.acceptedSequence : 9,
+    ...(kind === "accepted" || kind === "settled"
+      ? {
+          claim: {
+            binding,
+            acceptedEventId: claim.event.claim.acceptedEventId,
+            acceptedSequence: claim.event.claim.acceptedSequence,
+            acceptedAt: claim.event.claim.acceptedAt,
+          },
+        }
+      : {}),
+    ...(kind === "disqualified" ? { reason: "task_pause" } : {}),
+    ...patch,
+  };
+  const record = decodeWork({ event, context: context(event, sequence) });
+  if (record.event.type !== "task.ready-sequence-updated") throw new Error("ready fixture");
+  return { ...record, event: record.event };
+};
+const writeReady = Effect.fn("TaskGroupTest.writeReady")(function* (
+  record: ReturnType<typeof readyFact>,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`INSERT INTO work_task_ready_events(event_id,sequence,event_json) VALUES (${record.event.id},${record.context.sequence},${JSON.stringify(record.event)})`;
+});
+it.effect("uses historical custody for readiness and retains consumed age until settlement", () =>
+  Effect.gen(function* () {
+    const fixture = yield* seedReleaseClaim(releaseFixture());
+    let state = reduceTaskWork(
+      reduceTaskRunOwnership(pureSeed(fixture), fixture.owner),
+      fixture.claim,
+    );
+    const sql = yield* SqlClient.SqlClient;
+    const apply = Effect.fn("TaskGroupTest.applyReady")(function* (
+      record: ReturnType<typeof readyFact>,
+    ) {
+      yield* writeReady(record);
+      state = reduceTaskReadiness(state, record);
+      const ready = get(state.ready, JSON.stringify(["task", 1]));
+      const [row] =
+        yield* sql`SELECT * FROM work_task_ready_state WHERE task_id='task' AND membership_generation=1`;
+      assert.strictEqual(row!.latest_event_id, ready.record.event.id);
+      assert.strictEqual(row!.latest_sequence, ready.record.context.sequence);
+      assert.strictEqual(row!.oldest_ready_sequence, ready.record.event.oldestReadySequence);
+      assert.strictEqual(row!.epoch_start_event_id, ready.epoch ?? null);
+      assert.strictEqual(row!.pending_claim_id, ready.pending ?? null);
+      assert.strictEqual(row!.last_served_claim_id, ready.served?.claimId ?? null);
+      assert.strictEqual(row!.last_served_sequence, ready.served?.sequence ?? null);
+      assert.deepStrictEqual(JSON.parse(String(row!.basis_json)), ready.record.event.basis);
+    });
+    const qualified = readyFact(fixture.claim, "qualified", 25, "qualified", null);
+    yield* apply(qualified);
+    assert.strictEqual(
+      recordedTaskGroupCandidate(state, "g")?.ready.record.event.oldestReadySequence,
+      25,
+    );
+    yield* apply(
+      readyFact(fixture.claim, "refresh", 26, "qualified", 25, {
+        basis: { ...qualified.event.basis, controlRevision: 5 },
+      }),
+    );
+    yield* apply(readyFact(fixture.claim, "consumed", 31, "accepted", 25));
+    yield* apply(readyFact(fixture.claim, "paused", 32, "disqualified", null));
+    assert.throws(
+      () => reduceTaskReadiness(state, readyFact(fixture.claim, "bypass", 33, "qualified", null)),
+      GroupReplayConflict,
+    );
+    const release = releaseFor(fixture.claim, 70);
+    yield* sql.withTransaction(writeReleaseEvidence(release.recorded, release.native));
+    state = reduceTaskGroup(state, release);
+    yield* apply(
+      readyFact(fixture.claim, "settled", 71, "settled", null, {
+        releaseEventId: release.recorded.event.id,
+        releaseSequence: 70,
+        sourceEventId: release.recorded.event.id,
+        sourceSequence: 70,
+      }),
+    );
+    assert.strictEqual(
+      recordedTaskGroupCandidate(state, "g")?.ready.record.event.oldestReadySequence,
+      71,
+    );
+    assert.strictEqual(reduceTaskGroup(state, qualified), state);
+    const before = state;
+    const wrongCas = readyFact(fixture.claim, "wrong-cas", 72, "qualified", 25);
+    assert.throws(() => reduceTaskReadiness(state, wrongCas), GroupReplayConflict);
+    assert.strictEqual((yield* Effect.exit(writeReady(wrongCas)))._tag, "Failure");
+    yield* apply(readyFact(fixture.claim, "post-settlement-pause", 72, "disqualified", 71));
+    const duplicateRelease = readyFact(fixture.claim, "duplicate-settlement", 73, "settled", null, {
+      releaseEventId: release.recorded.event.id,
+      releaseSequence: 70,
+      sourceEventId: release.recorded.event.id,
+      sourceSequence: 70,
+    });
+    assert.throws(() => reduceTaskReadiness(state, duplicateRelease), GroupReplayConflict);
+    assert.strictEqual((yield* Effect.exit(writeReady(duplicateRelease)))._tag, "Failure");
+    assert.strictEqual(recordedTaskGroupCandidate(before, "g")?.oldestReadySequence, 71);
+    assert.strictEqual(recordedTaskGroupCandidate(state, "g"), undefined);
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect(
+  "resolves delayed readiness against historical intervals rather than current custody",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const fixture = yield* seedReleaseClaim(releaseFixture());
+      let state = reduceTaskGroup(reduceTaskGroup(pureSeed(fixture), fixture.owner), fixture.claim);
+      const release = releaseFor(fixture.claim, 80);
+      yield* sql.withTransaction(writeReleaseEvidence(release.recorded, release.native));
+      state = reduceTaskGroup(state, release);
+      const tooEarly = readyFact(fixture.claim, "early", 70, "qualified", null);
+      assert.throws(() => reduceTaskReadiness(state, tooEarly), GroupReplayConflict);
+      assert.strictEqual((yield* Effect.exit(writeReady(tooEarly)))._tag, "Failure");
+      const next = activateAgain(fixture.claim, "later-claim", 100);
+      yield* insertPhysicalWork(next.event);
+      const future = reduceTaskWork(state, next);
+      const middle = readyFact(fixture.claim, "middle", 90, "settled", null, {
+        sourceEventId: release.recorded.event.id,
+        sourceSequence: 80,
+        releaseEventId: release.recorded.event.id,
+        releaseSequence: 80,
+      });
+      yield* writeReady(middle);
+      const delayed = reduceTaskReadiness(future, freeze(middle));
+      assert.strictEqual(recordedTaskGroupCandidate(delayed, "g")?.ready.served?.sequence, 30);
+      assert.strictEqual(recordedTaskGroupCandidate(delayed, "g")?.physicalClaims.length, 1);
+      assert.strictEqual(recordedTaskGroupCandidate(delayed, "g")?.unclosedOwners.length, 1);
+      assert.strictEqual(HashMap.size(future.ready), 0);
+      assert.strictEqual(reduceTaskGroup(delayed, middle), delayed);
+      const [row] =
+        yield* sql`SELECT last_served_sequence,oldest_ready_sequence FROM work_task_ready_state`;
+      assert.strictEqual(row!.last_served_sequence, 30);
+      assert.strictEqual(row!.oldest_ready_sequence, 90);
+      for (const q of [25, 30, 31, 79, 80, 81, 99, 100, 101]) {
+        const claims =
+          yield* sql`SELECT work_claim_id FROM work_task_executable_claims WHERE task_id='task' AND accepted_sequence<${q} ORDER BY accepted_sequence DESC LIMIT 1`;
+        assert.strictEqual(
+          claims[0]?.work_claim_id,
+          q <= 30
+            ? undefined
+            : q <= 100
+              ? fixture.claim.event.claim.binding.workClaimId
+              : next.event.claim.binding.workClaimId,
+        );
+        const occupied =
+          yield* sql`SELECT EXISTS(SELECT 1 FROM work_task_executable_claims c WHERE c.task_id='task' AND c.accepted_sequence<${q} AND NOT EXISTS(SELECT 1 FROM work_task_claim_releases r WHERE r.event_id=c.release_event_id AND r.work_claim_id=c.work_claim_id AND r.sequence<${q})) AS occupied`;
+        assert.strictEqual(occupied[0]!.occupied, (q > 30 && q <= 80) || q > 100 ? 1 : 0);
+      }
+      const plan =
+        yield* sql`EXPLAIN QUERY PLAN SELECT work_claim_id FROM work_task_executable_claims WHERE task_id='task' AND accepted_sequence<90 ORDER BY accepted_sequence DESC LIMIT 1`;
+      assert.match(JSON.stringify(plan), /SEARCH.*INDEX/);
+      assert.notMatch(JSON.stringify(plan), /TEMP B-TREE|SCAN work_task_executable_claims/);
+    }).pipe(Effect.provide(db)),
+);
+
+it.effect.each(["qualified", "settled", "disqualified"] as const)(
+  "matches the physical reverse guard after a later %s fact",
+  (kind) =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const fixture = yield* seedReleaseClaim(releaseFixture());
+      const release = releaseFor(fixture.claim, 80);
+      yield* sql.withTransaction(writeReleaseEvidence(release.recorded, release.native));
+      let state = reduceTaskGroup(
+        reduceTaskGroup(reduceTaskGroup(pureSeed(fixture), fixture.owner), fixture.claim),
+        release,
+      );
+      const observation = readyFact(
+        fixture.claim,
+        "future-ready",
+        95,
+        kind,
+        null,
+        kind === "settled"
+          ? {
+              releaseEventId: release.recorded.event.id,
+              releaseSequence: 80,
+              sourceEventId: release.recorded.event.id,
+              sourceSequence: 80,
+            }
+          : {},
+      );
+      yield* writeReady(observation);
+      state = reduceTaskReadiness(state, observation);
+      const later = activateAgain(fixture.claim, "retroactive", 90);
+      if (kind === "disqualified") {
+        state = reduceTaskWork(state, later);
+        yield* insertPhysicalWork(later.event);
+        assert.strictEqual(reduceTaskWork(state, later), state);
+      } else {
+        assert.throws(() => reduceTaskWork(state, later), GroupReplayConflict);
+        assert.strictEqual((yield* Effect.exit(insertPhysicalWork(later.event)))._tag, "Failure");
+        const cleared = readyFact(fixture.claim, "cleared", 96, "disqualified", 95);
+        yield* writeReady(cleared);
+        state = reduceTaskReadiness(state, cleared);
+        assert.throws(() => reduceTaskWork(state, later), GroupReplayConflict);
+        assert.strictEqual((yield* Effect.exit(insertPhysicalWork(later.event)))._tag, "Failure");
+      }
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+    }).pipe(Effect.provide(db)),
+);
+
+it.effect("keeps retired membership debt separate from the new member queue age", () =>
+  Effect.gen(function* () {
+    const fixture = yield* seedReleaseClaim(releaseFixture());
+    let state = reduceTaskGroup(emptyTaskGroupControl(env), fixture.group);
+    assert.throws(() => reduceTaskGroup(state, fixture.join.root), GroupReplayConflict);
+    assert.throws(() => reduceTaskGroup(state, fixture.join.companions[0]!), GroupReplayConflict);
+    state = reduceTaskGroup(reduceTaskGroup(state, fixture.join), fixture.manager);
+    state = reduceTaskGroup(reduceTaskGroup(state, fixture.owner), fixture.claim);
+    state = reduceTaskGroup(state, readyFact(fixture.claim, "old-ready", 25, "qualified", null));
+    state = reduceTaskGroup(state, readyFact(fixture.claim, "old-consumed", 31, "accepted", 25));
+    const removed = membership(
+      fixture.join.root.event.snapshot,
+      [get(state.groups, "g").control],
+      null,
+      "remove-ready",
+      40,
+      [41],
+    );
+    state = reduceTaskGroup(state, removed);
+    assert.strictEqual(recordedTaskGroupCandidate(state, "g"), undefined);
+    const rejoined = membership(
+      removed.root.event.snapshot,
+      [get(state.groups, "g").control],
+      "g",
+      "rejoin-ready",
+      50,
+      [51],
+    );
+    state = reduceTaskGroup(state, rejoined);
+    const early = readyFact(fixture.claim, "new-early", 60, "qualified", null, {
+      membershipGeneration: 2,
+    });
+    assert.throws(() => reduceTaskGroup(state, early), GroupReplayConflict);
+    const release = releaseFor(fixture.claim, 70);
+    state = reduceTaskGroup(state, release);
+    const newReady = readyFact(fixture.claim, "new-ready", 80, "qualified", null, {
+      membershipGeneration: 2,
+    });
+    state = reduceTaskGroup(state, newReady);
+    assert.strictEqual(
+      get(state.ready, JSON.stringify(["task", 1])).pending,
+      fixture.claim.event.claim.binding.workClaimId,
+    );
+    assert.strictEqual(recordedTaskGroupCandidate(state, "g")?.generation, 2);
+    assert.strictEqual(recordedTaskGroupCandidate(state, "g")?.oldestReadySequence, 80);
+    const held = controlChange(
+      get(state.groups, "g").control,
+      "ready-hold",
+      90,
+      { dispatchHold: "paused" },
+      "task-group.hold-changed",
+    );
+    state = reduceTaskGroup(state, held);
+    assert.strictEqual(recordedTaskGroupCandidate(state, "g")?.control.dispatchHold, "paused");
+    assert.strictEqual(recordedTaskGroupCandidate(state, "g")?.oldestReadySequence, 80);
+    assert.strictEqual(recordedTaskGroupCandidate(state, "g")?.unclosedOwners.length, 1);
+    const closed = reduceTaskRunOwnership(
+      state,
+      terminateAfter(fixture.owner, release, "closed-owner", 100),
+    );
+    assert.strictEqual(recordedTaskGroupCandidate(closed, "g")?.unclosedOwners.length, 0);
+    assert.strictEqual(recordedTaskGroupCandidate(state, "g")?.unclosedOwners.length, 1);
+    assert.strictEqual(HashMap.size(closed.claims), 1);
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect(
+  "selects recorded current members with byte-safe identities and indexed SQL ordering",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const fixture = yield* seedReleaseClaim(releaseFixture());
+      let state = pureSeed(fixture);
+      const ids = ["task", "second\u0000\ud800"];
+      const second = ids[1]!;
+      yield* sql`INSERT INTO work_task_projections VALUES (json_extract(${JSON.stringify(second)},'$'),NULL,1,1,1,1,'{}','1','1')`;
+      yield* sql`INSERT INTO work_task_accepted_definitions VALUES (json_extract(${JSON.stringify(second)},'$'),1,1,'{}','{}','second-definition','1')`;
+      const joined = membership(
+        initialTask(second),
+        [get(state.groups, "g").control],
+        "g",
+        "second-join",
+        5,
+        [6],
+      );
+      yield* sql.withTransaction(writeJoin(joined));
+      state = reduceTaskGroup(state, joined);
+      for (const [i, taskId] of ids.entries()) {
+        const record = readyFact(fixture.claim, `candidate-${i}`, 25 + i, "qualified", null, {
+          task: { environmentId: env, taskId },
+        });
+        state = reduceTaskGroup(state, record);
+        yield* writeReady(record);
+      }
+      assert.strictEqual(recordedTaskGroupCandidate(state, "g")?.taskId, "task");
+      const paused = readyFact(fixture.claim, "candidate-paused", 27, "disqualified", 25);
+      state = reduceTaskGroup(state, paused);
+      yield* writeReady(paused);
+      const candidate = recordedTaskGroupCandidate(state, "g")!;
+      assert.strictEqual(candidate.taskId, second);
+      assert.strictEqual(candidate.oldestReadySequence, 26);
+      const query = `SELECT hex(s.task_id) AS task_hex FROM work_task_ready_state s JOIN work_task_group_memberships m ON m.task_id=s.task_id AND m.membership_generation=s.membership_generation WHERE s.environment_id='env' AND s.group_id='g' AND s.oldest_ready_sequence IS NOT NULL AND m.retired_event_id IS NULL ORDER BY s.oldest_ready_sequence,s.task_id COLLATE BINARY,s.membership_generation LIMIT 1`;
+      const rows = yield* sql.unsafe<{ task_hex: string }>(query);
+      const expected =
+        yield* sql`SELECT hex(json_extract(${JSON.stringify(second)},'$')) AS task_hex`;
+      assert.strictEqual(rows[0]!.task_hex, expected[0]!.task_hex);
+      const plan = yield* sql.unsafe(`EXPLAIN QUERY PLAN ${query}`);
+      assert.match(JSON.stringify(plan), /work_task_ready_selection_idx/);
+      assert.notMatch(JSON.stringify(plan), /TEMP B-TREE/);
+      const tuples = ["z", "a", "\u0000", "\ud800", "\ue000", "\ud800\udc00"].map((taskId) => ({
+        taskId,
+        oldestReadySequence: 10,
+      }));
+      tuples.sort(compareRecordedTaskCandidates);
+      const sqlTies =
+        yield* sql`SELECT hex(json_extract(value,'$.taskId')) AS id FROM json_each(${JSON.stringify(tuples.toReversed())}) ORDER BY json_extract(value,'$.oldestReadySequence'),json_extract(value,'$.taskId') COLLATE BINARY`;
+      for (const [i, tuple] of tuples.entries()) {
+        const expectedTie =
+          yield* sql`SELECT hex(json_extract(${JSON.stringify(tuple.taskId)},'$')) AS id`;
+        assert.strictEqual(sqlTies[i]!.id, expectedTie[0]!.id);
+      }
+      assert.strictEqual(recordedTaskGroupCandidate(state, "unknown"), undefined);
+      assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+    }).pipe(Effect.provide(db)),
 );

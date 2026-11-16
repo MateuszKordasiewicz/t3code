@@ -66,7 +66,25 @@ type ScanRecord = ReconciliationRecord & {
     { type: "task.reconciliation-progressed" }
   >;
 };
-type Record = ControlRecord | RootRecord | OwnerRecord | WorkRecord | ReconciliationRecord;
+type ReadyRecord = WorkTaskPersistedCoordinationEvent & {
+  readonly event: Extract<
+    WorkTaskPersistedCoordinationEvent["event"],
+    { type: "task.ready-sequence-updated" }
+  >;
+};
+type Ready = {
+  readonly record: ReadyRecord;
+  readonly epoch: string | undefined;
+  readonly pending: string | undefined;
+  readonly served: { readonly claimId: string; readonly sequence: number } | undefined;
+};
+type Record =
+  | ControlRecord
+  | RootRecord
+  | OwnerRecord
+  | WorkRecord
+  | ReconciliationRecord
+  | ReadyRecord;
 type Companion = ControlRecord & {
   readonly event: Extract<ControlRecord["event"], { type: "task-group.membership-changed" }>;
 };
@@ -89,6 +107,15 @@ type Manager = {
   readonly retired?: ControlRecord;
 };
 type State = {
+  readonly ready: HashMap.HashMap<string, Ready>;
+  readonly readyMaximum: HashMap.HashMap<string, number>;
+  readonly consumedClaims: HashMap.HashMap<string, string>;
+  readonly settledReleases: HashMap.HashMap<string, string>;
+  readonly claimRanks: HashMap.HashMap<
+    string,
+    { readonly count: number; readonly byRank: HashMap.HashMap<number, string> }
+  >;
+  readonly unclosedOwners: HashMap.HashMap<string, HashMap.HashMap<string, true>>;
   readonly dirty: HashMap.HashMap<string, DirtyRecord>;
   readonly dirtySources: HashMap.HashMap<string, DirtyRecord>;
   readonly scans: HashMap.HashMap<string, ScanRecord>;
@@ -121,6 +148,7 @@ export class GroupReplayConflict extends Schema.TaggedError<GroupReplayConflict>
   "GroupReplayConflict",
   {
     code: Schema.Literals([
+      "readiness",
       "reconciliation",
       "ownership",
       "custody",
@@ -152,6 +180,12 @@ const decodeRoot = Schema.decodeUnknownSync(WorkTaskPersistedMembershipEvent);
 const decodeBatch = Schema.decodeUnknownSync(WorkTaskMembershipEventBatch);
 
 export const emptyTaskGroupControl = (environmentId: EnvironmentId): State => ({
+  ready: HashMap.empty(),
+  readyMaximum: HashMap.empty(),
+  consumedClaims: HashMap.empty(),
+  settledReleases: HashMap.empty(),
+  claimRanks: HashMap.empty(),
+  unclosedOwners: HashMap.empty(),
   dirty: HashMap.empty(),
   dirtySources: HashMap.empty(),
   scans: HashMap.empty(),
@@ -211,10 +245,10 @@ const recordFacts = (
     const taskId =
       "ownership" in event
         ? event.ownership.run.task.taskId
-        : "claim" in event
-          ? event.claim.binding.task.taskId
-          : "task" in event
-            ? event.task.taskId
+        : "task" in event
+          ? event.task.taskId
+          : "claim" in event
+            ? event.claim.binding.task.taskId
             : event.type === "task.membership-changed"
               ? event.snapshot.task.taskId
               : undefined;
@@ -649,6 +683,15 @@ export const reduceTaskRunOwnership = (state: State, input: OwnerRecord): State 
     return {
       ...candidate,
       ownerAliases: aliases,
+      unclosedOwners: HashMap.set(
+        state.unclosedOwners,
+        event.ownership.run.task.taskId,
+        HashMap.set(
+          get(state.unclosedOwners, event.ownership.run.task.taskId) ?? HashMap.empty(),
+          runId,
+          true,
+        ),
+      ),
       owners: HashMap.set(state.owners, runId, {
         record: { ...record, event },
         latestSequence: record.context.sequence,
@@ -704,6 +747,14 @@ export const reduceTaskRunOwnership = (state: State, input: OwnerRecord): State 
       latestSequence: record.context.sequence,
       terminal: { ...record, event },
     }),
+    unclosedOwners: HashMap.set(
+      state.unclosedOwners,
+      event.ownership.run.task.taskId,
+      HashMap.remove(
+        get(state.unclosedOwners, event.ownership.run.task.taskId) ?? HashMap.empty(),
+        runId,
+      ),
+    ),
   };
 };
 const resources = (binding: WorkAccepted["event"]["claim"]["binding"]) => [
@@ -803,6 +854,7 @@ export const reduceTaskWork = (
   if (event.type === "task-group.work-accepted") {
     if (
       existing ||
+      (get(state.readyMaximum, binding.task.taskId) ?? -1) > record.context.sequence ||
       HashMap.has(state.effects, binding.effectId) ||
       owner.terminal ||
       owner.record.context.sequence >= record.context.sequence
@@ -857,8 +909,16 @@ export const reduceTaskWork = (
       active = HashMap.set(active, resource, binding.workClaimId);
       latest = HashMap.set(latest, resource, binding.workClaimId);
     }
+    const ranks = get(state.claimRanks, binding.task.taskId) ?? {
+      count: 0,
+      byRank: HashMap.empty<number, string>(),
+    };
     return {
       ...candidate,
+      claimRanks: HashMap.set(state.claimRanks, binding.task.taskId, {
+        count: ranks.count + 1,
+        byRank: HashMap.set(ranks.byRank, ranks.count, binding.workClaimId),
+      }),
       activeWork: active,
       latestWork: latest,
       latestRunWork: HashMap.set(state.latestRunWork, binding.runId, binding.workClaimId),
@@ -1063,4 +1123,214 @@ export const reduceTaskReconciliation = (
         conflict("reconciliation", event.id);
     }
   return candidate;
+};
+
+const predecessorClaim = (state: State, task: string, sequence: number) => {
+  const ranks = get(state.claimRanks, task);
+  let low = 0,
+    high = ranks?.count ?? 0;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2),
+      claim = get(state.claims, get(ranks!.byRank, middle)!)!;
+    if (claim.record.context.sequence < sequence) low = middle + 1;
+    else high = middle;
+  }
+  return low === 0 ? undefined : get(state.claims, get(ranks!.byRank, low - 1)!);
+};
+export const reduceTaskReadiness = (state: State, input: ReadyRecord): State => {
+  let record: ReadyRecord;
+  try {
+    const decoded = decodeCoordination(input);
+    if (decoded.event.type !== "task.ready-sequence-updated")
+      return conflict("envelope", input.context.eventId);
+    record = { ...decoded, event: decoded.event };
+  } catch {
+    return conflict("envelope", input.context.eventId);
+  }
+  if (preflight(state, [record])) return state;
+  const event = record.event,
+    task = event.task.taskId,
+    id = key(task, event.membershipGeneration),
+    prior = get(state.ready, id);
+  retainedMembership(state, task, event.membershipGeneration, event.group.groupId, event.id);
+  if (
+    event.basis.managerGeneration !== null &&
+    !HashMap.has(state.managers, key(event.group.groupId, event.basis.managerGeneration))
+  )
+    conflict("manager", event.id);
+  if (
+    (prior && prior.record.context.sequence >= record.context.sequence) ||
+    (prior?.record.event.oldestReadySequence ?? null) !== event.previousOldestReadySequence
+  )
+    conflict("readiness", event.id);
+  const predecessor = predecessorClaim(state, task, record.context.sequence);
+  const occupied =
+    predecessor !== undefined &&
+    (!predecessor.release ||
+      predecessor.release.recorded.context.sequence >= record.context.sequence);
+  let pending = prior?.pending,
+    served = prior?.served,
+    epoch = prior?.epoch,
+    consumed = state.consumedClaims,
+    settled = state.settledReleases;
+  const refs: SourceReference[] = [ref(event.sourceEventId, event.sourceSequence)];
+  if ((event.kind === "qualified" || event.kind === "accepted") && pending !== undefined)
+    conflict("readiness", event.id);
+  if ((event.kind === "qualified" || event.kind === "settled") && occupied)
+    conflict("custody", event.id);
+  if (event.kind === "accepted" || event.kind === "settled") {
+    const claim = get(state.claims, event.claim.binding.workClaimId);
+    if (
+      !claim ||
+      claim !== predecessor ||
+      !equal(event.claim, claimReference(claim.record.event.claim))
+    )
+      return conflict("readiness", event.id);
+    const binding = claim.record.event.claim.binding,
+      owner = get(state.owners, binding.runId)!;
+    refs.push(
+      ref(claim.record.event.id, claim.record.context.sequence, "task-group.work-accepted", task),
+      ref(
+        owner.record.event.id,
+        owner.record.context.sequence,
+        "task.run-ownership-accepted",
+        task,
+      ),
+    );
+    if (event.kind === "accepted") {
+      const basis = {
+        taskRevisions: binding.taskRevisions,
+        graphRevision: binding.graphRevision,
+        controlRevision: binding.controlRevision,
+        membershipRevision: binding.membershipRevision,
+        managerGeneration: binding.manager.managerGeneration,
+      };
+      if (!equal(event.basis, basis) || HashMap.has(consumed, binding.workClaimId))
+        conflict("readiness", event.id);
+      consumed = HashMap.set(consumed, binding.workClaimId, event.id);
+      pending = binding.workClaimId;
+      epoch = undefined;
+    } else {
+      const release = claim.release;
+      if (
+        !release ||
+        release.recorded.context.sequence >= record.context.sequence ||
+        release.recorded.event.id !== event.releaseEventId ||
+        release.recorded.context.sequence !== event.releaseSequence ||
+        (pending !== undefined && pending !== binding.workClaimId) ||
+        HashMap.has(settled, event.releaseEventId)
+      )
+        return conflict("readiness", event.id);
+      settled = HashMap.set(settled, event.releaseEventId, event.id);
+      refs.push(ref(event.releaseEventId, event.releaseSequence, "task-group.work-released", task));
+      pending = undefined;
+      epoch = event.id;
+    }
+    served = { claimId: binding.workClaimId, sequence: claim.record.context.sequence };
+  } else if (event.kind === "qualified")
+    epoch = event.previousOldestReadySequence === null ? event.id : epoch;
+  else epoch = undefined;
+  const candidate = recordFacts(state, [record], refs);
+  return {
+    ...candidate,
+    ready: HashMap.set(state.ready, id, { record, epoch, pending, served }),
+    consumedClaims: consumed,
+    settledReleases: settled,
+    readyMaximum:
+      event.kind === "disqualified"
+        ? state.readyMaximum
+        : HashMap.set(
+            state.readyMaximum,
+            task,
+            Math.max(get(state.readyMaximum, task) ?? -1, record.context.sequence),
+          ),
+  };
+};
+export const compareRecordedTaskCandidates = (
+  left: { readonly oldestReadySequence: number; readonly taskId: string },
+  right: { readonly oldestReadySequence: number; readonly taskId: string },
+) =>
+  left.oldestReadySequence - right.oldestReadySequence ||
+  compareTaskIdentifiers(left.taskId, right.taskId);
+export const recordedTaskGroupCandidate = (state: State, groupId: string) => {
+  const group = get(state.groups, groupId),
+    members = get(state.groupMembers, groupId);
+  if (!group || !members) return undefined;
+  let selected:
+    | { taskId: string; generation: number; ready: Ready; oldestReadySequence: number }
+    | undefined;
+  for (const [taskId, generation] of members) {
+    const ready = get(state.ready, key(taskId, generation)),
+      oldestReadySequence = ready?.record.event.oldestReadySequence;
+    if (
+      !ready ||
+      oldestReadySequence === undefined ||
+      oldestReadySequence === null ||
+      ready.record.event.group.groupId !== groupId
+    )
+      continue;
+    const candidate = { taskId, generation, ready, oldestReadySequence };
+    if (!selected || compareRecordedTaskCandidates(candidate, selected) < 0) selected = candidate;
+  }
+  if (!selected) return undefined;
+  const resourceKeys = [
+    JSON.stringify(["task", selected.taskId]),
+    JSON.stringify(["group", groupId]),
+    ...(group.control.currentManager
+      ? [JSON.stringify(["thread", group.control.currentManager.threadId])]
+      : []),
+  ];
+  const physical = new Map<string, Claim>();
+  for (const resource of resourceKeys) {
+    const claimId = get(state.activeWork, resource);
+    if (claimId !== undefined) physical.set(claimId, get(state.claims, claimId)!);
+  }
+  return {
+    ...selected,
+    control: group.control,
+    physicalClaims: [...physical.values()],
+    unclosedOwners: [
+      ...(get(state.unclosedOwners, selected.taskId) ?? HashMap.empty<string, true>()),
+    ].map(([run]) => get(state.owners, run)!),
+  };
+};
+type GroupInput =
+  | Record
+  | Batch
+  | { readonly recorded: WorkRecord; readonly native: unknown }
+  | readonly ReconciliationRecord[];
+const isReconciliationBatch = (input: GroupInput): input is readonly ReconciliationRecord[] =>
+  Array.isArray(input);
+export const reduceTaskGroup = (state: State, input: GroupInput): State => {
+  if (isReconciliationBatch(input)) return reduceTaskReconciliation(state, input);
+  if ("root" in input) return reduceTaskMembership(state, input);
+  if ("recorded" in input) return reduceTaskWork(state, input);
+  const event = input.event;
+  switch (event.type) {
+    case "task-group.created":
+    case "task-group.manager-changed":
+    case "task-group.hold-changed":
+      return reduceTaskGroupControl(state, { ...input, event });
+    case "task.membership-changed":
+    case "task-group.membership-changed":
+      return conflict("incomplete_batch", event.id);
+    case "task.run-ownership-accepted":
+    case "task.run-ownership-uncertain":
+    case "task.run-ownership-terminated":
+      return reduceTaskRunOwnership(state, { ...input, event });
+    case "task-group.work-accepted":
+    case "task-group.work-uncertain":
+    case "task-group.work-released":
+      return reduceTaskWork(state, { ...input, event });
+    case "task.dirty-source-recorded":
+    case "task.dirty-acknowledged":
+    case "task.reconciliation-progressed":
+      return reduceTaskReconciliation(state, [{ ...input, event }]);
+    case "task.ready-sequence-updated":
+      return reduceTaskReadiness(state, { ...input, event });
+    default: {
+      const unsupported: never = event;
+      return conflict("envelope", String(unsupported));
+    }
+  }
 };
