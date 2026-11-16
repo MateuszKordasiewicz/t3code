@@ -1,7 +1,8 @@
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
-import { WorkTaskError } from "@t3tools/contracts";
+import { WorkTaskError, WorkTaskNativeLaunchReservation } from "@t3tools/contracts";
 
 export interface NativeLaunchIntent {
   readonly environmentId: string;
@@ -32,6 +33,45 @@ type TerminalRow = { event_id: string; sequence: number; status: string };
 
 const error = (code: WorkTaskError["code"], message: string) =>
   new WorkTaskError({ code, message });
+const decodeReservation = Schema.decodeUnknownEffect(WorkTaskNativeLaunchReservation);
+
+export const readNativeLaunchReservation = Effect.fn("TaskNativeLaunchBinding.readReservation")(
+  function* (commandId: string) {
+    const sql = yield* SqlClient.SqlClient;
+    const rows = yield* sql<{
+      command_id: string;
+      environment_id: string;
+      task_id: string;
+      group_id: string;
+      manager_thread_id: string;
+      manager_generation: number;
+      membership_generation: number;
+      definition_revision: number;
+      lifecycle_revision: number;
+      allowance_unit: number;
+      message_id: string;
+      claimed_at: string;
+    }>`SELECT c.*,i.message_id FROM work_task_native_launch_claims c
+      JOIN work_task_native_launch_intents i ON i.command_id=c.command_id
+      WHERE c.command_id=${commandId}`;
+    const row = rows[0];
+    if (!row) return undefined;
+    return yield* decodeReservation({
+      commandId: row.command_id,
+      environmentId: row.environment_id,
+      taskId: row.task_id,
+      groupId: row.group_id,
+      managerThreadId: row.manager_thread_id,
+      managerGeneration: row.manager_generation,
+      membershipGeneration: row.membership_generation,
+      definitionRevision: row.definition_revision,
+      lifecycleRevision: row.lifecycle_revision,
+      allowanceUnit: row.allowance_unit,
+      messageId: row.message_id,
+      claimedAt: row.claimed_at,
+    }).pipe(Effect.mapError(() => error("invalid_state", "Native launch reservation is invalid")));
+  },
+);
 
 export const reserveNativeLaunch = Effect.fn("TaskNativeLaunchBinding.reserve")(function* (
   input: NativeLaunchIntent,
@@ -60,9 +100,10 @@ export const reserveNativeLaunch = Effect.fn("TaskNativeLaunchBinding.reserve")(
           return yield* error("invalid_state", "Native launch has no durable work claim");
         return row;
       }
-      const receipt =
-        yield* sql`SELECT 1 FROM orchestration_v2_command_receipts WHERE command_id=${input.commandId}`;
-      if (receipt.length)
+      const receipts =
+        yield* sql`SELECT 1 FROM orchestration_command_receipts WHERE command_id=${input.commandId}
+        UNION ALL SELECT 1 FROM orchestration_v2_command_receipts WHERE command_id=${input.commandId}`;
+      if (receipts.length)
         return yield* error("revision_conflict", "Native command predates the Task reservation");
       const eligible = yield* sql<{
         generation: number;
@@ -138,6 +179,104 @@ export const reconcileNativeLaunch = Effect.fn("TaskNativeLaunchBinding.reconcil
         yield* sql<IntentRow>`SELECT * FROM work_task_native_launch_intents WHERE command_id=${commandId}`;
       const intent = intents[0];
       if (!intent) return yield* error("not_found", "Native launch reservation not found");
+      const liveReceipts = yield* sql<{
+        aggregate_kind: string;
+        aggregate_id: string;
+        command_type: string;
+        status: string;
+        result_sequence: number;
+      }>`SELECT aggregate_kind,aggregate_id,command_type,status,result_sequence
+        FROM orchestration_command_receipts WHERE command_id=${commandId}`;
+      const liveReceipt = liveReceipts[0];
+      if (liveReceipt) {
+        if (
+          liveReceipt.aggregate_kind !== "thread" ||
+          liveReceipt.aggregate_id !== intent.manager_thread_id ||
+          liveReceipt.command_type !== "message.dispatch"
+        )
+          return yield* error(
+            "revision_conflict",
+            "Native receipt has a different command or thread",
+          );
+        if (liveReceipt.status === "rejected") return { state: "rejected" as const, commandId };
+        if (liveReceipt.status !== "accepted")
+          return yield* error("invalid_state", "Native receipt status is unknown");
+        const liveRuns = yield* sql<{
+          event_id: string;
+          sequence: number;
+          run_id: string | null;
+          message_id: string | null;
+        }>`SELECT event_id,sequence,json_extract(payload_json,'$.id') run_id,
+            json_extract(payload_json,'$.userMessageId') message_id
+          FROM orchestration_events WHERE command_id=${commandId}
+            AND aggregate_kind='thread' AND stream_id=${intent.manager_thread_id}
+            AND application_event_version=2 AND event_type='run.created' ORDER BY sequence`;
+        if (!liveRuns.length) return { state: "uncertain" as const, commandId };
+        if (
+          liveRuns.length !== 1 ||
+          liveRuns[0]!.run_id === null ||
+          liveRuns[0]!.message_id !== intent.message_id ||
+          liveRuns[0]!.sequence > liveReceipt.result_sequence
+        )
+          return yield* error("invalid_state", "Native run does not match the reserved message");
+        const liveRun = liveRuns[0]!;
+        const priorLive = yield* sql<BindingRow>`SELECT * FROM work_task_native_live_bindings
+          WHERE command_id=${commandId}`;
+        if (priorLive.length) {
+          if (
+            priorLive[0]!.run_id !== liveRun.run_id ||
+            priorLive[0]!.run_event_id !== liveRun.event_id ||
+            priorLive[0]!.run_sequence !== liveRun.sequence ||
+            priorLive[0]!.receipt_sequence !== liveReceipt.result_sequence
+          )
+            return yield* error("revision_conflict", "Native launch binding changed");
+        } else {
+          yield* sql`INSERT INTO work_task_native_live_bindings
+            (command_id,run_id,run_event_id,run_sequence,receipt_sequence)
+            VALUES (${commandId},${liveRun.run_id},${liveRun.event_id},${liveRun.sequence},${liveReceipt.result_sequence})`;
+        }
+        const terminals = yield* sql<TerminalRow>`SELECT event_id,sequence,
+            json_extract(payload_json,'$.status') status
+          FROM orchestration_events WHERE aggregate_kind='thread'
+            AND stream_id=${intent.manager_thread_id} AND application_event_version=2
+            AND event_type='run.updated' AND sequence>=${liveRun.sequence}
+            AND json_extract(payload_json,'$.id')=${liveRun.run_id}
+            AND json_extract(payload_json,'$.userMessageId')=${intent.message_id}
+            AND json_extract(payload_json,'$.status') IN ('completed','interrupted','failed','cancelled','rolled_back')
+          ORDER BY sequence`;
+        for (const terminal of terminals) {
+          const observed = yield* sql<{ command_id: string; sequence: number; status: string }>`
+            SELECT command_id,sequence,status FROM work_task_native_live_terminals
+            WHERE event_id=${terminal.event_id}`;
+          if (observed.length) {
+            if (
+              observed[0]!.command_id !== commandId ||
+              observed[0]!.sequence !== terminal.sequence ||
+              observed[0]!.status !== terminal.status
+            )
+              return yield* error("revision_conflict", "Native terminal evidence changed");
+          } else {
+            yield* sql`INSERT INTO work_task_native_live_terminals
+              (command_id,event_id,sequence,status)
+              VALUES (${commandId},${terminal.event_id},${terminal.sequence},${terminal.status})`;
+          }
+        }
+        const latestLive = terminals.at(-1);
+        return latestLive
+          ? {
+              state: "terminal" as const,
+              commandId,
+              runId: liveRun.run_id,
+              status: latestLive.status,
+              sequence: latestLive.sequence,
+            }
+          : {
+              state: "bound" as const,
+              commandId,
+              runId: liveRun.run_id,
+              sequence: liveRun.sequence,
+            };
+      }
       const receipts = yield* sql<{
         thread_id: string;
         command_type: string;

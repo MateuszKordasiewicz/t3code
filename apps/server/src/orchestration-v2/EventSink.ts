@@ -36,6 +36,7 @@ import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+import { readNativeLaunchReservation } from "../tasks/TaskNativeLaunchBinding.ts";
 
 export class EventSinkWriteError extends Schema.TaggedError<EventSinkWriteError>()(
   "EventSinkWriteError",
@@ -687,9 +688,23 @@ const layerBase: Layer.Layer<
               ? input.events
               : yield* updateDelegatedCompletionOnly(input.events, (id) => id === runId),
           );
+          const reservation =
+            input.commandType === "message.dispatch" &&
+            normalized.some((event) => event.type === "run.created")
+              ? yield* readNativeLaunchReservation(input.commandId).pipe(
+                  Effect.provideService(SqlClient.SqlClient, sql),
+                )
+              : undefined;
           const storedEvents = yield* eventStore.append({
             commandId: input.commandId,
-            events: normalized,
+            events:
+              reservation === undefined
+                ? normalized
+                : normalized.map((event) =>
+                    event.type === "run.created"
+                      ? { ...event, payload: { ...event.payload, nativeTaskLaunch: reservation } }
+                      : event,
+                  ),
           });
           // A Stop that changes nothing can still queue the stop of its delegated tasks.
           const sequence =

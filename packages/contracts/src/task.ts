@@ -1872,6 +1872,21 @@ export const WorkTaskRunBindingV2 = Schema.Struct({
   effectId: shortText,
 }).check(membershipEnvironment);
 export type WorkTaskRunBindingV2 = typeof WorkTaskRunBindingV2.Type;
+export const WorkTaskNativeLaunchReservation = Schema.Struct({
+  commandId: CommandId,
+  environmentId: EnvironmentId,
+  taskId: WorkTaskId,
+  groupId: WorkTaskManagerGroupId,
+  managerThreadId: ThreadId,
+  managerGeneration: WorkTaskGroupManagerGeneration,
+  membershipGeneration: WorkTaskMembershipGeneration,
+  definitionRevision: workPositive,
+  lifecycleRevision: workPositive,
+  allowanceUnit: workPositive,
+  messageId: MessageId,
+  claimedAt: persistedTime,
+});
+export type WorkTaskNativeLaunchReservation = typeof WorkTaskNativeLaunchReservation.Type;
 export const WorkTaskPrerequisiteCompletionWitness = Schema.Struct({
   edgeId: WorkTaskGraphEdgeId,
   blocker: WorkTaskGraphTaskRef,

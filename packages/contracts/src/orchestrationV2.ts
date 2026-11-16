@@ -56,7 +56,11 @@ import {
   OrchestrationGetTurnDiffResult,
 } from "./checkpointDiff.ts";
 import { ModelSelection } from "./modelSelection.ts";
-import { WorkTaskManagerRunBinding, WorkTaskRunBindingV2 } from "./task.ts";
+import {
+  WorkTaskManagerRunBinding,
+  WorkTaskNativeLaunchReservation,
+  WorkTaskRunBindingV2,
+} from "./task.ts";
 import {
   ThreadLinkedPullRequest,
   ThreadPullRequestLink,
@@ -691,16 +695,25 @@ const selectedWorkRunBinding = Schema.makeFilter(
     modelSelection: ModelSelection;
     taskManagerBinding?: WorkTaskManagerRunBinding | undefined;
     taskWorkBindingV2?: WorkTaskRunBindingV2 | undefined;
+    nativeTaskLaunch?: WorkTaskNativeLaunchReservation | undefined;
   }) => {
     const binding = run.taskWorkBindingV2;
+    const reservation = run.nativeTaskLaunch;
     return (
-      binding === undefined ||
-      (run.taskManagerBinding === undefined &&
-        run.id === binding.runId &&
-        run.threadId === binding.manager.threadId &&
-        run.userMessageId === binding.messageId &&
-        run.providerInstanceId === binding.providerInstanceId &&
-        run.modelSelection.instanceId === binding.providerInstanceId)
+      (reservation === undefined ||
+        (run.threadId === reservation.managerThreadId &&
+          run.userMessageId === reservation.messageId)) &&
+      (binding === undefined ||
+        (run.taskManagerBinding === undefined &&
+          run.id === binding.runId &&
+          run.threadId === binding.manager.threadId &&
+          run.userMessageId === binding.messageId &&
+          run.providerInstanceId === binding.providerInstanceId &&
+          run.modelSelection.instanceId === binding.providerInstanceId &&
+          (reservation === undefined ||
+            (binding.commandId === reservation.commandId &&
+              binding.task.taskId === reservation.taskId &&
+              binding.group.groupId === reservation.groupId))))
     );
   },
   { expected: "one task binding matching the accepted run, manager, message and provider" },
@@ -711,6 +724,7 @@ export const OrchestrationV2Run = Schema.Struct({
   threadId: ThreadId,
   taskManagerBinding: Schema.optional(WorkTaskManagerRunBinding),
   taskWorkBindingV2: Schema.optional(WorkTaskRunBindingV2),
+  nativeTaskLaunch: Schema.optional(WorkTaskNativeLaunchReservation),
   ordinal: PositiveInt,
   providerInstanceId: ProviderInstanceId,
   modelSelection: ModelSelection,
