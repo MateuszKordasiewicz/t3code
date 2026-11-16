@@ -51,6 +51,13 @@ export const reserveNativeLaunch = Effect.fn("TaskNativeLaunchBinding.reserve")(
           row.message_id !== input.messageId
         )
           return yield* error("revision_conflict", "Launch command already reserved differently");
+        const claim = yield* sql`SELECT 1 FROM work_task_native_launch_claims
+          WHERE command_id=${input.commandId} AND environment_id=${input.environmentId}
+            AND task_id=${input.taskId} AND group_id=${input.groupId}
+            AND manager_thread_id=${input.managerThreadId}
+            AND manager_generation=${row.manager_generation}`;
+        if (claim.length !== 1)
+          return yield* error("invalid_state", "Native launch has no durable work claim");
         return row;
       }
       const receipt =
@@ -59,26 +66,54 @@ export const reserveNativeLaunch = Effect.fn("TaskNativeLaunchBinding.reserve")(
         return yield* error("revision_conflict", "Native command predates the Task reservation");
       const eligible = yield* sql<{
         generation: number;
-      }>`SELECT g.current_manager_generation generation
+        membership_generation: number;
+        definition_revision: number;
+        lifecycle_revision: number;
+        allowance_unit: number;
+      }>`SELECT g.current_manager_generation generation,
+          m.membership_generation, t.definition_revision, t.lifecycle_revision,
+          a.consumed+1 allowance_unit
         FROM work_task_manager_groups g
         JOIN work_task_group_memberships m ON m.environment_id=g.environment_id AND m.group_id=g.group_id
         JOIN work_task_projections t ON t.task_id=m.task_id
+        JOIN work_task_current_state s ON s.task_id=t.task_id
+        JOIN work_task_allowances a ON a.task_id=t.task_id
         JOIN orchestration_v2_projection_threads p ON p.thread_id=g.current_manager_thread_id AND p.project_id=t.project_id
         WHERE g.environment_id=${input.environmentId} AND g.group_id=${input.groupId}
           AND g.current_manager_thread_id=${input.managerThreadId} AND g.dispatch_hold='none'
           AND m.task_id=${input.taskId} AND m.retired_event_id IS NULL
-          AND p.deleted_at IS NULL
-          AND EXISTS(SELECT 1 FROM work_task_accepted_definitions a WHERE a.task_id=t.task_id AND a.definition_revision=t.definition_revision)`;
+          AND p.deleted_at IS NULL AND s.desired_mode='active' AND s.execution_mode='idle'
+          AND a.consumed<a.configured_cap
+          AND NOT EXISTS(SELECT 1 FROM work_task_native_launch_intents i
+            WHERE i.environment_id=g.environment_id AND (i.group_id=g.group_id OR i.task_id=t.task_id OR i.manager_thread_id=g.current_manager_thread_id))
+          AND NOT EXISTS(SELECT 1 FROM work_task_native_launch_claims c
+            WHERE c.environment_id=g.environment_id AND (c.group_id=g.group_id OR c.task_id=t.task_id OR c.manager_thread_id=g.current_manager_thread_id))
+          AND NOT EXISTS(SELECT 1 FROM work_task_executable_claims c
+            WHERE c.release_event_id IS NULL AND (c.task_id=t.task_id OR (c.environment_id=g.environment_id AND c.group_id=g.group_id)
+              OR c.manager_thread_id=g.current_manager_thread_id))
+          AND EXISTS(SELECT 1 FROM work_task_accepted_definitions d WHERE d.task_id=t.task_id AND d.definition_revision=t.definition_revision)`;
       if (eligible.length !== 1 || eligible[0]!.generation === null)
         return yield* error(
           "invalid_state",
           "Task, manager, or accepted definition is unavailable",
         );
-      const generation = eligible[0]!.generation;
+      const {
+        generation,
+        membership_generation,
+        definition_revision,
+        lifecycle_revision,
+        allowance_unit,
+      } = eligible[0]!;
       const createdAt = DateTime.formatIso(yield* DateTime.now);
       yield* sql`INSERT INTO work_task_native_launch_intents
         (command_id,environment_id,task_id,group_id,manager_thread_id,manager_generation,message_id,created_at)
         VALUES (${input.commandId},${input.environmentId},${input.taskId},${input.groupId},${input.managerThreadId},${generation},${input.messageId},${createdAt})`;
+      yield* sql`INSERT INTO work_task_native_launch_claims
+        (command_id,environment_id,task_id,group_id,manager_thread_id,manager_generation,
+          membership_generation,definition_revision,lifecycle_revision,allowance_unit,claimed_at)
+        VALUES (${input.commandId},${input.environmentId},${input.taskId},${input.groupId},
+          ${input.managerThreadId},${generation},${membership_generation},${definition_revision},
+          ${lifecycle_revision},${allowance_unit},${createdAt})`;
       return {
         command_id: input.commandId,
         environment_id: input.environmentId,

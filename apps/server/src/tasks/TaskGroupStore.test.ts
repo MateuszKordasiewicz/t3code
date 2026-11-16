@@ -250,13 +250,65 @@ it.effect("reserves the native message once and recovers its exact run and termi
       commandId: "native-message",
       messageId: "native-message-id",
     };
+    const browser = yield* makeTaskSessionService({
+      sessionId: AuthSessionId.make("session"),
+      subject: "owner",
+      method: "browser-session-cookie",
+      scopes: [AuthOrchestrationOperateScope, AuthOrchestrationReadScope],
+    });
+    const token = yield* makeTaskSessionService({
+      sessionId: AuthSessionId.make("session"),
+      subject: "owner",
+      method: "bearer-access-token",
+      scopes: [AuthOrchestrationOperateScope, AuthOrchestrationReadScope],
+    });
     const sql = yield* SqlClient.SqlClient;
+    const denied = yield* token.reserveLaunch(intent).pipe(Effect.flip);
+    assert.strictEqual(denied.code, "unsupported");
+    assert.strictEqual((yield* sql`SELECT * FROM work_task_native_launch_intents`).length, 0);
     const missing = yield* reconcileNativeLaunch(intent.commandId).pipe(Effect.flip);
     assert.strictEqual(missing._tag, "WorkTaskError");
     if (missing._tag === "WorkTaskError") assert.strictEqual(missing.code, "not_found");
-    const reserved = yield* reserveNativeLaunch(intent);
+    const unconfigured = yield* reserveNativeLaunch(intent).pipe(Effect.flip);
+    assert.strictEqual(unconfigured._tag, "WorkTaskError");
+    if (unconfigured._tag === "WorkTaskError")
+      assert.strictEqual(unconfigured.code, "invalid_state");
+    yield* sql`INSERT INTO work_task_allowances VALUES('task',1,0)`;
+    yield* sql`UPDATE work_task_current_state SET desired_mode='closed',execution_mode='idle'
+      WHERE task_id='task'`;
+    const stopped = yield* reserveNativeLaunch(intent).pipe(Effect.flip);
+    assert.strictEqual(stopped._tag, "WorkTaskError");
+    if (stopped._tag === "WorkTaskError") assert.strictEqual(stopped.code, "invalid_state");
+    yield* sql`UPDATE work_task_current_state SET desired_mode='active',execution_mode='idle'
+      WHERE task_id='task'`;
+    yield* sql`UPDATE work_task_allowances SET consumed=1 WHERE task_id='task'`;
+    const exhausted = yield* reserveNativeLaunch(intent).pipe(Effect.flip);
+    assert.strictEqual(exhausted._tag, "WorkTaskError");
+    if (exhausted._tag === "WorkTaskError") assert.strictEqual(exhausted.code, "invalid_state");
+    yield* sql`UPDATE work_task_allowances SET consumed=0 WHERE task_id='task'`;
+    yield* sql`CREATE TRIGGER reject_native_claim BEFORE INSERT ON work_task_native_launch_claims
+      BEGIN SELECT RAISE(ABORT,'claim write failed'); END`;
+    assert.isTrue(yield* reserveNativeLaunch(intent).pipe(Effect.isFailure));
+    assert.strictEqual((yield* sql`SELECT * FROM work_task_native_launch_intents`).length, 0);
+    yield* sql`DROP TRIGGER reject_native_claim`;
+    const reserved = yield* browser.reserveLaunch(intent);
     assert.strictEqual(reserved.manager_generation, 1);
     assert.deepStrictEqual(yield* reserveNativeLaunch(intent), reserved);
+    const claims = yield* sql<{
+      allowance_unit: number;
+    }>`SELECT allowance_unit FROM work_task_native_launch_claims`;
+    assert.deepStrictEqual(
+      claims.map((row) => row.allowance_unit),
+      [1],
+    );
+    const competing = yield* reserveNativeLaunch({
+      ...intent,
+      commandId: "second-message",
+      messageId: "second-message-id",
+    }).pipe(Effect.flip);
+    assert.strictEqual(competing._tag, "WorkTaskError");
+    if (competing._tag === "WorkTaskError") assert.strictEqual(competing.code, "invalid_state");
+    assert.strictEqual((yield* sql`SELECT * FROM work_task_native_launch_intents`).length, 1);
     assert.strictEqual((yield* reconcileNativeLaunch(intent.commandId)).state, "reserved");
     const reused = yield* reserveNativeLaunch({ ...intent, messageId: "different" }).pipe(
       Effect.flip,
@@ -265,6 +317,25 @@ it.effect("reserves the native message once and recovers its exact run and termi
     if (reused._tag === "WorkTaskError") assert.strictEqual(reused.code, "revision_conflict");
     yield* sql`INSERT INTO orchestration_v2_command_receipts VALUES(${intent.commandId},'manager','message.dispatch',${time},1,'accepted',NULL)`;
     assert.strictEqual((yield* reconcileNativeLaunch(intent.commandId)).state, "uncertain");
+    yield* sql`UPDATE work_task_current_state SET desired_mode='paused' WHERE task_id='task'`;
+    assert.isTrue(
+      yield* sql`INSERT INTO orchestration_v2_events
+      (sequence,event_id,command_id,thread_id,run_id,event_type,occurred_at,payload_json)
+      VALUES (1,'paused-run',${intent.commandId},'manager','native-run','run.created',${time},
+        ${JSON.stringify({ type: "run.created", payload: { id: "native-run", userMessageId: intent.messageId } })})`.pipe(
+        Effect.isFailure,
+      ),
+    );
+    assert.strictEqual((yield* sql`SELECT * FROM orchestration_v2_events`).length, 0);
+    yield* sql`UPDATE work_task_current_state SET desired_mode='active' WHERE task_id='task'`;
+    assert.isTrue(
+      yield* sql`INSERT INTO orchestration_v2_events
+      (sequence,event_id,command_id,thread_id,run_id,event_type,occurred_at,payload_json)
+      VALUES (1,'wrong-run-message',${intent.commandId},'manager','native-run','run.created',${time},
+        ${JSON.stringify({ type: "run.created", payload: { id: "native-run", userMessageId: "other" } })})`.pipe(
+        Effect.isFailure,
+      ),
+    );
     yield* sql`INSERT INTO orchestration_v2_events
       (sequence,event_id,command_id,thread_id,run_id,event_type,occurred_at,payload_json)
       VALUES (1,'run-created',${intent.commandId},'manager','native-run','run.created',${time},
@@ -290,6 +361,18 @@ it.effect("reserves the native message once and recovers its exact run and termi
       (yield* sql`SELECT * FROM work_task_native_terminal_observations`).length,
       1,
     );
+    yield* sql`INSERT INTO work_task_native_launch_intents
+      (command_id,environment_id,task_id,group_id,manager_thread_id,manager_generation,message_id,created_at)
+      VALUES ('legacy-command','env','task','group','manager',1,'legacy-message',${time})`;
+    assert.strictEqual((yield* reconcileNativeLaunch("legacy-command")).state, "reserved");
+    const legacyReplay = yield* reserveNativeLaunch({
+      ...intent,
+      commandId: "legacy-command",
+      messageId: "legacy-message",
+    }).pipe(Effect.flip);
+    assert.strictEqual(legacyReplay._tag, "WorkTaskError");
+    if (legacyReplay._tag === "WorkTaskError")
+      assert.strictEqual(legacyReplay.code, "invalid_state");
   }).pipe(Effect.provide(sessionLayer)),
 );
 const input = {

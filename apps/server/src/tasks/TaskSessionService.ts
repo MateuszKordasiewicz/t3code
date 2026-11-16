@@ -15,6 +15,7 @@ import * as Schema from "effect/Schema";
 import type { AuthenticatedSession } from "../auth/EnvironmentAuth.ts";
 import { ServerEnvironment } from "../environment/ServerEnvironment.ts";
 import { TaskService } from "./TaskService.ts";
+import { reserveNativeLaunch, type NativeLaunchIntent } from "./TaskNativeLaunchBinding.ts";
 
 const isTaskError = Schema.is(WorkTaskError);
 const decodeCommitted = Schema.decodeUnknownEffect(WorkTaskCreateDraftResult);
@@ -93,6 +94,12 @@ export const makeTaskSessionService = Effect.fn("TaskSessionService.make")(funct
     const environmentId = yield* environment.getEnvironmentId;
     return yield* decodeGroup(yield* tasks.createInitialGroup({ ...input, environmentId }, caller));
   });
+  const reserveLaunch = Effect.fn("TaskSessionService.reserveLaunch")(function* (
+    input: Omit<NativeLaunchIntent, "environmentId">,
+  ) {
+    const environmentId = yield* environment.getEnvironmentId;
+    return yield* reserveNativeLaunch({ ...input, environmentId });
+  });
   const mapError = (error: unknown) =>
     isTaskError(error)
       ? error
@@ -106,5 +113,7 @@ export const makeTaskSessionService = Effect.fn("TaskSessionService.make")(funct
       authorize(true, accept(input)).pipe(Effect.mapError(mapError)),
     createInitialGroup: (input: Parameters<typeof createInitialGroup>[0]) =>
       authorize(true, createInitialGroup(input)).pipe(Effect.mapError(mapError)),
+    reserveLaunch: (input: Parameters<typeof reserveLaunch>[0]) =>
+      authorize(true, reserveLaunch(input)).pipe(Effect.mapError(mapError)),
   };
 });
