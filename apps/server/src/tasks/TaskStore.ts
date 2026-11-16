@@ -5,6 +5,7 @@ import {
   WorkTaskCallerContext,
   WorkTaskCompletionPolicyOverride,
   WorkTaskAllowanceState,
+  WorkTaskWaitTarget,
   WorkTaskId,
   ProjectId,
   ThreadId,
@@ -135,6 +136,7 @@ export class TaskProjectionError extends Schema.TaggedError<TaskProjectionError>
       "command",
       "unit",
       "wake",
+      "wait",
       "acknowledgement",
       "sql",
     ]),
@@ -316,9 +318,31 @@ type WakeRead = typeof WakeState.Type & {
   readonly pending: ReadonlyArray<WakeSourceRead>;
 };
 
+const WaitRow = Schema.Struct({
+  taskId: WorkTaskId,
+  waitId: Schema.String,
+  managerGeneration: positive,
+  target: WorkTaskWaitTarget,
+  state: Schema.Literals(["registered", "cleared"]),
+  updatedSequence: natural,
+  updatedAt: Schema.String,
+});
+type WaitEvent = Extract<WorkTaskPersistedEvent["event"], { type: "task.wait-updated" }>;
+type WaitRead = typeof WaitRow.Type & { readonly managerThreadId: string; readonly source: Native };
+
 export class TaskStore extends Context.Service<
   TaskStore,
   {
+    readonly readWait: (input: {
+      taskId: string;
+      waitId: string;
+    }) => Effect.Effect<WaitRead | undefined, ProjectionFailure>;
+    readonly applyWait: (
+      recorded: WorkTaskPersistedEvent,
+    ) => Effect.Effect<
+      { readonly applied: boolean; readonly lastSequence: number; readonly viewGeneration: number },
+      ProjectionFailure
+    >;
     readonly readWake: (taskId: string) => Effect.Effect<WakeRead | undefined, ProjectionFailure>;
     readonly readWakeSource: (input: {
       taskId: string;
@@ -1709,6 +1733,137 @@ const make = Effect.gen(function* () {
         }),
       ).pipe(NodeSqliteClient.readOnly),
   );
+  const waitRow = Effect.fn("TaskStore.readWaitRow")(function* (taskId: string, waitId: string) {
+    const rows = yield* sql<{ payload: string; valid: number; target_hex: string }>`SELECT
+      typeof(manager_generation)='integer' AND typeof(updated_sequence)='integer' AS valid,
+      hex(json_object('taskId',task_id,'waitId',wait_id,'managerGeneration',manager_generation,'target',json(target_json),
+        'state',state,'updatedSequence',updated_sequence,'updatedAt',updated_at)) AS payload,hex(target_json) AS target_hex
+      FROM work_task_waits WHERE task_id=json_extract(${yield* encodeProjectionJson(taskId)},'$') AND wait_id=json_extract(${yield* encodeProjectionJson(waitId)},'$')`;
+    const value = yield* stored(WaitRow, rows[0]);
+    if (!value) return undefined;
+    yield* guard(value.taskId === taskId && value.waitId === waitId, "invalid");
+    return { value, targetHex: rows[0]!.target_hex };
+  });
+  const waitBinding = Effect.fn("TaskStore.checkWaitBinding")(function* (
+    event: WaitEvent,
+    sequence: number,
+    through: number,
+  ) {
+    const binding = yield* bindingAt(event.taskId, event.managerGeneration, through);
+    yield* guard(
+      binding !== undefined &&
+        binding.managerThreadId === event.managerThreadId &&
+        binding.bound.recorded.context.sequence < sequence,
+      "manager",
+    );
+  });
+  const waitAt = Effect.fn("TaskStore.readWaitAt")(function* (
+    taskId: string,
+    waitId: string,
+    through: number,
+  ) {
+    const row = yield* waitRow(taskId, waitId);
+    if (!row) return undefined;
+    const value = row.value;
+    yield* guard(value.updatedSequence <= through, "legacy");
+    const source = yield* readNativeSequence({ taskId, sequence: value.updatedSequence });
+    const event = source.recorded.event;
+    if (event.type !== "task.wait-updated")
+      return yield* new TaskProjectionError({ code: "legacy" });
+    yield* guard(
+      event.waitId === value.waitId &&
+        event.managerGeneration === value.managerGeneration &&
+        event.state === value.state &&
+        event.occurredAt === value.updatedAt &&
+        NodeUtil.isDeepStrictEqual(event.target, value.target),
+      "legacy",
+    );
+    yield* waitBinding(event, value.updatedSequence, through);
+    return {
+      value: { ...value, managerThreadId: event.managerThreadId, source },
+      targetHex: row.targetHex,
+    };
+  });
+  const waitViewAt = Effect.fn("TaskStore.readWaitViewAt")(function* (taskId: string) {
+    const through = yield* projectedCheckpoint(taskId);
+    const rows =
+      yield* sql`SELECT 1 FROM work_task_waits WHERE task_id=json_extract(${yield* encodeProjectionJson(taskId)},'$') LIMIT 1`;
+    if (through === undefined) {
+      yield* guard(rows.length === 0 && !(yield* wakePresence(taskId, true)), "legacy");
+      return undefined;
+    }
+    const source = yield* readFoundationSource({ taskId, checkpointSequence: through });
+    const marker = yield* referenceCheckpoint(taskId);
+    yield* guard(
+      marker !== undefined &&
+        marker.creationEventId === source.creation.recorded.event.id &&
+        marker.creationSequence === source.creation.recorded.context.sequence &&
+        marker.eventId === source.checkpoint?.recorded.event.id &&
+        marker.sequence === through &&
+        marker.streamVersion === source.checkpoint?.streamVersion,
+      "qualification",
+    );
+    const latest = yield* latestType(taskId, "task.wait-updated", through);
+    if (latest) {
+      const event = latest.recorded.event;
+      if (event.type !== "task.wait-updated")
+        return yield* new TaskProjectionError({ code: "legacy" });
+      const current = yield* waitAt(taskId, event.waitId, through);
+      yield* guard(
+        current !== undefined &&
+          NodeUtil.isDeepStrictEqual(current.value.source.recorded, latest.recorded),
+        "legacy",
+      );
+    } else yield* guard(rows.length === 0, "legacy");
+    return through;
+  });
+  const readWait = Effect.fn("TaskStore.readWait")((input: { taskId: string; waitId: string }) =>
+    projectTransaction(
+      Effect.gen(function* () {
+        const through = yield* waitViewAt(input.taskId);
+        return through === undefined
+          ? undefined
+          : (yield* waitAt(input.taskId, input.waitId, through))?.value;
+      }),
+    ).pipe(NodeSqliteClient.readOnly),
+  );
+  const applyWaitAt = Effect.fn("TaskStore.applyWaitAt")(function* (
+    recorded: WorkTaskPersistedEvent,
+    replay: boolean,
+  ) {
+    const { event, context } = recorded;
+    if (event.type !== "task.wait-updated")
+      return yield* new TaskProjectionError({ code: "unsupported" });
+    const through = yield* waitViewAt(event.taskId);
+    if (through === undefined) return yield* new TaskProjectionError({ code: "legacy" });
+    yield* waitBinding(event, context.sequence, through);
+    const previous = yield* waitAt(event.taskId, event.waitId, through);
+    if (previous)
+      yield* guard(NodeUtil.isDeepStrictEqual(previous.value.target, event.target), "wait");
+    if (replay) {
+      yield* guard(
+        previous !== undefined &&
+          context.sequence <= previous.value.updatedSequence &&
+          (context.sequence !== previous.value.updatedSequence ||
+            NodeUtil.isDeepStrictEqual(previous.value.source.recorded, recorded)),
+        "replay",
+      );
+      return;
+    }
+    const task = yield* encodeProjectionJson(event.taskId),
+      id = yield* encodeProjectionJson(event.waitId);
+    if (!previous) {
+      yield* guard(event.state === "registered", "wait");
+      yield* sql`INSERT INTO work_task_waits VALUES(json_extract(${task},'$'),json_extract(${id},'$'),${event.managerGeneration},
+        ${yield* encodeProjectionJson(event.target)},${event.state},${context.sequence},${event.occurredAt})`;
+    } else {
+      const changed =
+        yield* sql`UPDATE work_task_waits SET manager_generation=${event.managerGeneration},state=${event.state},updated_sequence=${context.sequence},updated_at=${event.occurredAt}
+        WHERE task_id=json_extract(${task},'$') AND wait_id=json_extract(${id},'$') AND updated_sequence=${previous.value.updatedSequence}
+        AND state=${previous.value.state} AND manager_generation=${previous.value.managerGeneration} AND hex(target_json)=${previous.targetHex} RETURNING 1`;
+      yield* guard(changed.length === 1, "cas");
+    }
+  });
   const wakeDebit = Effect.fn("TaskStore.checkWakeDebit")(function* (
     taskId: string,
     unit: number,
@@ -1948,7 +2103,7 @@ const make = Effect.gen(function* () {
     }
   });
   const applyProjection = Effect.fn("TaskStore.applyProjection")(
-    (input: WorkTaskPersistedEvent, family: "foundation" | "managerAllowance" | "wake") =>
+    (input: WorkTaskPersistedEvent, family: "foundation" | "managerAllowance" | "wake" | "wait") =>
       projectTransaction(
         Effect.gen(function* () {
           const recorded = yield* decodeRecorded(input).pipe(
@@ -1956,19 +2111,21 @@ const make = Effect.gen(function* () {
           );
           const { event, context } = recorded;
           yield* guard(
-            (family === "wake"
-              ? wakeTypes
-              : family === "managerAllowance"
-                ? custodyTypes
-                : [
-                    "task.created",
-                    "task.definition-updated",
-                    "task.definition-accepted",
-                    "task.configuration-updated",
-                    "task.execution-updated",
-                    "task.thread-linked",
-                    "task.thread-unlinked",
-                  ]
+            (family === "wait"
+              ? ["task.wait-updated"]
+              : family === "wake"
+                ? wakeTypes
+                : family === "managerAllowance"
+                  ? custodyTypes
+                  : [
+                      "task.created",
+                      "task.definition-updated",
+                      "task.definition-accepted",
+                      "task.configuration-updated",
+                      "task.execution-updated",
+                      "task.thread-linked",
+                      "task.thread-unlinked",
+                    ]
             ).includes(event.type),
             "unsupported",
           );
@@ -1990,6 +2147,7 @@ const make = Effect.gen(function* () {
           });
           const view = yield* fence();
           if (source.checkpoint && original.streamVersion <= source.checkpoint.streamVersion) {
+            if (family === "wait") yield* applyWaitAt(recorded, true);
             if (family === "wake") yield* applyWakeAt(recorded, true);
             if (family === "managerAllowance") {
               if (event.type === "task.manager-bound" || event.type === "task.manager-retired") {
@@ -2029,7 +2187,17 @@ const make = Effect.gen(function* () {
             "completionPolicyRevision",
             "actionPolicyRevision",
           ] as const;
-          if (current) for (const key of keys) yield* guard(event[key] >= current[key], "revision");
+          const revisions = {
+            definitionRevision: event.definitionRevision,
+            lifecycleRevision: event.lifecycleRevision,
+            completionPolicyRevision: event.completionPolicyRevision,
+            actionPolicyRevision: event.actionPolicyRevision,
+          };
+          if (current)
+            for (const key of keys) {
+              if (family === "wait") revisions[key] = Math.max(current[key], event[key]);
+              else yield* guard(event[key] >= current[key], "revision");
+            }
           yield* guard(
             current ? event.type !== "task.created" : event.type === "task.created",
             "replay",
@@ -2037,6 +2205,9 @@ const make = Effect.gen(function* () {
           let effective = current?.definition;
           let activeLink: string | undefined;
           switch (event.type) {
+            case "task.wait-updated":
+              yield* applyWaitAt(recorded, false);
+              break;
             case "task.wake-source-recorded":
             case "task.wake-reserved":
             case "task.wake-claimed":
@@ -2202,8 +2373,8 @@ const make = Effect.gen(function* () {
           AND completion_policy_revision=${current.completionPolicyRevision} AND action_policy_revision=${current.actionPolicyRevision}) RETURNING 1`;
             yield* guard(changed.length === 1, "cas");
             const updated =
-              yield* sql`UPDATE work_task_projections SET definition_revision=${event.definitionRevision},lifecycle_revision=${event.lifecycleRevision},
-        completion_policy_revision=${event.completionPolicyRevision},action_policy_revision=${event.actionPolicyRevision},definition_json=${yield* encodeProjectionJson(effective)},updated_at=${event.occurredAt}
+              yield* sql`UPDATE work_task_projections SET definition_revision=${revisions.definitionRevision},lifecycle_revision=${revisions.lifecycleRevision},
+        completion_policy_revision=${revisions.completionPolicyRevision},action_policy_revision=${revisions.actionPolicyRevision},definition_json=${yield* encodeProjectionJson(effective)},updated_at=${event.occurredAt}
         WHERE task_id=json_extract(${yield* encodeProjectionJson(event.taskId)},'$') AND definition_revision=${current.definitionRevision} AND lifecycle_revision=${current.lifecycleRevision}
         AND completion_policy_revision=${current.completionPolicyRevision} AND action_policy_revision=${current.actionPolicyRevision} RETURNING 1`;
             yield* guard(updated.length === 1, "cas");
@@ -2240,6 +2411,7 @@ const make = Effect.gen(function* () {
             yield* sql`UPDATE work_task_view_fence SET generation=${view.generation + 1},high_water_sequence=${Math.max(view.high, context.sequence)}
       WHERE singleton_id=1 AND generation=${view.generation} AND high_water_sequence=${view.high} RETURNING 1`;
           yield* guard(advanced.length === 1, "cas");
+          if (family === "wait") yield* waitViewAt(event.taskId);
           if (family === "wake") yield* wakeViewAt(event.taskId);
           return {
             applied: true,
@@ -2248,6 +2420,9 @@ const make = Effect.gen(function* () {
           };
         }),
       ),
+  );
+  const applyWait = Effect.fn("TaskStore.applyWait")((input: WorkTaskPersistedEvent) =>
+    applyProjection(input, "wait"),
   );
   const applyWake = Effect.fn("TaskStore.applyWake")((input: WorkTaskPersistedEvent) =>
     applyProjection(input, "wake"),
@@ -2280,6 +2455,7 @@ const make = Effect.gen(function* () {
         Effect.gen(function* () {
           const task = yield* encodeProjectionJson(input.taskId);
           for (const table of [
+            "work_task_waits",
             "work_task_projections",
             "work_task_current_state",
             "work_task_accepted_definitions",
@@ -2301,7 +2477,10 @@ const make = Effect.gen(function* () {
           do {
             const page = yield* readNativeHistory({ ...input, ...(after ? { after } : {}) });
             for (const value of page.records) {
-              if (wakeTypes.includes(value.recorded.event.type)) yield* applyWake(value.recorded);
+              if (value.recorded.event.type === "task.wait-updated")
+                yield* applyWait(value.recorded);
+              else if (wakeTypes.includes(value.recorded.event.type))
+                yield* applyWake(value.recorded);
               else if (custodyTypes.includes(value.recorded.event.type))
                 yield* applyManagerAllowance(value.recorded);
               else yield* applyFoundation(value.recorded);
@@ -2314,6 +2493,8 @@ const make = Effect.gen(function* () {
   );
 
   return TaskStore.of({
+    readWait,
+    applyWait,
     applyWake,
     rebuildCustodyProjection,
     applyManagerAllowance,

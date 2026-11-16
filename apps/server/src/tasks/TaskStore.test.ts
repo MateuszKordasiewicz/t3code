@@ -9,8 +9,10 @@ import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as HashMap from "effect/HashMap";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import type { SqlError } from "effect/sql/SqlError";
 import { runMigrations } from "../persistence/Migrations.ts";
 import * as TaskStore from "./TaskStore.ts";
 import { reduceTaskCustody, reduceTaskFoundation } from "./TaskLifecycle.ts";
@@ -173,7 +175,8 @@ const appendTaskFact = Effect.fn("TaskStoreTest.appendTaskFact")(function* (
     COALESCE((SELECT max(stream_version) FROM orchestration_events WHERE aggregate_kind='task' AND stream_id=json_extract(${JSON.stringify(taskId)},'$')),-1)+1 AS version`;
   const value = yield* record(head!.sequence, { commandId: `command-${head!.sequence}`, ...input });
   yield* insert(value, head!.version);
-  if (value.event.type.startsWith("task.wake-")) yield* store.applyWake(value);
+  if (value.event.type === "task.wait-updated") yield* store.applyWait(value);
+  else if (value.event.type.startsWith("task.wake-")) yield* store.applyWake(value);
   else if (
     value.event.type.startsWith("task.allowance-") ||
     value.event.type.startsWith("task.manager-")
@@ -183,6 +186,7 @@ const appendTaskFact = Effect.fn("TaskStoreTest.appendTaskFact")(function* (
   return value;
 });
 const wakeTables = [
+  "work_task_waits",
   "orchestration_events",
   "work_task_projections",
   "work_task_current_state",
@@ -203,6 +207,373 @@ const wakeSnapshot = Effect.fn("TaskStoreTest.wakeSnapshot")(function* () {
     rows[table] = yield* sql`SELECT * FROM ${sql(table)} ORDER BY 1,2`;
   return rows;
 });
+
+it.effect(
+  "persists historical waits without replacing current task state and rebuilds their lifecycle",
+  () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* TaskStore.TaskStore;
+      assert.isUndefined(yield* store.readWait({ taskId: "unused", waitId: "wait" }));
+      const history = [yield* record(1), ...(yield* seedWakeCustody())];
+      const append = Effect.fn("TaskStoreTest.appendWaitHistory")(function* (
+        input: Record<string, unknown>,
+      ) {
+        const value = yield* appendTaskFact(input).pipe(sql.withTransaction);
+        history.push(value);
+        return value;
+      });
+      const wait = {
+        type: "task.wait-updated",
+        managerThreadId: "manager",
+        managerGeneration: 1,
+        waitId: "wait\0\ud800",
+        target: { type: "source", sourceId: "source\0\ud800" },
+        state: "registered",
+      };
+      assert.isUndefined(yield* store.readWait({ taskId: "task", waitId: wait.waitId }));
+      const original = yield* append(wait);
+      const source = { kind: "result", sourceId: "wake", resultRef: null };
+      yield* append({
+        type: "task.wake-source-recorded",
+        source,
+        reservationId: null,
+        dirtyGeneration: 1,
+      });
+      const reservation = {
+        reservationId: "reservation",
+        reservationCommandId: `command-${history.at(-1)!.context.sequence + 1}`,
+        managerGeneration: 1,
+        allowanceUnit: 1,
+        dirtyGeneration: 1,
+        acknowledgedGeneration: 0,
+      };
+      yield* append({
+        type: "task.wake-reserved",
+        ...reservation,
+        pending: { sources: [source], overflowThroughGeneration: null },
+      });
+      yield* append({ type: "task.wake-claim-uncertain", ...reservation, reason: "lost response" });
+      yield* append({
+        type: "task.wake-claimed",
+        ...reservation,
+        messageId: "message",
+        runId: "run",
+        pending: { sources: [source], overflowThroughGeneration: null },
+      });
+      yield* append({
+        type: "task.wake-acknowledged",
+        ...reservation,
+        previousAcknowledgedGeneration: 0,
+        observedDirtyGeneration: 1,
+        acknowledgedGeneration: 1,
+      });
+      yield* append({
+        type: "task.manager-retired",
+        managerThreadId: "manager",
+        managerGeneration: 1,
+      });
+      yield* append({
+        type: "task.manager-bound",
+        managerThreadId: "manager-2",
+        managerGeneration: 2,
+      });
+      const revisions = {
+        definitionRevision: 2,
+        lifecycleRevision: 2,
+        completionPolicyRevision: 2,
+        actionPolicyRevision: 2,
+      };
+      const draft = { ...definition, revision: 2, title: "Current draft" };
+      yield* append({ type: "task.definition-updated", ...revisions, definition: draft });
+      yield* append({ ...configuration, ...revisions });
+      yield* append({ ...execution(2), ...revisions, desiredMode: "paused" });
+      const current = (yield* store.readFoundation("task"))!;
+      yield* append({ ...wait, state: "cleared" });
+      const latest = yield* append({ ...wait, managerThreadId: "manager-2", managerGeneration: 2 });
+      for (const [index, target] of [
+        { type: "run", threadId: "thread\ud800", runId: "run\0" },
+        { type: "result", result: { type: "artifact", uri: "artifact\ud800", hash: "hash\0" } },
+      ].entries())
+        yield* append({
+          ...wait,
+          waitId: `other-${index}`,
+          target,
+          managerThreadId: "manager-2",
+          managerGeneration: 2,
+        });
+      const read = (yield* store.readWait({ taskId: "task", waitId: wait.waitId }))!;
+      assert.deepStrictEqual(read.source.recorded, latest);
+      assert.deepStrictEqual<unknown>(read.target, wait.target);
+      assert.equal(read.managerGeneration, 2);
+      assert.equal(read.state, "registered");
+      const after = (yield* store.readFoundation("task"))!;
+      for (const key of [
+        "definitionRevision",
+        "lifecycleRevision",
+        "completionPolicyRevision",
+        "actionPolicyRevision",
+      ] as const)
+        assert.equal(after.projection[key], current.projection[key]);
+      assert.deepStrictEqual(after.projection.definition, current.projection.definition);
+      assert.deepStrictEqual(
+        after.projection.current?.configuration,
+        current.projection.current?.configuration,
+      );
+      assert.deepStrictEqual<unknown>(after.draft, draft);
+      let pure: ReturnType<typeof reduceTaskFoundation> | undefined;
+      for (const value of history) {
+        const event = value.event;
+        switch (event.type) {
+          case "task.created":
+          case "task.definition-updated":
+          case "task.configuration-updated":
+          case "task.execution-updated":
+          case "task.wait-updated":
+            pure = reduceTaskFoundation(pure, { event, context: value.context });
+        }
+      }
+      assert.deepStrictEqual(HashMap.getUnsafe(pure!.waits, wait.waitId), latest);
+      const snapshot = yield* wakeSnapshot();
+      for (const value of history.filter((value) => value.event.type === "task.wait-updated"))
+        assert.isFalse((yield* store.applyWait(value)).applied);
+      assert.deepStrictEqual(yield* wakeSnapshot(), snapshot);
+      assert.deepStrictEqual(
+        yield* store
+          .readWait({ taskId: "task", waitId: wait.waitId })
+          .pipe(Effect.provide(TaskStore.layer)),
+        read,
+      );
+      assert.isUndefined(yield* store.readWait({ taskId: "unused", waitId: wait.waitId }));
+      const live = {
+        foundation: after,
+        wait: read,
+        custody: yield* store.readManagerCustody("task"),
+        allowance: yield* store.readAllowance("task"),
+        wake: yield* store.readWake("task"),
+      };
+      const rebuilt = yield* Effect.gen(function* () {
+        yield* runMigrations();
+        const database = yield* SqlClient.SqlClient;
+        const target = yield* TaskStore.TaskStore;
+        assert.deepStrictEqual(yield* database`SELECT * FROM orchestration_events`, []);
+        for (const [version, value] of history.entries()) yield* insert(value, version);
+        const native = yield* database`SELECT * FROM orchestration_events ORDER BY sequence`;
+        yield* target.rebuildCustodyProjection({
+          taskId: "task",
+          throughSequence: history.at(-1)!.context.sequence,
+        });
+        assert.deepStrictEqual(
+          yield* database`SELECT * FROM orchestration_events ORDER BY sequence`,
+          native,
+        );
+        return {
+          foundation: yield* target.readFoundation("task"),
+          wait: yield* target.readWait({ taskId: "task", waitId: wait.waitId }),
+          custody: yield* target.readManagerCustody("task"),
+          allowance: yield* target.readAllowance("task"),
+          wake: yield* target.readWake("task"),
+        };
+      }).pipe(Effect.provide(Layer.fresh(testLayer)));
+      assert.deepStrictEqual(rebuilt, live);
+      assert.equal(original.event.type, "task.wait-updated");
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("rejects contradictory wait evidence and rolls back common publication atomically", () =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    yield* seedWakeCustody();
+    const sql = yield* SqlClient.SqlClient;
+    const store = yield* TaskStore.TaskStore;
+    const wait = {
+      type: "task.wait-updated",
+      waitId: "wait",
+      managerThreadId: "manager",
+      managerGeneration: 1,
+      target: { type: "source", sourceId: "source" },
+      state: "registered",
+    };
+    const append = (input: Record<string, unknown>) =>
+      appendTaskFact(input).pipe(sql.withTransaction);
+    const reject = Effect.fn("TaskStoreTest.rejectWait")(function* (
+      input: Record<string, unknown>,
+    ) {
+      const before = yield* wakeSnapshot();
+      assert.equal((yield* Effect.exit(append(input)))._tag, "Failure");
+      assert.deepStrictEqual(yield* wakeSnapshot(), before);
+    });
+    yield* reject({ ...wait, state: "cleared" });
+    yield* reject({ ...wait, managerThreadId: "wrong" });
+    yield* reject({ ...wait, managerGeneration: 2 });
+    const first = yield* append(wait);
+    yield* reject({ ...wait, state: "cleared", target: { type: "source", sourceId: "other" } });
+    for (const table of [
+      "work_task_waits",
+      "work_task_current_state",
+      "work_task_manager_reference_checkpoints",
+      "work_task_view_fence",
+    ]) {
+      yield* sql.unsafe(
+        `CREATE TEMP TRIGGER fail_wait_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(IGNORE); END`,
+      );
+      yield* reject({ ...wait, state: "cleared" });
+      yield* sql`DROP TRIGGER fail_wait_update`;
+    }
+    const before = yield* wakeSnapshot();
+    assert.equal(
+      (yield* Effect.exit(
+        Effect.gen(function* () {
+          yield* appendTaskFact({ ...wait, state: "cleared" });
+          yield* appendTaskFact({ ...wait, target: { type: "source", sourceId: "changed" } });
+        }).pipe(sql.withTransaction),
+      ))._tag,
+      "Failure",
+    );
+    assert.deepStrictEqual(yield* wakeSnapshot(), before);
+    yield* append({ ...wait, state: "cleared" });
+    yield* append(wait);
+    yield* append(wait);
+    assert.equal((yield* store.readWait({ taskId: "task", waitId: "wait" }))?.state, "registered");
+    assert.isFalse((yield* store.applyWait(first)).applied);
+    const revisions = {
+      definitionRevision: 2,
+      lifecycleRevision: 2,
+      completionPolicyRevision: 2,
+      actionPolicyRevision: 2,
+    };
+    yield* append({
+      type: "task.definition-updated",
+      ...revisions,
+      definition: { ...definition, revision: 2 },
+    });
+    yield* reject(configuration);
+    yield* append({ ...wait, state: "cleared" });
+    const [head] = yield* sql<{
+      sequence: number;
+      version: number;
+    }>`SELECT max(sequence)+1 AS sequence,max(stream_version)+1 AS version FROM orchestration_events`;
+    const pending = yield* record(head!.sequence, wait);
+    yield* insert(pending, head!.version);
+    const applied = yield* Effect.all([store.applyWait(pending), store.applyWait(pending)], {
+      concurrency: 2,
+    });
+    assert.equal(applied.filter((value) => value.applied).length, 1);
+    assert.equal(
+      (yield* store.readWait({ taskId: "task", waitId: "wait" }))?.updatedSequence,
+      pending.context.sequence,
+    );
+    for (const query of [
+      "SELECT * FROM work_task_waits WHERE task_id='task' AND wait_id='wait'",
+      "SELECT 1 FROM work_task_waits WHERE task_id='task' LIMIT 1",
+      "UPDATE work_task_waits SET state='cleared' WHERE task_id='task' AND wait_id='wait' AND updated_sequence=5 AND state='registered' AND manager_generation=1 AND hex(target_json)='00'",
+    ]) {
+      const plans = yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`);
+      assert.isTrue(plans.some((row) => row.detail.includes("SEARCH work_task_waits")));
+      assert.isFalse(plans.some((row) => /SCAN work_task_waits|TEMP B-TREE/.test(row.detail)));
+    }
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "fails closed on missing or unproven wait materialization and future manager births",
+  () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      yield* seedWakeCustody();
+      const sql = yield* SqlClient.SqlClient;
+      const store = yield* TaskStore.TaskStore;
+      const wait = {
+        type: "task.wait-updated",
+        waitId: "wait",
+        managerThreadId: "manager",
+        managerGeneration: 1,
+        target: { type: "source", sourceId: "source" },
+        state: "registered",
+      };
+      const own = yield* appendTaskFact(wait).pipe(sql.withTransaction);
+      const read = store.readWait({ taskId: "task", waitId: "wait" });
+      const saved = yield* read;
+      const broken = Effect.fn("TaskStoreTest.rejectWaitMaterialization")(function* (
+        mutation: Effect.Effect<unknown, SqlError>,
+      ) {
+        let observed: string | undefined;
+        yield* Effect.gen(function* () {
+          yield* mutation.pipe(Effect.orDie);
+          observed = (yield* Effect.exit(read))._tag;
+          return yield* Effect.fail("restore fixture");
+        }).pipe(sql.withTransaction, Effect.ignore);
+        assert.equal(observed, "Failure");
+        assert.deepStrictEqual(yield* read, saved);
+      });
+      yield* broken(sql`DELETE FROM work_task_waits WHERE task_id='task'`);
+      yield* broken(
+        sql`UPDATE work_task_waits SET target_json='{"type":"source","sourceId":"changed"}' WHERE task_id='task'`,
+      );
+      yield* broken(sql`UPDATE work_task_waits SET updated_sequence=4 WHERE task_id='task'`);
+      yield* broken(sql`UPDATE work_task_waits SET state='cleared' WHERE task_id='task'`);
+      yield* broken(sql`DELETE FROM orchestration_events WHERE event_id=${own.event.id}`);
+      yield* broken(sql`DELETE FROM work_task_current_state WHERE task_id='task'`);
+      yield* broken(
+        Effect.gen(function* () {
+          yield* sql`DROP TRIGGER work_task_reference_delete`;
+          yield* sql`DELETE FROM work_task_manager_reference_checkpoints WHERE task_id='task'`;
+        }),
+      );
+      const nativeOnly = yield* record(own.context.sequence + 1, {
+        ...wait,
+        taskId: "native-only",
+      });
+      yield* insert(nativeOnly, 0);
+      assert.equal(
+        (yield* Effect.exit(store.readWait({ taskId: "native-only", waitId: "wait" })))._tag,
+        "Failure",
+      );
+      assert.isUndefined(yield* store.readWait({ taskId: "unused", waitId: "wait" }));
+      yield* Effect.gen(function* () {
+        yield* runMigrations();
+        const target = yield* TaskStore.TaskStore;
+        const database = yield* SqlClient.SqlClient;
+        const created = yield* record(1);
+        const early = yield* record(2, wait);
+        const birth = yield* record(3, {
+          type: "task.manager-bound",
+          managerThreadId: "manager",
+          managerGeneration: 1,
+        });
+        for (const [version, value] of [created, early, birth].entries())
+          yield* insert(value, version);
+        const before = yield* wakeSnapshot();
+        assert.equal(
+          (yield* Effect.exit(
+            target.rebuildCustodyProjection({ taskId: "task", throughSequence: 3 }),
+          ))._tag,
+          "Failure",
+        );
+        assert.deepStrictEqual(yield* wakeSnapshot(), before);
+        yield* target.applyFoundation(created);
+        yield* database`UPDATE work_task_current_state SET last_applied_sequence=3 WHERE task_id='task'`;
+        yield* database`UPDATE work_task_manager_reference_checkpoints SET checked_event_id='event-3',checked_sequence=3,checked_stream_version=2 WHERE task_id='task'`;
+        yield* database`INSERT INTO work_task_manager_bindings VALUES('task',1,'manager',${timestamp},NULL)`;
+        yield* database`INSERT INTO work_task_waits VALUES('task','wait',1,${JSON.stringify(wait.target)},'registered',2,${timestamp})`;
+        assert.equal(
+          (yield* target.readManagerBinding({ taskId: "task", generation: 1 }))?.bound.recorded
+            .context.sequence,
+          3,
+        );
+        const failure = yield* Effect.flip(target.readWait({ taskId: "task", waitId: "wait" }));
+        assert.equal(failure._tag, "TaskProjectionError");
+        if (failure._tag === "TaskProjectionError") assert.equal(failure.code, "manager");
+        assert.equal(
+          (yield* Effect.exit(
+            target.rebuildCustodyProjection({ taskId: "task", throughSequence: 3 }),
+          ))._tag,
+          "Failure",
+        );
+      }).pipe(Effect.provide(Layer.fresh(testLayer)));
+    }).pipe(Effect.provide(testLayer)),
+);
 
 it.effect(
   "applies native wake facts exactly once and rebuilds the complete supported custody prefix",
