@@ -3,6 +3,7 @@ import * as NodeSqlite from "node:sqlite";
 import { assert, it } from "@effect/vitest";
 import {
   WorkTaskPersistedEvent,
+  ThreadId,
   WorkTaskPersistedAcceptedRunOwnershipEvent,
   WorkTaskPersistedCoordinationEvent,
   WorkTaskGraphEdgeRecord,
@@ -23,6 +24,7 @@ import { runMigrations } from "../Migrations.ts";
 
 const db = NodeSqliteClient.layer({ filename: ":memory:" });
 const decodePersistedEvent = Schema.decodeUnknownSync(WorkTaskPersistedEvent);
+const decodeThreadId = Schema.decodeEffect(ThreadId);
 
 it.effect("creates the task foundation on a fresh database and reruns without changes", () =>
   Effect.gen(function* () {
@@ -143,6 +145,7 @@ it.effect("upgrades predecessor rows and events without changing their bytes or 
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
+      [102, "WorkTaskProjectionSource"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM projection_projects ORDER BY project_id`,
@@ -194,6 +197,7 @@ it.effect("rolls back a failed migration and succeeds on rerun", () =>
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
+      [102, "WorkTaskProjectionSource"],
     ]);
     assert.deepStrictEqual(yield* runMigrations(), []);
   }).pipe(Effect.provide(db)),
@@ -326,6 +330,7 @@ it.effect(
         [99, "WorkTaskManagerClaims"],
         [100, "WorkTaskOwnershipReleaseBridge"],
         [101, "WorkTaskReadyState"],
+        [102, "WorkTaskProjectionSource"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
       assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -500,6 +505,7 @@ it.effect("preserves task custody through validation upgrade and rolls back migr
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
+      [102, "WorkTaskProjectionSource"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -647,6 +653,7 @@ it.effect("upgrades validation data atomically to action reviews and preserves p
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
+      [102, "WorkTaskProjectionSource"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -870,6 +877,7 @@ it.effect("upgrades existing tasks without inventing state and rolls back migrat
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
+      [102, "WorkTaskProjectionSource"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_projections`, tasks);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_accepted_definitions`, definitions);
@@ -978,6 +986,7 @@ it.effect("upgrades waits atomically while preserving task state and link proven
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
+      [102, "WorkTaskProjectionSource"],
     ]);
     assert.deepStrictEqual(
       yield* sql`SELECT * FROM work_task_thread_links ORDER BY link_event_id`,
@@ -1113,6 +1122,7 @@ it.effect("upgrades result history atomically without changing predecessor data"
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
+      [102, "WorkTaskProjectionSource"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_current_state`, state);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_thread_links`, links);
@@ -1264,6 +1274,7 @@ it.effect("upgrades claim history atomically and preserves prior task and ordina
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
+      [102, "WorkTaskProjectionSource"],
     ]);
     assert.deepStrictEqual(
       yield* Effect.forEach(tables, (name) => sql.unsafe(`SELECT * FROM ${name}`)),
@@ -1611,6 +1622,7 @@ it.effect("preserves legacy validation rows and rolls replay migration back befo
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
+      [102, "WorkTaskProjectionSource"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_validation_attempts`, before);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_claims`, claims);
@@ -2732,6 +2744,7 @@ it.effect("preserves review evidence on upgrade and binds append-only outcomes a
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
+      [102, "WorkTaskProjectionSource"],
     ]);
     assert.deepStrictEqual(yield* snapshot(), before);
     assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
@@ -3137,6 +3150,7 @@ it.effect(
         [99, "WorkTaskManagerClaims"],
         [100, "WorkTaskOwnershipReleaseBridge"],
         [101, "WorkTaskReadyState"],
+        [102, "WorkTaskProjectionSource"],
       ]);
       const after = yield* snapshot();
       assert.deepStrictEqual(
@@ -3502,6 +3516,7 @@ it.effect(
         [99, "WorkTaskManagerClaims"],
         [100, "WorkTaskOwnershipReleaseBridge"],
         [101, "WorkTaskReadyState"],
+        [102, "WorkTaskProjectionSource"],
       ]);
       const after = yield* capture();
       assert.deepStrictEqual(
@@ -4140,6 +4155,7 @@ it.effect(
         [99, "WorkTaskManagerClaims"],
         [100, "WorkTaskOwnershipReleaseBridge"],
         [101, "WorkTaskReadyState"],
+        [102, "WorkTaskProjectionSource"],
       ]);
       const after = yield* capture();
       assert.deepStrictEqual(
@@ -4556,6 +4572,7 @@ it.effect("preserves dirty scan membership observations and rolls back migration
       [99, "WorkTaskManagerClaims"],
       [100, "WorkTaskOwnershipReleaseBridge"],
       [101, "WorkTaskReadyState"],
+      [102, "WorkTaskProjectionSource"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_group_memberships`, before);
     const member = batch.event.snapshot.currentMembership!;
@@ -5258,6 +5275,7 @@ it.effect(
         [99, "WorkTaskManagerClaims"],
         [100, "WorkTaskOwnershipReleaseBridge"],
         [101, "WorkTaskReadyState"],
+        [102, "WorkTaskProjectionSource"],
       ]);
       const after = yield* capture();
       for (const name of names.filter((name) => name !== "effect_sql_migrations"))
@@ -5747,6 +5765,7 @@ it.effect(
         [99, "WorkTaskManagerClaims"],
         [100, "WorkTaskOwnershipReleaseBridge"],
         [101, "WorkTaskReadyState"],
+        [102, "WorkTaskProjectionSource"],
       ]);
       const after = yield* capture();
       for (const name of names.filter((name) => name !== "effect_sql_migrations"))
@@ -6301,6 +6320,7 @@ it.effect(
         [99, "WorkTaskManagerClaims"],
         [100, "WorkTaskOwnershipReleaseBridge"],
         [101, "WorkTaskReadyState"],
+        [102, "WorkTaskProjectionSource"],
       ]);
       const after = yield* capture();
       for (const name of names.filter((n) => n !== "effect_sql_migrations"))
@@ -6885,6 +6905,7 @@ it.effect(
       assert.deepStrictEqual(yield* runMigrations(), [
         [100, "WorkTaskOwnershipReleaseBridge"],
         [101, "WorkTaskReadyState"],
+        [102, "WorkTaskProjectionSource"],
       ]);
       const after = yield* capture();
       for (const { name } of tables.filter((r) => r.name !== "effect_sql_migrations"))
@@ -7447,7 +7468,10 @@ it.effect("upgrades ready storage preserving every predecessor row and rolls bac
       [],
     );
     yield* sql`DROP INDEX work_task_ready_latest_idx`;
-    assert.deepStrictEqual(yield* runMigrations(), [[101, "WorkTaskReadyState"]]);
+    assert.deepStrictEqual(yield* runMigrations(), [
+      [101, "WorkTaskReadyState"],
+      [102, "WorkTaskProjectionSource"],
+    ]);
     const after = yield* capture();
     for (const { name } of tables.filter((t) => t.name !== "effect_sql_migrations"))
       assert.deepStrictEqual(after[name], before[name]);
@@ -7456,6 +7480,154 @@ it.effect("upgrades ready storage preserving every predecessor row and rolls bac
     const state = yield* sql`SELECT * FROM work_task_ready_state`;
     assert.deepStrictEqual(yield* runMigrations(), []);
     assert.deepStrictEqual(yield* sql`SELECT * FROM work_task_ready_state`, state);
+    assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect("preserves current projection shape and accepts lossless manager identities", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations();
+    yield* sql`INSERT INTO work_task_projections VALUES ('source-task',NULL,1,1,1,1,'{}','1','1')`;
+    const manager = yield* decodeThreadId("\u0000x");
+    yield* sql`INSERT INTO work_task_current_state(task_id,manager_thread_id,manager_generation) VALUES('source-task',json_extract(${JSON.stringify(manager)},'$'),1)`;
+    assert.strictEqual(
+      (yield* sql`SELECT hex(manager_thread_id) AS id FROM work_task_current_state WHERE task_id='source-task'`)[0]!
+        .id,
+      "0078",
+    );
+    yield* sql`UPDATE work_task_current_state SET manager_thread_id=json_extract(${JSON.stringify("\u0000\ud800")},'$') WHERE task_id='source-task'`;
+    assert.strictEqual(
+      (yield* sql`SELECT hex(manager_thread_id) AS id FROM work_task_current_state WHERE task_id='source-task'`)[0]!
+        .id,
+      "00EDA080",
+    );
+  }).pipe(Effect.provide(db)),
+);
+
+it.effect("upgrades native task lookup compatibility without changing predecessor evidence", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations({ toMigrationInclusive: 101 });
+    const columns = yield* sql`PRAGMA table_xinfo(work_task_current_state)`;
+    const foreignKeys = yield* sql`PRAGMA foreign_key_list(work_task_current_state)`;
+    assert.deepStrictEqual(
+      yield* sql`SELECT name FROM sqlite_master WHERE tbl_name='work_task_current_state' AND type='trigger'`,
+      [],
+    );
+    const tables = yield* sql<{
+      name: string;
+    }>`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`;
+    for (const { name } of tables) {
+      const references = yield* sql.unsafe<{ table: string }>(`PRAGMA foreign_key_list("${name}")`);
+      assert.isFalse(references.some((r) => r.table === "work_task_current_state"));
+    }
+    for (const [i, manager] of [null, "\t", "\ufeff", "manager"].entries()) {
+      const id = `legacy-${i}`;
+      yield* sql`INSERT INTO work_task_projections VALUES (${id},NULL,1,1,1,1,'{}','2026-11-16T00:00:00.0001Z','2026-11-16T00:00:00.0001Z')`;
+      yield* sql`INSERT INTO work_task_current_state(rowid,task_id,configuration_json,desired_mode,execution_mode,manager_thread_id,manager_generation,attention_json,completion,archived,last_applied_sequence)
+        VALUES(${i - 1},${id},' {"allowanceOverride":null} ','active',NULL,json_extract(${JSON.stringify(manager)},'$'),${manager === null ? null : 1},NULL,NULL,NULL,7)`;
+    }
+    yield* sql`UPDATE work_task_view_fence SET generation=5,high_water_sequence=7`;
+    const payloads = [
+      "{",
+      '{"manager":"wrong"}',
+      '{"manager":{"managerGeneration":1,"managerThreadId":"m1"}}',
+      '{"manager":{"managerGeneration":2,"managerThreadId":"m2"}}',
+      '{"allowanceOverride":null}',
+    ];
+    for (const [i, payload] of payloads.entries())
+      yield* sql`INSERT INTO orchestration_events(event_id,aggregate_kind,stream_id,stream_version,event_type,occurred_at,command_id,actor_kind,payload_json,metadata_json,application_event_version)
+        VALUES(${`source-${i}`},'task','source-stream',${i},${i === 4 ? "task.configuration-updated" : "task.execution-updated"},'2026-11-16T00:00:00.0001Z',NULL,'system',${payload},'{}',2)`;
+    yield* sql`INSERT INTO orchestration_events(event_id,aggregate_kind,stream_id,stream_version,event_type,occurred_at,command_id,actor_kind,payload_json,metadata_json,application_event_version)
+      VALUES('ordinary-source','thread','ordinary',0,'thread.created','1',NULL,'system','{','{}',2)`;
+    const capture = Effect.fn("PersistentTasks.captureProjectionSourcePredecessor")(function* () {
+      return Object.fromEntries(
+        yield* Effect.forEach(tables, ({ name }) =>
+          sql.unsafe(`SELECT * FROM "${name}"`).pipe(Effect.map((rows) => [name, rows] as const)),
+        ),
+      );
+    });
+    const before = yield* capture();
+    const rowids =
+      yield* sql`SELECT rowid,task_id,hex(manager_thread_id) AS manager_hex,hex(configuration_json) AS config_hex FROM work_task_current_state ORDER BY task_id`;
+    const schema = yield* sql`SELECT sql FROM sqlite_master WHERE name='work_task_current_state'`;
+    yield* sql`CREATE INDEX idx_task_source_type_sequence ON work_task_projections(task_id)`;
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(runMigrations())));
+    assert.deepStrictEqual(yield* capture(), before);
+    assert.deepStrictEqual(
+      yield* sql`SELECT sql FROM sqlite_master WHERE name='work_task_current_state'`,
+      schema,
+    );
+    assert.deepStrictEqual(
+      yield* sql`SELECT name FROM sqlite_master WHERE name='work_task_current_state_v102'`,
+      [],
+    );
+    assert.isTrue(
+      Exit.isFailure(
+        yield* Effect.exit(
+          sql`UPDATE work_task_current_state SET manager_thread_id=json_extract(${JSON.stringify("\u0000x")},'$'),manager_generation=1 WHERE task_id='legacy-0'`,
+        ),
+      ),
+    );
+    yield* sql`DROP INDEX idx_task_source_type_sequence`;
+    assert.deepStrictEqual(yield* runMigrations(), [[102, "WorkTaskProjectionSource"]]);
+    const after = yield* capture();
+    for (const { name } of tables.filter((t) => t.name !== "effect_sql_migrations"))
+      assert.deepStrictEqual(after[name], before[name]);
+    assert.deepStrictEqual(
+      yield* sql`SELECT rowid,task_id,hex(manager_thread_id) AS manager_hex,hex(configuration_json) AS config_hex FROM work_task_current_state ORDER BY task_id`,
+      rowids,
+    );
+    assert.deepStrictEqual(yield* sql`PRAGMA table_xinfo(work_task_current_state)`, columns);
+    assert.deepStrictEqual(
+      yield* sql`PRAGMA foreign_key_list(work_task_current_state)`,
+      foreignKeys,
+    );
+    assert.deepStrictEqual(
+      yield* sql`SELECT name FROM sqlite_master WHERE name='work_task_current_state_v102'`,
+      [],
+    );
+    const invalid = [
+      sql`UPDATE work_task_current_state SET manager_generation=NULL WHERE task_id='legacy-1'`,
+      sql`UPDATE work_task_current_state SET manager_generation=0 WHERE task_id='legacy-1'`,
+      sql`UPDATE work_task_current_state SET manager_generation=9007199254740992 WHERE task_id='legacy-1'`,
+      sql`UPDATE work_task_current_state SET manager_thread_id=' ' WHERE task_id='legacy-1'`,
+      sql`UPDATE work_task_current_state SET configuration_json='bad' WHERE task_id='legacy-1'`,
+      sql`UPDATE work_task_current_state SET execution_mode='made-up' WHERE task_id='legacy-1'`,
+      sql`UPDATE work_task_current_state SET last_applied_sequence=-1 WHERE task_id='legacy-1'`,
+      sql`UPDATE work_task_current_state SET archived=2 WHERE task_id='legacy-1'`,
+      sql`INSERT INTO work_task_current_state(task_id) VALUES('missing')`,
+    ];
+    for (const statement of invalid) assert.isTrue(Exit.isFailure(yield* Effect.exit(statement)));
+    const typeQuery =
+      "SELECT event_id FROM orchestration_events WHERE aggregate_kind='task' AND application_event_version=2 AND stream_id='source-stream' AND event_type='task.configuration-updated' ORDER BY sequence DESC LIMIT 1";
+    const managerExpression =
+      "CASE WHEN json_valid(payload_json) THEN json_extract(payload_json,'$.manager.managerGeneration') END";
+    const managerWhere =
+      "aggregate_kind='task' AND application_event_version=2 AND stream_id='source-stream' AND event_type='task.execution-updated' AND CASE WHEN json_valid(payload_json) THEN json_type(payload_json,'$.manager') END='object'";
+    for (const [query, index, expected] of [
+      [typeQuery, "idx_task_source_type_sequence", "source-4"],
+      [
+        `SELECT event_id FROM orchestration_events WHERE ${managerWhere} AND ${managerExpression}=1 ORDER BY sequence DESC LIMIT 1`,
+        "idx_task_source_manager_sequence",
+        "source-2",
+      ],
+      [
+        `SELECT event_id FROM orchestration_events WHERE ${managerWhere} ORDER BY ${managerExpression} DESC LIMIT 1`,
+        "idx_task_source_manager_sequence",
+        "source-3",
+      ],
+    ]) {
+      const plan = JSON.stringify(yield* sql.unsafe(`EXPLAIN QUERY PLAN ${query}`));
+      assert.include(plan, index!);
+      assert.notMatch(plan, /TEMP B-TREE|SCAN orchestration_events/);
+      const rows = yield* sql.unsafe<{ event_id: string }>(query!);
+      assert.strictEqual(rows[0]!.event_id, expected);
+    }
+    const preserved = yield* capture();
+    assert.deepStrictEqual(yield* runMigrations(), []);
+    assert.deepStrictEqual(yield* capture(), preserved);
     assert.deepStrictEqual(yield* sql`PRAGMA foreign_key_check`, []);
   }).pipe(Effect.provide(db)),
 );
