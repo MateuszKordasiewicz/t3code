@@ -23,6 +23,8 @@ import { runMigrations } from "../persistence/Migrations.ts";
 import * as TaskService from "./TaskService.ts";
 import * as TaskStore from "./TaskStore.ts";
 import { makeTaskSessionService } from "./TaskSessionService.ts";
+import { ServerEnvironment } from "../environment/ServerEnvironment.ts";
+import { EnvironmentId } from "@t3tools/contracts";
 const decodeCreate = Schema.decodeUnknownEffect(WorkTaskCreateDraftInput);
 const decodeAccept = Schema.decodeUnknownEffect(WorkTaskAcceptDraftInput);
 const tested = [
@@ -42,6 +44,15 @@ const decodeDefinition = Schema.decodeEffect(WorkTaskDraftDefinition);
 const services = TaskService.layer.pipe(
   Layer.provideMerge(
     TaskStore.layer.pipe(Layer.provideMerge(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  ),
+  Layer.provideMerge(
+    Layer.succeed(
+      ServerEnvironment,
+      ServerEnvironment.of({
+        getEnvironmentId: Effect.succeed(EnvironmentId.make("env")),
+        getDescriptor: Effect.die("unused in task service tests"),
+      }),
+    ),
   ),
 );
 it.effect("rejects token callers before any task mutation", () =>

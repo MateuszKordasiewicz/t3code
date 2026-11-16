@@ -11,6 +11,7 @@ import {
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type { AuthenticatedSession } from "../auth/EnvironmentAuth.ts";
+import { ServerEnvironment } from "../environment/ServerEnvironment.ts";
 import { TaskService } from "./TaskService.ts";
 
 const isTaskError = Schema.is(WorkTaskError);
@@ -20,6 +21,7 @@ export const makeTaskSessionService = Effect.fn("TaskSessionService.make")(funct
   session: AuthenticatedSession,
 ) {
   const tasks = yield* TaskService;
+  const environment = yield* ServerEnvironment;
   const authorize = <A, E, R>(mutation: boolean, operation: Effect.Effect<A, E, R>) => {
     const scope = mutation ? AuthOrchestrationOperateScope : AuthOrchestrationReadScope;
     return !session.scopes.includes(scope) ||
@@ -82,6 +84,15 @@ export const makeTaskSessionService = Effect.fn("TaskSessionService.make")(funct
       sequence,
     });
   });
+  const createInitialGroup = Effect.fn("TaskSessionService.createInitialGroup")(function* (input: {
+    readonly taskId: string;
+    readonly groupId: string;
+    readonly managerThreadId: string;
+    readonly commandId: string;
+  }) {
+    const environmentId = yield* environment.getEnvironmentId;
+    return yield* tasks.createInitialGroup({ ...input, environmentId }, caller);
+  });
   const mapError = (error: unknown) =>
     isTaskError(error)
       ? error
@@ -93,5 +104,7 @@ export const makeTaskSessionService = Effect.fn("TaskSessionService.make")(funct
       authorize(false, inspect(input)).pipe(Effect.mapError(mapError)),
     accept: (input: WorkTaskAcceptDraftInput) =>
       authorize(true, accept(input)).pipe(Effect.mapError(mapError)),
+    createInitialGroup: (input: Parameters<typeof createInitialGroup>[0]) =>
+      authorize(true, createInitialGroup(input)).pipe(Effect.mapError(mapError)),
   };
 });

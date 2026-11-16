@@ -11,6 +11,15 @@ import {
   WorkTaskPersistedMembershipEvent,
 } from "@t3tools/contracts";
 import { runMigrations } from "../persistence/Migrations.ts";
+import {
+  AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
+  AuthSessionId,
+  EnvironmentId,
+} from "@t3tools/contracts";
+import { ServerEnvironment } from "../environment/ServerEnvironment.ts";
+import * as TaskService from "./TaskService.ts";
+import { makeTaskSessionService } from "./TaskSessionService.ts";
 import * as TaskStore from "./TaskStore.ts";
 import { persistInitialGroup } from "./TaskGroupStore.ts";
 import {
@@ -20,6 +29,18 @@ import {
 } from "./TaskGroup.ts";
 const layer = TaskStore.layer.pipe(
   Layer.provideMerge(NodeSqliteClient.layer({ filename: ":memory:" })),
+);
+const sessionLayer = TaskService.layer.pipe(
+  Layer.provideMerge(layer),
+  Layer.provideMerge(
+    Layer.succeed(
+      ServerEnvironment,
+      ServerEnvironment.of({
+        getEnvironmentId: Effect.succeed(EnvironmentId.make("env")),
+        getDescriptor: Effect.die("unused in task group tests"),
+      }),
+    ),
+  ),
 );
 const decode = Schema.decodeUnknownEffect(WorkTaskPersistedEvent);
 const decodeControl = Schema.decodeUnknownEffect(WorkTaskPersistedGroupControlEvent);
@@ -34,6 +55,7 @@ const definition = {
 };
 const seed = Effect.fn("TaskGroupStoreTest.seed")(function* () {
   const sql = yield* SqlClient.SqlClient;
+  yield* sql`INSERT INTO orchestration_v2_projection_threads (thread_id,project_id,title,default_provider,runtime_mode,interaction_mode,created_at,updated_at,payload_json) VALUES ('manager','project','Manager','codex','full-access','default',${time},${time},'{}')`;
   const store = yield* TaskStore.TaskStore;
   for (const [sequence, details] of [
     [
@@ -73,6 +95,76 @@ const seed = Effect.fn("TaskGroupStoreTest.seed")(function* () {
     yield* store.applyFoundation(recorded);
   }
 });
+it.effect("requires an authenticated operator and replays only the same group command", () =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    yield* seed();
+    const session = {
+      sessionId: AuthSessionId.make("session"),
+      subject: "owner",
+      method: "browser-session-cookie" as const,
+      scopes: [AuthOrchestrationOperateScope, AuthOrchestrationReadScope],
+    };
+    const group = {
+      taskId: "task",
+      groupId: "group",
+      managerThreadId: "manager",
+      commandId: "join",
+    };
+    const sql = yield* SqlClient.SqlClient;
+    const service = yield* TaskService.TaskService;
+    const serviceDenied = yield* service
+      .createInitialGroup({ ...group, environmentId: "env" }, { type: "server" })
+      .pipe(Effect.flip);
+    assert.strictEqual(serviceDenied._tag, "WorkTaskError");
+    if (serviceDenied._tag === "WorkTaskError")
+      assert.strictEqual(serviceDenied.code, "unsupported");
+    const denied = yield* makeTaskSessionService({ ...session, method: "bearer-access-token" });
+    assert.strictEqual(
+      (yield* denied.createInitialGroup(group).pipe(Effect.flip)).code,
+      "unsupported",
+    );
+    const reader = yield* makeTaskSessionService({
+      ...session,
+      scopes: [AuthOrchestrationReadScope],
+    });
+    assert.strictEqual(
+      (yield* reader.createInitialGroup(group).pipe(Effect.flip)).code,
+      "unsupported",
+    );
+    assert.strictEqual((yield* sql`SELECT * FROM work_task_manager_groups`).length, 0);
+    const operator = yield* makeTaskSessionService(session);
+    const absent = yield* operator
+      .createInitialGroup({ ...group, managerThreadId: "missing" })
+      .pipe(Effect.flip);
+    assert.strictEqual(absent.code, "not_found");
+    yield* sql`INSERT INTO orchestration_v2_projection_threads (thread_id,project_id,title,default_provider,runtime_mode,interaction_mode,created_at,updated_at,payload_json) VALUES ('other','different','Other','codex','full-access','default',${time},${time},'{}')`;
+    assert.strictEqual(
+      (yield* operator.createInitialGroup({ ...group, managerThreadId: "other" }).pipe(Effect.flip))
+        .code,
+      "not_found",
+    );
+    yield* sql`CREATE TRIGGER reject_group BEFORE INSERT ON work_task_manager_groups BEGIN SELECT RAISE(ABORT,'blocked'); END`;
+    assert.isTrue(yield* operator.createInitialGroup(group).pipe(Effect.isFailure));
+    assert.strictEqual((yield* sql`SELECT * FROM orchestration_events`).length, 2);
+    yield* sql`DROP TRIGGER reject_group`;
+    const committed = yield* operator.createInitialGroup(group);
+    assert.deepStrictEqual(yield* operator.createInitialGroup(group), committed);
+    assert.strictEqual((yield* sql`SELECT * FROM orchestration_events`).length, 6);
+    const different = yield* operator
+      .createInitialGroup({ ...group, managerThreadId: "other" })
+      .pipe(Effect.flip);
+    assert.strictEqual(different.code, "revision_conflict");
+    const otherSession = yield* makeTaskSessionService({
+      ...session,
+      sessionId: AuthSessionId.make("other"),
+    });
+    assert.strictEqual(
+      (yield* otherSession.createInitialGroup(group).pipe(Effect.flip)).code,
+      "revision_conflict",
+    );
+  }).pipe(Effect.provide(sessionLayer)),
+);
 const input = {
   taskId: "task",
   environmentId: "env",
@@ -142,7 +234,7 @@ it.effect("commits one group, manager and membership root with its companion ato
     assert.strictEqual((yield* sql`SELECT * FROM work_task_group_managers`).length, 1);
     const store = yield* TaskStore.TaskStore;
     assert.isTrue((yield* store.readFoundation("task"))?.sourceVerified);
-    assert.isTrue(yield* persistInitialGroup(input).pipe(Effect.isFailure));
+    assert.deepStrictEqual(yield* persistInitialGroup(input), result);
     assert.strictEqual((yield* sql`SELECT * FROM orchestration_events`).length, 6);
   }).pipe(Effect.provide(layer)),
 );

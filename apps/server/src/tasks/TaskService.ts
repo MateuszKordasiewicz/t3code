@@ -18,6 +18,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import { TaskStore } from "./TaskStore.ts";
+import { persistInitialGroup } from "./TaskGroupStore.ts";
 
 const decodeAcceptedDefinition = Schema.decodeEffect(WorkTaskAcceptedDefinition);
 const decodeEvent = Schema.decodeEffect(WorkTaskEvent);
@@ -211,9 +212,31 @@ export const makeTaskService = Effect.gen(function* () {
       }),
     );
   });
+  const createInitialGroup = Effect.fn("TaskService.createInitialGroup")(function* (
+    input: {
+      readonly taskId: string;
+      readonly environmentId: string;
+      readonly groupId: string;
+      readonly managerThreadId: string;
+      readonly commandId: string;
+    },
+    caller: WorkTaskCallerContext,
+  ) {
+    if (caller.type !== "user")
+      return yield* new WorkTaskError({
+        code: "unsupported",
+        message: "Only an authenticated human can create a task group",
+      });
+    return yield* persistInitialGroup({
+      ...input,
+      subject: caller.subject,
+      sessionId: caller.sessionId,
+    });
+  });
   return {
     create,
     acceptDraft,
+    createInitialGroup,
     inspect: store.readFoundation,
     inspectResults: store.readResults,
     readNativeHistory: store.readNativeHistory,

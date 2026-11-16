@@ -2,6 +2,7 @@ import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as NodeUtil from "node:util";
 import * as SqlClient from "effect/sql/SqlClient";
 import {
   WorkTaskGroupControlEvent,
@@ -19,6 +20,7 @@ import {
 
 const decodeControl = Schema.decodeUnknownEffect(WorkTaskGroupControlEvent);
 const decodeBatch = Schema.decodeUnknownEffect(WorkTaskMembershipEventBatch);
+const decodeRootEvent = Schema.decodeUnknownEffect(WorkTaskMembershipEventBatch.fields.event);
 const decodeRecordedControl = Schema.decodeUnknownEffect(WorkTaskPersistedGroupControlEvent);
 const decodeRecordedRoot = Schema.decodeUnknownEffect(WorkTaskPersistedMembershipEvent);
 const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
@@ -38,6 +40,69 @@ export const persistInitialGroup = Effect.fn("TaskGroupStore.persistInitialGroup
     const store = yield* TaskStore;
     return yield* sql.withTransaction(
       Effect.gen(function* () {
+        const prior = yield* sql<{
+          payload_json: string;
+          aggregate_kind: string;
+        }>`SELECT payload_json,aggregate_kind FROM orchestration_events WHERE command_id=${input.commandId} ORDER BY sequence`;
+        if (prior.length) {
+          const events = prior.map((row) => JSON.parse(row.payload_json) as unknown);
+          const same =
+            prior.length === 4 &&
+            prior.every(
+              (row, index) =>
+                row.aggregate_kind ===
+                (["task-group", "task-group", "task-membership", "task-group"] as const)[index],
+            ) &&
+            NodeUtil.isDeepStrictEqual(
+              events.map((event) => (event as { type?: string }).type),
+              [
+                "task-group.created",
+                "task-group.manager-changed",
+                "task.membership-changed",
+                "task-group.membership-changed",
+              ],
+            );
+          const created = events[0] as
+            | {
+                control?: { group?: { environmentId?: string; groupId?: string } };
+                performedBy?: { subject?: string; sessionId?: string };
+              }
+            | undefined;
+          const manager = events[1] as
+            | { control?: { currentManager?: { threadId?: string } } }
+            | undefined;
+          const membership = events[2] as { snapshot?: { task?: { taskId?: string } } } | undefined;
+          if (
+            !same ||
+            created?.control?.group?.environmentId !== input.environmentId ||
+            created.control.group.groupId !== input.groupId ||
+            created.performedBy?.subject !== input.subject ||
+            created.performedBy.sessionId !== input.sessionId ||
+            manager?.control?.currentManager?.threadId !== input.managerThreadId ||
+            membership?.snapshot?.task?.taskId !== input.taskId
+          )
+            return yield* new WorkTaskError({
+              code: "revision_conflict",
+              message: "Group command already used",
+            });
+          const group =
+            yield* sql`SELECT 1 FROM work_task_manager_groups WHERE environment_id=${input.environmentId} AND group_id=${input.groupId}`;
+          const joined =
+            yield* sql`SELECT 1 FROM work_task_group_memberships WHERE task_id=${input.taskId} AND environment_id=${input.environmentId} AND group_id=${input.groupId}`;
+          if (group.length !== 1 || joined.length !== 1)
+            return yield* new WorkTaskError({
+              code: "invalid_state",
+              message: "Group replay source is incomplete",
+            });
+          return {
+            events: [
+              yield* decodeControl(events[0]),
+              yield* decodeControl(events[1]),
+              yield* decodeRootEvent(events[2]),
+              yield* decodeControl(events[3]),
+            ],
+          };
+        }
         const task = yield* store.readFoundation(input.taskId);
         if (!task?.sourceVerified || !task.accepted || task.projection.projectId === null)
           return yield* new WorkTaskError({
@@ -48,6 +113,17 @@ export const persistInitialGroup = Effect.fn("TaskGroupStore.persistInitialGroup
           return yield* new WorkTaskError({
             code: "revision_conflict",
             message: "Accepted definition is stale",
+          });
+        const managerThread = yield* sql<{
+          project_id: string;
+        }>`SELECT project_id FROM orchestration_v2_projection_threads WHERE thread_id=${input.managerThreadId} AND deleted_at IS NULL`;
+        if (
+          managerThread.length !== 1 ||
+          managerThread[0]!.project_id !== task.projection.projectId
+        )
+          return yield* new WorkTaskError({
+            code: "not_found",
+            message: "Manager thread not found in task project",
           });
         const existing =
           yield* sql`SELECT 1 FROM work_task_group_memberships WHERE task_id=${input.taskId} LIMIT 1`;
