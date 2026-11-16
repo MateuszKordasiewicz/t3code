@@ -42,6 +42,7 @@ import {
   reconcileNativeLaunch,
   reserveNativeLaunch,
 } from "./TaskNativeLaunchBinding.ts";
+import { acceptNativeInitialRun } from "./TaskNativeAcceptedClaim.ts";
 import {
   emptyTaskGroupControl,
   reduceTaskGroupControl,
@@ -253,6 +254,67 @@ it.effect("creates a group through authenticated typed RPC and returns its persi
     assert.strictEqual(denied.code, "unsupported");
   }).pipe(Effect.provide(sessionLayer)),
 );
+it.effect.each([
+  ["pause", "paused"],
+  ["stop", "closed"],
+] as const)(
+  "persists and replays an authenticated task %s without launching a run",
+  ([operation, mode]) =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      yield* seed();
+      yield* persistInitialGroup(input);
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`UPDATE work_task_current_state SET desired_mode='active', manager_thread_id='manager', manager_generation=1
+        WHERE task_id='task'`;
+      const service = yield* makeTaskSessionService({
+        sessionId: AuthSessionId.make("session"),
+        subject: "owner",
+        method: "browser-session-cookie",
+        scopes: [AuthOrchestrationOperateScope, AuthOrchestrationReadScope],
+      });
+      const request = {
+        taskId: WorkTaskId.make("task"),
+        commandId: CommandId.make(`${operation}-task`),
+        expectedLifecycleRevision: 1,
+        expectedManagerGeneration: 1,
+      };
+      const committed = yield* service[operation](request);
+      assert.strictEqual(committed.lifecycleRevision, 2);
+      assert.deepStrictEqual(yield* service[operation](request), committed);
+      const inspected = yield* service.inspect({ taskId: request.taskId });
+      assert.strictEqual(inspected.execution.desiredMode, mode);
+      assert.strictEqual(inspected.lifecycleRevision, 2);
+      assert.strictEqual(
+        (yield* sql<{
+          desired_mode: string;
+        }>`SELECT desired_mode FROM work_task_current_state WHERE task_id='task'`)[0]!.desired_mode,
+        mode,
+      );
+      assert.strictEqual(
+        (yield* sql`SELECT 1 FROM orchestration_events WHERE command_id=${request.commandId}`)
+          .length,
+        1,
+      );
+      assert.strictEqual((yield* sql`SELECT 1 FROM orchestration_v2_effect_outbox`).length, 0);
+      const rejected = yield* service[operation]({
+        ...request,
+        commandId: CommandId.make("other"),
+      }).pipe(Effect.flip);
+      assert.strictEqual(rejected.code, "revision_conflict");
+      const token = yield* makeTaskSessionService({
+        sessionId: AuthSessionId.make("token"),
+        subject: "owner",
+        method: "bearer-access-token",
+        scopes: [AuthOrchestrationOperateScope, AuthOrchestrationReadScope],
+      });
+      const denied = yield* token[operation]({
+        ...request,
+        commandId: CommandId.make("token-command"),
+      }).pipe(Effect.flip);
+      assert.strictEqual(denied.code, "unsupported");
+    }).pipe(Effect.provide(sessionLayer)),
+);
 it.effect("reserves the native message once and recovers its exact run and terminal evidence", () =>
   Effect.gen(function* () {
     yield* runMigrations();
@@ -305,7 +367,8 @@ it.effect("reserves the native message once and recovers its exact run and termi
     const stopped = yield* reserveNativeLaunch(intent).pipe(Effect.flip);
     assert.strictEqual(stopped._tag, "WorkTaskError");
     if (stopped._tag === "WorkTaskError") assert.strictEqual(stopped.code, "invalid_state");
-    yield* sql`UPDATE work_task_current_state SET desired_mode='active',execution_mode='idle'
+    yield* sql`UPDATE work_task_current_state SET desired_mode='active',execution_mode='idle',
+      manager_thread_id='manager',manager_generation=1
       WHERE task_id='task'`;
     yield* sql`UPDATE work_task_allowances SET consumed=1 WHERE task_id='task'`;
     const exhausted = yield* reserveNativeLaunch(intent).pipe(Effect.flip);
@@ -318,10 +381,10 @@ it.effect("reserves the native message once and recovers its exact run and termi
     assert.strictEqual((yield* sql`SELECT * FROM work_task_native_launch_intents`).length, 0);
     yield* sql`DROP TRIGGER reject_native_claim`;
     const reserved = yield* browser.reserveLaunch(intent);
-    assert.strictEqual(reserved.manager_generation, 1);
+    assert.strictEqual(reserved.managerGeneration, 1);
     const nativeTaskLaunch = yield* readNativeLaunchReservation(intent.commandId);
     assert.strictEqual(nativeTaskLaunch?.allowanceUnit, 1);
-    assert.deepStrictEqual(yield* reserveNativeLaunch(intent), reserved);
+    assert.deepStrictEqual(yield* browser.reserveLaunch(intent), reserved);
     const claims = yield* sql<{
       allowance_unit: number;
     }>`SELECT allowance_unit FROM work_task_native_launch_claims`;
@@ -413,9 +476,50 @@ it.effect("binds a reserved launch in the native event and receipt transaction",
     yield* seed();
     yield* persistInitialGroup(input);
     const sql = yield* SqlClient.SqlClient;
-    yield* sql`INSERT INTO work_task_allowances VALUES('task',1,0)`;
-    yield* sql`UPDATE work_task_current_state SET desired_mode='active',execution_mode='idle'
-      WHERE task_id='task'`;
+    const service = yield* makeTaskSessionService({
+      sessionId: AuthSessionId.make("session"),
+      subject: "owner",
+      method: "browser-session-cookie",
+      scopes: [AuthOrchestrationOperateScope, AuthOrchestrationReadScope],
+    });
+    const allowanceInput = {
+      taskId: WorkTaskId.make("task"),
+      commandId: CommandId.make("allowance"),
+      expectedLifecycleRevision: 1,
+      cap: 1,
+    };
+    const configured = yield* service.configureNativeAllowance(allowanceInput);
+    assert.deepStrictEqual(yield* service.configureNativeAllowance(allowanceInput), configured);
+    assert.strictEqual(
+      (yield* service.configureNativeAllowance({ ...allowanceInput, cap: 2 }).pipe(Effect.flip))
+        .code,
+      "revision_conflict",
+    );
+    const startInput = {
+      taskId: WorkTaskId.make("task"),
+      commandId: CommandId.make("start"),
+      expectedLifecycleRevision: 1,
+      groupId: "group",
+      managerThreadId: ThreadId.make("manager"),
+    };
+    const started = yield* service.startPrepared(startInput);
+    assert.deepStrictEqual(yield* service.startPrepared(startInput), started);
+    assert.strictEqual(
+      (yield* service.startPrepared({ ...startInput, groupId: "other" }).pipe(Effect.flip)).code,
+      "revision_conflict",
+    );
+    const token = yield* makeTaskSessionService({
+      sessionId: AuthSessionId.make("token"),
+      subject: "owner",
+      method: "bearer-access-token",
+      scopes: [AuthOrchestrationOperateScope, AuthOrchestrationReadScope],
+    });
+    assert.strictEqual(
+      (yield* token
+        .startPrepared({ ...startInput, commandId: CommandId.make("token-start") })
+        .pipe(Effect.flip)).code,
+      "unsupported",
+    );
     const intent = {
       environmentId: "env",
       taskId: "task",
@@ -452,14 +556,46 @@ it.effect("binds a reserved launch in the native event and receipt transaction",
         contextHandoffId: null,
       },
     });
+    const message = yield* decodeNativeEvent({
+      id: "native-integration-message-event",
+      type: "message.updated",
+      threadId: "manager",
+      runId: "native-integration-run",
+      providerInstanceId: "codex",
+      occurredAt: now,
+      payload: {
+        createdBy: "user",
+        creationSource: "web",
+        id: intent.messageId,
+        threadId: "manager",
+        runId: "native-integration-run",
+        nodeId: null,
+        role: "user",
+        text: "Do the task",
+        attachments: [],
+        streaming: false,
+        createdAt: now,
+        updatedAt: now,
+      },
+    });
     const sink = yield* EventSink.EventSinkV2;
     const command = {
       commandId: CommandId.make(intent.commandId),
       threadId: ThreadId.make(intent.managerThreadId),
       commandType: "message.dispatch",
       acceptedAt: now,
-      events: [event],
-      effects: [],
+      events: [event, message],
+      effects: [
+        {
+          id: "native-integration-effect",
+          commandId: CommandId.make(intent.commandId),
+          threadId: ThreadId.make(intent.managerThreadId),
+          request: {
+            type: "provider-turn.start" as const,
+            runId: RunId.make("native-integration-run"),
+          },
+        },
+      ],
     };
     yield* sql`UPDATE work_task_current_state SET desired_mode='paused' WHERE task_id='task'`;
     assert.isTrue(yield* sink.commitCommand(command).pipe(Effect.isFailure));
@@ -483,32 +619,90 @@ it.effect("binds a reserved launch in the native event and receipt transaction",
           ...command,
           effects: [
             {
-              id: "native-integration-effect",
-              commandId: command.commandId,
-              threadId: command.threadId,
-              request: { type: "provider-turn.start", runId: RunId.make("native-integration-run") },
+              ...command.effects[0]!,
+              request: { type: "provider-turn.start", runId: RunId.make("other-run") },
             },
           ],
         })
         .pipe(Effect.isFailure),
     );
+    assert.strictEqual((yield* sql`SELECT 1 FROM work_task_accepted_runs`).length, 0);
     assert.strictEqual(
-      (yield* sql`SELECT * FROM orchestration_command_receipts WHERE command_id=${intent.commandId}`)
+      (yield* sql`SELECT 1 FROM orchestration_command_receipts WHERE command_id=${intent.commandId}`)
         .length,
-      0,
-    );
-    assert.strictEqual(
-      (yield* sql`SELECT * FROM orchestration_events WHERE command_id=${intent.commandId}`).length,
       0,
     );
     const committed = yield* sink.commitCommand(command);
     assert.isTrue(committed.committed);
+    const recovery = {
+      commandId: intent.commandId,
+      threadId: intent.managerThreadId,
+      acceptedAt: DateTime.formatIso(now),
+      receiptSequence: committed.receipt.resultSequence,
+      storedEvents: committed.storedEvents,
+      startEffectId: "native-integration-effect",
+    };
+    yield* acceptNativeInitialRun(recovery);
+    const conflictingRecovery = yield* acceptNativeInitialRun({
+      ...recovery,
+      startEffectId: "other-effect",
+    }).pipe(Effect.flip);
+    assert.strictEqual(conflictingRecovery._tag, "WorkTaskError");
+    if (conflictingRecovery._tag === "WorkTaskError")
+      assert.strictEqual(conflictingRecovery.code, "invalid_state");
     const run = committed.storedEvents[0]?.event;
     assert.strictEqual(run?.type, "run.created");
     if (run?.type === "run.created") {
       assert.strictEqual(run.payload.nativeTaskLaunch?.commandId, intent.commandId);
       assert.strictEqual(run.payload.nativeTaskLaunch?.allowanceUnit, 1);
     }
+    assert.strictEqual(
+      (yield* sql`SELECT * FROM work_task_accepted_runs WHERE run_id='native-integration-run'`)
+        .length,
+      1,
+    );
+    assert.strictEqual(
+      (yield* sql`SELECT * FROM work_task_executable_claims WHERE run_id='native-integration-run'`)
+        .length,
+      1,
+    );
+    const owner = yield* sql<{ origin_type: string; allowance_unit: number | null }>`
+      SELECT origin_type,allowance_unit FROM work_task_accepted_runs WHERE run_id='native-integration-run'`;
+    assert.deepStrictEqual(owner, [{ origin_type: "initial_start", allowance_unit: null }]);
+    const allowance = yield* sql<{
+      consumed: number;
+    }>`SELECT consumed FROM work_task_allowances WHERE task_id='task'`;
+    assert.strictEqual(allowance[0]!.consumed, 0);
+    assert.isTrue(
+      yield* sink.isNativeTaskRunAllowed({
+        runId: RunId.make("native-integration-run"),
+        threadId: ThreadId.make("manager"),
+      }),
+    );
+    yield* sql`UPDATE orchestration_v2_projection_runs
+      SET payload_json=json_remove(payload_json,'$.nativeTaskLaunch')
+      WHERE run_id='native-integration-run'`;
+    assert.isFalse(
+      yield* sink.isNativeTaskRunAllowed({
+        runId: RunId.make("native-integration-run"),
+        threadId: ThreadId.make("manager"),
+      }),
+    );
+    yield* sql`UPDATE orchestration_v2_projection_runs
+      SET payload_json=json_set(payload_json,'$.nativeTaskLaunch',json(${JSON.stringify(run?.type === "run.created" ? run.payload.nativeTaskLaunch : null)}))
+      WHERE run_id='native-integration-run'`;
+    yield* service.pause({
+      taskId: WorkTaskId.make("task"),
+      commandId: CommandId.make("pause"),
+      expectedLifecycleRevision: 2,
+      expectedManagerGeneration: 1,
+    });
+    assert.isFalse(
+      yield* sink.isNativeTaskRunAllowed({
+        runId: RunId.make("native-integration-run"),
+        threadId: ThreadId.make("manager"),
+      }),
+    );
     yield* sql`UPDATE orchestration_events
       SET payload_json=json_remove(payload_json,'$.nativeTaskLaunch')
       WHERE event_id='native-integration-run-event'`;
@@ -532,7 +726,7 @@ it.effect("binds a reserved launch in the native event and receipt transaction",
     assert.isFalse((yield* sink.commitCommand(command)).committed);
     assert.strictEqual(
       (yield* sql`SELECT * FROM orchestration_events WHERE command_id=${intent.commandId}`).length,
-      1,
+      2,
     );
     if (run?.type !== "run.created") return yield* Effect.die("Expected native run");
     const terminalEvent = yield* decodeNativeEvent({

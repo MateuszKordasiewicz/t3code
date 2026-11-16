@@ -11,6 +11,7 @@ import {
   NodeId,
   type ProjectId,
   ThreadId,
+  WorkTaskError,
 } from "@t3tools/contracts";
 import * as ProviderCommitBatch from "./ProviderCommitBatch.ts";
 import * as Context from "effect/Context";
@@ -37,6 +38,7 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 import { readNativeLaunchReservation } from "../tasks/TaskNativeLaunchBinding.ts";
+import { acceptNativeInitialRun } from "../tasks/TaskNativeAcceptedClaim.ts";
 
 export class EventSinkWriteError extends Schema.TaggedError<EventSinkWriteError>()(
   "EventSinkWriteError",
@@ -79,6 +81,10 @@ const CurrentProviderBatch = Context.Reference<ProviderBatchPublication | undefi
 );
 
 export interface EventSinkV2Shape {
+  readonly isNativeTaskRunAllowed: (input: {
+    readonly runId: RunId;
+    readonly threadId: ThreadId;
+  }) => Effect.Effect<boolean>;
   /** Items that are not provider snapshots, such as a consumer's own control items, never batch. */
   readonly consumeProviderEvents: <A extends { readonly type: string }, E, R, E2, R2>(
     source: Stream.Stream<A, E, R>,
@@ -492,6 +498,31 @@ const layerBase: Layer.Layer<
       return committed;
     });
 
+    const isNativeTaskRunAllowed = Effect.fn("orchestrationV2.EventSink.isNativeTaskRunAllowed")(
+      function* (input: { readonly runId: RunId; readonly threadId: ThreadId }) {
+        const rows = yield* sql<{ allowed: number }>`SELECT CASE
+          WHEN json_type(r.payload_json,'$.nativeTaskLaunch') IS NULL
+            AND NOT EXISTS(SELECT 1 FROM work_task_accepted_runs a WHERE a.run_id=r.run_id) THEN 1
+          WHEN EXISTS(SELECT 1 FROM work_task_native_launch_claims n
+            JOIN work_task_accepted_runs a ON a.native_receipt_command_id=n.command_id
+              AND a.run_id=r.run_id AND a.origin_type='initial_start'
+            JOIN work_task_executable_claims c ON c.run_id=r.run_id AND c.release_event_id IS NULL
+            JOIN work_task_current_state s ON s.task_id=n.task_id
+            JOIN work_task_manager_groups g ON g.environment_id=n.environment_id AND g.group_id=n.group_id
+            JOIN work_task_group_memberships m ON m.task_id=n.task_id AND m.membership_generation=n.membership_generation
+            WHERE n.command_id=json_extract(r.payload_json,'$.nativeTaskLaunch.commandId')
+              AND n.manager_thread_id=r.thread_id AND n.task_id=a.task_id
+              AND c.task_id=n.task_id AND c.group_id=n.group_id
+              AND s.desired_mode='active' AND s.execution_mode='running'
+              AND s.manager_thread_id=n.manager_thread_id AND s.manager_generation=n.manager_generation
+              AND g.current_manager_thread_id=n.manager_thread_id
+              AND g.current_manager_generation=n.manager_generation AND g.dispatch_hold='none'
+              AND m.retired_event_id IS NULL) THEN 1 ELSE 0 END allowed
+          FROM orchestration_v2_projection_runs r
+          WHERE r.run_id=${input.runId} AND r.thread_id=${input.threadId}`;
+        return rows.length === 1 && rows[0]!.allowed === 1;
+      },
+    );
     const writeIfRunCurrentEffect = Effect.fn("orchestrationV2.EventSink.writeIfRunCurrent")(
       function* (input: Parameters<EventSinkV2Shape["writeIfRunCurrent"]>[0]) {
         yield* Effect.annotateCurrentSpan({
@@ -506,10 +537,15 @@ const layerBase: Layer.Layer<
             const rows = yield* sql<{
               readonly status: string;
               readonly active_attempt_id: string | null;
+              readonly native_command_id: string | null;
+              readonly has_task_owner: number;
             }>`
             SELECT
               status,
-              json_extract(payload_json, '$.activeAttemptId') AS active_attempt_id
+              json_extract(payload_json, '$.activeAttemptId') AS active_attempt_id,
+              json_extract(payload_json, '$.nativeTaskLaunch.commandId') AS native_command_id,
+              EXISTS(SELECT 1 FROM work_task_accepted_runs a
+                WHERE a.run_id=orchestration_v2_projection_runs.run_id) AS has_task_owner
             FROM orchestration_v2_projection_runs
             WHERE run_id = ${input.runId}
               AND thread_id = ${input.threadId}
@@ -526,6 +562,14 @@ const layerBase: Layer.Layer<
                 storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
               };
             }
+            if (
+              (current.native_command_id !== null || current.has_task_owner === 1) &&
+              !(yield* isNativeTaskRunAllowed({ runId: input.runId, threadId: input.threadId }))
+            )
+              return {
+                committed: false as const,
+                storedEvents: [] as ReadonlyArray<OrchestrationV2StoredEvent>,
+              };
 
             const normalized = yield* normalizeEvents(
               input.guardPendingUserInputCancellations === true
@@ -718,7 +762,6 @@ const layerBase: Layer.Layer<
             );
           }
           const outcomes = yield* applyStoredEvents(storedEvents);
-          yield* effectOutbox.enqueue(input.effects);
           const receipt: CommandReceiptStore.CommandReceiptV2 = {
             commandId: input.commandId,
             threadId: input.threadId,
@@ -729,6 +772,32 @@ const layerBase: Layer.Layer<
             error: null,
           };
           yield* commandReceipts.upsert(receipt);
+          if (reservation !== undefined) {
+            const starts = input.effects.filter(
+              (effect) => effect.request.type === "provider-turn.start",
+            );
+            const nativeRuns = storedEvents.filter((item) => item.event.type === "run.created");
+            if (
+              starts.length !== 1 ||
+              nativeRuns.length !== 1 ||
+              nativeRuns[0]!.event.type !== "run.created" ||
+              starts[0]!.request.type !== "provider-turn.start" ||
+              starts[0]!.request.runId !== nativeRuns[0]!.event.payload.id
+            )
+              return yield* new WorkTaskError({
+                code: "invalid_state",
+                message: "Native Task launch needs one matching provider start effect",
+              });
+            yield* acceptNativeInitialRun({
+              commandId: input.commandId,
+              threadId: input.threadId,
+              acceptedAt: DateTime.formatIso(input.acceptedAt),
+              receiptSequence: sequence,
+              storedEvents,
+              startEffectId: starts[0]!.id,
+            }).pipe(Effect.provideService(SqlClient.SqlClient, sql));
+          }
+          yield* effectOutbox.enqueue(input.effects);
           const cancelledEffectIds =
             input.cancelUnsettledEffects === undefined
               ? []
@@ -1009,6 +1078,8 @@ const layerBase: Layer.Layer<
     );
 
     return EventSinkV2.of({
+      isNativeTaskRunAllowed: (input) =>
+        isNativeTaskRunAllowed(input).pipe(Effect.orElseSucceed(() => false)),
       consumeProviderEvents: coordinator.consume,
       withProviderBatch,
       write: (input) =>

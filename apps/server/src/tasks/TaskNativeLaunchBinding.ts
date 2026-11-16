@@ -126,6 +126,8 @@ export const reserveNativeLaunch = Effect.fn("TaskNativeLaunchBinding.reserve")(
           AND g.current_manager_thread_id=${input.managerThreadId} AND g.dispatch_hold='none'
           AND m.task_id=${input.taskId} AND m.retired_event_id IS NULL
           AND p.deleted_at IS NULL AND s.desired_mode='active' AND s.execution_mode='idle'
+          AND s.manager_thread_id=g.current_manager_thread_id
+          AND s.manager_generation=g.current_manager_generation
           AND a.consumed<a.configured_cap
           AND NOT EXISTS(SELECT 1 FROM work_task_native_launch_intents i
             WHERE i.environment_id=g.environment_id AND (i.group_id=g.group_id OR i.task_id=t.task_id OR i.manager_thread_id=g.current_manager_thread_id))

@@ -211,6 +211,11 @@ describe("command permissions", () => {
     WS_METHODS.workTasksCreateDraft,
     WS_METHODS.workTasksAcceptDraft,
     WS_METHODS.workTasksCreateInitialGroup,
+    WS_METHODS.workTasksConfigureNativeAllowance,
+    WS_METHODS.workTasksStartPrepared,
+    WS_METHODS.workTasksReserveLaunch,
+    WS_METHODS.workTasksPause,
+    WS_METHODS.workTasksStop,
   ])("uses the target grant for both availability and execution of %s", (method) =>
     Effect.scoped(
       Effect.gen(function* () {

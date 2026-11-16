@@ -7,6 +7,16 @@ import {
   WorkTaskError,
   WorkTaskCreateInitialGroupInput,
   WorkTaskCreateInitialGroupResult,
+  WorkTaskPauseInput,
+  WorkTaskPauseResult,
+  WorkTaskStopInput,
+  WorkTaskStopResult,
+  WorkTaskConfigureNativeAllowanceInput,
+  WorkTaskConfigureNativeAllowanceResult,
+  WorkTaskStartPreparedInput,
+  WorkTaskStartPreparedResult,
+  WorkTaskReserveNativeLaunchInput,
+  WorkTaskNativeLaunchReservation,
 } from "./task.ts";
 import {
   OrchestrationV2SearchThreadError,
@@ -427,6 +437,11 @@ export const WS_METHODS = {
   workTasksInspectDraft: "workTasks.inspectDraft",
   workTasksAcceptDraft: "workTasks.acceptDraft",
   workTasksCreateInitialGroup: "workTasks.createInitialGroup",
+  workTasksPause: "workTasks.pause",
+  workTasksStop: "workTasks.stop",
+  workTasksConfigureNativeAllowance: "workTasks.configureNativeAllowance",
+  workTasksStartPrepared: "workTasks.startPrepared",
+  workTasksReserveLaunch: "workTasks.reserveLaunch",
   projectsListEntries: "projects.listEntries",
   projectsListIgnoredFiles: "projects.listIgnoredFiles",
   projectsReadFile: "projects.readFile",
@@ -2098,12 +2113,45 @@ const WsWorkTasksCreateInitialGroupRpc = Rpc.make(WS_METHODS.workTasksCreateInit
   success: WorkTaskCreateInitialGroupResult,
   error: Schema.Union([WorkTaskError, EnvironmentAuthorizationError]),
 });
+const WsWorkTasksPauseRpc = Rpc.make(WS_METHODS.workTasksPause, {
+  payload: WorkTaskPauseInput,
+  success: WorkTaskPauseResult,
+  error: Schema.Union([WorkTaskError, EnvironmentAuthorizationError]),
+});
+const WsWorkTasksStopRpc = Rpc.make(WS_METHODS.workTasksStop, {
+  payload: WorkTaskStopInput,
+  success: WorkTaskStopResult,
+  error: Schema.Union([WorkTaskError, EnvironmentAuthorizationError]),
+});
+const WsWorkTasksConfigureNativeAllowanceRpc = Rpc.make(
+  WS_METHODS.workTasksConfigureNativeAllowance,
+  {
+    payload: WorkTaskConfigureNativeAllowanceInput,
+    success: WorkTaskConfigureNativeAllowanceResult,
+    error: Schema.Union([WorkTaskError, EnvironmentAuthorizationError]),
+  },
+);
+const WsWorkTasksStartPreparedRpc = Rpc.make(WS_METHODS.workTasksStartPrepared, {
+  payload: WorkTaskStartPreparedInput,
+  success: WorkTaskStartPreparedResult,
+  error: Schema.Union([WorkTaskError, EnvironmentAuthorizationError]),
+});
+const WsWorkTasksReserveLaunchRpc = Rpc.make(WS_METHODS.workTasksReserveLaunch, {
+  payload: WorkTaskReserveNativeLaunchInput,
+  success: WorkTaskNativeLaunchReservation,
+  error: Schema.Union([WorkTaskError, EnvironmentAuthorizationError]),
+});
 
 export const WsRpcGroup = RpcGroup.make(
   WsWorkTasksCreateDraftRpc,
   WsWorkTasksInspectDraftRpc,
   WsWorkTasksAcceptDraftRpc,
   WsWorkTasksCreateInitialGroupRpc,
+  WsWorkTasksPauseRpc,
+  WsWorkTasksStopRpc,
+  WsWorkTasksConfigureNativeAllowanceRpc,
+  WsWorkTasksStartPreparedRpc,
+  WsWorkTasksReserveLaunchRpc,
   WsGuestShareCreateRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,

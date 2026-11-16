@@ -205,6 +205,14 @@ export const WorkTaskInspectDraftResult = Schema.Struct({
   ...committed,
   projectId: Schema.NullOr(ProjectId),
   completionPolicyRevision: PositiveInt,
+  execution: Schema.Struct({
+    desiredMode: Schema.NullOr(Schema.Literals(["not_started", "active", "paused", "closed"])),
+    executionMode: Schema.NullOr(
+      Schema.Literals(["not_started", "idle", "queued", "running", "waiting"]),
+    ),
+    managerThreadId: Schema.NullOr(ThreadId),
+    managerGeneration: Schema.NullOr(PositiveInt),
+  }),
   definition: WorkTaskDraftDefinition,
   accepted: Schema.NullOr(
     Schema.Struct({
@@ -319,6 +327,29 @@ export const WorkTaskPauseInput = Schema.Struct({ ...taskCommand, ...lifecycleGu
 export type WorkTaskPauseInput = typeof WorkTaskPauseInput.Type;
 export const WorkTaskPauseResult = Schema.Struct(lifecycleResult);
 export type WorkTaskPauseResult = typeof WorkTaskPauseResult.Type;
+export const WorkTaskStopInput = Schema.Struct({ ...taskCommand, ...lifecycleGuards });
+export type WorkTaskStopInput = typeof WorkTaskStopInput.Type;
+export const WorkTaskStopResult = Schema.Struct(lifecycleResult);
+export type WorkTaskStopResult = typeof WorkTaskStopResult.Type;
+export const WorkTaskConfigureNativeAllowanceInput = Schema.Struct({
+  ...taskCommand,
+  expectedLifecycleRevision: PositiveInt,
+  cap: PositiveInt,
+});
+export type WorkTaskConfigureNativeAllowanceInput =
+  typeof WorkTaskConfigureNativeAllowanceInput.Type;
+export const WorkTaskConfigureNativeAllowanceResult = Schema.Struct(lifecycleResult);
+export type WorkTaskConfigureNativeAllowanceResult =
+  typeof WorkTaskConfigureNativeAllowanceResult.Type;
+export const WorkTaskStartPreparedInput = Schema.Struct({
+  ...taskCommand,
+  expectedLifecycleRevision: PositiveInt,
+  groupId: TrimmedNonEmptyString,
+  managerThreadId: ThreadId,
+});
+export type WorkTaskStartPreparedInput = typeof WorkTaskStartPreparedInput.Type;
+export const WorkTaskStartPreparedResult = Schema.Struct(lifecycleResult);
+export type WorkTaskStartPreparedResult = typeof WorkTaskStartPreparedResult.Type;
 export const WorkTaskResumeInput = Schema.Struct({ ...taskCommand, ...executionGuards });
 export type WorkTaskResumeInput = typeof WorkTaskResumeInput.Type;
 export const WorkTaskResumeResult = Schema.Struct(lifecycleResult);
@@ -1246,6 +1277,7 @@ const WorkTaskNonReviewRequestedEvent = Schema.Union([
     previousManagerGeneration: Schema.NullOr(PositiveInt),
     manager: Schema.NullOr(Schema.Struct(managerIdentity)),
     reason: shortText,
+    groupId: Schema.optional(TrimmedNonEmptyString),
     runId: Schema.optional(RunId),
     messageId: Schema.optional(MessageId),
     effectId: Schema.optional(shortText),
@@ -1887,6 +1919,14 @@ export const WorkTaskNativeLaunchReservation = Schema.Struct({
   claimedAt: persistedTime,
 });
 export type WorkTaskNativeLaunchReservation = typeof WorkTaskNativeLaunchReservation.Type;
+export const WorkTaskReserveNativeLaunchInput = Schema.Struct({
+  taskId: WorkTaskId,
+  groupId: WorkTaskManagerGroupId,
+  managerThreadId: ThreadId,
+  commandId: CommandId,
+  messageId: MessageId,
+});
+export type WorkTaskReserveNativeLaunchInput = typeof WorkTaskReserveNativeLaunchInput.Type;
 export const WorkTaskPrerequisiteCompletionWitness = Schema.Struct({
   edgeId: WorkTaskGraphEdgeId,
   blocker: WorkTaskGraphTaskRef,

@@ -11,6 +11,10 @@ import {
   WorkTaskPersistedEvent,
   WorkTaskCallerContext,
   WorkTaskError,
+  WorkTaskPauseInput,
+  WorkTaskStopInput,
+  WorkTaskConfigureNativeAllowanceInput,
+  WorkTaskStartPreparedInput,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Layer from "effect/Layer";
@@ -49,7 +53,13 @@ export const makeTaskService = Effect.gen(function* () {
         commandId,
       },
     });
-    yield* store.applyFoundation(recorded);
+    if (
+      event.type === "task.allowance-configured" ||
+      event.type === "task.allowance-topped-up" ||
+      event.type === "task.allowance-debited"
+    )
+      yield* store.applyManagerAllowance(recorded);
+    else yield* store.applyFoundation(recorded);
     return recorded;
   });
   const create = Effect.fn("TaskService.create")(function* (
@@ -233,10 +243,334 @@ export const makeTaskService = Effect.gen(function* () {
       sessionId: caller.sessionId,
     }).pipe(Effect.provideService(TaskStore, store));
   });
+  const configureNativeAllowance = Effect.fn("TaskService.configureNativeAllowance")(function* (
+    input: WorkTaskConfigureNativeAllowanceInput,
+    caller: WorkTaskCallerContext,
+  ) {
+    if (caller.type !== "user")
+      return yield* new WorkTaskError({
+        code: "unsupported",
+        message: "Only an authenticated human can configure task allowance",
+      });
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const prior = yield* sql<{
+          payload_json: string;
+          sequence: number;
+          aggregate_kind: string;
+        }>`
+            SELECT payload_json,sequence,aggregate_kind FROM orchestration_events WHERE command_id=${input.commandId}`;
+        if (prior.length) {
+          if (prior.length !== 1 || prior[0]!.aggregate_kind !== "task")
+            return yield* new WorkTaskError({
+              code: "revision_conflict",
+              message: "Task command already used",
+            });
+          const event = yield* decodeEventJson(prior[0]!.payload_json);
+          if (
+            event.type !== "task.allowance-configured" ||
+            event.taskId !== input.taskId ||
+            event.resulting.cap !== input.cap ||
+            event.lifecycleRevision !== input.expectedLifecycleRevision ||
+            !NodeUtil.isDeepStrictEqual(event.attribution, caller)
+          )
+            return yield* new WorkTaskError({
+              code: "revision_conflict",
+              message: "Task command already used",
+            });
+          return {
+            taskId: event.taskId,
+            definitionRevision: event.definitionRevision,
+            lifecycleRevision: event.lifecycleRevision,
+            completionPolicyRevision: event.completionPolicyRevision,
+            actionPolicyRevision: event.actionPolicyRevision,
+            sequence: prior[0]!.sequence,
+          };
+        }
+        const task = yield* store.readFoundation(input.taskId);
+        if (!task?.sourceVerified || !task.accepted || !task.projection.current)
+          return yield* new WorkTaskError({
+            code: "invalid_state",
+            message: "Task has no accepted definition",
+          });
+        const projection = task.projection;
+        const state = projection.current;
+        if (
+          projection.lifecycleRevision !== input.expectedLifecycleRevision ||
+          (state?.desiredMode !== null && state?.desiredMode !== "not_started") ||
+          (yield* sql`SELECT 1 FROM work_task_allowances WHERE task_id=${input.taskId}`).length
+        )
+          return yield* new WorkTaskError({
+            code: "revision_conflict",
+            message: "Task allowance or lifecycle changed",
+          });
+        const event = yield* decodeEvent({
+          id: yield* Effect.sync(() => SecureRandom.uuidV4Unsafe()),
+          taskId: input.taskId,
+          commandId: input.commandId,
+          occurredAt: DateTime.formatIso(yield* DateTime.now),
+          attribution: caller,
+          definitionRevision: projection.definitionRevision,
+          lifecycleRevision: projection.lifecycleRevision,
+          completionPolicyRevision: projection.completionPolicyRevision,
+          actionPolicyRevision: projection.actionPolicyRevision,
+          type: "task.allowance-configured",
+          previous: { type: "unconfigured", consumed: 0 },
+          resulting: { type: "configured", cap: input.cap, consumed: 0 },
+        });
+        const versions = yield* sql<{
+          version: number;
+        }>`SELECT MAX(stream_version) AS version FROM orchestration_events WHERE aggregate_kind='task' AND stream_id=${input.taskId}`;
+        const recorded = yield* append(event, input.commandId, versions[0]!.version + 1);
+        return {
+          taskId: event.taskId,
+          definitionRevision: event.definitionRevision,
+          lifecycleRevision: event.lifecycleRevision,
+          completionPolicyRevision: event.completionPolicyRevision,
+          actionPolicyRevision: event.actionPolicyRevision,
+          sequence: recorded.context.sequence,
+        };
+      }),
+    );
+  });
+  const startPrepared = Effect.fn("TaskService.startPrepared")(function* (
+    input: WorkTaskStartPreparedInput,
+    caller: WorkTaskCallerContext,
+    environmentId: string,
+  ) {
+    if (caller.type !== "user")
+      return yield* new WorkTaskError({
+        code: "unsupported",
+        message: "Only an authenticated human can start a task",
+      });
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const prior = yield* sql<{
+          payload_json: string;
+          sequence: number;
+          aggregate_kind: string;
+        }>`SELECT payload_json,sequence,aggregate_kind FROM orchestration_events WHERE command_id=${input.commandId}`;
+        if (prior.length) {
+          if (prior.length !== 1 || prior[0]!.aggregate_kind !== "task")
+            return yield* new WorkTaskError({
+              code: "revision_conflict",
+              message: "Task command already used",
+            });
+          const event = yield* decodeEventJson(prior[0]!.payload_json);
+          if (
+            event.type !== "task.execution-updated" ||
+            event.reason !== "task_start" ||
+            event.taskId !== input.taskId ||
+            event.lifecycleRevision !== input.expectedLifecycleRevision + 1 ||
+            event.groupId !== input.groupId ||
+            event.manager?.managerThreadId !== input.managerThreadId ||
+            !NodeUtil.isDeepStrictEqual(event.attribution, caller)
+          )
+            return yield* new WorkTaskError({
+              code: "revision_conflict",
+              message: "Task command already used",
+            });
+          return {
+            taskId: event.taskId,
+            definitionRevision: event.definitionRevision,
+            lifecycleRevision: event.lifecycleRevision,
+            completionPolicyRevision: event.completionPolicyRevision,
+            actionPolicyRevision: event.actionPolicyRevision,
+            sequence: prior[0]!.sequence,
+          };
+        }
+        const task = yield* store.readFoundation(input.taskId);
+        if (
+          !task?.sourceVerified ||
+          !task.accepted ||
+          !task.projection.current ||
+          task.projection.projectId === null
+        )
+          return yield* new WorkTaskError({
+            code: "invalid_state",
+            message: "Task has no accepted project definition",
+          });
+        const projection = task.projection;
+        const state = projection.current;
+        if (
+          projection.lifecycleRevision !== input.expectedLifecycleRevision ||
+          task.accepted.definitionRevision !== projection.definitionRevision ||
+          (state?.desiredMode !== null && state?.desiredMode !== "not_started") ||
+          state?.managerThreadId !== null ||
+          (state?.executionMode !== null && state?.executionMode !== "not_started")
+        )
+          return yield* new WorkTaskError({
+            code: "revision_conflict",
+            message: "Task execution changed",
+          });
+        const eligible = yield* sql<{
+          generation: number;
+        }>`SELECT g.current_manager_generation generation
+            FROM work_task_manager_groups g
+            JOIN work_task_group_memberships m ON m.environment_id=g.environment_id AND m.group_id=g.group_id
+            JOIN orchestration_v2_projection_threads p ON p.thread_id=g.current_manager_thread_id
+            JOIN work_task_allowances a ON a.task_id=m.task_id
+            WHERE g.environment_id=${environmentId} AND g.group_id=${input.groupId}
+              AND g.current_manager_thread_id=${input.managerThreadId} AND g.dispatch_hold='none'
+              AND m.task_id=${input.taskId} AND m.retired_event_id IS NULL
+              AND m.accepted_definition_revision=${projection.definitionRevision}
+              AND p.project_id=${projection.projectId} AND p.deleted_at IS NULL
+              AND a.configured_cap>0 AND a.consumed=0`;
+        if (eligible.length !== 1 || eligible[0]!.generation === null)
+          return yield* new WorkTaskError({
+            code: "invalid_state",
+            message: "Prepared manager or finite allowance is unavailable",
+          });
+        const event = yield* decodeEvent({
+          id: yield* Effect.sync(() => SecureRandom.uuidV4Unsafe()),
+          taskId: input.taskId,
+          occurredAt: DateTime.formatIso(yield* DateTime.now),
+          attribution: caller,
+          definitionRevision: projection.definitionRevision,
+          lifecycleRevision: projection.lifecycleRevision + 1,
+          completionPolicyRevision: projection.completionPolicyRevision,
+          actionPolicyRevision: projection.actionPolicyRevision,
+          type: "task.execution-updated",
+          desiredMode: "active",
+          previousManagerGeneration: null,
+          manager: {
+            managerThreadId: input.managerThreadId,
+            managerGeneration: eligible[0]!.generation,
+          },
+          reason: "task_start",
+          groupId: input.groupId,
+        });
+        const versions = yield* sql<{
+          version: number;
+        }>`SELECT MAX(stream_version) AS version FROM orchestration_events WHERE aggregate_kind='task' AND stream_id=${input.taskId}`;
+        const recorded = yield* append(event, input.commandId, versions[0]!.version + 1);
+        return {
+          taskId: event.taskId,
+          definitionRevision: event.definitionRevision,
+          lifecycleRevision: event.lifecycleRevision,
+          completionPolicyRevision: event.completionPolicyRevision,
+          actionPolicyRevision: event.actionPolicyRevision,
+          sequence: recorded.context.sequence,
+        };
+      }),
+    );
+  });
+  const setExecutionHold = Effect.fn("TaskService.setExecutionHold")(function* (
+    input: WorkTaskPauseInput | WorkTaskStopInput,
+    desiredMode: "paused" | "closed",
+    caller: WorkTaskCallerContext,
+  ) {
+    if (caller.type !== "user")
+      return yield* new WorkTaskError({
+        code: "unsupported",
+        message: "Only an authenticated human can change task execution",
+      });
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const prior = yield* sql<{
+          payload_json: string;
+          sequence: number;
+          aggregate_kind: string;
+        }>`
+          SELECT payload_json,sequence,aggregate_kind FROM orchestration_events
+          WHERE command_id=${input.commandId}`;
+        if (prior.length) {
+          if (prior.length !== 1 || prior[0]!.aggregate_kind !== "task")
+            return yield* new WorkTaskError({
+              code: "revision_conflict",
+              message: "Task command already used",
+            });
+          const event = yield* decodeEventJson(prior[0]!.payload_json);
+          if (
+            event.type !== "task.execution-updated" ||
+            event.taskId !== input.taskId ||
+            event.desiredMode !== desiredMode ||
+            event.lifecycleRevision !== input.expectedLifecycleRevision + 1 ||
+            event.previousManagerGeneration !== input.expectedManagerGeneration ||
+            !NodeUtil.isDeepStrictEqual(event.attribution, caller)
+          )
+            return yield* new WorkTaskError({
+              code: "revision_conflict",
+              message: "Task command already used",
+            });
+          return {
+            taskId: event.taskId,
+            definitionRevision: event.definitionRevision,
+            lifecycleRevision: event.lifecycleRevision,
+            completionPolicyRevision: event.completionPolicyRevision,
+            actionPolicyRevision: event.actionPolicyRevision,
+            sequence: prior[0]!.sequence,
+          };
+        }
+        const current = yield* store.readFoundation(input.taskId);
+        if (!current)
+          return yield* new WorkTaskError({ code: "not_found", message: "Task not found" });
+        if (!current.sourceVerified)
+          return yield* new WorkTaskError({
+            code: "invalid_state",
+            message: "Task source is not verified",
+          });
+        const projection = current.projection;
+        const state = projection.current;
+        if (!state)
+          return yield* new WorkTaskError({
+            code: "invalid_state",
+            message: "Task has no execution state",
+          });
+        if (
+          projection.lifecycleRevision !== input.expectedLifecycleRevision ||
+          state.managerGeneration !== input.expectedManagerGeneration ||
+          state.desiredMode !== "active"
+        )
+          return yield* new WorkTaskError({
+            code: "revision_conflict",
+            message: "Task execution changed",
+          });
+        const event = yield* decodeEvent({
+          id: yield* Effect.sync(() => SecureRandom.uuidV4Unsafe()),
+          taskId: input.taskId,
+          occurredAt: DateTime.formatIso(yield* DateTime.now),
+          attribution: caller,
+          definitionRevision: projection.definitionRevision,
+          lifecycleRevision: projection.lifecycleRevision + 1,
+          completionPolicyRevision: projection.completionPolicyRevision,
+          actionPolicyRevision: projection.actionPolicyRevision,
+          type: "task.execution-updated",
+          desiredMode,
+          previousManagerGeneration: input.expectedManagerGeneration,
+          manager:
+            state.managerThreadId === null || state.managerGeneration === null
+              ? null
+              : {
+                  managerThreadId: state.managerThreadId,
+                  managerGeneration: state.managerGeneration,
+                },
+          reason: desiredMode === "paused" ? "task_pause" : "task_stop",
+        });
+        const versions = yield* sql<{ version: number }>`SELECT MAX(stream_version) AS version
+          FROM orchestration_events WHERE aggregate_kind='task' AND stream_id=${input.taskId}`;
+        const recorded = yield* append(event, input.commandId, versions[0]!.version + 1);
+        return {
+          taskId: input.taskId,
+          definitionRevision: event.definitionRevision,
+          lifecycleRevision: event.lifecycleRevision,
+          completionPolicyRevision: event.completionPolicyRevision,
+          actionPolicyRevision: event.actionPolicyRevision,
+          sequence: recorded.context.sequence,
+        };
+      }),
+    );
+  });
   return {
     create,
     acceptDraft,
     createInitialGroup,
+    configureNativeAllowance,
+    startPrepared,
+    pause: (input: WorkTaskPauseInput, caller: WorkTaskCallerContext) =>
+      setExecutionHold(input, "paused", caller),
+    stop: (input: WorkTaskStopInput, caller: WorkTaskCallerContext) =>
+      setExecutionHold(input, "closed", caller),
     inspect: store.readFoundation,
     inspectResults: store.readResults,
     readNativeHistory: store.readNativeHistory,

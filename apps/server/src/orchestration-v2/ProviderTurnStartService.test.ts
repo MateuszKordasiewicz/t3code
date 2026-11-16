@@ -135,7 +135,10 @@ function startWithMissingWorktree(
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({}),
-        Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
+        Layer.mock(EventSink.EventSinkV2)({
+          writeIfRunCurrent,
+          isNativeTaskRunAllowed: () => Effect.succeed(true),
+        }),
         IdAllocator.layer,
         Layer.succeed(FileSystem.FileSystem, {
           exists: () => Effect.succeed(false),
@@ -938,6 +941,7 @@ function makeLocalCommandHarness(input: {
         }),
         Layer.mock(EventSink.EventSinkV2)({
           writeIfRunCurrent,
+          isNativeTaskRunAllowed: () => Effect.succeed(true),
           write: ({ events: incoming }) =>
             Effect.sync(() => {
               for (const event of incoming) {

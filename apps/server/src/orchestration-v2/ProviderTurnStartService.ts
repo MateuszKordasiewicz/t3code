@@ -1598,6 +1598,8 @@ export const layer: Layer.Layer<
             persist: persistHandoff,
           });
           if (!(yield* isCurrentAttemptInStatus("running"))) return;
+          if (!(yield* eventSink.isNativeTaskRunAllowed({ runId: run.id, threadId: run.threadId })))
+            return;
           const start = compact ? session.compactThread! : session.startTurn;
           // Like history, the side chat context waits for a turn that sends a prompt.
           const sideChatContext =

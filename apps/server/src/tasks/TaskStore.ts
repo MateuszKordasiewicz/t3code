@@ -2605,7 +2605,9 @@ const make = Effect.gen(function* () {
               break;
             case "task.execution-updated":
               yield* sql`UPDATE work_task_current_state SET desired_mode=${event.desiredMode},manager_thread_id=json_extract(${yield* encodeProjectionJson(event.manager?.managerThreadId ?? null)},'$'),
-          manager_generation=${event.manager?.managerGeneration ?? null} WHERE task_id=json_extract(${yield* encodeProjectionJson(event.taskId)},'$')`;
+          manager_generation=${event.manager?.managerGeneration ?? null},
+          execution_mode=CASE WHEN ${event.reason}='task_start' THEN 'idle' ELSE execution_mode END
+          WHERE task_id=json_extract(${yield* encodeProjectionJson(event.taskId)},'$')`;
               break;
             case "task.thread-linked":
               yield* sql`INSERT INTO work_task_thread_links(link_event_id,task_id,thread_id,linked_at,linked_attribution_json) VALUES(json_extract(${yield* encodeProjectionJson(event.id)},'$'),json_extract(${yield* encodeProjectionJson(event.taskId)},'$'),json_extract(${yield* encodeProjectionJson(event.threadId)},'$'),${event.occurredAt},${yield* encodeProjectionJson(event.attribution)})`;
