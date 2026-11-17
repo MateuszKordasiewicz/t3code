@@ -166,17 +166,12 @@ function logThreadOutboxUploadFailure(queuedMessage: QueuedThreadMessage, error:
 }
 
 function logIssueLinkFailure(queuedMessage: QueuedThreadMessage, error: unknown): void {
-  const context = {
+  console.warn("[thread-outbox] failed to link the new thread's issue", {
     environmentId: queuedMessage.environmentId,
     threadId: queuedMessage.threadId,
     messageId: queuedMessage.messageId,
     error,
-  };
-  if (isOrdinaryThreadOutboxTransportFailure(error)) {
-    threadOutboxDebug.log("issue link failed", context);
-  } else {
-    console.warn("[thread-outbox] failed to link the new thread's issue", context);
-  }
+  });
 }
 
 function setQueuedMessageRetrying(queuedMessageId: MessageId, retrying: boolean): void {
@@ -720,7 +715,10 @@ const deliveryCommand = <W, A, E>(
 ): Effect.Effect<AtomCommandResult<A, E>> =>
   Effect.promise(() => runAtomCommand(appAtomRegistry, command, input, { reportFailure: false }));
 
-/** Best effort: the turn has started, so a failed link is logged, never retried or handed back. */
+/**
+ * Best effort: the turn has started, so a failed link is logged, never retried or handed back.
+ * Detached, so a slow reply never holds the thread's later messages.
+ */
 const linkCreatedThreadIssue = Effect.fn("ThreadOutbox.linkCreatedThreadIssue")(function* (
   queuedMessage: QueuedThreadMessage,
   issueLink: ThreadIssueLinkTarget,
@@ -1214,7 +1212,9 @@ export function createThreadOutboxDelivery(): {
       return yield* restoreQueuedMessage(persistedMessage, failure.message);
     }
     recordPendingThreadCreationOutcome({ kind: "delivered", message: persistedMessage });
-    if (creation.issueLink) yield* linkCreatedThreadIssue(queuedMessage, creation.issueLink);
+    if (creation.issueLink) {
+      yield* Effect.forkDetach(linkCreatedThreadIssue(queuedMessage, creation.issueLink));
+    }
     const outcome = yield* completeQueuedMessageDelivery(
       persistedMessage,
       deliveryRevision,

@@ -309,6 +309,7 @@ describe.each([
     );
     expect(testState.draftStore.setDraftThreadContext).toHaveBeenCalledWith(opened?.draftId, {
       issueLink,
+      environmentSelection: "manual",
     });
     expect(testState.draftStore.setPrompt.mock.invocationCallOrder[0]).toBeLessThan(
       testState.router.navigate.mock.invocationCallOrder[0] ?? 0,

@@ -367,10 +367,16 @@ describe("queued task started from an issue", () => {
       },
     });
 
-  it("links the issue once the launch is accepted", async () => {
+  it("links the issue once the launch is accepted, without holding delivery for the reply", async () => {
     setOperateGrant("secondary", true);
+    const linked = Promise.withResolvers<void>();
+    state.link.mockImplementationOnce(() => {
+      linked.resolve();
+      return new Promise(() => {});
+    });
     await state.manager.enqueue(queuedIssueTask());
     await runDrain();
+    await linked.promise;
     expect(state.link).toHaveBeenCalledExactlyOnceWith({
       environmentId: "secondary",
       input: { threadId: "new-issue-thread", ...issueLink, source: "manual" },
@@ -383,12 +389,14 @@ describe("queued task started from an issue", () => {
 
   it("completes the launch when the link fails, without retrying or handing it back", async () => {
     setOperateGrant("secondary", true);
-    using warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const warned = Promise.withResolvers<void>();
+    using warn = vi.spyOn(console, "warn").mockImplementation(() => warned.resolve());
     await state.manager.enqueue(queuedIssueTask());
     state.link.mockResolvedValueOnce(
       AsyncResult.failure(Cause.fail(new Error("Issue tracking is not enabled."))),
     );
     await runDrain();
+    await warned.promise;
     expect(state.start).toHaveBeenCalledOnce();
     expect(state.link).toHaveBeenCalledOnce();
     expect(warn).toHaveBeenCalledOnce();
@@ -619,7 +627,13 @@ describe("queued task whose launch reply is lost", () => {
   it("resends an unedited launch instead of handing its text back", async () => {
     await loseLaunchReply(queuedTask({ issueLink }));
     expect(state.link).not.toHaveBeenCalled();
+    const linked = Promise.withResolvers<void>();
+    state.link.mockImplementationOnce(async () => {
+      linked.resolve();
+      return AsyncResult.success(undefined);
+    });
     await fireRetry();
+    await linked.promise;
 
     expect(state.draftText).toBe("Keep this draft separate");
     // The resend reuses the launch's command and message ids, so the server replays it.
