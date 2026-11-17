@@ -150,11 +150,19 @@ export function issueUrl(scope: string, key: string): string {
   return `beads://${encodeURIComponent(scope)}/${encodeURIComponent(key)}`;
 }
 
+function decodePart(part: string): string | null {
+  try {
+    return decodeURIComponent(part);
+  } catch {
+    return null;
+  }
+}
+
 export function parseIssueUrl(url: URL) {
   if (url.protocol !== URL_PROTOCOL) return null;
-  const key = decodeURIComponent(url.pathname.replace(/^\/+/, ""));
-  const scope = decodeURIComponent(url.hostname).toLowerCase();
-  if (scope.length === 0 || key.length === 0 || key.includes("/")) return null;
+  const key = decodePart(url.pathname.replace(/^\/+/, ""));
+  const scope = decodePart(url.hostname)?.toLowerCase();
+  if (!scope || !key || key.includes("/")) return null;
   return { host: HOST, scope, key };
 }
 
@@ -204,10 +212,23 @@ function relationLine(relation: BeadRelation): string {
   return `${relation.id} · ${relation.title} (${stateName(relation.status).toLowerCase()})`;
 }
 
-function relationList(label: string, relations: ReadonlyArray<BeadRelation>): string[] {
+function relationList(
+  label: string,
+  relations: ReadonlyArray<BeadRelation>,
+  line: (relation: BeadRelation) => string = relationLine,
+): string[] {
   if (relations.length === 0) return [];
-  return [`- ${label}:`, ...relations.map((relation) => `  - ${relationLine(relation)}`)];
+  return [`- ${label}:`, ...relations.map((relation) => `  - ${line(relation)}`)];
 }
+
+const typedRelationLine = (relation: BeadRelation) =>
+  `${relation.dependency_type} · ${relationLine(relation)}`;
+
+/** Only `blocks` holds a bead back; an edge without a type is one, as `bd dep add` defaults. */
+const isBlocking = (relation: BeadRelation) =>
+  relation.dependency_type === undefined || relation.dependency_type === "blocks";
+const isParentChild = (relation: BeadRelation) => relation.dependency_type === "parent-child";
+const isOtherLink = (relation: BeadRelation) => !isBlocking(relation) && !isParentChild(relation);
 
 /**
  * The generic issue has no fields for a bead's type, priority or graph, so they are written out
@@ -216,10 +237,10 @@ function relationList(label: string, relations: ReadonlyArray<BeadRelation>): st
 export function detailBody(bead: BeadDetail): string {
   const dependencies = bead.dependencies ?? [];
   const dependents = bead.dependents ?? [];
-  const parent = dependencies.filter((relation) => relation.dependency_type === "parent-child");
-  const needs = dependencies.filter((relation) => relation.dependency_type !== "parent-child");
-  const children = dependents.filter((relation) => relation.dependency_type === "parent-child");
-  const neededBy = dependents.filter((relation) => relation.dependency_type !== "parent-child");
+  const parent = dependencies.filter(isParentChild);
+  const needs = dependencies.filter(isBlocking);
+  const children = dependents.filter(isParentChild);
+  const neededBy = dependents.filter(isBlocking);
   const details = [
     `- Type: ${bead.issue_type ?? "unknown"}`,
     `- Priority: ${bead.priority === undefined ? "none" : `P${bead.priority}`}`,
@@ -233,6 +254,8 @@ export function detailBody(bead: BeadDetail): string {
     ...relationList("Depends on", needs),
     ...relationList("Children", children),
     ...relationList("Required by", neededBy),
+    ...relationList("Links to", dependencies.filter(isOtherLink), typedRelationLine),
+    ...relationList("Linked from", dependents.filter(isOtherLink), typedRelationLine),
   ];
   const sections = [
     bead.description?.trim() ?? "",
@@ -403,6 +426,8 @@ export const make: Effect.Effect<IssueTrackerApi, never, SourceControlHost.Sourc
           return yield* failure("listIssues", "failed", "The beads page cursor is not valid.");
         }
         yield* requireScope("listIssues", input.cwd, input.scope);
+        // Beads have no mentions, so no bead mentions the viewer.
+        if (input.involvement === "mentioned") return { items: [], nextCursor: null };
         const offset = input.cursor === undefined ? 0 : Number(input.cursor);
         const assignee = input.involvement === "assigned" ? input.viewer : input.assignee;
         const rows = yield* read(

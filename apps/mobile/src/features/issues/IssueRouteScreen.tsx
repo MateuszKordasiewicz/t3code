@@ -19,6 +19,7 @@ import { KeyboardStickyView } from "react-native-keyboard-controller";
 import { RelativeTime } from "../../components/RelativeTime";
 import { AppActivityIndicator } from "../../components/ui/AppActivityIndicator";
 import { AppBar } from "../../components/ui/AppBar";
+import type { AppBarMenuItem } from "../../components/ui/AppBar.types";
 import { SymbolView } from "../../components/ui/AppSymbol";
 import { AppText as Text } from "../../components/ui/AppText";
 import { Button } from "../../components/ui/Button";
@@ -447,6 +448,50 @@ function IssueRoute({ params }: { readonly params: IssueParams }) {
         : undefined;
   const url = issue ? issueWebUrl(issue.url) : null;
   const detailUrl = detail ? issueWebUrl(detail.url) : null;
+  const issueActions: ReadonlyArray<AppBarMenuItem> = [
+    ...(access?.edit
+      ? [
+          {
+            id: "edit-title",
+            title: "Edit title",
+            icon: "pencil",
+            onPress: () => navigation.navigate("IssueEdit", { ...identity, field: "title" }),
+          },
+          {
+            id: "edit-description",
+            title: "Edit description",
+            icon: "doc.text",
+            onPress: () => navigation.navigate("IssueEdit", { ...identity, field: "body" }),
+          },
+        ]
+      : []),
+    ...(url
+      ? [
+          {
+            id: "open-on-host",
+            title: "Open on the tracker",
+            icon: "arrow.up.right",
+            onPress: () => void Linking.openURL(url),
+          },
+          {
+            id: "copy-link",
+            title: "Copy link",
+            icon: "link",
+            onPress: () => copyTextWithHaptic(url, { target: "issue link" }),
+          },
+          {
+            id: "share",
+            title: "Share…",
+            icon: "square.and.arrow.up",
+            onPress: () =>
+              // Android ignores `url`; iOS shows a `message` URL as plain text.
+              void Share.share(Platform.OS === "ios" ? { url } : { message: url }).catch(
+                () => undefined,
+              ),
+          },
+        ]
+      : []),
+  ];
   return (
     <PullRequestMarkdownRepository
       params={{
@@ -462,58 +507,11 @@ function IssueRoute({ params }: { readonly params: IssueParams }) {
           title={issue?.displayKey ?? params.issueKey}
           subtitle={connected ? params.scope : `${params.scope} · Offline`}
           onBack={layout.usesSplitView ? undefined : returnToList}
-          menus={[
-            {
-              title: "Issue actions",
-              icon: "ellipsis",
-              items: [
-                ...(access?.edit
-                  ? [
-                      {
-                        id: "edit-title",
-                        title: "Edit title",
-                        icon: "pencil",
-                        onPress: () =>
-                          navigation.navigate("IssueEdit", { ...identity, field: "title" }),
-                      },
-                      {
-                        id: "edit-description",
-                        title: "Edit description",
-                        icon: "doc.text",
-                        onPress: () =>
-                          navigation.navigate("IssueEdit", { ...identity, field: "body" }),
-                      },
-                    ]
-                  : []),
-                ...(url
-                  ? [
-                      {
-                        id: "open-on-host",
-                        title: "Open on the tracker",
-                        icon: "arrow.up.right",
-                        onPress: () => void Linking.openURL(url),
-                      },
-                      {
-                        id: "copy-link",
-                        title: "Copy link",
-                        icon: "link",
-                        onPress: () => copyTextWithHaptic(url, { target: "issue link" }),
-                      },
-                      {
-                        id: "share",
-                        title: "Share…",
-                        icon: "square.and.arrow.up",
-                        onPress: () =>
-                          // Android ignores `url`; iOS shows a `message` URL as plain text.
-                          void Share.share(
-                            Platform.OS === "ios" ? { url } : { message: url },
-                          ).catch(() => undefined),
-                      },
-                    ]
-                  : []),
-              ],
-            },
-          ]}
+          menus={
+            issueActions.length > 0
+              ? [{ title: "Issue actions", icon: "ellipsis", items: issueActions }]
+              : []
+          }
         />
         {!usesNativeWorkspaceColumns ? <NativeLayoutObserver onChange={setScreenMetrics} /> : null}
         {/* Not a bare marker: Android wraps a refreshable scroll view, which the marker rejects. */}

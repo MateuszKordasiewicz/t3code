@@ -182,6 +182,10 @@ describe("BeadsIssueTracker", () => {
         "--readonly",
       ]);
       assert.deepStrictEqual(lists[1]?.slice(5, 7), ["--status", "closed"]);
+      assert.deepStrictEqual(yield* beads.listIssues({ ...listInput, involvement: "mentioned" }), {
+        items: [],
+        nextCursor: null,
+      });
       const found = yield* beads.listIssues({ ...listInput, query: "WHICH" });
       assert.deepStrictEqual(
         found.items.map((item) => item.key),
@@ -251,6 +255,19 @@ describe("BeadsIssueTracker", () => {
       assert.include(
         epic.body,
         "- Children:\n  - demo-ku6.1 · First slice (open)\n  - demo-ku6.2 · Q: which way? (closed)",
+      );
+      // Only a blocking edge is a dependency; any other link keeps its own name.
+      const related = yield* (yield* tracker({
+        show: () =>
+          fixture("show-slice.json").replace(
+            '"dependency_type":"blocks"',
+            '"dependency_type":"related"',
+          ),
+      }).api).getIssue({ cwd: "/repo", host: "beads", scope: SCOPE, key: "demo-ku6.1" });
+      assert.notInclude(related.body, "Depends on");
+      assert.include(
+        related.body,
+        "- Links to:\n  - related · demo-ku6.2 · Q: which way? (closed)",
       );
     }),
   );
@@ -337,5 +354,6 @@ describe("BeadsIssueTracker", () => {
     });
     assert.isNull(BeadsIssueTracker.parseIssueUrl(new URL("https://github.com/a/b/issues/1")));
     assert.isNull(BeadsIssueTracker.parseIssueUrl(new URL(`beads://${SCOPE}/`)));
+    assert.isNull(BeadsIssueTracker.parseIssueUrl(new URL(`beads://${SCOPE}/%`)));
   });
 });

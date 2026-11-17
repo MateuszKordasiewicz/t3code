@@ -227,25 +227,29 @@ const make = Effect.gen(function* () {
   /**
    * Where a project's issues live: its bound standalone tracker, a tracker its directory
    * carries, its git host's, or several. The tracker bound in Settings leads, as the one the
-   * user chose; a directory's own tracker comes before the git host's, which every remote implies.
+   * user chose, then the git host's, then a tracker found in the directory: finding one must not
+   * move where an agent's key-only read or create already went.
    */
   const resolveProjectTracker = (
     project: OrchestrationProjectShell,
   ): Effect.Effect<ReadonlyArray<ProjectTrackerBinding>, IssueOperationError> =>
-    Effect.all([
-      resolveStandaloneBinding(project),
-      discoverProjectLocal(project),
-      (project.repositoryIdentity != null
-        ? Effect.succeed(project.repositoryIdentity)
-        : repositoryIdentities.resolve(project.workspaceRoot)
-      ).pipe(
-        Effect.map((repositoryIdentity) =>
-          resolveGitHostBinding({ ...project, repositoryIdentity }),
+    Effect.all(
+      [
+        resolveStandaloneBinding(project),
+        discoverProjectLocal(project),
+        (project.repositoryIdentity != null
+          ? Effect.succeed(project.repositoryIdentity)
+          : repositoryIdentities.resolve(project.workspaceRoot)
+        ).pipe(
+          Effect.map((repositoryIdentity) =>
+            resolveGitHostBinding({ ...project, repositoryIdentity }),
+          ),
         ),
-      ),
-    ]).pipe(
+      ],
+      { concurrency: "unbounded" },
+    ).pipe(
       Effect.map(([standalone, local, gitHost]) =>
-        [standalone, ...local, gitHost].filter((binding) => binding !== null),
+        [standalone, gitHost, ...local].filter((binding) => binding !== null),
       ),
     );
 

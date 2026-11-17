@@ -626,7 +626,7 @@ describe("IssueService with a standalone tracker", () => {
 describe("IssueService with a project-local tracker", () => {
   const scopes = { "/w/web": "web-db", "/w/web/.worktrees/fix": "web-db", "/w/api": "api-db" };
 
-  it.effect("lists a directory's tracker first beside its git host, once per database", () =>
+  it.effect("lists a directory's tracker beside its git host, once per database", () =>
     Effect.gen(function* () {
       const listed: string[] = [];
       const record = (tracker: IssueTrackerKind): Partial<IssueTrackerApi> => ({
@@ -672,11 +672,16 @@ describe("IssueService with a project-local tracker", () => {
       expect(result.trackers).toContainEqual(
         expect.objectContaining({ tracker: "beads", host: "beads", projectCount: 3 }),
       );
-      expect(yield* service.projectScope("web" as ProjectId)).toEqual({
-        projectId: "web",
+      // A key-only read or create keeps going to the git host; the database leads only alone.
+      expect(yield* service.projectScope("web" as ProjectId)).toMatchObject({
+        tracker: "github",
+        scope: "acme/web",
+      });
+      expect(yield* service.projectScope("api" as ProjectId)).toEqual({
+        projectId: "api",
         tracker: "beads",
         host: "beads",
-        scope: "web-db",
+        scope: "api-db",
       });
       expect(yield* service.projectScope("broken" as ProjectId)).toMatchObject({
         tracker: "github",
