@@ -683,6 +683,16 @@ describe("IssueService with a project-local tracker", () => {
         host: "beads",
         scope: "api-db",
       });
+      // A Settings binding still leads over both.
+      const bound = yield* makeService({
+        projects: [project({ id: "web", repository: "acme/web" })],
+        trackers: [fakeTracker(), fakeStandaloneTracker(), fakeProjectLocalTracker(scopes)],
+        bindings: { ["web" as ProjectId]: { tracker: LINEAR, scope: "ENG" } },
+      });
+      expect(yield* bound.projectScope("web" as ProjectId)).toMatchObject({
+        tracker: "linear",
+        scope: "ENG",
+      });
       expect(yield* service.projectScope("broken" as ProjectId)).toMatchObject({
         tracker: "github",
         scope: "acme/broken",

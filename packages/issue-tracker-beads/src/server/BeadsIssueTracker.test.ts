@@ -257,17 +257,30 @@ describe("BeadsIssueTracker", () => {
         "- Children:\n  - demo-ku6.1 · First slice (open)\n  - demo-ku6.2 · Q: which way? (closed)",
       );
       // Only a blocking edge is a dependency; any other link keeps its own name.
-      const related = yield* (yield* tracker({
+      const [slice] = JSON.parse(fixture("show-slice.json"));
+      const [parent, blocker] = slice.dependencies;
+      const { dependency_type: _untyped, ...untypedBlocker } = blocker;
+      const linked = yield* (yield* tracker({
         show: () =>
-          fixture("show-slice.json").replace(
-            '"dependency_type":"blocks"',
-            '"dependency_type":"related"',
-          ),
+          JSON.stringify([
+            {
+              ...slice,
+              dependencies: [parent, untypedBlocker, { ...blocker, dependency_type: "related" }],
+              dependents: [{ ...blocker, id: "demo-ku6.3", dependency_type: "tracks" }],
+            },
+          ]),
       }).api).getIssue({ cwd: "/repo", host: "beads", scope: SCOPE, key: "demo-ku6.1" });
-      assert.notInclude(related.body, "Depends on");
+      assert.notInclude(linked.body, "Required by");
       assert.include(
-        related.body,
-        "- Links to:\n  - related · demo-ku6.2 · Q: which way? (closed)",
+        linked.body,
+        [
+          "- Depends on:",
+          "  - demo-ku6.2 · Q: which way? (closed)",
+          "- Links to:",
+          "  - related · demo-ku6.2 · Q: which way? (closed)",
+          "- Linked from:",
+          "  - tracks · demo-ku6.3 · Q: which way? (closed)",
+        ].join("\n"),
       );
     }),
   );
