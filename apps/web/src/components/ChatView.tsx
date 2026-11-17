@@ -1340,11 +1340,13 @@ export default function ChatView(props: ChatViewProps) {
     loadBalancingEnabled: settings.loadBalancingEnabled,
     loadBalancingWeights: settings.loadBalancingWeights,
   }));
+  // An issue draft stays on its machine: its link names that machine's project.
+  const canAutoBalanceDraft = canAutoBalanceEnvironments && !draftThread?.issueLink;
   const automaticEnvironment = Boolean(
     clientSettingsHydrated &&
     draftId &&
     !envLocked &&
-    canAutoBalanceEnvironments &&
+    canAutoBalanceDraft &&
     loadBalancingSettings.loadBalancingEnabled &&
     draftThread?.environmentSelection !== "manual" &&
     (!composerHasAttachments || Boolean(draftThread?.loadBalancedEnvironmentId)) &&
@@ -3848,7 +3850,7 @@ export default function ChatView(props: ChatViewProps) {
                                   onAutoEnvironment={
                                     draftId &&
                                     !envLocked &&
-                                    canAutoBalanceEnvironments &&
+                                    canAutoBalanceDraft &&
                                     loadBalancingSettings.loadBalancingEnabled
                                       ? onAutoEnvironmentStable
                                       : undefined
@@ -3947,7 +3949,7 @@ export default function ChatView(props: ChatViewProps) {
                   onAutoEnvironment={
                     draftId &&
                     !envLocked &&
-                    canAutoBalanceEnvironments &&
+                    canAutoBalanceDraft &&
                     loadBalancingSettings.loadBalancingEnabled
                       ? onAutoEnvironmentStable
                       : undefined

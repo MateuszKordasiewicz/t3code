@@ -134,14 +134,8 @@ export function createNewThreadHandler(router: AnyRouter) {
     // Never over text the user wrote: a draft can gain some while this awaits.
     const seedPrompt = (draftId: DraftId) => {
       if (composerDraftHasUserContent(getComposerDraft(draftId))) return;
-      // A reused empty draft may still carry an earlier issue's link. A linked draft stays on
-      // its machine: the link names that machine's project, and load balancing would drop it.
-      setDraftThreadContext(
-        draftId,
-        options?.issueLink
-          ? { issueLink: options.issueLink, environmentSelection: "manual" }
-          : { issueLink: null },
-      );
+      // A reused empty draft may still carry an earlier issue's link.
+      setDraftThreadContext(draftId, { issueLink: options?.issueLink ?? null });
       if (options?.prompt !== undefined) setPrompt(draftId, options.prompt);
     };
     const requestingRouteHref = router.state.location.href;
