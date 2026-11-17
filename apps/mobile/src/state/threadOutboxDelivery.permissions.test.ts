@@ -2,6 +2,7 @@ import {
   AuthOrchestrationOperateScope,
   CommandId,
   EnvironmentId,
+  IssueTrackerKind,
   MessageId,
   ProjectId,
   ProviderInstanceId,
@@ -27,6 +28,7 @@ const state = vi.hoisted(() => ({
   interaction: vi.fn(),
   prepare: vi.fn(),
   checkout: vi.fn(),
+  link: vi.fn(),
   modelUnavailable: vi.fn(() => false),
   familyMount: vi.fn(() => () => {}),
   threadShells: null as unknown as Atom.Writable<ReadonlyArray<unknown>>,
@@ -95,6 +97,7 @@ vi.mock("./threads", async () => {
       updateMetadata: state.metadata,
       setRuntimeMode: state.runtime,
       setInteractionMode: state.interaction,
+      linkIssue: state.link,
     },
     environmentThreadShells: { threadShellsAtom: state.threadShells },
     threadFamilies: {
@@ -182,6 +185,16 @@ const message = (overrides: Partial<QueuedThreadMessage> = {}): QueuedThreadMess
   createdAt: "2026-09-05T00:00:00.000Z",
   ...overrides,
 });
+const issueLink = {
+  tracker: IssueTrackerKind.make("github"),
+  host: "github.com",
+  scope: "acme/repo",
+  key: "7",
+  projectId: ProjectId.make("project"),
+  url: "https://github.com/acme/repo/issues/7",
+  displayKey: "#7",
+  title: "Crash on launch",
+};
 const remaining = () =>
   Object.values(appAtomRegistry.get(state.manager.queuedMessagesByThreadKeyAtom)).flat();
 
@@ -231,6 +244,7 @@ beforeEach(() => {
     state.runtime,
     state.interaction,
     state.checkout,
+    state.link,
   ]) {
     command.mockReset().mockResolvedValue(AsyncResult.success(undefined));
   }
@@ -291,6 +305,7 @@ describe("queued PR checkout", () => {
       worktreePath: preparedCheckout.worktreePath,
     });
     expect(bootstrap.prepareWorktree).toBeUndefined();
+    expect(state.link).not.toHaveBeenCalled();
     expect(remaining()).toEqual([]);
   });
 
@@ -335,6 +350,51 @@ describe("queued PR checkout", () => {
 });
 afterEach(() => {
   state.cleanups.splice(0).forEach((cleanup) => cleanup());
+});
+
+describe("queued task started from an issue", () => {
+  const queuedIssueTask = () =>
+    message({
+      threadId: ThreadId.make("new-issue-thread"),
+      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+      creation: {
+        projectId: ProjectId.make("project"),
+        projectCwd: "/repo",
+        workspaceMode: "worktree",
+        branch: "main",
+        worktreePath: null,
+        issueLink,
+      },
+    });
+
+  it("links the issue once the launch is accepted", async () => {
+    setOperateGrant("secondary", true);
+    await state.manager.enqueue(queuedIssueTask());
+    await runDrain();
+    expect(state.link).toHaveBeenCalledExactlyOnceWith({
+      environmentId: "secondary",
+      input: { threadId: "new-issue-thread", ...issueLink, source: "manual" },
+    });
+    expect(state.start.mock.invocationCallOrder[0]).toBeLessThan(
+      state.link.mock.invocationCallOrder[0]!,
+    );
+    expect(remaining()).toEqual([]);
+  });
+
+  it("completes the launch when the link fails, without retrying or handing it back", async () => {
+    setOperateGrant("secondary", true);
+    using warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await state.manager.enqueue(queuedIssueTask());
+    state.link.mockResolvedValueOnce(
+      AsyncResult.failure(Cause.fail(new Error("Issue tracking is not enabled."))),
+    );
+    await runDrain();
+    expect(state.start).toHaveBeenCalledOnce();
+    expect(state.link).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledOnce();
+    expect(state.draftText).toBe("Keep this draft separate");
+    expect(remaining()).toEqual([]);
+  });
 });
 
 describe("queued task operation access", () => {
@@ -557,7 +617,8 @@ describe("queued task whose launch reply is lost", () => {
   }
 
   it("resends an unedited launch instead of handing its text back", async () => {
-    await loseLaunchReply(queuedTask());
+    await loseLaunchReply(queuedTask({ issueLink }));
+    expect(state.link).not.toHaveBeenCalled();
     await fireRetry();
 
     expect(state.draftText).toBe("Keep this draft separate");
@@ -566,6 +627,7 @@ describe("queued task whose launch reply is lost", () => {
     expect(state.start).toHaveBeenCalledTimes(2);
     expect(resent.commandId).toBe(first.commandId);
     expect(resent.message.messageId).toBe(first.message.messageId);
+    expect(state.link).toHaveBeenCalledOnce();
     expect(remaining()).toEqual([]);
   });
 

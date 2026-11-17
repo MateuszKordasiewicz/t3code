@@ -20,6 +20,7 @@ import {
   managedRuntimeModeDenial,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   type EnvironmentId,
+  type ThreadIssueLinkTarget,
 } from "@t3tools/contracts";
 import { buildTemporaryWorktreeBranchName } from "@t3tools/shared/git";
 import * as Cause from "effect/Cause";
@@ -161,6 +162,20 @@ function logThreadOutboxUploadFailure(queuedMessage: QueuedThreadMessage, error:
     threadOutboxDebug.log("attachment upload failed; retrying", { ...context, error });
   } else {
     console.warn("[thread-outbox] failed to upload attachments", { ...context, error });
+  }
+}
+
+function logIssueLinkFailure(queuedMessage: QueuedThreadMessage, error: unknown): void {
+  const context = {
+    environmentId: queuedMessage.environmentId,
+    threadId: queuedMessage.threadId,
+    messageId: queuedMessage.messageId,
+    error,
+  };
+  if (isOrdinaryThreadOutboxTransportFailure(error)) {
+    threadOutboxDebug.log("issue link failed", context);
+  } else {
+    console.warn("[thread-outbox] failed to link the new thread's issue", context);
   }
 }
 
@@ -530,6 +545,9 @@ export const restoreRejectedQueuedMessage = Effect.fn("ThreadOutbox.restoreRejec
                 branch: queuedMessage.creation.branch,
                 worktreePath: queuedMessage.creation.worktreePath,
                 pullRequestReference: queuedMessage.creation.pullRequestReference,
+                ...(queuedMessage.creation.issueLink
+                  ? { issueLink: queuedMessage.creation.issueLink }
+                  : {}),
                 ...(queuedMessage.creation.startFromOrigin !== undefined
                   ? { startFromOrigin: queuedMessage.creation.startFromOrigin }
                   : {}),
@@ -701,6 +719,18 @@ const deliveryCommand = <W, A, E>(
   input: W,
 ): Effect.Effect<AtomCommandResult<A, E>> =>
   Effect.promise(() => runAtomCommand(appAtomRegistry, command, input, { reportFailure: false }));
+
+/** Best effort: the turn has started, so a failed link is logged, never retried or handed back. */
+const linkCreatedThreadIssue = Effect.fn("ThreadOutbox.linkCreatedThreadIssue")(function* (
+  queuedMessage: QueuedThreadMessage,
+  issueLink: ThreadIssueLinkTarget,
+) {
+  const result = yield* deliveryCommand(threadEnvironment.linkIssue, {
+    environmentId: queuedMessage.environmentId,
+    input: { threadId: queuedMessage.threadId, ...issueLink, source: "manual" },
+  });
+  if (AsyncResult.isFailure(result)) logIssueLinkFailure(queuedMessage, Cause.squash(result.cause));
+});
 
 function reportCommandFailure(
   queuedMessage: QueuedThreadMessage,
@@ -1184,6 +1214,7 @@ export function createThreadOutboxDelivery(): {
       return yield* restoreQueuedMessage(persistedMessage, failure.message);
     }
     recordPendingThreadCreationOutcome({ kind: "delivered", message: persistedMessage });
+    if (creation.issueLink) yield* linkCreatedThreadIssue(queuedMessage, creation.issueLink);
     const outcome = yield* completeQueuedMessageDelivery(
       persistedMessage,
       deliveryRevision,

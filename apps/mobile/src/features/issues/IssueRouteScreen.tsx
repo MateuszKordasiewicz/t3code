@@ -12,6 +12,7 @@ import type {
   IssueSummary,
 } from "@t3tools/contracts";
 import { AsyncResult } from "effect/reactivity";
+import { useGT } from "gt-react-native";
 import { useRef, useState } from "react";
 import { Linking, Platform, Pressable, Share, View } from "react-native";
 import { KeyboardStickyView } from "react-native-keyboard-controller";
@@ -60,6 +61,7 @@ import {
   issueStatus,
   useIssueAccess,
 } from "./issuePresentation";
+import { useStartIssueThread } from "./useStartIssueThread";
 
 type IssueAccess = NonNullable<ReturnType<typeof useIssueAccess>>;
 
@@ -356,6 +358,8 @@ function IssueRoute({ params }: { readonly params: IssueParams }) {
   const detail = detailQuery.data;
   const issue: IssueSummary | null = detail ?? params.initialSummary ?? null;
   const access = useIssueAccess(params, detail);
+  const startThread = useStartIssueThread(params, detail ?? null);
+  const gt = useGT();
 
   const loadComments = useAtomCommand(issueEnvironment.comments, { reportFailure: false });
   const postComment = useAtomCommand(issueEnvironment.comment, { reportFailure: false });
@@ -449,6 +453,16 @@ function IssueRoute({ params }: { readonly params: IssueParams }) {
   const url = issue ? issueWebUrl(issue.url) : null;
   const detailUrl = detail ? issueWebUrl(detail.url) : null;
   const issueActions: ReadonlyArray<AppBarMenuItem> = [
+    ...(startThread
+      ? [
+          {
+            id: "start-thread",
+            title: gt("Start thread"),
+            icon: "plus.bubble",
+            onPress: () => void startThread(),
+          },
+        ]
+      : []),
     ...(access?.edit
       ? [
           {

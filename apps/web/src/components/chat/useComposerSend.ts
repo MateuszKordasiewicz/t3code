@@ -24,6 +24,7 @@ import {
   type PreviewAnnotationPayload,
   type ScopedThreadRef,
   type ThreadId,
+  type ThreadIssueLinkTarget,
   ProviderInteractionMode,
   RuntimeMode,
 } from "@t3tools/contracts";
@@ -258,6 +259,8 @@ interface ComposerSendInput {
   }) => Promise<AtomCommandResult<void, unknown>>;
   /** Links a checked-out pull request to its thread; best effort, failures only logged. */
   readonly linkCheckoutPullRequest: (threadRef: ScopedThreadRef, url: string) => void;
+  /** Links the issue a draft was started from to its new thread; best effort. */
+  readonly linkIssue: (threadRef: ScopedThreadRef, issue: ThreadIssueLinkTarget) => void;
 }
 
 /**
@@ -340,6 +343,7 @@ export function useComposerSend(input: ComposerSendInput) {
     handleNewThreadInActiveProject,
     persistThreadSettingsForNextTurn,
     linkCheckoutPullRequest,
+    linkIssue,
   } = input;
   const linkedEnvironments = useLinkedEnvironments(environmentId);
   const handleNewThread = useNewThreadHandler();
@@ -1331,11 +1335,12 @@ export function useComposerSend(input: ComposerSendInput) {
           : null;
       // Read the live session, not the render snapshot: the draft is finalized away once the
       // thread exists.
-      const checkoutPullRequestUrl = isLocalDraftThread
-        ? checkoutPullRequestUrlToLink(
-            draftId === null ? null : useComposerDraftStore.getState().getDraftSession(draftId),
-          )
-        : null;
+      const sentDraftSession =
+        isLocalDraftThread && draftId !== null
+          ? useComposerDraftStore.getState().getDraftSession(draftId)
+          : null;
+      const checkoutPullRequestUrl = checkoutPullRequestUrlToLink(sentDraftSession);
+      const issueToLink = sentDraftSession?.issueLink ?? null;
       if (backgroundThreadRef) beginBackgroundDraftSubmissionByRef(backgroundThreadRef);
       const startPromise = startThreadTurn({
         environmentId,
@@ -1396,6 +1401,7 @@ export function useComposerSend(input: ComposerSendInput) {
             checkoutPullRequestUrl,
           );
         }
+        if (issueToLink) linkIssue(scopeThreadRef(environmentId, threadIdForSend), issueToLink);
         setKeepFullHistory(routeThreadKey, false);
         if (freshArm !== undefined) disarmFreshSession(routeThreadKey, freshArm);
         clearUsageLimitsFor(routeThreadKey);

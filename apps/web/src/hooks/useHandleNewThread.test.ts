@@ -253,6 +253,17 @@ vi.mock("./useSettings", () => ({ getClientSettings: () => ({}) }));
 
 import { resolveDefaultProjectRef, useNewThreadHandler } from "./useHandleNewThread";
 
+const issueLink = {
+  tracker: "github",
+  host: "github.com",
+  scope: "acme/widgets",
+  key: "7",
+  projectId: "project-remote",
+  url: "https://github.com/acme/widgets/issues/7",
+  displayKey: "#7",
+  title: "Crash on save",
+} as never;
+
 describe.each([
   ["new", null],
   [
@@ -282,11 +293,11 @@ describe.each([
     expect(testState.draftStore.setLogicalProjectDraftThreadId).not.toHaveBeenCalled();
   });
 
-  it("sets the prompt before the draft shows", async () => {
+  it("sets the prompt and its issue link before the draft shows", async () => {
     testState.reset(draft);
     const pendingOpen = useNewThreadHandler()(
       { environmentId: "environment-ssh", projectId: "project-remote" } as never,
-      { prompt: "Read the playbook. " },
+      { prompt: "Read the playbook. ", issueLink },
     );
 
     testState.completeProjectFileRead(null);
@@ -296,6 +307,9 @@ describe.each([
       opened?.draftId,
       "Read the playbook. ",
     );
+    expect(testState.draftStore.setDraftThreadContext).toHaveBeenCalledWith(opened?.draftId, {
+      issueLink,
+    });
     expect(testState.draftStore.setPrompt.mock.invocationCallOrder[0]).toBeLessThan(
       testState.router.navigate.mock.invocationCallOrder[0] ?? 0,
     );
@@ -333,14 +347,19 @@ describe("useNewThreadHandler", () => {
 
     const opened = await useNewThreadHandler()(
       { environmentId: "environment-ssh", projectId: "project-remote" } as never,
-      { prompt: "Read the playbook. " },
+      { prompt: "Read the playbook. ", issueLink },
     );
 
     expect(opened?.draftId).toBe("draft-raced");
     expect(testState.draftStore.setPrompt).not.toHaveBeenCalled();
+    // The user's text is about something else, so the issue must not ride along on its send.
+    expect(testState.draftStore.setDraftThreadContext).not.toHaveBeenCalledWith(
+      "draft-raced",
+      expect.objectContaining({ issueLink: expect.anything() }),
+    );
   });
 
-  it("seeds the prompt into the empty draft that is already open", async () => {
+  it("seeds the prompt into the empty draft that is already open, dropping an earlier issue link", async () => {
     testState.reset(null);
     testState.openEmptyDraft("draft-open");
 
@@ -354,6 +373,9 @@ describe("useNewThreadHandler", () => {
       "draft-open",
       "Read the playbook. ",
     );
+    expect(testState.draftStore.setDraftThreadContext).toHaveBeenCalledWith("draft-open", {
+      issueLink: null,
+    });
   });
 
   it("opens the draft without waiting on a project file from an offline machine", async () => {

@@ -1,7 +1,12 @@
-import { EnvironmentId, ProjectId, SourceControlProviderKind } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  IssueTrackerKind,
+  ProjectId,
+  SourceControlProviderKind,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { issueWebUrl, resolveIssueLinkTarget } from "./issueLinks.ts";
+import { issueThreadLinkTarget, issueWebUrl, resolveIssueLinkTarget } from "./issueLinks.ts";
 
 const project = (id: string, repository: string) =>
   ({
@@ -75,5 +80,33 @@ describe("issueWebUrl", () => {
     ["not a url", null],
   ])("%s", (url, expected) => {
     expect(issueWebUrl(url)).toBe(expected);
+  });
+});
+
+describe("issueThreadLinkTarget", () => {
+  const issue = {
+    host: "github.com",
+    url: "https://github.com/acme/web/issues/7",
+    displayKey: "#7",
+    title: "Crash",
+  };
+  const reference = {
+    projectId: ProjectId.make("p2"),
+    tracker: IssueTrackerKind.make("github"),
+    scope: "acme/web",
+    key: "7",
+  };
+
+  it("takes the host from the issue when the reference leaves it to the project", () => {
+    expect(issueThreadLinkTarget(reference, issue)).toEqual({
+      ...reference,
+      host: "github.com",
+      url: issue.url,
+      displayKey: "#7",
+      title: "Crash",
+    });
+    expect(issueThreadLinkTarget({ ...reference, host: "ghe.acme.dev" }, issue).host).toBe(
+      "ghe.acme.dev",
+    );
   });
 });

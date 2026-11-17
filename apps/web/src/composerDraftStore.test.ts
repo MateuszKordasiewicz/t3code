@@ -22,6 +22,7 @@ import {
   DEFAULT_MODEL,
   DEFAULT_MODEL_BY_PROVIDER,
   EnvironmentId,
+  IssueTrackerKind,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -2832,7 +2833,7 @@ describe("composerDraftStore attachment references", () => {
   });
 });
 
-describe("composerDraftStore checkout pull request", () => {
+describe("composerDraftStore links made when a draft is sent", () => {
   const projectId = ProjectId.make("project-checkout");
   const projectRef = scopeProjectRef(TEST_ENVIRONMENT_ID, projectId);
   const otherProjectRef = scopeProjectRef(TEST_ENVIRONMENT_ID, ProjectId.make("project-other"));
@@ -2840,6 +2841,16 @@ describe("composerDraftStore checkout pull request", () => {
   const draftId = DraftId.make("draft-checkout");
   const url = "https://github.com/acme/widgets/pull/42";
   const checkout = { url, branch: "feature/pr-42" };
+  const issueLink = {
+    tracker: IssueTrackerKind.make("github"),
+    host: "github.com",
+    scope: "acme/widgets",
+    key: "7",
+    projectId,
+    url: "https://github.com/acme/widgets/issues/7",
+    displayKey: "#7",
+    title: "Crash on save",
+  };
 
   beforeEach(() => {
     resetComposerDraftStore();
@@ -2893,16 +2904,21 @@ describe("composerDraftStore checkout pull request", () => {
       threadId,
       branch: checkout.branch,
       checkoutPullRequest: checkout,
+      issueLink,
     });
-    store().setDraftThreadContext(draftId, { checkoutPullRequest: null });
+    store().setDraftThreadContext(draftId, { branch: "main" });
+    expect(store().getDraftSession(draftId)?.issueLink).toEqual(issueLink);
+    store().setDraftThreadContext(draftId, { checkoutPullRequest: null, issueLink: null });
     expect(store().getDraftSession(draftId)?.checkoutPullRequest).toBeUndefined();
+    expect(store().getDraftSession(draftId)?.issueLink).toBeUndefined();
 
-    store().setDraftThreadContext(draftId, { checkoutPullRequest: checkout });
+    store().setDraftThreadContext(draftId, { checkoutPullRequest: checkout, issueLink });
     store().setDraftThreadContext(draftId, { projectRef: otherProjectRef });
     expect(store().getDraftSession(draftId)?.checkoutPullRequest).toBeUndefined();
+    expect(store().getDraftSession(draftId)?.issueLink).toBeUndefined();
   });
 
-  it("persists the pull request and still restores drafts saved without one", async () => {
+  it("persists the links and still restores drafts saved without one or with a broken one", async () => {
     vi.useFakeTimers();
     try {
       await useComposerDraftStore.persist.clearStorage();
@@ -2928,8 +2944,15 @@ describe("composerDraftStore checkout pull request", () => {
         state: {
           draftsByThreadKey: {},
           draftThreadsByThreadKey: {
-            [draftId]: { ...persistedDraftThread(threadId), checkoutPullRequest: checkout },
-            [legacyDraftId]: persistedDraftThread(ThreadId.make("thread-legacy")),
+            [draftId]: {
+              ...persistedDraftThread(threadId),
+              checkoutPullRequest: checkout,
+              issueLink,
+            },
+            [legacyDraftId]: {
+              ...persistedDraftThread(ThreadId.make("thread-legacy")),
+              issueLink: { url: issueLink.url },
+            },
           },
           logicalProjectDraftThreadKeyByLogicalProjectKey: {
             [scopedProjectKey(projectRef)]: draftId,
@@ -2944,9 +2967,11 @@ describe("composerDraftStore checkout pull request", () => {
       const legacy = store().getDraftSession(legacyDraftId);
       expect(legacy).toMatchObject({ branch: checkout.branch });
       expect(checkoutPullRequestUrlToLink(legacy)).toBeNull();
+      expect(legacy?.issueLink).toBeUndefined();
+      expect(store().getDraftSession(draftId)?.issueLink).toEqual(issueLink);
       expect(
         partializeComposerDraftStoreState(store()).draftThreadsByThreadKey[draftId],
-      ).toMatchObject({ checkoutPullRequest: checkout });
+      ).toMatchObject({ checkoutPullRequest: checkout, issueLink });
     } finally {
       await useComposerDraftStore.persist.clearStorage();
       vi.useRealTimers();

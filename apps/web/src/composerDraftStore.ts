@@ -29,7 +29,9 @@ import {
   type ScopedProjectRef,
   type ScopedThreadRef,
   ThreadId,
+  ThreadIssueLinkTarget,
   SnapShotSource,
+  threadIssueKeysEqual,
 } from "@t3tools/contracts";
 import {
   parseScopedProjectKey,
@@ -420,6 +422,7 @@ const PersistedDraftThreadState = Schema.Struct({
   checkoutPullRequest: Schema.optionalKey(
     Schema.Struct({ url: Schema.String, branch: Schema.String }),
   ),
+  issueLink: Schema.optionalKey(ThreadIssueLinkTarget),
   promotedTo: Schema.optionalKey(
     Schema.NullOr(
       Schema.Struct({
@@ -518,6 +521,8 @@ export interface DraftSessionState {
   startFromOrigin: boolean;
   /** Linked to the thread when the draft is sent on this branch. */
   checkoutPullRequest?: DraftCheckoutPullRequest;
+  /** The issue a thread started from it links to once the draft is sent. */
+  issueLink?: ThreadIssueLinkTarget;
   promotedTo?: ScopedThreadRef | null;
 }
 
@@ -591,6 +596,7 @@ interface ComposerDraftStoreState {
       environmentSelection?: "auto" | "manual";
       loadBalancedEnvironmentId?: EnvironmentId | null;
       checkoutPullRequest?: DraftCheckoutPullRequest | null;
+      issueLink?: ThreadIssueLinkTarget | null;
     },
   ) => void;
   setProjectDraftThreadId: (
@@ -608,6 +614,7 @@ interface ComposerDraftStoreState {
       environmentSelection?: "auto" | "manual";
       loadBalancedEnvironmentId?: EnvironmentId | null;
       checkoutPullRequest?: DraftCheckoutPullRequest | null;
+      issueLink?: ThreadIssueLinkTarget | null;
     },
   ) => void;
   setDraftThreadContext: (
@@ -624,6 +631,7 @@ interface ComposerDraftStoreState {
       environmentSelection?: "auto" | "manual";
       loadBalancedEnvironmentId?: EnvironmentId | null;
       checkoutPullRequest?: DraftCheckoutPullRequest | null;
+      issueLink?: ThreadIssueLinkTarget | null;
     },
   ) => void;
   clearProjectDraftThreadId: (projectRef: ScopedProjectRef) => void;
@@ -1718,6 +1726,7 @@ function createDraftThreadState(
     environmentSelection?: "auto" | "manual";
     loadBalancedEnvironmentId?: EnvironmentId | null;
     checkoutPullRequest?: DraftCheckoutPullRequest | null;
+    issueLink?: ThreadIssueLinkTarget | null;
   },
 ): DraftThreadState {
   const projectChanged =
@@ -1747,6 +1756,7 @@ function createDraftThreadState(
     options?.checkoutPullRequest,
     projectChanged,
   );
+  const issueLink = resolveIssueLink(existingThread, options?.issueLink, projectChanged);
   return {
     threadId,
     environmentId: projectRef.environmentId,
@@ -1772,6 +1782,7 @@ function createDraftThreadState(
       options?.envMode ?? (nextWorktreePath ? "worktree" : (existingThread?.envMode ?? "local")),
     startFromOrigin: nextStartFromOrigin,
     ...(checkoutPullRequest ? { checkoutPullRequest } : {}),
+    ...(issueLink ? { issueLink } : {}),
     promotedTo: null,
   };
 }
@@ -1784,6 +1795,30 @@ function resolveCheckoutPullRequest(
 ): DraftCheckoutPullRequest | undefined {
   if (explicit !== undefined) return explicit ?? undefined;
   return projectChanged ? undefined : existing?.checkoutPullRequest;
+}
+
+/** An explicit value wins; otherwise the issue stays with its project, like a checkout. */
+function resolveIssueLink(
+  existing: DraftThreadState | undefined,
+  explicit: ThreadIssueLinkTarget | null | undefined,
+  projectChanged: boolean,
+): ThreadIssueLinkTarget | undefined {
+  if (explicit !== undefined) return explicit ?? undefined;
+  return projectChanged ? undefined : existing?.issueLink;
+}
+
+function issueLinksEqual(
+  left: ThreadIssueLinkTarget | undefined,
+  right: ThreadIssueLinkTarget | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return (
+    threadIssueKeysEqual(left, right) &&
+    left.projectId === right.projectId &&
+    left.url === right.url &&
+    left.displayKey === right.displayKey &&
+    left.title === right.title
+  );
 }
 
 function checkoutPullRequestsEqual(
@@ -1824,6 +1859,7 @@ function draftThreadsEqual(left: DraftThreadState | undefined, right: DraftThrea
     left.envMode === right.envMode &&
     left.startFromOrigin === right.startFromOrigin &&
     checkoutPullRequestsEqual(left.checkoutPullRequest, right.checkoutPullRequest) &&
+    issueLinksEqual(left.issueLink, right.issueLink) &&
     scopedThreadRefsEqual(left.promotedTo, right.promotedTo)
   );
 }
@@ -1873,6 +1909,8 @@ function normalizePersistedCheckoutPullRequest(value: unknown): DraftCheckoutPul
     ? { url, branch }
     : null;
 }
+
+const decodePersistedIssueLink = Schema.decodeUnknownOption(ThreadIssueLinkTarget);
 
 function normalizePersistedDraftThreads(
   rawDraftThreadsByThreadId: unknown,
@@ -1939,6 +1977,7 @@ function normalizePersistedDraftThreads(
       const checkoutPullRequest = normalizePersistedCheckoutPullRequest(
         candidateDraftThread.checkoutPullRequest,
       );
+      const issueLink = Option.getOrNull(decodePersistedIssueLink(candidateDraftThread.issueLink));
       const promotedToCandidate = candidateDraftThread.promotedTo;
       const promotedToRecord =
         promotedToCandidate && typeof promotedToCandidate === "object"
@@ -1997,6 +2036,7 @@ function normalizePersistedDraftThreads(
             ? { loadBalancedEnvironmentId: null }
             : {}),
         ...(checkoutPullRequest ? { checkoutPullRequest } : {}),
+        ...(issueLink ? { issueLink } : {}),
         promotedTo,
       };
     }
@@ -2777,6 +2817,7 @@ function toHydratedDraftThreadState(
     ...(persistedDraftThread.checkoutPullRequest
       ? { checkoutPullRequest: persistedDraftThread.checkoutPullRequest }
       : {}),
+    ...(persistedDraftThread.issueLink ? { issueLink: persistedDraftThread.issueLink } : {}),
     promotedTo: persistedDraftThread.promotedTo
       ? scopeThreadRef(
           persistedDraftThread.promotedTo.environmentId as EnvironmentId,
@@ -3041,6 +3082,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
               options.checkoutPullRequest,
               projectChanged,
             );
+            const issueLink = resolveIssueLink(existing, options.issueLink, projectChanged);
             const nextDraftThread: DraftThreadState = {
               threadId: existing.threadId,
               environmentId: nextProjectRef.environmentId,
@@ -3065,6 +3107,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
                 options.envMode ?? (nextWorktreePath ? "worktree" : (existing.envMode ?? "local")),
               startFromOrigin: nextStartFromOrigin,
               ...(checkoutPullRequest ? { checkoutPullRequest } : {}),
+              ...(issueLink ? { issueLink } : {}),
               promotedTo: existing.promotedTo ?? null,
             };
             const isUnchanged =
@@ -3084,6 +3127,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
                 nextDraftThread.checkoutPullRequest,
                 existing.checkoutPullRequest,
               ) &&
+              issueLinksEqual(nextDraftThread.issueLink, existing.issueLink) &&
               scopedThreadRefsEqual(nextDraftThread.promotedTo, existing.promotedTo);
             if (isUnchanged) {
               return state;

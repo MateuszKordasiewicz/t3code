@@ -1835,6 +1835,16 @@ describe("mobile composer drafts", () => {
   });
 
   it("hydrates selector state even when the message content is empty", () => {
+    const issueLink = {
+      tracker: "github",
+      host: "github.com",
+      scope: "acme/repo",
+      key: "7",
+      projectId: "project-1",
+      url: "https://github.com/acme/repo/issues/7",
+      displayKey: "#7",
+      title: "Crash on launch",
+    };
     const hydrated = Object.entries(
       decodePersistedComposerState({
         schemaVersion: 1,
@@ -1853,6 +1863,7 @@ describe("mobile composer drafts", () => {
               mode: "worktree",
               branch: "main",
               worktreePath: null,
+              issueLink,
             },
           },
         },
@@ -1876,6 +1887,7 @@ describe("mobile composer drafts", () => {
         mode: "worktree",
         branch: "main",
         worktreePath: null,
+        issueLink,
       },
       project: {
         environmentId: "environment-1",

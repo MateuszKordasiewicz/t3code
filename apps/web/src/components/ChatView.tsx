@@ -48,7 +48,7 @@ import { RightPanelSurfaceContent } from "./chat/RightPanelSurfaceContent";
 import { usePendingThreadRequests } from "./chat/usePendingThreadRequests";
 import { isScratchProject } from "@t3tools/client-runtime/state/projects";
 import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
-import type { UsageLimitSourceSnapshots } from "@t3tools/contracts";
+import type { ThreadIssueLinkTarget, UsageLimitSourceSnapshots } from "@t3tools/contracts";
 import { feedbackBannerItem } from "./chat/ComposerFeedback";
 import { freshSessionBannerItem } from "./chat/ComposerFreshSession";
 import { armFreshSession, disarmFreshSession, useFreshSessionArmed } from "./chat/freshSessionArms";
@@ -206,6 +206,8 @@ import { shortcutLabelForCommand } from "../keybindings";
 import { cn } from "~/lib/utils";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 import { toastManager } from "./ui/toast";
+import { readableFailure } from "./pullRequest/pullRequestDetail.logic";
+import { useGT } from "gt-react";
 import { projectScriptIdFromCommand } from "~/projectScripts";
 import { newMessageId } from "~/lib/utils";
 import {
@@ -455,6 +457,7 @@ export default function ChatView(props: ChatViewProps) {
   const canOperateTerminal = useEnvironmentScope(environmentId, AuthTerminalOperateScope);
   const draftId = routeKind === "draft" ? props.draftId : null;
   const handleNewThread = useNewThreadHandler();
+  const gt = useGT();
   const routeThreadRef = scopeThreadRef(environmentId, threadId);
   const routeThreadKey = scopedThreadKey(routeThreadRef);
   const currentRouteThreadKeyRef = useRef<string | null>(routeThreadKey);
@@ -1245,6 +1248,25 @@ export default function ChatView(props: ChatViewProps) {
       console.warn("Failed to link the checked-out pull request to its thread.", error);
     });
   });
+  const linkThreadIssue = useAtomCommand(threadEnvironment.linkIssue, { reportFailure: false });
+  // The thread has started either way; the issue panel's Link button is the way back.
+  const linkIssue = useStableCallback(
+    (threadRef: ScopedThreadRef, issue: ThreadIssueLinkTarget) => {
+      void linkThreadIssue({
+        environmentId: threadRef.environmentId,
+        input: { threadId: threadRef.threadId, ...issue, source: "manual" },
+      }).then((result) => {
+        if (result._tag !== "Failure") return;
+        const reason = readableFailure(squashAtomCommandFailure(result), "");
+        const wayBack = gt("Link it from the issue panel.");
+        toastManager.add({
+          type: "warning",
+          title: gt("Could not link the issue to this thread"),
+          description: reason === "" ? wayBack : `${reason} ${wayBack}`,
+        });
+      });
+    },
+  );
   const { handlePreparedPullRequestThreadStable, openPullRequestDialogStable } =
     usePullRequestDraftThread({
       routeKind,
@@ -3003,6 +3025,7 @@ export default function ChatView(props: ChatViewProps) {
     handleNewThreadInActiveProject,
     persistThreadSettingsForNextTurn,
     linkCheckoutPullRequest,
+    linkIssue,
   });
 
   const onWorktreeSetupWorkLocally = () => {

@@ -504,6 +504,16 @@ export const ThreadIssueKey = Schema.Struct({
 });
 export type ThreadIssueKey = typeof ThreadIssueKey.Type;
 
+/** What a thread needs to link an issue: the issue's key, the project it is read through, and its name. */
+export const ThreadIssueLinkTarget = Schema.Struct({
+  ...ThreadIssueKey.fields,
+  projectId: ProjectId,
+  url: TrimmedNonEmptyString,
+  displayKey: TrimmedNonEmptyString,
+  title: TrimmedNonEmptyString,
+});
+export type ThreadIssueLinkTarget = typeof ThreadIssueLinkTarget.Type;
+
 /**
  * An issue linked to a thread. `projectId` is the project the issue is read through, which the
  * detail panel needs; `url` is what the agent or user handed over.
