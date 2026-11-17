@@ -1,4 +1,5 @@
-// A project bound to a standalone tracker (Linear) in settings lists it beside its git host's.
+// A project bound to a standalone tracker (Linear) in settings, or carrying a tracker in its own
+// directory (beads), lists it beside its git host's.
 // References outside the project's canonical repository may be read on the same host,
 // but every write must pass through requireWritable.
 import * as Context from "effect/Context";
@@ -36,7 +37,6 @@ import {
   IssueTrackerError,
   isStandaloneIssueTracker,
   type IssueTrackerApi,
-  type StandaloneIssueTrackerApi,
 } from "@t3tools/source-control-core/server/IssueTracker";
 import { parseUrl } from "@t3tools/shared/url";
 
@@ -93,11 +93,11 @@ function resolveGitHostBinding(project: OrchestrationProjectShell): ProjectTrack
   };
 }
 
-function findStandaloneIssueUrl(trackers: ReadonlyArray<StandaloneIssueTrackerApi>, value: string) {
+function findTrackerIssueUrl(trackers: ReadonlyArray<IssueTrackerApi>, value: string) {
   const url = parseUrl(value);
   if (url === null) return null;
   for (const api of trackers) {
-    const link = api.parseIssueUrl(url);
+    const link = api.parseIssueUrl?.(url) ?? null;
     if (link !== null) return { api, tracker: api.kind, link };
   }
   return null;
@@ -207,24 +207,51 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  // A tracker that cannot look is not a reason to hide the project's other trackers.
+  const discoverProjectLocal = (project: OrchestrationProjectShell) =>
+    Effect.forEach(registry.projectLocal, (api) =>
+      api.discoverProject!({ cwd: project.workspaceRoot }).pipe(
+        Effect.map((found): ProjectTrackerBinding | null =>
+          found === null ? null : { tracker: api.kind, host: found.host, scope: found.scope },
+        ),
+        Effect.catch((error) =>
+          Effect.logWarning("Issue tracker discovery failed", {
+            tracker: api.kind,
+            projectId: project.id,
+            detail: trackerDetail(error),
+          }).pipe(Effect.as(null)),
+        ),
+      ),
+    );
+
   /**
-   * Where a project's issues live: its bound standalone tracker, its git host's, or both. The
-   * tracker bound in Settings leads, as the one the user chose for the project.
+   * Where a project's issues live: its bound standalone tracker, a tracker its directory
+   * carries, its git host's, or several. The tracker bound in Settings leads, as the one the
+   * user chose, then the git host's, then a tracker found in the directory: finding one must not
+   * move where an agent's key-only read or create already went.
    */
   const resolveProjectTracker = (
     project: OrchestrationProjectShell,
   ): Effect.Effect<ReadonlyArray<ProjectTrackerBinding>, IssueOperationError> =>
-    Effect.all([
-      resolveStandaloneBinding(project),
-      (project.repositoryIdentity != null
-        ? Effect.succeed(project.repositoryIdentity)
-        : repositoryIdentities.resolve(project.workspaceRoot)
-      ).pipe(
-        Effect.map((repositoryIdentity) =>
-          resolveGitHostBinding({ ...project, repositoryIdentity }),
+    Effect.all(
+      [
+        resolveStandaloneBinding(project),
+        discoverProjectLocal(project),
+        (project.repositoryIdentity != null
+          ? Effect.succeed(project.repositoryIdentity)
+          : repositoryIdentities.resolve(project.workspaceRoot)
+        ).pipe(
+          Effect.map((repositoryIdentity) =>
+            resolveGitHostBinding({ ...project, repositoryIdentity }),
+          ),
         ),
+      ],
+      { concurrency: "unbounded" },
+    ).pipe(
+      Effect.map(([standalone, local, gitHost]) =>
+        [standalone, gitHost, ...local].filter((binding) => binding !== null),
       ),
-    ]).pipe(Effect.map((resolved) => resolved.filter((binding) => binding !== null)));
+    );
 
   const listProjects = (filter: {
     readonly projectId?: IssueListInput["projectId"];
@@ -643,10 +670,15 @@ const make = Effect.gen(function* () {
   const resolveUrl: IssueService["Service"]["resolveUrl"] = Effect.fn("IssueService.resolveUrl")(
     function* (url, preferredProjectId) {
       const gitHost = sourceControlDefinitions.parseIssueUrl(url);
-      const standalone = gitHost === null ? findStandaloneIssueUrl(registry.standalone, url) : null;
+      const trackerLink =
+        gitHost === null
+          ? findTrackerIssueUrl([...registry.standalone, ...registry.projectLocal], url)
+          : null;
+      const standalone =
+        trackerLink !== null && isStandaloneIssueTracker(trackerLink.api) ? trackerLink.api : null;
       const parsed =
         gitHost === null
-          ? standalone
+          ? trackerLink
           : { tracker: IssueTrackerKind.make(gitHost.definition.kind), link: gitHost.link };
       if (parsed === null) {
         return yield* new IssueOperationError({
@@ -682,8 +714,9 @@ const make = Effect.gen(function* () {
           })
           .pipe(Effect.mapError(toIssueError("resolveUrl")));
         const canonicalUrl = parseUrl(issue.url);
-        const canonical = canonicalUrl === null ? null : standalone.api.parseIssueUrl(canonicalUrl);
-        if (canonical === null || canonical.workspace !== standalone.link.workspace) {
+        const canonical = canonicalUrl === null ? null : standalone.parseIssueUrl(canonicalUrl);
+        const requested = standalone.parseIssueUrl(new URL(url));
+        if (canonical === null || canonical.workspace !== requested?.workspace) {
           return yield* new IssueOperationError({
             operation: "resolveUrl",
             reason: "not-found",

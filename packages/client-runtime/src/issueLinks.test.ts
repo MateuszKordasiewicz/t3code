@@ -1,7 +1,7 @@
 import { EnvironmentId, ProjectId, SourceControlProviderKind } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { resolveIssueLinkTarget } from "./issueLinks.ts";
+import { issueWebUrl, resolveIssueLinkTarget } from "./issueLinks.ts";
 
 const project = (id: string, repository: string) =>
   ({
@@ -63,5 +63,17 @@ describe("resolveIssueLinkTarget", () => {
     "https://github.com/acme/web/pull/7",
   ])("leaves %s an ordinary link", (url) => {
     expect(resolveIssueLinkTarget({ url, projects })).toBeNull();
+  });
+});
+
+describe("issueWebUrl", () => {
+  it.each([
+    ["https://github.com/acme/web/issues/7", "https://github.com/acme/web/issues/7"],
+    ["http://gitea.local:3000/acme/web/issues/7", "http://gitea.local:3000/acme/web/issues/7"],
+    ["beads://t3code/t3-dxh.1", null],
+    ["javascript:alert(1)", null],
+    ["not a url", null],
+  ])("%s", (url, expected) => {
+    expect(issueWebUrl(url)).toBe(expected);
   });
 });

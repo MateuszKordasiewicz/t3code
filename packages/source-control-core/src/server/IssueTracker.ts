@@ -94,9 +94,29 @@ export interface TrackerIssueDetail extends TrackerIssueSummary {
   readonly linkedPullRequests: ReadonlyArray<IssueLinkedPullRequest>;
 }
 
+/** Where a tracker found a project's issues inside the project's own directory. */
+export interface IssueProjectDiscovery {
+  /** Lower case and free of spaces, like a git host's. */
+  readonly host: string;
+  /** The store's own identity: shared by checkouts of one repository, never by two. */
+  readonly scope: string;
+}
+
 export interface IssueTrackerApi {
   readonly kind: IssueTrackerKind;
   readonly capabilities: IssueCapabilities;
+
+  /**
+   * Claims a project from what its directory holds, such as a tracker database kept in the
+   * repository, with no Settings binding or credential. Null when the directory holds none.
+   * Called on every project resolution, so it must be cheap or cached.
+   */
+  readonly discoverProject?: (input: {
+    readonly cwd: string;
+  }) => Effect.Effect<IssueProjectDiscovery | null, IssueTrackerError>;
+
+  /** Recognises the tracker's own issue links, for a tracker whose links are not a git host's. */
+  readonly parseIssueUrl?: (url: URL) => IssueLink | null;
 
   /** The signed-in account, which is what involvement filtering compares against. */
   readonly getViewer: (input: {

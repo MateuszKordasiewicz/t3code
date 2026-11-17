@@ -1,5 +1,6 @@
+import { offeredIssueLabels } from "@t3tools/client-runtime/issue-list";
 import type { IssueCandidatesTarget } from "@t3tools/client-runtime/state/issues";
-import type { IssueInvolvement, IssueListState } from "@t3tools/contracts";
+import type { IssueInvolvement, IssueLabel, IssueListState } from "@t3tools/contracts";
 import { LayersIcon, ListFilterIcon, TagIcon, UserIcon } from "lucide-react";
 import { useState } from "react";
 
@@ -39,6 +40,8 @@ export function IssueFiltersMenu(props: {
   involvementOptions: ReadonlyArray<PullRequestFilterOption<IssueInvolvement>>;
   onInvolvement: (involvement: IssueInvolvement) => void;
   scopes: ReadonlyArray<IssueCandidatesTarget>;
+  /** Labels the listed rows carry, offered too for a tracker that cannot list its labels. */
+  seenLabels: ReadonlyArray<Pick<IssueLabel, "name" | "color">>;
   labels: ReadonlyArray<string>;
   onLabels: (labels: ReadonlyArray<string>) => void;
   assignee: string | undefined;
@@ -91,7 +94,12 @@ export function IssueFiltersMenu(props: {
             </span>
           </MenuSubTrigger>
           <MenuSubPopup>
-            <LabelChoices scopes={scopes} value={props.labels} onChange={props.onLabels} />
+            <LabelChoices
+              scopes={scopes}
+              seen={props.seenLabels}
+              value={props.labels}
+              onChange={props.onLabels}
+            />
           </MenuSubPopup>
         </MenuSub>
         <MenuSub>
@@ -113,13 +121,16 @@ export function IssueFiltersMenu(props: {
 
 function LabelChoices(props: {
   scopes: ReadonlyArray<IssueCandidatesTarget>;
+  seen: ReadonlyArray<Pick<IssueLabel, "name" | "color">>;
   value: ReadonlyArray<string>;
   onChange: (value: ReadonlyArray<string>) => void;
 }) {
   const [query, setQuery] = useState("");
   const known = useIssueFilterCandidates(props.scopes);
   const needle = query.trim().toLowerCase();
-  const found = known.labels.filter((label) => matches(needle, label.name, label.description));
+  const found = offeredIssueLabels(known.labels, props.seen).filter((label) =>
+    matches(needle, label.name, label.description),
+  );
   // Chosen labels lead, so one the tracker's first page lacks can still be seen and cleared.
   const visible = [
     ...props.value

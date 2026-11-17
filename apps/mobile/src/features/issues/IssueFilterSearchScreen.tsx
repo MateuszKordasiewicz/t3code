@@ -1,6 +1,8 @@
 import { useAtom } from "@effect/atom-react";
 import { useNavigation, type StaticScreenProps } from "@react-navigation/native";
+import { offeredIssueLabels } from "@t3tools/client-runtime/issue-list";
 import type { IssueCandidatesTarget } from "@t3tools/client-runtime/state/issues";
+import type { IssueLabel } from "@t3tools/contracts";
 import { useState } from "react";
 
 import { refreshIssueFilterCandidates, useIssueFilterCandidates } from "../../state/issues";
@@ -19,10 +21,13 @@ export function IssueFilterSearchScreen({
 }: StaticScreenProps<{
   readonly kind: "labels" | "assignee";
   readonly scopes: ReadonlyArray<IssueCandidatesTarget>;
+  /** Labels the listed rows carry, offered too for a tracker that cannot list its labels. */
+  readonly seenLabels?: ReadonlyArray<Pick<IssueLabel, "name" | "color">>;
 }>) {
   const navigation = useNavigation();
-  const { kind, scopes } = route.params;
-  const known = useIssueFilterCandidates(scopes);
+  const { kind, scopes, seenLabels = [] } = route.params;
+  const fromScopes = useIssueFilterCandidates(scopes);
+  const known = { ...fromScopes, labels: offeredIssueLabels(fromScopes.labels, seenLabels) };
   const [filters, setFilters] = useAtom(issueListFiltersAtom);
   const [query, setQuery] = useState("");
   const needle = query.trim().toLowerCase();

@@ -30,6 +30,16 @@ function linkAuthority(url: string): string | null {
   }
 }
 
+/** An issue's URL when a browser can open it; a tracker without web pages gives a placeholder. */
+export function issueWebUrl(url: string): string | null {
+  try {
+    const { protocol } = new URL(url);
+    return protocol === "http:" || protocol === "https:" ? url : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * The reference an issue link resolves to, and the project it is read through: the project whose
  * tracker binding is that host and scope, else any project on the same tracker and host lending

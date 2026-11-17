@@ -1,0 +1,43 @@
+[
+  {
+    "id": "demo-ku6",
+    "title": "Demo epic",
+    "description": "Epic body",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "epic",
+    "owner": "fixture@example.invalid",
+    "created_at": "2026-11-17T16:26:59Z",
+    "created_by": "Fixture Agent",
+    "updated_at": "2026-11-17T16:26:59Z",
+    "dependents": [
+      {
+        "id": "demo-ku6.1",
+        "title": "First slice",
+        "status": "open",
+        "priority": 1,
+        "issue_type": "feature",
+        "created_at": "0001-01-01T00:00:00Z",
+        "updated_at": "0001-01-01T00:00:00Z",
+        "dependency_type": "parent-child"
+      },
+      {
+        "id": "demo-ku6.2",
+        "title": "Q: which way?",
+        "status": "closed",
+        "priority": 2,
+        "issue_type": "task",
+        "created_at": "0001-01-01T00:00:00Z",
+        "updated_at": "0001-01-01T00:00:00Z",
+        "dependency_type": "parent-child"
+      }
+    ],
+    "dependent_count": 2,
+    "dependency_count": 0,
+    "comment_count": 0,
+    "epic_total_children": 2,
+    "epic_closed_children": 1,
+    "epic_closeable": false,
+    "revision": "3445176204528082310"
+  }
+]

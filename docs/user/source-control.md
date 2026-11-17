@@ -369,6 +369,10 @@ requests.
 To list a Linear team's issues beside a project's, connect Linear with an API key under
 Settings → Source control & issues, then choose the team for that project there.
 
+A project whose repository keeps a beads database lists its beads too, with no setup: the T3
+server reads it with the `bd` command, so `bd` must be on that server's `PATH`. Worktrees of one
+repository share its database. Beads are read-only here, and have no web page to open.
+
 Select an issue to open it beside the list: description, comments, state changes, linked pull
 requests, labels, assignees, and reactions. Linked pull requests open in the same panel. You can
 comment, edit the title and description, change labels and assignees, react, and close or

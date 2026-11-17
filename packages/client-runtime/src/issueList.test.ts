@@ -13,6 +13,8 @@ import {
   holdIssuePages,
   issueCursorsForHost,
   issueFilterScopes,
+  issueLabelsSeen,
+  offeredIssueLabels,
 } from "./issueList.ts";
 
 const environmentId = "env-1" as EnvironmentId;
@@ -151,5 +153,32 @@ describe("issueFilterScopes", () => {
       ],
     ]);
     expect(issueFilterScopes(held, [])).toEqual([]);
+  });
+});
+
+describe("offeredIssueLabels", () => {
+  it("adds the listed rows' labels after the tracker's candidates, each named once", () => {
+    const bug = { name: "bug", color: "d73a4a" };
+    const held = new Map([
+      [
+        environmentId,
+        hold(
+          answer({
+            entries: [
+              entry({ key: "1", labels: [{ name: "ui", color: null }, bug] }),
+              entry({ key: "2", labels: [{ ...bug, description: "Broken" }] }),
+            ],
+          }),
+        ),
+      ],
+    ]);
+    const seen = issueLabelsSeen(held);
+    expect(seen).toEqual([bug, { name: "ui", color: null }]);
+    expect(
+      offeredIssueLabels([{ name: "ui", color: "00ff00", description: "Looks" }], seen),
+    ).toEqual([
+      { name: "ui", color: "00ff00", description: "Looks" },
+      { ...bug, description: null },
+    ]);
   });
 });

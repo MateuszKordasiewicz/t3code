@@ -56,7 +56,17 @@ function IssueRowImpl({
       >
         <IssueStateGlyph state={entry.state} />
         <PullRequestRowLines
-          number={<span className={PULL_REQUEST_ROW_NUMBER_CLASS}>{entry.displayKey}</span>}
+          number={
+            // Boxed: a key like `t3-dxh.1` otherwise reads as the title's first word.
+            <span
+              className={cn(
+                PULL_REQUEST_ROW_NUMBER_CLASS,
+                "rounded border border-border bg-muted/40 px-1 leading-4",
+              )}
+            >
+              {entry.displayKey}
+            </span>
+          }
           title={entry.title}
           status={
             <>

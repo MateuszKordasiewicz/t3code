@@ -2,6 +2,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import type { IssueTrackerKind } from "@t3tools/contracts";
+import * as BeadsDriver from "@t3tools/issue-tracker-beads/server/driver";
 import * as LinearDriver from "@t3tools/issue-tracker-linear/server/driver";
 import {
   isStandaloneIssueTracker,
@@ -20,6 +21,8 @@ export class IssueTrackerRegistry extends Context.Service<
     readonly kinds: ReadonlyArray<IssueTrackerKind>;
     /** The trackers a user connects with a credential of their own, in registration order. */
     readonly standalone: ReadonlyArray<StandaloneIssueTrackerApi>;
+    /** The trackers that find a project's issues in its own directory, in registration order. */
+    readonly projectLocal: ReadonlyArray<IssueTrackerApi>;
   }
 >()("t3/issue/IssueTrackerRegistry") {}
 
@@ -32,16 +35,25 @@ export function fromTrackers(
     get: (kind) => byKind.get(kind) ?? null,
     kinds: trackers.map((tracker) => tracker.kind),
     standalone: trackers.filter(isStandaloneIssueTracker),
+    projectLocal: trackers.filter((tracker) => tracker.discoverProject !== undefined),
   };
 }
 
 /** Trackers that are not a git host's own. Each signs requests with a credential from Settings. */
 const STANDALONE_TRACKERS = [LinearDriver.make];
 
+/** Trackers a project carries in its own directory. Each needs no Settings and no credential. */
+const PROJECT_LOCAL_TRACKERS = [BeadsDriver.make];
+
 const make = Effect.gen(function* () {
   const drivers = yield* BuiltInDrivers.SourceControlDrivers;
   const standalone = yield* Effect.all(STANDALONE_TRACKERS);
-  return fromTrackers([...drivers.flatMap(({ instance }) => instance.issues ?? []), ...standalone]);
+  const projectLocal = yield* Effect.all(PROJECT_LOCAL_TRACKERS);
+  return fromTrackers([
+    ...drivers.flatMap(({ instance }) => instance.issues ?? []),
+    ...standalone,
+    ...projectLocal,
+  ]);
 });
 
 export const layer = Layer.effect(IssueTrackerRegistry, make).pipe(

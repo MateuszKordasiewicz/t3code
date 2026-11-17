@@ -5,6 +5,7 @@ import {
   groupIssues,
   holdIssuePages,
   issueFilterScopes,
+  issueLabelsSeen,
   issueOrder,
   type EnvironmentIssueEntry,
   type HeldIssuePage,
@@ -188,6 +189,7 @@ export function IssuesScreen(
   const groups = groupIssues(held, query, projects, sort);
   const entries = groups.flatMap((group) => group.rows).sort(issueOrder(sort));
   const filterScopes = issueFilterScopes(held, projects);
+  const seenLabels = issueLabelsSeen(held);
   const notices = [
     // An environment that failed while another answered: its issues are missing from the rows.
     ...(entries.length > 0 && list.error ? [list.error] : []),
@@ -256,7 +258,11 @@ export function IssuesScreen(
             if (field === "involvement") setInvolvement(value as IssueInvolvement);
             if (field === "sort") setSort(value as IssueListSort);
             if (field === "labels" || field === "assignee")
-              navigation.navigate("IssueFilterSearch", { kind: field, scopes: filterScopes });
+              navigation.navigate("IssueFilterSearch", {
+                kind: field,
+                scopes: filterScopes,
+                ...(field === "labels" ? { seenLabels } : {}),
+              });
             if (field === "reset") {
               setState("open");
               setInvolvement("all");
@@ -393,7 +399,11 @@ export function IssuesScreen(
                 colorScheme={themeAppearance}
                 accessibilityLabel="Filter by label"
                 onPress={() =>
-                  navigation.navigate("IssueFilterSearch", { kind: "labels", scopes: filterScopes })
+                  navigation.navigate("IssueFilterSearch", {
+                    kind: "labels",
+                    scopes: filterScopes,
+                    seenLabels,
+                  })
                 }
               />
               <Chip
