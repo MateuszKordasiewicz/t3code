@@ -1,4 +1,5 @@
 import { StackActions, useNavigation, type StaticScreenProps } from "@react-navigation/native";
+import { issueWebUrl } from "@t3tools/client-runtime/issue-links";
 import { issueEventSentence } from "@t3tools/client-runtime/issue-presentation";
 import { sourceControlClients } from "@t3tools/client-runtime/source-control-clients";
 import { prependIssueComments } from "@t3tools/client-runtime/state/issues";
@@ -444,7 +445,8 @@ function IssueRoute({ params }: { readonly params: IssueParams }) {
       : layout.usesSplitView
         ? CHAT_CONTENT_MAX_WIDTH
         : undefined;
-  const url = issue?.url;
+  const url = issue ? issueWebUrl(issue.url) : null;
+  const detailUrl = detail ? issueWebUrl(detail.url) : null;
   return (
     <PullRequestMarkdownRepository
       params={{
@@ -453,7 +455,7 @@ function IssueRoute({ params }: { readonly params: IssueParams }) {
         repository: params.scope,
         number: 0,
       }}
-      changeRequest={detail ? { provider: detail.tracker, url: detail.url } : null}
+      changeRequest={detail && detailUrl ? { provider: detail.tracker, url: detailUrl } : null}
     >
       <View className="flex-1 bg-screen">
         <AppBar

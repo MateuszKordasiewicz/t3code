@@ -1,0 +1,64 @@
+[
+  {
+    "id": "demo-ku6.1",
+    "title": "First slice",
+    "description": "Slice body",
+    "design": "Design note",
+    "acceptance_criteria": "Try it: run the thing",
+    "notes": "A note",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "feature",
+    "assignee": "Fixture Agent",
+    "owner": "fixture@example.invalid",
+    "created_at": "2026-11-17T16:26:59Z",
+    "created_by": "Fixture Agent",
+    "updated_at": "2026-11-17T16:27:00Z",
+    "labels": ["qa", "ui"],
+    "dependencies": [
+      {
+        "id": "demo-ku6",
+        "title": "Demo epic",
+        "description": "Epic body",
+        "status": "open",
+        "priority": 2,
+        "issue_type": "epic",
+        "owner": "fixture@example.invalid",
+        "created_at": "2026-11-17T16:26:59Z",
+        "created_by": "Fixture Agent",
+        "updated_at": "2026-11-17T16:26:59Z",
+        "dependency_type": "parent-child"
+      },
+      {
+        "id": "demo-ku6.2",
+        "title": "Q: which way?",
+        "description": "Question",
+        "status": "closed",
+        "priority": 2,
+        "issue_type": "task",
+        "owner": "fixture@example.invalid",
+        "created_at": "2026-11-17T16:27:00Z",
+        "created_by": "Fixture Agent",
+        "updated_at": "2026-11-17T16:27:00Z",
+        "closed_at": "2026-11-17T16:27:00Z",
+        "close_reason": "answered: left",
+        "labels": ["human"],
+        "dependency_type": "blocks"
+      }
+    ],
+    "comments": [
+      {
+        "id": "40330eb9-ed41-5ede-a520-0ef573b86085",
+        "issue_id": "demo-ku6.1",
+        "author": "Fixture Agent",
+        "text": "First comment",
+        "created_at": "2026-11-17T16:27:00Z"
+      }
+    ],
+    "parent": "demo-ku6",
+    "dependent_count": 0,
+    "dependency_count": 2,
+    "comment_count": 1,
+    "revision": "-5130968668088451899"
+  }
+]

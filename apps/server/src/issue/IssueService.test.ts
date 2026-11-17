@@ -28,6 +28,7 @@ import * as IssueTrackerRegistry from "./IssueTrackerRegistry.ts";
 
 const GITHUB = IssueTrackerKind.make("github");
 const LINEAR = IssueTrackerKind.make("linear");
+const BEADS = IssueTrackerKind.make("beads");
 
 /** A standalone tracker shaped like Linear: its own host, team keys for scopes, `ENG-1` keys. */
 function fakeStandaloneTracker(
@@ -69,17 +70,44 @@ function fakeStandaloneTracker(
   };
 }
 
+/** A tracker shaped like beads: found in a project's directory, scoped by its database's id. */
+function fakeProjectLocalTracker(
+  scopes: Record<string, string>,
+  overrides: Partial<IssueTrackerApi> = {},
+): IssueTrackerApi {
+  return fakeTracker({
+    kind: BEADS,
+    discoverProject: ({ cwd }) =>
+      cwd.startsWith("/w/broken")
+        ? Effect.fail(
+            new IssueTrackerError({
+              tracker: BEADS,
+              operation: "discoverProject",
+              reason: "failed",
+              detail: "database is locked",
+            }),
+          )
+        : Effect.succeed(scopes[cwd] === undefined ? null : { host: "beads", scope: scopes[cwd] }),
+    parseIssueUrl: (url) =>
+      url.protocol === "beads:"
+        ? { host: "beads", scope: url.hostname, key: url.pathname.slice(1) }
+        : null,
+    ...overrides,
+  });
+}
+
 function project(input: {
   readonly id: string;
   readonly repository?: string;
   readonly provider?: string;
   readonly host?: string;
+  readonly workspaceRoot?: string;
 }): OrchestrationProjectShell {
   const host = input.host ?? "github.com";
   return {
     id: input.id as ProjectId,
     title: input.id,
-    workspaceRoot: `/w/${input.id}`,
+    workspaceRoot: input.workspaceRoot ?? `/w/${input.id}`,
     ...(input.repository
       ? {
           repositoryIdentity: {
@@ -590,6 +618,90 @@ describe("IssueService with a standalone tracker", () => {
       expect(yield* Effect.flip(unreadable.list({ state: "open" }))).toMatchObject({
         _tag: "IssueOperationError",
         operation: "listProjects",
+      });
+    }),
+  );
+});
+
+describe("IssueService with a project-local tracker", () => {
+  const scopes = { "/w/web": "web-db", "/w/web/.worktrees/fix": "web-db", "/w/api": "api-db" };
+
+  it.effect("lists a directory's tracker first beside its git host, once per database", () =>
+    Effect.gen(function* () {
+      const listed: string[] = [];
+      const record = (tracker: IssueTrackerKind): Partial<IssueTrackerApi> => ({
+        listIssues: (input) =>
+          Effect.sync(() => {
+            listed.push(`${tracker} ${input.scope}`);
+            return { items: [issue(tracker === BEADS ? "t3-1" : "1")], nextCursor: null };
+          }),
+      });
+      const service = yield* makeService({
+        projects: [
+          project({ id: "web", repository: "acme/web" }),
+          project({
+            id: "web-worktree",
+            repository: "acme/web",
+            workspaceRoot: "/w/web/.worktrees/fix",
+          }),
+          project({ id: "api" }),
+          // Its discovery fails; its git host's issues still list.
+          project({ id: "broken", repository: "acme/broken" }),
+        ],
+        trackers: [fakeTracker(record(GITHUB)), fakeProjectLocalTracker(scopes, record(BEADS))],
+      });
+
+      const result = yield* service.list({ state: "open" });
+      expect(listed.sort()).toEqual([
+        "beads api-db",
+        "beads web-db",
+        "github acme/broken",
+        "github acme/web",
+      ]);
+      // Equal keys in two databases stay two issues, each under its own scope and project.
+      expect(
+        result.entries
+          .filter((entry) => entry.tracker === BEADS)
+          .map((entry) => [entry.projectId, entry.scope, entry.key])
+          .sort(),
+      ).toEqual([
+        ["api", "api-db", "t3-1"],
+        ["web", "web-db", "t3-1"],
+      ]);
+      expect(result.errors).toEqual([]);
+      expect(result.trackers).toContainEqual(
+        expect.objectContaining({ tracker: "beads", host: "beads", projectCount: 3 }),
+      );
+      expect(yield* service.projectScope("web" as ProjectId)).toEqual({
+        projectId: "web",
+        tracker: "beads",
+        host: "beads",
+        scope: "web-db",
+      });
+      expect(yield* service.projectScope("broken" as ProjectId)).toMatchObject({
+        tracker: "github",
+        scope: "acme/broken",
+      });
+    }),
+  );
+
+  it.effect("resolves a link through the project whose database it names", () =>
+    Effect.gen(function* () {
+      const service = yield* makeService({
+        projects: [project({ id: "web" }), project({ id: "api" })],
+        trackers: [fakeProjectLocalTracker(scopes)],
+      });
+      expect(yield* service.resolveUrl("beads://api-db/t3-1", "web" as ProjectId)).toEqual({
+        projectId: "api",
+        tracker: "beads",
+        host: "beads",
+        scope: "api-db",
+        key: "t3-1",
+        writable: true,
+      });
+      expect(yield* service.resolveUrl("beads://other-db/t3-1")).toMatchObject({
+        scope: "other-db",
+        writable: false,
       });
     }),
   );

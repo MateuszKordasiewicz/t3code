@@ -1,3 +1,4 @@
+import { issueWebUrl } from "@t3tools/client-runtime/issue-links";
 import type { IssueListEntry } from "@t3tools/contracts";
 import { ExternalLinkIcon } from "lucide-react";
 
@@ -17,6 +18,7 @@ import { IssueStateGlyph, issueTrackerPresentation } from "./issuePresentation";
 /** The issue panel while its detail loads, showing what the list row already knows. */
 export function IssueDetailGhost({ seed }: { seed?: IssueListEntry | null }) {
   const tracker = seed ? issueTrackerPresentation(seed.tracker) : null;
+  const webUrl = seed ? issueWebUrl(seed.url) : null;
   return (
     <div
       role="status"
@@ -37,14 +39,16 @@ export function IssueDetailGhost({ seed }: { seed?: IssueListEntry | null }) {
               <tracker.Icon aria-hidden className="mr-1 inline size-3 align-[-2px]" />
               {seed.scope}
             </span>
-            <Button
-              size="icon-xs"
-              variant="ghost"
-              aria-label={`Open on ${tracker.providerName}`}
-              render={<a href={seed.url} target="_blank" rel="noopener noreferrer" />}
-            >
-              <ExternalLinkIcon aria-hidden className="size-3.5" />
-            </Button>
+            {webUrl ? (
+              <Button
+                size="icon-xs"
+                variant="ghost"
+                aria-label={`Open on ${tracker.providerName}`}
+                render={<a href={webUrl} target="_blank" rel="noopener noreferrer" />}
+              >
+                <ExternalLinkIcon aria-hidden className="size-3.5" />
+              </Button>
+            ) : null}
           </PullRequestDetailTitleRow>
           {/* Leaves room for the edit button, so the title wraps the same once loaded. */}
           <h2 className="pr-7 text-base font-semibold leading-snug">{seed.title}</h2>

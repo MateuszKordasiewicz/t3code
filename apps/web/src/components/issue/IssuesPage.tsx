@@ -5,6 +5,7 @@ import {
   holdIssuePages,
   issueCursorsForHost,
   issueFilterScopes,
+  issueLabelsSeen,
   issueTrackerKey,
   type HeldIssuePage,
 } from "@t3tools/client-runtime/issue-list";
@@ -247,6 +248,7 @@ export function IssuesPage() {
     : held;
   const groups = groupIssues(shown, debouncedQuery, projects, search.order ?? "updated");
   const filterScopes = issueFilterScopes(shown, projects);
+  const seenLabels = issueLabelsSeen(shown);
 
   const hostOptions = hostOptionsFor(
     [...held.values()].flatMap((page) => page.answer.trackers),
@@ -603,6 +605,7 @@ export function IssuesPage() {
                   involvementOptions={INVOLVEMENT_TABS}
                   onInvolvement={(who) => updateSearch({ who })}
                   scopes={filterScopes}
+                  seenLabels={seenLabels}
                   labels={search.label ?? []}
                   onLabels={(label) => updateSearch({ label })}
                   assignee={search.assignee}

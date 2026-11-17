@@ -1,5 +1,7 @@
 import type {
   EnvironmentId,
+  IssueLabel,
+  IssueLabelCandidate,
   IssueListCursors,
   IssueListEntry,
   IssueListProjectError,
@@ -218,4 +220,31 @@ export function issueFilterScopes(
     }
   }
   return scopes;
+}
+
+/** The labels the listed rows carry, each named once, so a tracker that lists no labels offers them. */
+export function issueLabelsSeen(
+  held: ReadonlyMap<EnvironmentId, HeldIssuePage>,
+  limit = 100,
+): ReadonlyArray<Pick<IssueLabel, "name" | "color">> {
+  const seen = new Map<string, Pick<IssueLabel, "name" | "color">>();
+  for (const page of held.values())
+    for (const entry of page.entries)
+      for (const { name, color } of entry.labels)
+        if (!seen.has(name)) seen.set(name, { name, color });
+  return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name)).slice(0, limit);
+}
+
+/** A tracker's own label candidates, then the listed rows' labels it did not name. */
+export function offeredIssueLabels(
+  candidates: ReadonlyArray<IssueLabelCandidate>,
+  seen: ReadonlyArray<Pick<IssueLabel, "name" | "color">>,
+): ReadonlyArray<IssueLabelCandidate> {
+  const named = new Set(candidates.map((label) => label.name));
+  return [
+    ...candidates,
+    ...seen
+      .filter((label) => !named.has(label.name))
+      .map((label) => ({ ...label, description: null })),
+  ];
 }

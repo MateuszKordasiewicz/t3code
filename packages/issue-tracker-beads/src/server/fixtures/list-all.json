@@ -1,0 +1,108 @@
+[
+  {
+    "id": "demo-ku6.1",
+    "title": "First slice",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "feature",
+    "assignee": "Fixture Agent",
+    "owner": "fixture@example.invalid",
+    "created_at": "2026-11-17T16:26:59Z",
+    "created_by": "Fixture Agent",
+    "updated_at": "2026-11-17T16:27:00Z",
+    "labels": ["qa", "ui"],
+    "dependencies": [
+      {
+        "issue_id": "demo-ku6.1",
+        "depends_on_id": "demo-ku6",
+        "type": "parent-child",
+        "created_at": "2026-11-17T16:26:59Z",
+        "created_by": "Fixture Agent",
+        "metadata": "{}"
+      },
+      {
+        "issue_id": "demo-ku6.1",
+        "depends_on_id": "demo-ku6.2",
+        "type": "blocks",
+        "created_at": "2026-11-17T16:27:00Z",
+        "created_by": "Fixture Agent",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 1,
+    "dependent_count": 0,
+    "comment_count": 1,
+    "parent": "demo-ku6"
+  },
+  {
+    "id": "demo-dvm",
+    "title": "Blocked one",
+    "status": "blocked",
+    "priority": 2,
+    "issue_type": "bug",
+    "owner": "fixture@example.invalid",
+    "created_at": "2026-11-17T16:30:24Z",
+    "created_by": "Fixture Agent",
+    "updated_at": "2026-11-17T16:30:24Z",
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "demo-0b4",
+    "title": "Later",
+    "status": "deferred",
+    "priority": 2,
+    "issue_type": "chore",
+    "owner": "fixture@example.invalid",
+    "created_at": "2026-11-17T16:30:23Z",
+    "created_by": "Fixture Agent",
+    "updated_at": "2026-11-17T16:30:24Z",
+    "defer_until": "2027-01-01T05:00:00Z",
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  },
+  {
+    "id": "demo-ku6.2",
+    "title": "Q: which way?",
+    "status": "closed",
+    "priority": 2,
+    "issue_type": "task",
+    "owner": "fixture@example.invalid",
+    "created_at": "2026-11-17T16:27:00Z",
+    "created_by": "Fixture Agent",
+    "updated_at": "2026-11-17T16:27:00Z",
+    "closed_at": "2026-11-17T16:27:00Z",
+    "close_reason": "answered: left",
+    "labels": ["human"],
+    "dependencies": [
+      {
+        "issue_id": "demo-ku6.2",
+        "depends_on_id": "demo-ku6",
+        "type": "parent-child",
+        "created_at": "2026-11-17T16:27:00Z",
+        "created_by": "Fixture Agent",
+        "metadata": "{}"
+      }
+    ],
+    "dependency_count": 0,
+    "dependent_count": 1,
+    "comment_count": 0,
+    "parent": "demo-ku6"
+  },
+  {
+    "id": "demo-ku6",
+    "title": "Demo epic",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "epic",
+    "owner": "fixture@example.invalid",
+    "created_at": "2026-11-17T16:26:59Z",
+    "created_by": "Fixture Agent",
+    "updated_at": "2026-11-17T16:26:59Z",
+    "dependency_count": 0,
+    "dependent_count": 0,
+    "comment_count": 0
+  }
+]

@@ -1,4 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
+import { issueWebUrl } from "@t3tools/client-runtime/issue-links";
 import { issueEventSentence, issueWriteAccess } from "@t3tools/client-runtime/issue-presentation";
 import { prependIssueComments } from "@t3tools/client-runtime/state/issues";
 import {
@@ -504,6 +505,7 @@ export function IssueDetailPanel({
   const otherStates = access.states;
   const tracker = issueTrackerPresentation(detail.tracker);
   const currentState = issueStatePresentation(detail.state);
+  const webUrl = issueWebUrl(detail.url);
 
   const loadOlder = async () => {
     if (nextCursor === null || loadingOlder) return;
@@ -619,14 +621,20 @@ export function IssueDetailPanel({
             <span className="min-w-0 truncate font-medium text-muted-foreground">
               {detail.scope}
             </span>
-            <InlineButton
-              className={cn("shrink-0 font-medium", currentState.toneClassName)}
-              aria-label={`Open ${detail.displayKey} on ${tracker.providerName}`}
-              render={<a href={detail.url} target="_blank" rel="noopener noreferrer" />}
-            >
-              {detail.displayKey}
-              <ExternalLinkIcon aria-hidden className="size-2.5" />
-            </InlineButton>
+            {webUrl ? (
+              <InlineButton
+                className={cn("shrink-0 font-medium", currentState.toneClassName)}
+                aria-label={`Open ${detail.displayKey} on ${tracker.providerName}`}
+                render={<a href={webUrl} target="_blank" rel="noopener noreferrer" />}
+              >
+                {detail.displayKey}
+                <ExternalLinkIcon aria-hidden className="size-2.5" />
+              </InlineButton>
+            ) : (
+              <span className={cn("shrink-0 font-medium", currentState.toneClassName)}>
+                {detail.displayKey}
+              </span>
+            )}
             <span className="flex-1" />
             {stateControl}
             {threadRef ? (
