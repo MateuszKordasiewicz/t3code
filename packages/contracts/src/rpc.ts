@@ -177,6 +177,7 @@ import {
   IssueCreateInput,
   IssueCreateResult,
   IssueDetail,
+  IssueLinkedThreadsResult,
   IssueListInput,
   IssueListResult,
   IssueOperationError,
@@ -192,6 +193,7 @@ import {
   IssueTrackerConnectionList,
   IssueUnavailableError,
   IssueUpdateInput,
+  ThreadIssueKey,
 } from "./issue.ts";
 import {
   GuestShareCreateError,
@@ -629,6 +631,7 @@ export const WS_METHODS = {
   // Issue tracking methods
   issuesList: "issues.list",
   issuesDetail: "issues.detail",
+  issuesLinkedThreads: "issues.linkedThreads",
   issuesComments: "issues.comments",
   issuesTemplates: "issues.templates",
   issuesCandidates: "issues.candidates",
@@ -1337,6 +1340,13 @@ const WsIssuesListRpc = Rpc.make(WS_METHODS.issuesList, {
 const WsIssuesDetailRpc = Rpc.make(WS_METHODS.issuesDetail, {
   payload: IssueRef,
   success: IssueDetail,
+  error: IssueRpcError,
+});
+
+/** Threads linked to an issue. Refreshes with `pullRequests.subscribeLinkedThreadRefreshes`. */
+const WsIssuesLinkedThreadsRpc = Rpc.make(WS_METHODS.issuesLinkedThreads, {
+  payload: ThreadIssueKey,
+  success: IssueLinkedThreadsResult,
   error: IssueRpcError,
 });
 
@@ -2248,6 +2258,7 @@ export class RpcScopeAuthorization extends RpcMiddleware.Service<RpcScopeAuthori
 export const WsRpcGroup = RpcGroup.make(
   WsIssuesListRpc,
   WsIssuesDetailRpc,
+  WsIssuesLinkedThreadsRpc,
   WsIssuesCommentsRpc,
   WsIssuesTemplatesRpc,
   WsIssuesCandidatesRpc,

@@ -12,6 +12,7 @@ import {
 import {
   PullRequestActor,
   PullRequestLabel,
+  PullRequestLinkedThreadsResult,
   PullRequestReaction,
   PullRequestReactionContent,
   PullRequestState,
@@ -529,6 +530,10 @@ export const ThreadIssueLink = Schema.Struct({
   title: TrimmedNonEmptyString,
 });
 export type ThreadIssueLink = typeof ThreadIssueLink.Type;
+
+/** The threads linked to one issue, most recently updated first: the same rows a pull request answers. */
+export const IssueLinkedThreadsResult = PullRequestLinkedThreadsResult;
+export type IssueLinkedThreadsResult = typeof IssueLinkedThreadsResult.Type;
 
 export function threadIssueKeyOf(key: ThreadIssueKey): string {
   return `${key.tracker}\u0000${key.host.trim().toLowerCase()}\u0000${key.scope.trim().toLowerCase()}\u0000${key.key.trim()}`;

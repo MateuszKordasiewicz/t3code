@@ -603,6 +603,10 @@
       "types": "./src/issueLinks.ts",
       "default": "./src/issueLinks.ts"
     },
+    "./issue-threads": {
+      "types": "./src/issueThreads.ts",
+      "default": "./src/issueThreads.ts"
+    },
     "./issue-selection": {
       "types": "./src/issueSelection.ts",
       "default": "./src/issueSelection.ts"

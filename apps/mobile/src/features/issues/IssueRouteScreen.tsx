@@ -1,6 +1,8 @@
+import type { MenuAction } from "@react-native-menu/menu";
 import { StackActions, useNavigation, type StaticScreenProps } from "@react-navigation/native";
 import { issueWebUrl } from "@t3tools/client-runtime/issue-links";
 import { issueEventSentence } from "@t3tools/client-runtime/issue-presentation";
+import type { IssueThreads, IssueThreadStatus } from "@t3tools/client-runtime/issue-threads";
 import { sourceControlClients } from "@t3tools/client-runtime/source-control-clients";
 import { prependIssueComments } from "@t3tools/client-runtime/state/issues";
 import type {
@@ -21,7 +23,7 @@ import { RelativeTime } from "../../components/RelativeTime";
 import { AppActivityIndicator } from "../../components/ui/AppActivityIndicator";
 import { AppBar } from "../../components/ui/AppBar";
 import type { AppBarMenuItem } from "../../components/ui/AppBar.types";
-import { SymbolView } from "../../components/ui/AppSymbol";
+import { SymbolView, type AppSymbolName } from "../../components/ui/AppSymbol";
 import { AppText as Text } from "../../components/ui/AppText";
 import { Button } from "../../components/ui/Button";
 import { Chip } from "../../components/ui/Chip";
@@ -43,6 +45,7 @@ import { useAtomCommand } from "../../state/use-atom-command";
 import { usePullToRefresh } from "../../state/use-pull-to-refresh";
 import { useAdaptiveWorkspaceLayout } from "../layout/AdaptiveWorkspaceLayout";
 import { useAndroidWorkspaceBack } from "../layout/workspace/useAndroidWorkspaceNavigation";
+import { useOpenLinkedThread } from "../threads/useOpenLinkedThread";
 import { PullRequestDescription } from "../pull-requests/PullRequestDescription";
 import {
   PullRequestMarkdown,
@@ -61,6 +64,7 @@ import {
   issueStatus,
   useIssueAccess,
 } from "./issuePresentation";
+import { useIssueThreads } from "./useIssueThreads";
 import { useStartIssueThread } from "./useStartIssueThread";
 
 type IssueAccess = NonNullable<ReturnType<typeof useIssueAccess>>;
@@ -140,10 +144,110 @@ function IssueStateControl(props: {
   );
 }
 
+// One button for the issue's linked threads: start one, or open the running or latest one.
+// The chevron lists every linked thread; a flat list, since Android allows one submenu level.
+function IssueThreadControl(props: {
+  readonly threads: IssueThreads & { readonly answered: boolean };
+  readonly onStart: (() => void) | null;
+  readonly onOpen: (threadId: string) => void;
+}) {
+  const gt = useGT();
+  const { threads, primary, answered } = props.threads;
+  if (!answered) return null;
+  if (!primary) {
+    if (!props.onStart) return null;
+    return (
+      <Pressable
+        accessibilityRole="button"
+        onPress={props.onStart}
+        className="min-h-8 flex-row items-center gap-1.5 active:opacity-70"
+      >
+        <SymbolView name="plus.bubble" size={14} tintColorClassName="accent-icon" />
+        <Text className="text-xs font-t3-medium">{gt("Start thread")}</Text>
+      </Pressable>
+    );
+  }
+  const statuses = {
+    running: {
+      label: gt("Thread running"),
+      icon: "ellipsis.bubble",
+      tint: "accent-adaptive-sky-600-400",
+      text: "text-adaptive-sky-600-400",
+    },
+    idle: {
+      label: gt("Thread idle"),
+      icon: "bubble.left",
+      tint: "accent-icon",
+      text: "text-foreground",
+    },
+    done: {
+      label: gt("Thread done"),
+      icon: "checkmark.circle",
+      tint: "accent-icon-muted",
+      text: "text-foreground-muted",
+    },
+  } as const satisfies Record<
+    IssueThreadStatus,
+    { label: string; icon: AppSymbolName; tint: string; text: string }
+  >;
+  const status = statuses[primary.status];
+  const subtitles: Record<IssueThreadStatus, string> = {
+    running: gt("Running"),
+    idle: gt("Idle"),
+    done: gt("Done"),
+  };
+  const { onStart } = props;
+  const actions: MenuAction[] = [
+    ...threads.map((thread) => ({
+      id: `thread:${thread.id}`,
+      title: thread.title,
+      subtitle: subtitles[thread.status],
+      image: statuses[thread.status].icon,
+    })),
+    ...(onStart ? [{ id: "start", title: gt("Start another thread"), image: "plus" }] : []),
+  ];
+  return (
+    <View className="flex-row items-center gap-1">
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`${status.label}, ${primary.title}`}
+        onPress={() => props.onOpen(primary.id)}
+        className="min-h-8 flex-row items-center gap-1.5 active:opacity-70"
+      >
+        <SymbolView name={status.icon} size={14} tintColorClassName={status.tint} />
+        <Text className={`text-xs font-t3-medium ${status.text}`}>{status.label}</Text>
+      </Pressable>
+      {threads.length > 1 || onStart ? (
+        <Menu
+          title={gt("Linked threads")}
+          actions={actions}
+          onPressAction={({ nativeEvent }) => {
+            if (nativeEvent.event === "start") onStart?.();
+            else if (nativeEvent.event.startsWith("thread:"))
+              props.onOpen(nativeEvent.event.slice("thread:".length));
+          }}
+        >
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={gt("Linked threads")}
+            hitSlop={8}
+            className="min-h-8 justify-center px-1 active:opacity-70"
+          >
+            <SymbolView name="chevron.down" size={9} tintColorClassName="accent-icon-muted" />
+          </Pressable>
+        </Menu>
+      ) : null}
+    </View>
+  );
+}
+
 function IssueIdentity(props: {
   readonly issue: IssueSummary;
   readonly access: IssueAccess | null;
   readonly busy: boolean;
+  readonly threads: IssueThreads & { readonly answered: boolean };
+  readonly onStartThread: (() => void) | null;
+  readonly onOpenThread: (threadId: string) => void;
   readonly onMove: (state: string) => void;
   readonly onEditLabels: () => void;
   readonly onEditAssignees: () => void;
@@ -154,12 +258,19 @@ function IssueIdentity(props: {
   const canAssign = access?.assignees === true;
   return (
     <View className="gap-3">
-      <IssueStateControl
-        state={issue.state}
-        states={access?.states ?? []}
-        busy={props.busy}
-        onMove={props.onMove}
-      />
+      <View className="flex-row flex-wrap items-center gap-x-4">
+        <IssueStateControl
+          state={issue.state}
+          states={access?.states ?? []}
+          busy={props.busy}
+          onMove={props.onMove}
+        />
+        <IssueThreadControl
+          threads={props.threads}
+          onStart={props.onStartThread}
+          onOpen={props.onOpenThread}
+        />
+      </View>
       <Text selectable className="text-xl font-t3-bold leading-7">
         {issue.title}
       </Text>
@@ -410,6 +521,10 @@ function IssueRoute({ params }: { readonly params: IssueParams }) {
   const issue: IssueSummary | null = detail ?? params.initialSummary ?? null;
   const access = useIssueAccess(params, detail);
   const startThread = useStartIssueThread(params, detail ?? null);
+  const linkedThreads = useIssueThreads(params, issue);
+  const openLinkedThread = useOpenLinkedThread();
+  const openThread = (threadId: string) =>
+    openLinkedThread({ environmentId: params.environmentId, threadId });
 
   const loadComments = useAtomCommand(issueEnvironment.comments, { reportFailure: false });
   const postComment = useAtomCommand(issueEnvironment.comment, { reportFailure: false });
@@ -503,16 +618,6 @@ function IssueRoute({ params }: { readonly params: IssueParams }) {
   const url = issue ? issueWebUrl(issue.url) : null;
   const detailUrl = detail ? issueWebUrl(detail.url) : null;
   const issueActions: ReadonlyArray<AppBarMenuItem> = [
-    ...(startThread
-      ? [
-          {
-            id: "start-thread",
-            title: gt("Start thread"),
-            icon: "plus.bubble",
-            onPress: () => void startThread(),
-          },
-        ]
-      : []),
     ...(access?.edit
       ? [
           {
@@ -617,6 +722,9 @@ function IssueRoute({ params }: { readonly params: IssueParams }) {
                 issue={issue}
                 access={access}
                 busy={busy === "state"}
+                threads={linkedThreads}
+                onStartThread={startThread ? () => void startThread() : null}
+                onOpenThread={openThread}
                 onMove={moveTo}
                 onEditLabels={() => navigation.navigate("IssueLabels", identity)}
                 onEditAssignees={() => navigation.navigate("IssueAssignees", identity)}

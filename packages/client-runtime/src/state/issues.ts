@@ -20,7 +20,9 @@ import {
   createAtomCommandScheduler,
   createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
+  createEnvironmentRpcSubscriptionAtomFamily,
 } from "./runtime.ts";
+import { createEnvironmentSessionAtoms } from "./session.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 
 /** One row's identity across list pages and detail reads; hosts compare case-insensitively. */
@@ -88,7 +90,28 @@ export function createIssueEnvironmentAtoms<R, E>(
     { environmentId, input }: { readonly environmentId: EnvironmentId; readonly input: IssueRef },
     registry: AtomRegistry.AtomRegistry,
   ) => Effect.sync(() => registry.refresh(detail({ environmentId, input: detailRef(input) })));
+  const sessions = createEnvironmentSessionAtoms(runtime);
+  const linkedThreadSignals = createEnvironmentRpcSubscriptionAtomFamily(runtime, {
+    label: "environment-data:issues:linked-thread-refreshes",
+    tag: WS_METHODS.pullRequestsSubscribeLinkedThreadRefreshes,
+  });
+  // A server without the signal predates `issues.linkedThreads`, so there is nothing to refresh.
+  const linkedThreadsRefreshes = Atom.family((environmentId: EnvironmentId) =>
+    Atom.make((get): unknown => {
+      const config = get(sessions.initialConfigValueAtom(environmentId));
+      return config?.environment.capabilities.linkedThreadRefreshes === true
+        ? get(linkedThreadSignals({ environmentId, input: {} }))
+        : null;
+    }),
+  );
   return {
+    /** Threads linked to an issue; refetched when the server signals a link or settle change. */
+    linkedThreads: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:issues:linked-threads",
+      tag: WS_METHODS.issuesLinkedThreads,
+      staleTimeMs: 0,
+      refreshTrigger: ({ environmentId }) => linkedThreadsRefreshes(environmentId),
+    }),
     list: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:issues:list",
       tag: WS_METHODS.issuesList,
