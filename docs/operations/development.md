@@ -27,6 +27,20 @@ a new browser.
 
 Prefer a container? See [Dev container](../internals/devcontainer.md) for VS Code and Codespaces setup.
 
+## Shared pnpm store on Linux/Btrfs
+
+To opt a T3 Code project into the shared virtual store, create a dedicated store
+directory on the same Btrfs subvolume as its worktrees. Put the absolute path in
+`.t3/pnpm-worktree-store` in the project checkout registered in T3 Code. The
+installed desktop app runs Setup Worktree as usual. New worktrees from branches that
+include this setup share dependencies, and repeated installs use the same layout.
+CI and worktrees created without this setting use the default setup.
+Use a default-layout worktree for local release packaging and Android native builds.
+
+Remove the project setting to return new worktrees to the default layout. Existing
+worktrees can keep using their original layout, or you can create a fresh worktree
+to switch. Keep the store available while any worktree uses it.
+
 ## Forge mirror (optional)
 
 GitHub is the source of truth. [source.tanstack.com/@pingdotgg/t3code](https://source.tanstack.com/@pingdotgg/t3code)

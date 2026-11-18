@@ -1,6 +1,17 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
+function worktreeStoreDir() {
+  // oxlint-disable-next-line t3code/no-global-process-runtime -- pnpm loads this file before any Effect runtime exists.
+  if (process.platform !== "linux" || process.env.CI) return undefined;
+  const marker = path.join(__dirname, ".t3", "pnpm-global-virtual-store");
+  if (!fs.existsSync(marker)) return undefined;
+  const storeDir = fs.readFileSync(marker, "utf8").trim();
+  if (!path.isAbsolute(storeDir))
+    throw new Error(`Expected an absolute pnpm store path in ${marker}.`);
+  return storeDir;
+}
+
 // Our forks ship as tarballs in apps/mobile/deps. A pnpm patch on one is a second source of
 // truth that the next tarball silently drops, so changes go to the fork (apps/mobile/deps/README.md).
 function forkTarballPatches(patchedDependencies) {
@@ -25,6 +36,21 @@ module.exports = {
           `pnpm-workspace.yaml patches ${forkPatches.join(", ")}, which ships as a fork tarball in ` +
             "apps/mobile/deps. Change the fork and replace the tarball instead (apps/mobile/deps/README.md).",
         );
+      }
+      const storeDir = worktreeStoreDir();
+      if (storeDir) {
+        const sideEffectsCache = config.sideEffectsCache;
+        const cache =
+          typeof sideEffectsCache === "object"
+            ? sideEffectsCache
+            : { read: sideEffectsCache !== false, write: sideEffectsCache !== false };
+        return {
+          ...config,
+          storeDir,
+          virtualStoreType: "global",
+          // Electron's runtime installer writes to the resolved package directory.
+          sideEffectsCache: { ...cache, exclude: [...(cache.exclude ?? []), "electron"] },
+        };
       }
       // Windows installs need Linux x64 glibc binaries because WSL shares node_modules.
       // Keep other platforms native; release scripts set their own architectures.

@@ -309,7 +309,7 @@ export default defineConfig(({ command }) => {
       tasks: {
         // A local tsbuildinfo is leftover build state, not a typecheck input.
         typecheck: {
-          command: "effect-tsgo tsrs --noEmit",
+          command: "effect-tsgo tsrs --noEmit -p tsconfig.typecheck.json",
           cache: { input: [{ auto: true }, "!*.tsbuildinfo"] },
         },
       },

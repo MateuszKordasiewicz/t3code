@@ -360,7 +360,7 @@ overrides:
 
 packageExtensionsChecksum: sha256-18pwcgTDbqYFYAzCw8OfBYuC2btyq6aJSLhE/gjTJb4=
 
-pnpmfileChecksum: sha256-h8NLkl2dhhbQKbAHnoo4rQ3tYV96igLQxJ7la6dsbSc=
+pnpmfileChecksum: sha256-2r9HQKTKlL5ClAah0g4lWuZXyJkJPfvELJBEK6Nul+o=
 
 patchedDependencies:
   '@alchemy.run/test@2.0.0-beta.85': 29c0539ea71d9cc372f0b16558640599beb9bc609605feb2a493da268d72713e
