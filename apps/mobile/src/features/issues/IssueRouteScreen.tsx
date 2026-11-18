@@ -474,7 +474,6 @@ function IssueRoute({ params }: { readonly params: IssueParams }) {
   const openLinkedThread = useOpenLinkedThread();
   const openThread = (threadId: string) =>
     openLinkedThread({ environmentId: params.environmentId, threadId });
-  const gt = useGT();
 
   const loadComments = useAtomCommand(issueEnvironment.comments, { reportFailure: false });
   const postComment = useAtomCommand(issueEnvironment.comment, { reportFailure: false });
@@ -568,16 +567,6 @@ function IssueRoute({ params }: { readonly params: IssueParams }) {
   const url = issue ? issueWebUrl(issue.url) : null;
   const detailUrl = detail ? issueWebUrl(detail.url) : null;
   const issueActions: ReadonlyArray<AppBarMenuItem> = [
-    ...(startThread
-      ? [
-          {
-            id: "start-thread",
-            title: linkedThreads.primary ? gt("Start another thread") : gt("Start thread"),
-            icon: "plus.bubble",
-            onPress: () => void startThread(),
-          },
-        ]
-      : []),
     ...(access?.edit
       ? [
           {

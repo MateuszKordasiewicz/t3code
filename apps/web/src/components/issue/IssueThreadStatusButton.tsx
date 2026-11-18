@@ -79,18 +79,15 @@ export function IssueThreadStatusButton({
   const linked = useEnvironmentQuery(
     issueEnvironment.linkedThreads({ environmentId, input: { tracker, host, scope, key } }),
   );
-  // Keep the last answer while a refresh is in flight, so the button does not flicker.
-  const [lastLinked, setLastLinked] = useState(linked.data);
-  if (linked.data !== null && linked.data !== lastLinked) setLastLinked(linked.data);
   const shells = useQuietThreadShells();
   const hiddenKeys = useAtomValue(environmentThreadShells.hiddenThreadKeysAtom);
   const hidingAnywhere = useAnyEnvironmentHiding();
   const loadedThreadRefs = useEnvironmentThreadRefs(environmentId);
 
-  const answered = (linked.data ?? lastLinked) !== null || linked.error !== null;
+  const answered = linked.data !== null || linked.error !== null;
   const { threads, primary } = issueThreads(
     visibleLinkedThreads(
-      (linked.data ?? lastLinked)?.threads ?? [],
+      linked.data?.threads ?? [],
       environmentId,
       loadedThreadRefs,
       hiddenKeys,

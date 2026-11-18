@@ -3,7 +3,6 @@ import { issueThreads } from "@t3tools/client-runtime/issue-threads";
 import { visibleLinkedThreads } from "@t3tools/client-runtime/state/threads";
 import { EnvironmentId, ThreadId, type IssueSummary } from "@t3tools/contracts";
 import { Atom } from "effect/reactivity";
-import { useState } from "react";
 
 import { issueEnvironment } from "../../state/issues";
 import { useEnvironmentQuery } from "../../state/query";
@@ -47,10 +46,7 @@ export function useIssueThreads(params: IssueParams, issue: IssueSummary | null)
         })
       : null,
   );
-  // Keep the last answer while a refresh is in flight, so the button does not flicker.
-  const [lastData, setLastData] = useState(relations.data);
-  if (relations.data !== null && relations.data !== lastData) setLastData(relations.data);
-  const data = relations.data ?? lastData;
+  const data = relations.data;
   const hiddenKeys = useAtomValue(environmentThreadShells.hiddenThreadKeysAtom);
   const hidingAnywhere = useAtomValue(environmentThreadShells.anyEnvironmentHidingAtom);
   const loadedThreadRefs = useAtomValue(
