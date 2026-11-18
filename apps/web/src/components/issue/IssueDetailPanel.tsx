@@ -115,8 +115,8 @@ function IssueStartThreadButton({
         setPending(false);
         toastManager.add({
           type: "error",
-          title: gt("Could not start a thread"),
-          description: readableFailure(error, gt("Try again from the issue.")),
+          title: m(msg("Could not start a thread")),
+          description: readableFailure(error, m(msg("Try again from the issue."))),
         });
       },
     );

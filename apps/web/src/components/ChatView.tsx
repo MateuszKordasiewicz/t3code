@@ -1,6 +1,6 @@
 import { m } from "../i18n/messages";
 import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
-import { useGT, useMessages } from "gt-react";
+import { msg, useGT, useMessages } from "gt-react";
 import { ChildThreadApprovals } from "./chat/ChildThreadApprovals";
 import { workspaceAreaProps } from "../lib/workspaceFocus";
 import { sourceControlClients } from "@t3tools/client-runtime/source-control-clients";
@@ -1267,10 +1267,10 @@ export default function ChatView(props: ChatViewProps) {
       }).then((result) => {
         if (result._tag !== "Failure") return;
         const reason = readableFailure(squashAtomCommandFailure(result), "");
-        const wayBack = gt("Link it from the issue panel.");
+        const wayBack = m(msg("Link it from the issue panel."));
         toastManager.add({
           type: "warning",
-          title: gt("Could not link the issue to this thread"),
+          title: m(msg("Could not link the issue to this thread")),
           description: reason === "" ? wayBack : `${reason} ${wayBack}`,
         });
       });
