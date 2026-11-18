@@ -1,5 +1,13 @@
 {
   "16f4a4334f9cae97": "Iniciar hilo",
+  "b95d21a0127d7352": "Hilo en curso",
+  "532e9b36cd0958d5": "Hilo inactivo",
+  "8eadfb6b66f4435c": "Hilo terminado",
+  "7342bfc328008926": "En curso",
+  "86d60d42f6cb4a40": "Inactivo",
+  "166661f94b300f5b": "Terminado",
+  "7156c1fa76269bab": "Iniciar otro hilo",
+  "938b14127a3c907d": "Hilos vinculados",
   "dba4868fa4829e79": "No se pudo iniciar un hilo",
   "448735c0084132f5": "Vuelve a intentarlo.",
   "2c1c93a646bbea6e": "Idioma",
