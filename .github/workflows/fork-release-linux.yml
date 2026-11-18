@@ -151,3 +151,22 @@ jobs:
             --title "T3 Code Fork nightly $VERSION ($SHORT_SHA)" \
             --notes "Fork build of MateuszKordasiewicz/t3code main at $SHA. This app updates only from this fork's releases."
           gh release edit "$TAG" --draft=false
+
+      # releases.atom also lists the upstream nightly tags this fork carries, so point the patched
+      # updater at the newest fork release the way upstream's update_feed job does.
+      - name: Point the update feed at this release
+        if: env.PUBLISH == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GH_REPO/releases/tags/$TAG" --jq '{tag_name, name, body}' > "$RUNNER_TEMP/nightly.json"
+          cat "$RUNNER_TEMP/nightly.json"
+          gh release view update-feed > /dev/null 2>&1 ||
+            gh release create update-feed --prerelease --latest=false --title "Update feed" \
+              --notes "The fork's desktop updater reads this release to find the newest fork nightly. Do not delete it."
+          gh release upload update-feed "$RUNNER_TEMP/nightly.json" --clobber
+          gh release edit update-feed --draft=false --prerelease --latest=false
