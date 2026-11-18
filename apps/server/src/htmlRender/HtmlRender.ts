@@ -1,3 +1,6 @@
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Hash UTF-8 directly without a second page-sized buffer.
+import * as NodeCrypto from "node:crypto";
+
 import type { ThreadId } from "@t3tools/contracts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -42,6 +45,7 @@ import * as PreviewBrowserHost from "../preview/PreviewBrowserHost.ts";
 const MIB = 1024 * 1024;
 const MAX_IMAGE_BYTES = 10 * MIB;
 const MAX_PAGE_BYTES = 25 * MIB;
+const RECENT_PAYLOAD_LIMIT = 128;
 const HTML_FILE_EXTENSION = /\.html?$/i;
 // Like the image check, judge the bytes: a renamed .env or key does not start like a page.
 const HTML_DOCUMENT_START = /^\s*<(?:!doctype\s+html|html)[\s>]/i;
@@ -376,6 +380,8 @@ const make = Effect.gen(function* () {
     FileSystem.FileSystem | Path.Path | ChildProcessSpawner.ChildProcessSpawner
   >();
   const browsers = yield* Semaphore.make(MAX_CONCURRENT_BROWSERS);
+  const payloadWrites = yield* Semaphore.make(1);
+  const recentPayloads = new Map<string, string>();
   // Keep Chrome sandboxed unless explicitly disabled; root must opt out to run.
   const noSandbox = PreviewBrowserHost.sandboxDisabled(yield* HostProcess.Environment);
   // sudo resets the environment, so the command has to name this server's home.
@@ -498,6 +504,31 @@ const make = Effect.gen(function* () {
     return inlined.html;
   });
 
+  const storePreparedHtml = Effect.fn("HtmlRender.storePreparedHtml")(function* (
+    filePath: string,
+    html: string,
+  ) {
+    const digest = NodeCrypto.createHash("sha256").update(html).digest("hex");
+    yield* payloadWrites.withPermit(
+      Effect.gen(function* () {
+        // Published HTML is immutable. Reuse a thread's file without adding a separate owner.
+        const sourcePath = recentPayloads.get(digest);
+        if (
+          sourcePath === undefined ||
+          !(yield* Effect.isSuccess(fileSystem.link(sourcePath, filePath)))
+        ) {
+          yield* fileSystem.writeFileString(filePath, html);
+        }
+        recentPayloads.delete(digest);
+        recentPayloads.set(digest, filePath);
+        if (recentPayloads.size > RECENT_PAYLOAD_LIMIT) {
+          const oldest = recentPayloads.keys().next();
+          if (!oldest.done) recentPayloads.delete(oldest.value);
+        }
+      }).pipe(Effect.uninterruptible),
+    );
+  });
+
   const publish = Effect.fn("HtmlRender.publish")(function* (
     input: HtmlRenderSource & {
       readonly threadId: ThreadId;
@@ -524,9 +555,8 @@ const make = Effect.gen(function* () {
       title: input.title.trim().slice(0, HTML_RENDER_MAX_TITLE_LENGTH) || "HTML",
       height: clampHtmlRenderHeight(input.height),
     };
-    return yield* fileSystem.writeFileString(filePath, html).pipe(
+    return yield* storePreparedHtml(filePath, html).pipe(
       Effect.mapError((cause) => new HtmlRenderStoreError({ cause })),
-      Effect.uninterruptible,
       Effect.andThen(measure(html)),
       Effect.andThen((heights) => {
         const reference: HtmlRenderReference = {

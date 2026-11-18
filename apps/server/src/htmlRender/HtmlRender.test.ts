@@ -14,11 +14,15 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Ref from "effect/Ref";
 import * as NodeDgram from "node:dgram";
 import * as NodeHttp from "node:http";
 import * as NodeURL from "node:url";
 
-import { resolveAttachmentPathById } from "../attachmentStore.ts";
+import {
+  parseThreadSegmentFromAttachmentId,
+  resolveAttachmentPathById,
+} from "../attachmentStore.ts";
 import * as ServerConfig from "../config.ts";
 import * as HtmlRender from "./HtmlRender.ts";
 import { HtmlRenderBrowserError } from "./headlessChrome.ts";
@@ -265,6 +269,68 @@ describe("HtmlRender", () => {
     }).pipe(Effect.provide(layerTest)),
   );
 
+  it.effect("reuses concurrently published HTML bytes across independently owned attachments", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const config = yield* ServerConfig.ServerConfig;
+      const htmlRender = yield* HtmlRender.HtmlRender;
+      const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-html-reuse-" });
+      const image = path.join(directory, "chart.png");
+      yield* fileSystem.writeFile(image, PNG_BYTES);
+      const html = `<img src="${image}">`;
+      const firstThread = ThreadId.make("reports-first");
+      const secondThread = ThreadId.make("reports-second");
+      const [first, second] = yield* Effect.all(
+        [
+          htmlRender.publish({ threadId: firstThread, html, title: "First", height: 200 }),
+          htmlRender.publish({ threadId: secondThread, html, title: "Second", height: 300 }),
+        ],
+        { concurrency: 2 },
+      );
+
+      expect(first).toMatchObject({ title: "First", height: 200 });
+      expect(second).toMatchObject({ title: "Second", height: 300 });
+      expect(first.attachmentId).not.toBe(second.attachmentId);
+      expect(parseThreadSegmentFromAttachmentId(first.attachmentId)).toBe(firstThread);
+      expect(parseThreadSegmentFromAttachmentId(second.attachmentId)).toBe(secondThread);
+      const storedPath = (attachmentId: string) =>
+        path.join(config.attachmentsDir, `${attachmentId}.html`);
+      const firstPath = storedPath(first.attachmentId);
+      const secondPath = storedPath(second.attachmentId);
+      const original = yield* fileSystem.readFileString(firstPath);
+      expect(original.includes("data:image/png;base64,")).toBe(true);
+      expect(yield* fileSystem.readFileString(secondPath)).toBe(original);
+      const firstInfo = yield* fileSystem.stat(firstPath);
+      const secondInfo = yield* fileSystem.stat(secondPath);
+      expect(firstInfo.nlink).toEqual(Option.some(2n));
+      expect(secondInfo.ino).toEqual(firstInfo.ino);
+
+      yield* fileSystem.remove(firstPath);
+      expect(yield* fileSystem.readFileString(secondPath)).toBe(original);
+      yield* fileSystem.writeFile(image, new Uint8Array([...PNG_BYTES, 1]));
+      const changed = yield* htmlRender.publish({
+        threadId: secondThread,
+        html,
+        title: "Changed",
+        height: 300,
+      });
+      expect(yield* fileSystem.readFileString(storedPath(changed.attachmentId))).not.toBe(original);
+      expect(yield* fileSystem.readFileString(secondPath)).toBe(original);
+      expect((yield* fileSystem.stat(secondPath)).nlink).toEqual(Option.some(1n));
+
+      yield* fileSystem.remove(secondPath);
+      yield* fileSystem.writeFile(image, PNG_BYTES);
+      const republished = yield* htmlRender.publish({
+        threadId: secondThread,
+        html,
+        title: "Republished",
+        height: 300,
+      });
+      expect(yield* fileSystem.readFileString(storedPath(republished.attachmentId))).toBe(original);
+    }).pipe(Effect.provide(layerTest)),
+  );
+
   it.effect("publishes a page from an .html file as a snapshot that path calls recover", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -378,11 +444,12 @@ describe("HtmlRender", () => {
     }).pipe(Effect.provide(layerTest)),
   );
 
-  it.effect("removes the page when publishing is interrupted", () =>
+  it.effect("removes only the interrupted publication when another thread reuses it", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("thread-html-cancel");
       const page = { html: "<p>x</p>", title: "X", height: 200 };
       const measuring = yield* Deferred.make<void>();
+      const firstMeasurement = yield* Ref.make(true);
       yield* Effect.gen(function* () {
         const fileSystem = yield* FileSystem.FileSystem;
         const config = yield* ServerConfig.ServerConfig;
@@ -395,14 +462,25 @@ describe("HtmlRender", () => {
         const publishing = yield* htmlRender.publish({ threadId, ...page }).pipe(Effect.forkChild);
         yield* Deferred.await(measuring);
         expect(yield* storedPages).toHaveLength(1);
+        const other = yield* htmlRender.publish({
+          threadId: ThreadId.make("thread-html-kept"),
+          ...page,
+        });
+        expect(yield* storedPages).toHaveLength(2);
         yield* Fiber.interrupt(publishing);
-        expect(yield* storedPages).toEqual([]);
+        expect(yield* storedPages).toEqual([`${other.attachmentId}.html`]);
         expect(yield* mcpSessions.takeHtmlRender(threadId, page)).toBe(undefined);
       }).pipe(
         Effect.provide(
           layerHtmlRender(
             undefined,
-            Deferred.succeed(measuring, undefined).pipe(Effect.andThen(Effect.never)),
+            Ref.getAndSet(firstMeasurement, false).pipe(
+              Effect.flatMap((first) =>
+                first
+                  ? Deferred.succeed(measuring, undefined).pipe(Effect.andThen(Effect.never))
+                  : Effect.succeedNone,
+              ),
+            ),
           ),
         ),
       );
