@@ -3,6 +3,7 @@ import { useNavigation, type StaticScreenProps } from "@react-navigation/native"
 import { offeredIssueLabels } from "@t3tools/client-runtime/issue-list";
 import type { IssueCandidatesTarget } from "@t3tools/client-runtime/state/issues";
 import type { IssueLabel } from "@t3tools/contracts";
+import { useGT } from "gt-react-native";
 import { useState } from "react";
 
 import { refreshIssueFilterCandidates, useIssueFilterCandidates } from "../../state/issues";
@@ -24,6 +25,7 @@ export function IssueFilterSearchScreen({
   /** Labels the listed rows carry, offered too for a tracker that cannot list its labels. */
   readonly seenLabels?: ReadonlyArray<Pick<IssueLabel, "name" | "color">>;
 }>) {
+  const gt = useGT();
   const navigation = useNavigation();
   const { kind, scopes, seenLabels = [] } = route.params;
   const fromScopes = useIssueFilterCandidates(scopes);
@@ -61,7 +63,7 @@ export function IssueFilterSearchScreen({
   const loaded = labels ? known.labels.length > 0 : known.assignees.length > 0;
   return (
     <IssueCandidatesSheet
-      title={labels ? "Filter by label" : "Filter by assignee"}
+      title={labels ? gt("Filter by label") : gt("Filter by assignee")}
       noun={labels ? "labels" : "people"}
       query={query}
       onQueryChange={setQuery}

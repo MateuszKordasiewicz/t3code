@@ -1,13 +1,15 @@
 import { StackActions, useNavigation } from "@react-navigation/native";
+import { errorDisplayMessage } from "@t3tools/client-runtime/errors";
 import { issueThreadLinkTarget } from "@t3tools/client-runtime/issue-links";
 import { issueThreadPrompt } from "@t3tools/client-runtime/issue-presentation";
 import { settlePromise, squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { AuthOrchestrationOperateScope, type IssueDetail } from "@t3tools/contracts";
 import { AsyncResult } from "effect/reactivity";
-import { useGT } from "gt-react-native";
+import { msg } from "gt-react-native";
 import { useRef } from "react";
 
 import * as Dialog from "../../components/ui/Dialog";
+import { m } from "../../i18n/messages";
 import { useEnvironmentScope } from "../../state/session";
 import {
   createNewTaskDraft,
@@ -24,7 +26,6 @@ import { issueTarget, type IssueParams } from "./issueParams";
  * Null until the detail (and its body) has loaded, or when this connection cannot run threads.
  */
 export function useStartIssueThread(params: IssueParams, detail: IssueDetail | null) {
-  const gt = useGT();
   const target = issueTarget(params);
   const navigation = useNavigation();
   const connected = usePullRequestConnected(params.environmentId);
@@ -58,8 +59,8 @@ export function useStartIssueThread(params: IssueParams, detail: IssueDetail | n
     if (AsyncResult.isFailure(result)) {
       const cause = squashAtomCommandFailure(result);
       Dialog.alert(
-        gt("Could not start a thread"),
-        cause instanceof Error ? cause.message : gt("Try again."),
+        m(msg("Could not start a thread")),
+        errorDisplayMessage(cause, m) ?? m(msg("Try again.")),
       );
     }
   };
