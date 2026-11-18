@@ -51,7 +51,7 @@
     "generate:nitro": "cd modules/t3-highlights && nitrogen",
     "eas-build-on-success": "node scripts/upload-sourcemaps.mts build",
     "test": "vp test run --project unit --project react",
-    "typecheck": "effect-tsgo tsrs --noEmit"
+    "typecheck": "effect-tsgo tsrs --noEmit -p tsconfig.typecheck.json"
   },
   "dependencies": {
     "@clerk/expo": "catalog:",

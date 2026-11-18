@@ -2,8 +2,10 @@
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
+import * as NodeProcess from "node:process";
 
 const ENV_FILES = [".env", NodePath.join("infra", "relay", ".env")];
+const BTRFS_SUPER_MAGIC = 0x9123683e;
 
 const worktree = NodePath.dirname(import.meta.dirname);
 
@@ -44,6 +46,36 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
 const projectRoot = process.env.T3CODE_PROJECT_ROOT;
 if (!projectRoot) {
   throw new Error("T3CODE_PROJECT_ROOT is not set. Run this through the t3.json setup action.");
+}
+
+const storeOptIn = NodePath.join(projectRoot, ".t3", "pnpm-worktree-store");
+const storeMarker = NodePath.join(markerDir, "pnpm-global-virtual-store");
+if (
+  NodeProcess.platform === "linux" &&
+  !process.env.CI &&
+  !NodeFS.existsSync(NodePath.join(worktree, "node_modules", ".modules.yaml"))
+) {
+  const optInStat = NodeFS.statSync(storeOptIn, { throwIfNoEntry: false });
+  const store = optInStat?.isFile() ? NodeFS.readFileSync(storeOptIn, "utf8").trim() : undefined;
+  const storeStat =
+    store && NodePath.isAbsolute(store)
+      ? NodeFS.statSync(store, { throwIfNoEntry: false })
+      : undefined;
+  if (
+    store &&
+    storeStat?.isDirectory() &&
+    storeStat.dev === NodeFS.statSync(worktree).dev &&
+    NodeFS.statfsSync(worktree).type === BTRFS_SUPER_MAGIC
+  ) {
+    NodeFS.writeFileSync(storeMarker, `${store}\n`);
+  } else {
+    NodeFS.rmSync(storeMarker, { force: true });
+    if (optInStat) {
+      process.stderr.write(
+        "Skipping the pnpm shared store: use an existing directory on this Btrfs filesystem.\n",
+      );
+    }
+  }
 }
 
 // Use the shell for Windows vp shims. Unattended installs need pnpm's confirmation

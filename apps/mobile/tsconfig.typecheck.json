@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // Resolve declarations from the workspace when a dependency's realpath is in the shared store.
+    "paths": {
+      "react": ["./node_modules/@types/react/index.d.ts"],
+      "react/jsx-runtime": ["./node_modules/@types/react/jsx-runtime.d.ts"],
+      "react/jsx-dev-runtime": ["./node_modules/@types/react/jsx-dev-runtime.d.ts"],
+      "@react-navigation/core": [
+        "../../node_modules/.pnpm/node_modules/@react-navigation/core/lib/typescript/src/index.d.ts"
+      ]
+    }
+  }
+}
