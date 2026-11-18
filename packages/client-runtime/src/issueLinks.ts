@@ -1,4 +1,4 @@
-import type { IssueRef } from "@t3tools/contracts";
+import type { IssueRef, IssueSummary, ThreadIssueLinkTarget } from "@t3tools/contracts";
 
 import { sourceControlClients } from "./sourceControlClients.ts";
 import type { EnvironmentProject } from "./state/shell.ts";
@@ -38,6 +38,26 @@ export function issueWebUrl(url: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * What a thread links to for an issue read through `reference`. The detail always names the
+ * host, which a reference leaves out when the project's binding supplies it.
+ */
+export function issueThreadLinkTarget(
+  reference: IssueRef,
+  issue: Pick<IssueSummary, "host" | "url" | "displayKey" | "title">,
+): ThreadIssueLinkTarget {
+  return {
+    tracker: reference.tracker,
+    host: reference.host ?? issue.host,
+    scope: reference.scope,
+    key: reference.key,
+    projectId: reference.projectId,
+    url: issue.url,
+    displayKey: issue.displayKey,
+    title: issue.title,
+  };
 }
 
 /**

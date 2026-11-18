@@ -1,6 +1,11 @@
 import { useAtomValue } from "@effect/atom-react";
-import { issueWebUrl } from "@t3tools/client-runtime/issue-links";
-import { issueEventSentence, issueWriteAccess } from "@t3tools/client-runtime/issue-presentation";
+import { scopeProjectRef } from "@t3tools/client-runtime/environment";
+import { issueThreadLinkTarget, issueWebUrl } from "@t3tools/client-runtime/issue-links";
+import {
+  issueEventSentence,
+  issueThreadPrompt,
+  issueWriteAccess,
+} from "@t3tools/client-runtime/issue-presentation";
 import { prependIssueComments } from "@t3tools/client-runtime/state/issues";
 import {
   issueAssigneeHeld,
@@ -34,16 +39,19 @@ import {
   ExternalLinkIcon,
   Link2Icon,
   Link2OffIcon,
+  SquarePenIcon,
   TagIcon,
   UserPlusIcon,
   UsersIcon,
 } from "lucide-react";
+import { useGT } from "gt-react";
 import { useState, type ReactNode } from "react";
 
 import { RefreshIcon } from "~/components/ui/refresh-icon";
 import { issueEnvironment, refreshIssueLists } from "~/state/issues";
 import { useProjects, useThreadShell } from "~/state/entities";
 import { useEnvironmentQuery } from "~/state/query";
+import { useNewThreadHandler } from "~/hooks/useHandleNewThread";
 import { useEnvironmentScope } from "~/state/session";
 import { threadEnvironment } from "~/state/threads";
 import { useAtomCommand } from "~/state/use-atom-command";
@@ -75,6 +83,50 @@ import { IssueDetailGhost } from "./IssueDetailGhost";
 import { ReactionBar } from "../pullRequest/PullRequestReactions";
 import { PullRequestsUnavailableState } from "../pullRequest/PullRequestsUnavailableState";
 import { issueTrackerPresentation, issueStatePresentation } from "./issuePresentation";
+
+/** Opens a new worktree draft in the issue's project with the issue as an unsent prompt. */
+function IssueStartThreadButton({
+  environmentId,
+  reference,
+  issue,
+}: {
+  environmentId: EnvironmentId;
+  reference: IssueRef;
+  issue: IssueDetail;
+}) {
+  const gt = useGT();
+  const canOperate = useEnvironmentScope(environmentId, AuthOrchestrationOperateScope);
+  const newThread = useNewThreadHandler();
+  const [pending, setPending] = useState(false);
+  if (!canOperate) return null;
+  const start = () => {
+    if (pending) return;
+    setPending(true);
+    newThread(scopeProjectRef(environmentId, reference.projectId), {
+      envMode: "worktree",
+      branch: null,
+      worktreePath: null,
+      prompt: issueThreadPrompt(issue),
+      issueLink: issueThreadLinkTarget(reference, issue),
+    }).then(
+      () => setPending(false),
+      (error: unknown) => {
+        setPending(false);
+        toastManager.add({
+          type: "error",
+          title: gt("Could not start a thread"),
+          description: readableFailure(error, gt("Try again from the issue.")),
+        });
+      },
+    );
+  };
+  return (
+    <Button size="xs" variant="ghost" disabled={pending} onClick={start}>
+      <SquarePenIcon aria-hidden />
+      {gt("Start thread")}
+    </Button>
+  );
+}
 
 /**
  * Links or unlinks the issue to the thread it is shown beside. Dispatches the orchestration
@@ -637,6 +689,11 @@ export function IssueDetailPanel({
             )}
             <span className="flex-1" />
             {stateControl}
+            <IssueStartThreadButton
+              environmentId={environmentId}
+              reference={reference}
+              issue={detail}
+            />
             {threadRef ? (
               <IssueThreadLinkButton
                 environmentId={environmentId}

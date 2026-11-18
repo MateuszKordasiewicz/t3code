@@ -1,7 +1,7 @@
-import type { IssueDetail, IssueState } from "@t3tools/contracts";
+import { IssueTrackerKind, type IssueDetail, type IssueState } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { issueWriteAccess } from "./issuePresentation.ts";
+import { issueThreadPrompt, issueWriteAccess } from "./issuePresentation.ts";
 
 const workflow: ReadonlyArray<IssueState> = [
   { category: "open", name: "Backlog" },
@@ -38,5 +38,37 @@ describe("issueWriteAccess", () => {
     expect(issueWriteAccess(issue({ writable: false }), true).states).toEqual([]);
     expect(issueWriteAccess(issue({}), false).states).toEqual([]);
     expect(issueWriteAccess(issue({ states: [] }), true).states).toEqual([]);
+  });
+});
+
+describe("issueThreadPrompt", () => {
+  it.each([
+    {
+      name: "names a git host's issue by the host and links its page",
+      issue: {
+        tracker: "github",
+        displayKey: "#7",
+        title: "Crash on save",
+        url: "https://github.com/acme/web/issues/7",
+        body: "  Steps:\n1. Save  ",
+      },
+      expected:
+        "GitHub issue #7: Crash on save\nhttps://github.com/acme/web/issues/7\n\nSteps:\n1. Save",
+    },
+    {
+      name: "leaves out a placeholder URL no browser opens, and an empty description",
+      issue: {
+        tracker: "tickets",
+        displayKey: "T-12",
+        title: "Rename the setting",
+        url: "tickets://acme/T-12",
+        body: " \n",
+      },
+      expected: "Tickets issue T-12: Rename the setting",
+    },
+  ])("$name", ({ issue, expected }) => {
+    expect(issueThreadPrompt({ ...issue, tracker: IssueTrackerKind.make(issue.tracker) })).toBe(
+      expected,
+    );
   });
 });
