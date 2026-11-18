@@ -117,6 +117,7 @@ export function groupIssues(
       more: EnvironmentId[];
     }
   >();
+  const listed = new Set<string>();
   const needle = query.toLowerCase();
   for (const [environmentId, page] of held) {
     for (const tracker of page.answer.trackers) {
@@ -139,6 +140,9 @@ export function groupIssues(
         !entry.displayKey.toLowerCase().includes(needle)
       )
         continue;
+      // Environments holding the same repository answer the same issue; the first one keeps it.
+      if (listed.has(entry.url)) continue;
+      listed.add(entry.url);
       group.rows.push({ ...entry, environmentId });
     }
     for (const error of page.errors) {
