@@ -14,7 +14,7 @@ import type {
   IssueSummary,
 } from "@t3tools/contracts";
 import { AsyncResult } from "effect/reactivity";
-import { useGT } from "gt-react-native";
+import { T, useGT, useMessages, Var } from "gt-react-native";
 import { useRef, useState } from "react";
 import { Linking, Platform, Pressable, Share, View } from "react-native";
 import { KeyboardStickyView } from "react-native-keyboard-controller";
@@ -108,12 +108,13 @@ function IssueStateControl(props: {
   readonly busy: boolean;
   readonly onMove: (state: string) => void;
 }) {
+  const gt = useGT();
   const status = issueStatus(props.state);
   const moves = props.states;
   const trigger = (
     <Pressable
       accessibilityRole={moves.length ? "button" : undefined}
-      accessibilityLabel={`Issue state, ${status.label}`}
+      accessibilityLabel={gt("Issue state, {state}", { state: status.label })}
       disabled={!moves.length || props.busy}
       className="min-h-8 flex-row items-center gap-1.5 active:opacity-70"
     >
@@ -129,7 +130,7 @@ function IssueStateControl(props: {
     // As wide as the trigger: iOS anchors the menu to this view, not to the text inside it.
     <View className="self-start">
       <Menu
-        title="Issue state"
+        title={gt("Issue state")}
         // The name is the id: unique within a workflow, and a NUL separator would end the native string.
         actions={moves.map((move) => ({ id: move.name, title: move.name }))}
         onPressAction={({ nativeEvent }) => {
@@ -251,6 +252,7 @@ function IssueIdentity(props: {
   readonly onEditLabels: () => void;
   readonly onEditAssignees: () => void;
 }) {
+  const gt = useGT();
   const { issue, access } = props;
   const canLabel = access?.labels === true;
   const canAssign = access?.assignees === true;
@@ -275,17 +277,25 @@ function IssueIdentity(props: {
       <View className="flex-row items-center gap-2">
         <PullRequestAvatar actor={issue.author} size={20} />
         <Text className="min-w-0 flex-1 text-xs font-t3-medium" numberOfLines={1}>
-          {issue.author?.login ?? "Unknown author"}
+          {issue.author?.login ?? gt("Unknown author")}
         </Text>
         <Text className="shrink text-right text-2xs text-foreground-muted" numberOfLines={1}>
           {issue.closedAt ? (
-            <>
-              Closed <RelativeTime timestamp={issue.closedAt} /> ago
-            </>
+            <T>
+              Closed{" "}
+              <Var>
+                <RelativeTime timestamp={issue.closedAt} />
+              </Var>{" "}
+              ago
+            </T>
           ) : (
-            <>
-              Opened <RelativeTime timestamp={issue.createdAt} /> ago
-            </>
+            <T>
+              Opened{" "}
+              <Var>
+                <RelativeTime timestamp={issue.createdAt} />
+              </Var>{" "}
+              ago
+            </T>
           )}
         </Text>
       </View>
@@ -296,19 +306,27 @@ function IssueIdentity(props: {
           ))}
           {canLabel ? (
             <Chip
-              label={issue.labels.length ? "Edit" : "Add labels"}
+              label={
+                issue.labels.length
+                  ? gt("Edit", { $context: "verb, edits labels" })
+                  : gt("Add labels")
+              }
               icon="tag"
               size="small"
-              accessibilityLabel="Edit labels"
+              accessibilityLabel={gt("Edit labels")}
               onPress={props.onEditLabels}
             />
           ) : null}
         </View>
       ) : null}
       <View className="flex-row flex-wrap items-center gap-2">
-        <Text className="text-xs text-foreground-muted">Assignees</Text>
+        <Text className="text-xs text-foreground-muted">
+          <T>Assignees</T>
+        </Text>
         {issue.assignees.length === 0 ? (
-          <Text className="text-xs text-foreground-muted">none</Text>
+          <Text className="text-xs text-foreground-muted">
+            <T context="no assignees">none</T>
+          </Text>
         ) : null}
         {issue.assignees.map((actor) => (
           <View key={actor.login} className="flex-row items-center gap-1.5">
@@ -318,10 +336,14 @@ function IssueIdentity(props: {
         ))}
         {canAssign ? (
           <Chip
-            label={issue.assignees.length ? "Edit" : "Assign"}
+            label={
+              issue.assignees.length
+                ? gt("Edit", { $context: "verb, edits assignees" })
+                : gt("Assign", { $context: "verb, assigns people to an issue" })
+            }
             icon="person.badge.plus"
             size="small"
-            accessibilityLabel="Edit assignees"
+            accessibilityLabel={gt("Edit assignees")}
             onPress={props.onEditAssignees}
           />
         ) : null}
@@ -334,19 +356,26 @@ function LinkedPullRequests(props: {
   readonly params: IssueParams;
   readonly links: ReadonlyArray<IssueLinkedPullRequest>;
 }) {
+  const gt = useGT();
   const navigation = useNavigation();
   // Only a git host's tracker shares its host with the change request it links.
   const sameHost = sourceControlClients.find(props.params.tracker) !== undefined;
   return (
     <View className="gap-2">
-      <PullRequestSectionHeading>Linked pull requests</PullRequestSectionHeading>
+      <PullRequestSectionHeading>
+        <T>Linked pull requests</T>
+      </PullRequestSectionHeading>
       {props.links.map((link) => {
         const status = pullRequestStatus(link);
         return (
           <Pressable
             key={`${link.repository}#${link.number}`}
             accessibilityRole="button"
-            accessibilityLabel={`${status.label} pull request ${link.number}, ${link.title}`}
+            accessibilityLabel={gt("{status} pull request {number}, {title}", {
+              status: status.label,
+              number: String(link.number),
+              title: link.title,
+            })}
             onPress={() =>
               sameHost
                 ? navigation.dispatch(
@@ -369,7 +398,9 @@ function LinkedPullRequests(props: {
               </Text>
               <Text className="font-mono text-2xs text-foreground-muted" numberOfLines={1}>
                 {link.repository}#{link.number}
-                {link.closesIssue ? " · closes" : ""}
+                {link.closesIssue
+                  ? ` · ${gt("closes", { $context: "the pull request closes this issue" })}`
+                  : ""}
               </Text>
             </View>
             <SymbolView name="chevron.right" size={12} tintColorClassName="accent-icon-muted" />
@@ -385,15 +416,19 @@ function IssueCommentCard(props: {
   readonly comment: IssueComment;
   readonly canReact: boolean;
 }) {
+  const gt = useGT();
+  const messages = useMessages();
   const { comment } = props;
   return (
     <View className="gap-3 rounded-2xl bg-grouped-card p-3">
       <View className="flex-row items-center gap-2">
         <PullRequestAvatar actor={comment.author} size={22} />
         <Text className="min-w-0 flex-1 text-sm font-t3-medium" numberOfLines={1}>
-          {comment.author?.login ?? "Unknown author"}
+          {comment.author?.login ?? gt("Unknown author")}
         </Text>
-        <Text className="text-2xs text-foreground-tertiary">{relativeTime(comment.createdAt)}</Text>
+        <Text className="text-2xs text-foreground-tertiary">
+          {relativeTime(comment.createdAt, undefined, messages)}
+        </Text>
       </View>
       <PullRequestMarkdown markdown={comment.body} />
       {comment.reactions !== undefined ? (
@@ -409,23 +444,36 @@ function IssueCommentCard(props: {
 }
 
 function IssueEventRow({ event }: { readonly event: IssueEvent }) {
+  const gt = useGT();
+  const messages = useMessages();
   return (
     <View className="flex-row items-center gap-2 px-1">
       <PullRequestAvatar actor={event.actor} size={18} />
       <Text className="min-w-0 flex-1 text-xs text-foreground-muted">
-        <Text className="text-xs font-t3-medium">{event.actor?.login ?? "Someone"}</Text>{" "}
-        {issueEventSentence(event)}
+        <Text className="text-xs font-t3-medium">
+          {event.actor?.login ?? gt("Someone", { $context: "an unknown person" })}
+        </Text>{" "}
+        {issueEventSentence(event, messages)}
       </Text>
-      <Text className="text-2xs text-foreground-tertiary">{relativeTime(event.createdAt)}</Text>
+      <Text className="text-2xs text-foreground-tertiary">
+        {relativeTime(event.createdAt, undefined, messages)}
+      </Text>
     </View>
   );
 }
 
 function IssueLoadingBody() {
+  const gt = useGT();
   return (
-    <View className="gap-5" accessibilityLabel="Loading issue" accessibilityState={{ busy: true }}>
+    <View
+      className="gap-5"
+      accessibilityLabel={gt("Loading issue")}
+      accessibilityState={{ busy: true }}
+    >
       <View className="gap-3">
-        <PullRequestSectionHeading>Description</PullRequestSectionHeading>
+        <PullRequestSectionHeading>
+          <T>Description</T>
+        </PullRequestSectionHeading>
         <View className="gap-3 py-1">
           <View className="h-4 w-full rounded bg-subtle-strong" />
           <View className="h-4 w-full rounded bg-subtle-strong" />
@@ -433,7 +481,9 @@ function IssueLoadingBody() {
         </View>
       </View>
       <View className="gap-3">
-        <PullRequestSectionHeading>Activity</PullRequestSectionHeading>
+        <PullRequestSectionHeading>
+          <T>Activity</T>
+        </PullRequestSectionHeading>
         <View className="h-20 rounded-2xl bg-subtle-strong" />
         <View className="h-20 rounded-2xl bg-subtle-strong" />
       </View>
@@ -447,6 +497,7 @@ export function IssueRouteScreen({ route }: StaticScreenProps<IssueParams>) {
 }
 
 function IssueRoute({ params }: { readonly params: IssueParams }) {
+  const gt = useGT();
   const identity = issueIdentity(params);
   const target = issueTarget(params);
   const navigation = useNavigation();
@@ -539,7 +590,7 @@ function IssueRoute({ params }: { readonly params: IssueParams }) {
     setBusy(null);
     if (asked !== refreshes.current) return;
     if (AsyncResult.isFailure(result)) {
-      setError("Older comments could not be read.");
+      setError(gt("Older comments could not be read."));
       return;
     }
     setOlder({
@@ -557,7 +608,7 @@ function IssueRoute({ params }: { readonly params: IssueParams }) {
 
   const showComposer = detail?.capabilities.comment === true;
   const commentBlocked =
-    access?.comment === true ? null : (access?.blocked ?? "You cannot comment here.");
+    access?.comment === true ? null : (access?.blocked ?? gt("You cannot comment here."));
   const contentMaxWidth =
     Platform.OS === "android"
       ? ANDROID_READING_MAX_WIDTH
@@ -571,13 +622,13 @@ function IssueRoute({ params }: { readonly params: IssueParams }) {
       ? [
           {
             id: "edit-title",
-            title: "Edit title",
+            title: gt("Edit title"),
             icon: "pencil",
             onPress: () => navigation.navigate("IssueEdit", { ...identity, field: "title" }),
           },
           {
             id: "edit-description",
-            title: "Edit description",
+            title: gt("Edit description"),
             icon: "doc.text",
             onPress: () => navigation.navigate("IssueEdit", { ...identity, field: "body" }),
           },
@@ -587,19 +638,19 @@ function IssueRoute({ params }: { readonly params: IssueParams }) {
       ? [
           {
             id: "open-on-host",
-            title: "Open on the tracker",
+            title: gt("Open on the tracker"),
             icon: "arrow.up.right",
             onPress: () => void Linking.openURL(url),
           },
           {
             id: "copy-link",
-            title: "Copy link",
+            title: gt("Copy link"),
             icon: "link",
             onPress: () => copyTextWithHaptic(url, { target: "issue link" }),
           },
           {
             id: "share",
-            title: "Share…",
+            title: gt("Share…"),
             icon: "square.and.arrow.up",
             onPress: () =>
               // Android ignores `url`; iOS shows a `message` URL as plain text.
@@ -623,11 +674,11 @@ function IssueRoute({ params }: { readonly params: IssueParams }) {
       <View className="flex-1 bg-screen">
         <AppBar
           title={issue?.displayKey ?? params.issueKey}
-          subtitle={connected ? params.scope : `${params.scope} · Offline`}
+          subtitle={connected ? params.scope : gt("{scope} · Offline", { scope: params.scope })}
           onBack={layout.usesSplitView ? undefined : returnToList}
           menus={
             issueActions.length > 0
-              ? [{ title: "Issue actions", icon: "ellipsis", items: issueActions }]
+              ? [{ title: gt("Issue actions"), icon: "ellipsis", items: issueActions }]
               : []
           }
         />
@@ -658,7 +709,7 @@ function IssueRoute({ params }: { readonly params: IssueParams }) {
           {!issue ? (
             detailQuery.error && !detailQuery.isPending ? (
               <EmptyState
-                title="Couldn't load this issue"
+                title={gt("Couldn't load this issue")}
                 detail={detailQuery.error}
                 variant="plain"
               />
@@ -686,7 +737,7 @@ function IssueRoute({ params }: { readonly params: IssueParams }) {
               {!detail ? (
                 detailQuery.error && !detailQuery.isPending ? (
                   <EmptyState
-                    title="Couldn't load this issue"
+                    title={gt("Couldn't load this issue")}
                     detail={detailQuery.error}
                     variant="plain"
                   />
@@ -712,21 +763,23 @@ function IssueRoute({ params }: { readonly params: IssueParams }) {
                   ) : null}
                   <View className="gap-3">
                     <PullRequestSectionHeading>
-                      Activity
                       {detail.commentCount > 0
-                        ? ` · ${detail.commentCount} ${detail.commentCount === 1 ? "comment" : "comments"}`
-                        : ""}
+                        ? gt(
+                            "{count, plural, one {Activity · {count} comment} other {Activity · {count} comments}}",
+                            { count: detail.commentCount },
+                          )
+                        : gt("Activity")}
                     </PullRequestSectionHeading>
                     {nextCursor !== null ? (
                       <Button
-                        label={busy === "older" ? "Loading…" : "Load older comments"}
+                        label={busy === "older" ? gt("Loading…") : gt("Load older comments")}
                         disabled={busy !== null}
                         onPress={() => void loadOlder()}
                       />
                     ) : null}
                     {timeline.length === 0 ? (
                       <Text className="text-sm text-foreground-muted">
-                        Nothing has happened here yet.
+                        <T>Nothing has happened here yet.</T>
                       </Text>
                     ) : null}
                     {timeline.map((item) => (

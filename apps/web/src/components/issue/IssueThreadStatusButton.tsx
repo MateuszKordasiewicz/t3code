@@ -18,10 +18,11 @@ import {
   MessageSquareIcon,
   SquarePenIcon,
 } from "lucide-react";
-import { useGT } from "gt-react";
+import { msg, useGT } from "gt-react";
 import { useState } from "react";
 
 import { useNewThreadHandler } from "~/hooks/useHandleNewThread";
+import { m } from "~/i18n/messages";
 import {
   useAnyEnvironmentHiding,
   useEnvironmentThreadRefs,
@@ -112,8 +113,8 @@ export function IssueThreadStatusButton({
         setPending(false);
         toastManager.add({
           type: "error",
-          title: gt("Could not start a thread"),
-          description: readableFailure(error, gt("Try again from the issue.")),
+          title: m(msg("Could not start a thread")),
+          description: readableFailure(error, m(msg("Try again from the issue."))),
         });
       },
     );

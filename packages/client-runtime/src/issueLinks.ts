@@ -40,6 +40,24 @@ export function issueWebUrl(url: string): string | null {
   }
 }
 
+/** A host whose hostname does not name it, such as GitHub Enterprise Server, is vouched for by a project on it. */
+function parseIssueLink(
+  url: string,
+  authority: string | null,
+  projects: ReadonlyArray<LinkProject>,
+) {
+  const parsed = sourceControlClients.parseIssueUrl(url);
+  if (parsed !== null || authority === null) return parsed;
+  const hostname = new URL(url).hostname.toLowerCase();
+  for (const project of projects) {
+    const binding = projectIssueBinding(project);
+    if (binding === null || (binding.host !== hostname && binding.host !== authority)) continue;
+    const known = sourceControlClients.parseIssueUrl(url, project.repositoryIdentity?.provider);
+    if (known !== null) return known;
+  }
+  return null;
+}
+
 /**
  * What a thread links to for an issue read through `reference`. The detail always names the
  * host, which a reference leaves out when the project's binding supplies it.
@@ -72,11 +90,11 @@ export function resolveIssueLinkTarget<Project extends LinkProject>(input: {
   readonly projects: ReadonlyArray<Project>;
   readonly preferredProjectId?: string | undefined;
 }): { readonly project: Project; readonly ref: IssueRef } | null {
-  const parsed = sourceControlClients.parseIssueUrl(input.url);
-  if (parsed === null) return null;
-  const { definition, link } = parsed;
   // A link names its server's port; a binding does only when its remote or web URL did.
   const authority = linkAuthority(input.url);
+  const parsed = parseIssueLink(input.url, authority, input.projects);
+  if (parsed === null) return null;
+  const { definition, link } = parsed;
   const onHost = input.projects.flatMap((project) => {
     const binding = projectIssueBinding(project);
     return binding === null ||
