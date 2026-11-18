@@ -57,7 +57,12 @@ import {
   OrchestrationGetTurnDiffResult,
 } from "./checkpointDiff.ts";
 import { ModelSelection } from "./modelSelection.ts";
-import { ThreadIssueKey, ThreadIssueLink, ThreadIssueLinkSource } from "./issue.ts";
+import {
+  ThreadIssueKey,
+  ThreadIssueLink,
+  ThreadIssueLinkSource,
+  ThreadIssueLinkTarget,
+} from "./issue.ts";
 import {
   ThreadLinkedPullRequest,
   ThreadPullRequestLink,
@@ -3299,11 +3304,7 @@ export const OrchestrationV2Command = Schema.Union([
     type: Schema.Literal("thread.issue.link"),
     commandId: CommandId,
     threadId: ThreadId,
-    ...ThreadIssueKey.fields,
-    projectId: ProjectId,
-    url: TrimmedNonEmptyString,
-    displayKey: TrimmedNonEmptyString,
-    title: TrimmedNonEmptyString,
+    ...ThreadIssueLinkTarget.fields,
     source: ThreadIssueLinkSource,
   }),
   Schema.Struct({

@@ -14,6 +14,7 @@ import {
   ProviderInteractionMode as ProviderInteractionModeSchema,
   ProviderOptionSelection as ProviderOptionSelectionSchema,
   RuntimeMode as RuntimeModeSchema,
+  ThreadIssueLinkTarget,
   type EnvironmentId,
   type ModelSelection,
   type ProjectId,
@@ -473,6 +474,8 @@ export interface ComposerDraftWorkspaceSelection {
   readonly worktreePath: string | null;
   readonly startFromOrigin?: boolean;
   readonly pullRequestReference?: string;
+  /** The issue the new thread links once its first turn starts. */
+  readonly issueLink?: ThreadIssueLinkTarget;
   /**
    * Local mode chosen before refs named the current branch. It is never cleared when refs load:
    * a local task runs on the checkout, so the draft keeps following it (a later checkout change
@@ -497,6 +500,7 @@ const ComposerDraftWorkspaceSelectionSchema = Schema.Struct({
   worktreePath: Schema.NullOr(Schema.String),
   startFromOrigin: Schema.optional(Schema.Boolean),
   pullRequestReference: Schema.optional(Schema.String),
+  issueLink: Schema.optional(ThreadIssueLinkTarget),
   followsCurrentCheckout: Schema.optional(Schema.Boolean),
 });
 
@@ -1284,6 +1288,8 @@ export async function removeDeliveredCloudQueuedMessage(
             editor.workspaceSelection.worktreePath !== message.creation?.worktreePath ||
             editor.workspaceSelection.pullRequestReference !==
               message.creation?.pullRequestReference ||
+            JSON.stringify(editor.workspaceSelection.issueLink) !==
+              JSON.stringify(message.creation?.issueLink) ||
             (editor.workspaceSelection.startFromOrigin ?? false) !==
               (message.creation?.startFromOrigin ?? false))))
     )

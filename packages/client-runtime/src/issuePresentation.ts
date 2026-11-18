@@ -2,6 +2,9 @@ import type { IssueDetail, IssueEvent } from "@t3tools/contracts";
 import { mFallback, msg } from "gt-i18n";
 import type { MFunctionType } from "gt-i18n/types";
 
+import { issueWebUrl } from "./issueLinks.ts";
+import { capitalizeTerm, sourceControlClients } from "./sourceControlClients.ts";
+
 /** "completed" → "Completed"; a reason the tracker spells with a dash reads as words. */
 function issueCloseReasonLabel(reason: string): string {
   const words = reason.replace(/[-_]+/g, " ").trim();
@@ -79,4 +82,25 @@ export function issueWriteAccess(
       ? detail.states.filter((state) => state.name !== detail.state.name)
       : [],
   };
+}
+
+/** A git host's tracker goes by the host's name; a standalone tracker by its kind. */
+function issueTrackerName(tracker: string): string {
+  return sourceControlClients.find(tracker)?.label ?? capitalizeTerm(tracker);
+}
+
+/**
+ * The opening prompt of a thread started from an issue: which issue, where a browser opens it,
+ * and its description. The user edits it before sending, so it states the issue, not a task.
+ */
+export function issueThreadPrompt(
+  issue: Pick<IssueDetail, "tracker" | "displayKey" | "title" | "url" | "body">,
+): string {
+  const webUrl = issueWebUrl(issue.url);
+  const body = issue.body.trim();
+  return [
+    `${issueTrackerName(issue.tracker)} issue ${issue.displayKey}: ${issue.title}`,
+    ...(webUrl === null ? [] : [webUrl]),
+    ...(body === "" ? [] : ["", body]),
+  ].join("\n");
 }
