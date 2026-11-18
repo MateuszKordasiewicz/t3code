@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 
-# Releases publish in push order, so a newer version never lands before an older one.
+# One publisher at a time; a newer push replaces a pending one, since it carries the older changes.
 concurrency:
   group: fork-release-linux-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -29,12 +29,12 @@ jobs:
     permissions:
       contents: write
     env:
-      PUBLISH: ${{ github.event_name != 'pull_request' }}
       T3CODE_DESKTOP_UPDATE_REPOSITORY: MateuszKordasiewicz/t3code
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          persist-credentials: false
           sparse-checkout: |
             /*
             !/.repos/
@@ -51,9 +51,10 @@ jobs:
         env:
           RUN_NUMBER: ${{ github.run_number }}
           SHA: ${{ github.sha }}
+        # The commit's date, not the clock, so re-running a run cannot rank an old commit above newer releases.
         run: |
           node scripts/resolve-nightly-release.ts \
-            --date "$(date -u +%Y%m%d)" \
+            --date "$(TZ=UTC git show -s --format=%cd --date=format-local:%Y%m%d "$SHA")" \
             --run-number "$RUN_NUMBER" \
             --sha "$SHA" \
             --github-output
@@ -93,9 +94,6 @@ jobs:
             ~/.cache/electron-builder/7zip@*/7zip-linux-*.tar.gz
           key: electron-builder-linux-tools-x64-${{ hashFiles('node_modules/.pnpm/app-builder-lib@*/node_modules/app-builder-lib/out/toolsets/linux.js', 'node_modules/.pnpm/app-builder-lib@*/node_modules/app-builder-lib/out/toolsets/7zip.js') }}
 
-      - name: Align package versions to release version
-        run: node scripts/update-release-package-versions.ts "${{ steps.version.outputs.version }}"
-
       - name: Build desktop AppImage
         run: >-
           vp run dist:desktop:artifact
@@ -123,7 +121,7 @@ jobs:
           (cd "$ASSETS" && sha256sum * > SHA256SUMS && cat SHA256SUMS)
 
       - name: Upload build (pull request)
-        if: env.PUBLISH != 'true'
+        if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fork-linux-${{ steps.version.outputs.version }}
@@ -133,8 +131,9 @@ jobs:
           retention-days: 7
 
       # Created as a draft so the updater never sees a release whose files are still uploading.
+      # A re-run keeps an already published release and redoes only an unfinished draft.
       - name: Publish fork release
-        if: env.PUBLISH == 'true'
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -145,6 +144,14 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          draft="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || echo missing)"
+          if [[ "$draft" == "false" ]]; then
+            echo "$TAG is already published; keeping it."
+            exit 0
+          fi
+          if [[ "$draft" == "true" ]]; then
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
           gh release create "$TAG" "$ASSETS"/* \
             --draft --prerelease --latest=false \
             --target "$SHA" \
@@ -153,17 +160,20 @@ jobs:
           gh release edit "$TAG" --draft=false
 
       # releases.atom also lists the upstream nightly tags this fork carries, so point the patched
-      # updater at the newest fork release the way upstream's update_feed job does.
-      - name: Point the update feed at this release
-        if: env.PUBLISH == 'true'
+      # updater at the newest fork release the way upstream's update_feed job does. Upstream's
+      # copied tags have no releases, so the release list holds only fork nightlies.
+      - name: Point the update feed at the newest fork release
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ steps.version.outputs.tag }}
         run: |
           set -euo pipefail
-          gh api "repos/$GH_REPO/releases/tags/$TAG" --jq '{tag_name, name, body}' > "$RUNNER_TEMP/nightly.json"
+          newest="$(gh release list --exclude-drafts --limit 200 --json tagName --jq '.[].tagName' |
+            grep -E -- '-nightly\.[0-9]{8}\.[0-9]+$' | sort -V | tail -1)"
+          echo "Newest fork nightly: $newest"
+          gh api "repos/$GH_REPO/releases/tags/$newest" --jq '{tag_name, name, body}' > "$RUNNER_TEMP/nightly.json"
           cat "$RUNNER_TEMP/nightly.json"
           gh release view update-feed > /dev/null 2>&1 ||
             gh release create update-feed --prerelease --latest=false --title "Update feed" \
