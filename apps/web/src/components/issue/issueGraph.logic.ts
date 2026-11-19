@@ -21,35 +21,38 @@ export interface IssueGraphEdge {
   readonly path: string;
 }
 
-export interface IssueGraphCluster {
+export interface IssueGraphRegion {
+  /** Unique across projects, so a region's collapse is remembered for its own project only. */
   readonly id: string;
   readonly kind: "tree" | "loose" | "type" | "status";
   /** Raw value: root displayKey or missing parent key, the issue type, or the state name. */
   readonly label: string;
   /** The root issue of a tree; null when that root is not among the entries. */
-  readonly rootNodeId: string | null;
-  readonly x: number;
-  readonly y: number;
+  readonly root: EnvironmentIssueEntry | null;
+  readonly issueCount: number;
+  /** The body under the region's header; node and edge coordinates are relative to it. */
   readonly width: number;
   readonly height: number;
-  readonly nodeIds: ReadonlyArray<string>;
+  readonly nodes: ReadonlyArray<IssueGraphNode>;
+  /** Only links inside the region: each region scrolls sideways on its own. */
+  readonly edges: ReadonlyArray<IssueGraphEdge>;
 }
 
-export interface IssueGraphLayout {
-  readonly nodes: ReadonlyArray<IssueGraphNode>;
-  readonly edges: ReadonlyArray<IssueGraphEdge>;
-  readonly clusters: ReadonlyArray<IssueGraphCluster>;
-  readonly width: number;
-  readonly height: number;
+export interface IssueGraphProject {
+  /** `environmentId:projectId`. */
+  readonly id: string;
+  readonly title: string;
+  readonly issueCount: number;
+  readonly regions: ReadonlyArray<IssueGraphRegion>;
 }
 
 const DEFAULT_SIZE = { nodeWidth: 240, nodeHeight: 56 };
-const CLUSTER_HEADER = 28;
-const CLUSTER_PADDING = 12;
-const CLUSTER_GAP = 24;
+const REGION_PADDING = 12;
 const RANK_GAP = 64;
 const ROW_GAP = 12;
 const GRID_COLUMNS = 4;
+// Grid issues have no links between them, so their columns need no room for edges.
+const GRID_GAP = 16;
 const EDGE_BOW = 48;
 
 const TYPE_ORDER = ["epic", "feature", "bug", "task", "chore"];
@@ -64,7 +67,7 @@ const OPEN_STATUS_ORDER = [
 ];
 const collator = new Intl.Collator("en", { numeric: true });
 
-type ClusterKind = IssueGraphCluster["kind"];
+type ClusterKind = IssueGraphRegion["kind"];
 
 interface Item {
   readonly id: string;
@@ -119,36 +122,67 @@ function compareIds(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+/**
+ * Issues grouped into one row per project, each holding the regions of the chosen grouping. Every
+ * issue of one tracker scope sits in the project that listed that scope first, so parent and
+ * blocking links never cross projects.
+ */
 export function layoutIssueGraph(
   entries: ReadonlyArray<EnvironmentIssueEntry>,
   groupBy: IssueGraphGroupBy,
   size: { nodeWidth: number; nodeHeight: number } = DEFAULT_SIZE,
-): IssueGraphLayout {
+): ReadonlyArray<IssueGraphProject> {
   // One node per issue: the same issue read through two projects of one scope is drawn once.
   const items: Array<Item> = [];
-  const byRef = new Map<string, number>();
+  const seenRefs = new Set<string>();
   const seenIds = new Set<string>();
+  const projectOfScope = new Map<string, { id: string; title: string }>();
+  const projectItems = new Map<string, { title: string; items: Array<Item> }>();
   for (const entry of entries) {
     const ref = scopeRef(entry, entry.key);
     const id = `${entry.environmentId}:${issueEntryKey(entry)}`;
-    if (byRef.has(ref) || seenIds.has(id)) continue;
-    byRef.set(ref, items.length);
+    if (seenRefs.has(ref) || seenIds.has(id)) continue;
+    seenRefs.add(ref);
     seenIds.add(id);
-    items.push({ id, entry, order: 0 });
+    const scope = scopeRef(entry, "");
+    let project = projectOfScope.get(scope);
+    if (project === undefined) {
+      project = { id: `${entry.environmentId}:${entry.projectId}`, title: entry.projectTitle };
+      projectOfScope.set(scope, project);
+    }
+    const item: Item = { id, entry, order: 0 };
+    items.push(item);
+    let group = projectItems.get(project.id);
+    if (group === undefined) {
+      group = { title: project.title, items: [] };
+      projectItems.set(project.id, group);
+    }
+    group.items.push(item);
   }
   // Within a priority, the list's chosen sort order decides, so the Sort control applies here too.
-  const sorted = items
-    .map((_, index) => index)
-    .toSorted((a, b) => priorityOf(items[a]!.entry) - priorityOf(items[b]!.entry) || a - b);
-  sorted.forEach((index, order) => {
-    items[index]!.order = order;
-  });
+  items
+    .map((item, index) => ({ item, index }))
+    .toSorted((a, b) => priorityOf(a.item.entry) - priorityOf(b.item.entry) || a.index - b.index)
+    .forEach(({ item }, order) => {
+      item.order = order;
+    });
 
-  const edges = collectEdges(items, byRef);
-  const clusters =
-    groupBy === "tree" ? treeClusters(items, byRef) : attributeClusters(items, groupBy);
-
-  return placeClusters(items, edges, clusters, size);
+  return [...projectItems]
+    .toSorted(([idA, a], [idB, b]) => collator.compare(a.title, b.title) || compareIds(idA, idB))
+    .map(([id, { title, items: members }]) => {
+      const byRef = new Map(
+        members.map((item, index) => [scopeRef(item.entry, item.entry.key), index]),
+      );
+      const edges = collectEdges(members, byRef);
+      const clusters =
+        groupBy === "tree" ? treeClusters(members, byRef) : attributeClusters(members, groupBy);
+      return {
+        id,
+        title,
+        issueCount: members.length,
+        regions: clusters.map((cluster) => placeRegion(id, members, edges, cluster, size)),
+      };
+    });
 }
 
 function collectEdges(
@@ -367,133 +401,125 @@ function rankCluster(
   return { ranks, predecessors };
 }
 
-function placeClusters(
+function placeRegion(
+  projectId: string,
   items: ReadonlyArray<Item>,
   edges: ReadonlyArray<RawEdge>,
-  clusters: ReadonlyArray<PendingCluster>,
+  cluster: PendingCluster,
   size: { nodeWidth: number; nodeHeight: number },
-): IssueGraphLayout {
+): IssueGraphRegion {
   const { nodeWidth, nodeHeight } = size;
-  const clusterOf = new Map<number, string>();
-  for (const cluster of clusters)
-    for (const index of cluster.members) clusterOf.set(index, cluster.id);
-  const innerEdges = new Map<string, Array<RawEdge>>();
-  for (const edge of edges) {
-    const cluster = clusterOf.get(edge.from);
-    if (cluster === undefined || cluster !== clusterOf.get(edge.to)) continue;
-    const list = innerEdges.get(cluster) ?? [];
-    list.push(edge);
-    innerEdges.set(cluster, list);
-  }
-
-  const nodes: Array<IssueGraphNode> = [];
-  const nodeAt = new Map<number, IssueGraphNode>();
-  const placed: Array<IssueGraphCluster> = [];
-  let top = 0;
-  let width = 0;
-  for (const cluster of clusters) {
-    const clusterEdges = innerEdges.get(cluster.id) ?? [];
-    const linked = new Set<number>();
-    for (const edge of clusterEdges) linked.add(edge.from).add(edge.to);
-    const { ranks, predecessors } = rankCluster(
-      items,
-      cluster.members.filter((index) => linked.has(index)),
-      clusterEdges,
-    );
-    const columns: Array<Array<number>> = [];
-    for (const [index, rank] of ranks) (columns[rank] ??= []).push(index);
-    const row = new Map<number, number>();
-    const column = new Map<number, number>();
-    columns.forEach((members, rank) => {
-      const barycenter = new Map<number, number>();
-      if (rank > 0) {
-        for (const index of members) {
-          const preds = predecessors.get(index)!;
-          barycenter.set(
-            index,
-            preds.reduce((sum, from) => sum + row.get(from)!, 0) / preds.length,
-          );
-        }
+  const memberSet = new Set(cluster.members);
+  const regionEdges = edges.filter((edge) => memberSet.has(edge.from) && memberSet.has(edge.to));
+  const linked = new Set<number>();
+  for (const edge of regionEdges) linked.add(edge.from).add(edge.to);
+  const { ranks, predecessors } = rankCluster(
+    items,
+    cluster.members.filter((index) => linked.has(index)),
+    regionEdges,
+  );
+  const columns: Array<Array<number>> = [];
+  for (const [index, rank] of ranks) (columns[rank] ??= []).push(index);
+  const row = new Map<number, number>();
+  const column = new Map<number, number>();
+  columns.forEach((members, rank) => {
+    const barycenter = new Map<number, number>();
+    if (rank > 0) {
+      for (const index of members) {
+        const preds = predecessors.get(index)!;
+        barycenter.set(index, preds.reduce((sum, from) => sum + row.get(from)!, 0) / preds.length);
       }
-      members.sort(
-        (a, b) =>
-          (barycenter.get(a) ?? 0) - (barycenter.get(b) ?? 0) || items[a]!.order - items[b]!.order,
-      );
-      members.forEach((index, position) => {
-        row.set(index, position);
-        column.set(index, rank);
-      });
-    });
-    // Issues with no link inside the band fill a grid beside the ranked part, not one tall column.
-    const loose = cluster.members
-      .filter((index) => !linked.has(index))
-      .toSorted((a, b) => items[a]!.order - items[b]!.order);
-    loose.forEach((index, position) => {
-      row.set(index, Math.floor(position / GRID_COLUMNS));
-      column.set(index, columns.length + (position % GRID_COLUMNS));
-    });
-
-    const columnCount = columns.length + Math.min(loose.length, GRID_COLUMNS);
-    const rows = Math.max(
-      Math.ceil(loose.length / GRID_COLUMNS),
-      ...columns.map((members) => members.length),
-    );
-    const clusterWidth =
-      CLUSTER_PADDING * 2 + columnCount * nodeWidth + (columnCount - 1) * RANK_GAP;
-    const clusterHeight =
-      CLUSTER_HEADER + CLUSTER_PADDING + rows * nodeHeight + (rows - 1) * ROW_GAP;
-    const nodeIds: Array<string> = [];
-    for (const index of [...columns.flat(), ...loose]) {
-      const node: IssueGraphNode = {
-        id: items[index]!.id,
-        entry: items[index]!.entry,
-        x: CLUSTER_PADDING + column.get(index)! * (nodeWidth + RANK_GAP),
-        y: top + CLUSTER_HEADER + row.get(index)! * (nodeHeight + ROW_GAP),
-        width: nodeWidth,
-        height: nodeHeight,
-      };
-      nodes.push(node);
-      nodeAt.set(index, node);
-      nodeIds.push(node.id);
     }
-    placed.push({
-      id: cluster.id,
-      kind: cluster.kind,
-      label: cluster.label,
-      rootNodeId: cluster.rootNodeId,
-      x: 0,
-      y: top,
-      width: clusterWidth,
-      height: clusterHeight,
-      nodeIds,
+    members.sort(
+      (a, b) =>
+        (barycenter.get(a) ?? 0) - (barycenter.get(b) ?? 0) || items[a]!.order - items[b]!.order,
+    );
+    members.forEach((index, position) => {
+      row.set(index, position);
+      column.set(index, rank);
     });
-    width = Math.max(width, clusterWidth);
-    top += clusterHeight + CLUSTER_GAP;
-  }
+  });
+  // Issues with no link inside the region fill a grid beside the ranked part, not one tall column.
+  const loose = cluster.members
+    .filter((index) => !linked.has(index))
+    .toSorted((a, b) => items[a]!.order - items[b]!.order);
+  loose.forEach((index, position) => {
+    row.set(index, Math.floor(position / GRID_COLUMNS));
+    column.set(index, columns.length + (position % GRID_COLUMNS));
+  });
 
+  const gridColumns = Math.min(loose.length, GRID_COLUMNS);
+  const rows = Math.max(
+    Math.ceil(loose.length / GRID_COLUMNS),
+    ...columns.map((members) => members.length),
+  );
+  // A link back into the first column turns left of it, so that column moves right to make room.
+  const left =
+    REGION_PADDING +
+    (regionEdges.some((edge) => column.get(edge.to) === 0 && column.get(edge.from)! > 0)
+      ? EDGE_BOW
+      : 0);
+  const nodeAt = new Map<number, IssueGraphNode>();
+  const nodes = [...columns.flat(), ...loose].map((index) => {
+    const node: IssueGraphNode = {
+      id: items[index]!.id,
+      entry: items[index]!.entry,
+      x: left + columnX(column.get(index)!, columns.length, nodeWidth),
+      y: REGION_PADDING + row.get(index)! * (nodeHeight + ROW_GAP),
+      width: nodeWidth,
+      height: nodeHeight,
+    };
+    nodeAt.set(index, node);
+    return node;
+  });
+  const lastColumn = columns.length + gridColumns - 1;
+  let width =
+    lastColumn < 0
+      ? left + REGION_PADDING
+      : left + columnX(lastColumn, columns.length, nodeWidth) + nodeWidth + REGION_PADDING;
+  const placedEdges = regionEdges.map((edge): IssueGraphEdge => {
+    const from = nodeAt.get(edge.from)!;
+    const to = nodeAt.get(edge.to)!;
+    const { path, maxX } = edgePath(from, to);
+    // A same-column bow leaves the last column; the region scrolls far enough to show it.
+    width = Math.max(width, maxX + REGION_PADDING);
+    return { id: edge.id, from: from.id, to: to.id, kind: edge.kind, path };
+  });
   return {
-    nodes,
-    edges: edges.map((edge) => ({
-      id: edge.id,
-      from: items[edge.from]!.id,
-      to: items[edge.to]!.id,
-      kind: edge.kind,
-      path: edgePath(nodeAt.get(edge.from)!, nodeAt.get(edge.to)!),
-    })),
-    clusters: placed,
+    id: `${projectId}:${cluster.id}`,
+    kind: cluster.kind,
+    label: cluster.label,
+    root:
+      cluster.rootNodeId === null
+        ? null
+        : (items.find((item) => item.id === cluster.rootNodeId)?.entry ?? null),
+    issueCount: cluster.members.length,
     width,
-    height: placed.length === 0 ? 0 : top - CLUSTER_GAP,
+    height: REGION_PADDING * 2 + rows * nodeHeight + (rows - 1) * ROW_GAP,
+    nodes,
+    edges: placedEdges,
   };
 }
 
-function edgePath(from: IssueGraphNode, to: IssueGraphNode): string {
+function columnX(column: number, rankedColumns: number, nodeWidth: number): number {
+  if (column < rankedColumns) return column * (nodeWidth + RANK_GAP);
+  return rankedColumns * (nodeWidth + RANK_GAP) + (column - rankedColumns) * (nodeWidth + GRID_GAP);
+}
+
+function edgePath(
+  from: IssueGraphNode,
+  to: IssueGraphNode,
+): { readonly path: string; readonly maxX: number } {
   const sx = from.x + from.width;
   const sy = from.y + from.height / 2;
   const ty = to.y + to.height / 2;
   if (to.x === from.x) {
     // Same column: leave and enter on the right, bowing out past both nodes.
     const bow = EDGE_BOW + Math.abs(ty - sy) / 4;
-    return `M ${sx} ${sy} C ${sx + bow} ${sy}, ${sx + bow} ${ty}, ${sx} ${ty}`;
+    return {
+      path: `M ${sx} ${sy} C ${sx + bow} ${sy}, ${sx + bow} ${ty}, ${sx} ${ty}`,
+      maxX: sx + bow,
+    };
   }
   const tx = to.x;
   if (tx < sx || tx - sx > from.width + EDGE_BOW) {
@@ -501,11 +527,13 @@ function edgePath(from: IssueGraphNode, to: IssueGraphNode): string {
     // then come down, so the edge never runs behind the cards it passes.
     const gapY = Math.min(from.y, to.y) - ROW_GAP / 2;
     const half = EDGE_BOW / 2;
-    return (
-      `M ${sx} ${sy} C ${sx + half} ${sy}, ${sx + half} ${gapY}, ${sx + EDGE_BOW} ${gapY} ` +
-      `L ${tx - EDGE_BOW} ${gapY} C ${tx - half} ${gapY}, ${tx - half} ${ty}, ${tx} ${ty}`
-    );
+    return {
+      path:
+        `M ${sx} ${sy} C ${sx + half} ${sy}, ${sx + half} ${gapY}, ${sx + EDGE_BOW} ${gapY} ` +
+        `L ${tx - EDGE_BOW} ${gapY} C ${tx - half} ${gapY}, ${tx - half} ${ty}, ${tx} ${ty}`,
+      maxX: Math.max(sx + EDGE_BOW, tx),
+    };
   }
   const pull = Math.max(EDGE_BOW / 2, (tx - sx) / 2);
-  return `M ${sx} ${sy} C ${sx + pull} ${sy}, ${tx - pull} ${ty}, ${tx} ${ty}`;
+  return { path: `M ${sx} ${sy} C ${sx + pull} ${sy}, ${tx - pull} ${ty}, ${tx} ${ty}`, maxX: tx };
 }

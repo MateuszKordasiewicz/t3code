@@ -2,7 +2,7 @@ import type { EnvironmentIssueEntry } from "@t3tools/client-runtime/issue-list";
 import { EnvironmentId, IssueTrackerKind, ProjectId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { layoutIssueGraph, type IssueGraphLayout } from "./issueGraph.logic";
+import { layoutIssueGraph, type IssueGraphProject } from "./issueGraph.logic";
 
 type Overrides = Partial<
   Pick<
@@ -38,18 +38,22 @@ function issue(key: string, overrides: Overrides = {}): EnvironmentIssueEntry {
 
 const nodeId = (key: string) => `env-1:project-1\u0000local\u0000t3\u0000${key}`;
 
-function clusterKeys(layout: IssueGraphLayout) {
-  return layout.clusters.map((cluster) => ({
-    kind: cluster.kind,
-    label: cluster.label,
-    keys: cluster.nodeIds
-      .map((id) => layout.nodes.find((node) => node.id === id)!.entry.key)
-      .toSorted(),
+type Layout = ReadonlyArray<IssueGraphProject>;
+
+const regionsOf = (layout: Layout) => layout.flatMap((project) => project.regions);
+const nodesOf = (layout: Layout) => regionsOf(layout).flatMap((region) => region.nodes);
+const edgesOf = (layout: Layout) => regionsOf(layout).flatMap((region) => region.edges);
+
+function regionKeys(layout: Layout) {
+  return regionsOf(layout).map((region) => ({
+    kind: region.kind,
+    label: region.label,
+    keys: region.nodes.map((node) => node.entry.key).toSorted(),
   }));
 }
 
-function nodeOf(layout: IssueGraphLayout, key: string) {
-  return layout.nodes.find((node) => node.entry.key === key)!;
+function nodeOf(layout: Layout, key: string) {
+  return nodesOf(layout).find((node) => node.entry.key === key)!;
 }
 
 describe("layoutIssueGraph", () => {
@@ -73,7 +77,7 @@ describe("layoutIssueGraph", () => {
       "tree",
     );
 
-    expect(clusterKeys(layout)).toEqual([
+    expect(regionKeys(layout)).toEqual([
       { kind: "tree", label: "epic-hidden", keys: ["h.1", "h.2"] },
       { kind: "tree", label: "epic-a", keys: ["a.1", "a.1.1", "epic-a"] },
       { kind: "tree", label: "epic-solo", keys: ["epic-solo"] },
@@ -81,17 +85,13 @@ describe("layoutIssueGraph", () => {
       { kind: "loose", label: "chore", keys: ["chore-1"] },
       { kind: "loose", label: "", keys: ["gh-1"] },
     ]);
-    expect(layout.clusters[0]!.rootNodeId).toBeNull();
-    expect(layout.clusters[1]!.rootNodeId).toBe(nodeId("epic-a"));
-    expect(layout.nodes).toHaveLength(10);
-    // Bands stack top to bottom without overlapping.
-    for (let i = 1; i < layout.clusters.length; i++) {
-      const above = layout.clusters[i - 1]!;
-      expect(layout.clusters[i]!.y).toBeGreaterThan(above.y + above.height);
-    }
+    const [hidden, epicA] = regionsOf(layout);
+    expect(hidden!.root).toBeNull();
+    expect(epicA!.root?.key).toBe("epic-a");
+    expect(nodesOf(layout)).toHaveLength(10);
   });
 
-  it("draws parent and blocks edges between present issues and drops the rest", () => {
+  it("draws parent and blocks edges inside a region and drops the rest", () => {
     const layout = layoutIssueGraph(
       [
         issue("epic", { issueType: "epic" }),
@@ -102,16 +102,16 @@ describe("layoutIssueGraph", () => {
       "tree",
     );
 
-    expect(layout.edges.map(({ kind, from, to }) => ({ kind, from, to }))).toEqual(
+    expect(edgesOf(layout).map(({ kind, from, to }) => ({ kind, from, to }))).toEqual(
       expect.arrayContaining([
         { kind: "blocks", from: nodeId("one"), to: nodeId("two") },
-        { kind: "blocks", from: nodeId("two"), to: nodeId("loose") },
         { kind: "parent", from: nodeId("epic"), to: nodeId("one") },
         { kind: "parent", from: nodeId("epic"), to: nodeId("two") },
       ]),
     );
-    expect(layout.edges).toHaveLength(4);
-    for (const edge of layout.edges) expect(edge.path).toMatch(/^M [\d.]+ [\d.]+ C /);
+    // two -> loose crosses into the loose region, which scrolls on its own: not drawn.
+    expect(edgesOf(layout)).toHaveLength(3);
+    for (const edge of edgesOf(layout)) expect(edge.path).toMatch(/^M [\d.]+ [\d.]+ C /);
   });
 
   it("ranks blockers left of what they block and survives dependency cycles", () => {
@@ -128,7 +128,9 @@ describe("layoutIssueGraph", () => {
     expect(nodeOf(chain, "b").x).toBeLessThan(nodeOf(chain, "c").x);
     expect(nodeOf(chain, "side").x).toBe(nodeOf(chain, "b").x);
     // a -> c skips b's column: it turns inside the column gaps and crosses above b's card.
-    const skip = chain.edges.find((edge) => edge.from === nodeId("a") && edge.to === nodeId("c"))!;
+    const skip = edgesOf(chain).find(
+      (edge) => edge.from === nodeId("a") && edge.to === nodeId("c"),
+    )!;
     const b = nodeOf(chain, "b");
     const [, riseEndX, crossY, crossEndX] = skip.path
       .match(/, ([\d.-]+) ([\d.-]+) L ([\d.-]+) [\d.-]+ C/)!
@@ -143,17 +145,126 @@ describe("layoutIssueGraph", () => {
       issue("z", { dependsOnKeys: ["y"], parentKey: "y" }),
     ];
     const first = layoutIssueGraph(cycle, "tree");
-    expect(first.nodes).toHaveLength(3);
-    expect(new Set(first.nodes.map((node) => node.x)).size).toBe(3);
-    // A backward edge crosses in the row gap too, above the card it passes.
-    const back = first.edges.find((edge) => {
-      const from = first.nodes.find((node) => node.id === edge.from)!;
-      const to = first.nodes.find((node) => node.id === edge.to)!;
+    const firstNodes = nodesOf(first);
+    expect(firstNodes).toHaveLength(3);
+    expect(new Set(firstNodes.map((node) => node.x)).size).toBe(3);
+    // A backward edge crosses in the row gap too, above the card it passes, inside the region.
+    const back = edgesOf(first).find((edge) => {
+      const from = firstNodes.find((node) => node.id === edge.from)!;
+      const to = firstNodes.find((node) => node.id === edge.to)!;
       return to.x < from.x - from.width;
     })!;
     const backY = Number(back.path.match(/ L [\d.-]+ ([\d.-]+) C/)![1]);
-    expect(backY).toBeLessThan(Math.min(...first.nodes.map((node) => node.y)));
+    expect(backY).toBeLessThan(Math.min(...firstNodes.map((node) => node.y)));
+    expect(backY).toBeGreaterThan(0);
     expect(layoutIssueGraph(cycle, "tree")).toEqual(first);
+  });
+
+  it("sizes each region to its cards plus padding, and widens it for an edge past the last column", () => {
+    const layout = layoutIssueGraph(
+      [
+        issue("epic", { issueType: "epic" }),
+        issue("one", { parentKey: "epic" }),
+        issue("two", { parentKey: "epic" }),
+        issue("bug-1", { issueType: "bug" }),
+      ],
+      "tree",
+      { nodeWidth: 100, nodeHeight: 40 },
+    );
+    const [tree, loose] = regionsOf(layout);
+    // epic in column 0; one and two stacked in column 1: two rows of 40 with a 12 gap, 12 padding.
+    expect(tree!.height).toBe(12 + 40 + 12 + 40 + 12);
+    expect(Math.min(...tree!.nodes.map((node) => node.y))).toBe(12);
+    expect(Math.max(...tree!.nodes.map((node) => node.y + node.height))).toBe(tree!.height - 12);
+    expect(tree!.width).toBe(12 + 100 + 64 + 100 + 12);
+    expect(loose).toMatchObject({ height: 12 + 40 + 12, width: 12 + 100 + 12, edges: [] });
+
+    // A backward edge leaves the last column to its right and enters the first from its left;
+    // the region makes room on both sides.
+    const cycle = regionsOf(
+      layoutIssueGraph(
+        [
+          issue("x", { dependsOnKeys: ["z"] }),
+          issue("y", { dependsOnKeys: ["x"] }),
+          issue("z", { dependsOnKeys: ["y"] }),
+        ],
+        "tree",
+        { nodeWidth: 100, nodeHeight: 40 },
+      ),
+    )[0]!;
+    const cardsRight = Math.max(...cycle.nodes.map((node) => node.x + node.width));
+    const pathRight = Math.max(
+      ...cycle.edges.flatMap((edge) =>
+        [...edge.path.matchAll(/(-?[\d.]+) -?[\d.]+/g)].map((match) => Number(match[1])),
+      ),
+    );
+    const pathLeft = Math.min(
+      ...cycle.edges.flatMap((edge) =>
+        [...edge.path.matchAll(/(-?[\d.]+) -?[\d.]+/g)].map((match) => Number(match[1])),
+      ),
+    );
+    expect(pathRight).toBeGreaterThan(cardsRight);
+    expect(cycle.width).toBe(pathRight + 12);
+    expect(pathLeft).toBe(12);
+  });
+
+  it("groups regions under one row per project, keeping a shared scope in the project that listed it first", () => {
+    const inProject = (entry: EnvironmentIssueEntry, project: string, title: string) => ({
+      ...entry,
+      projectId: ProjectId.make(project),
+      projectTitle: title,
+    });
+    const github = (entry: EnvironmentIssueEntry) => ({
+      ...entry,
+      tracker: IssueTrackerKind.make("github"),
+      host: "github.com",
+      scope: "owner/repo",
+    });
+    const layout = layoutIssueGraph(
+      [
+        inProject({ ...issue("bug-1", { issueType: "bug" }), scope: "zed" }, "zed", "zed"),
+        inProject(github(issue("7")), "zed", "zed"),
+        inProject(issue("epic", { issueType: "epic" }), "fork", "Fork"),
+        // The t3 beads scope and the GitHub repo were listed first by Fork and zed.
+        inProject(issue("child", { parentKey: "epic" }), "app", "app"),
+        inProject({ ...issue("bug-2", { issueType: "bug" }), scope: "app" }, "app", "app"),
+        inProject(github(issue("8")), "app", "app"),
+      ],
+      "tree",
+    );
+    expect(
+      layout.map((project) => ({
+        id: project.id,
+        title: project.title,
+        issueCount: project.issueCount,
+        regions: project.regions.map((region) => [
+          region.id,
+          region.nodes.map((node) => node.entry.key),
+        ]),
+      })),
+    ).toEqual([
+      {
+        id: "env-1:app",
+        title: "app",
+        issueCount: 1,
+        regions: [["env-1:app:loose:bug", ["bug-2"]]],
+      },
+      {
+        id: "env-1:fork",
+        title: "Fork",
+        issueCount: 2,
+        regions: [["env-1:fork:tree:env-1:fork\u0000local\u0000t3\u0000epic", ["epic", "child"]]],
+      },
+      {
+        id: "env-1:zed",
+        title: "zed",
+        issueCount: 3,
+        regions: [
+          ["env-1:zed:loose:bug", ["bug-1"]],
+          ["env-1:zed:loose:", ["7", "8"]],
+        ],
+      },
+    ]);
   });
 
   it("groups by type and by status in a stable order", () => {
@@ -165,7 +276,7 @@ describe("layoutIssueGraph", () => {
       issue("5", { issueType: "epic", status: "open" }),
       issue("6", { issueType: "alpha" }),
     ];
-    expect(layoutIssueGraph(entries, "type").clusters.map((c) => [c.kind, c.label])).toEqual([
+    expect(regionsOf(layoutIssueGraph(entries, "type")).map((c) => [c.kind, c.label])).toEqual([
       ["type", "epic"],
       ["type", "bug"],
       ["type", "chore"],
@@ -173,15 +284,20 @@ describe("layoutIssueGraph", () => {
       ["type", "zeta"],
       ["type", ""],
     ]);
-    const grid = layoutIssueGraph(
-      entries.map((entry) => ({ ...entry, issueType: "task" })),
-      "type",
-    ).nodes;
+    const grid = nodesOf(
+      layoutIssueGraph(
+        entries.map((entry) => ({ ...entry, issueType: "task" })),
+        "type",
+      ),
+    );
     expect({
       columns: new Set(grid.map((node) => node.x)).size,
       rows: new Set(grid.map((node) => node.y)).size,
     }).toEqual({ columns: 4, rows: 2 });
-    expect(layoutIssueGraph(entries, "status").clusters.map((c) => c.label)).toEqual([
+    // Unlinked grid columns sit close together; only ranked columns leave room for edges.
+    const gridXs = [...new Set(grid.map((node) => node.x))].toSorted((a, b) => a - b);
+    expect(gridXs[1]! - gridXs[0]!).toBe(grid[0]!.width + 16);
+    expect(regionsOf(layoutIssueGraph(entries, "status")).map((c) => c.label)).toEqual([
       "open",
       "in_progress",
       "blocked",
