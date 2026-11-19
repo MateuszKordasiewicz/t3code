@@ -517,7 +517,6 @@ export function IssuesPage() {
       {graph ? (
         <IssueGraphView
           entries={groups.flatMap((group) => group.rows)}
-          projects={projects}
           groupBy={search.group ?? "tree"}
           selectedId={selectedIssueId}
           onSelect={selectEntry}
