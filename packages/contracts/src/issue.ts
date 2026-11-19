@@ -7,6 +7,7 @@ import {
   NonNegativeInt,
   PositiveInt,
   ProjectId,
+  ThreadId,
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
 import {
@@ -512,6 +513,31 @@ export const ThreadIssueKey = Schema.Struct({
   key: TrimmedNonEmptyString,
 });
 export type ThreadIssueKey = typeof ThreadIssueKey.Type;
+
+export const IssueContinuationSource = Schema.Struct({
+  threadId: ThreadId,
+  issue: ThreadIssueKey,
+});
+export type IssueContinuationSource = typeof IssueContinuationSource.Type;
+
+export const IssueContinuationResult = Schema.Union([
+  Schema.Struct({
+    status: Schema.Literal("ready"),
+    projectId: ProjectId,
+    worktreePath: TrimmedNonEmptyString,
+    branch: TrimmedNonEmptyString,
+  }),
+  Schema.Struct({
+    status: Schema.Literals([
+      "source-unavailable",
+      "answer-needed",
+      "thread-busy",
+      "worktree-unavailable",
+      "worktree-busy",
+    ]),
+  }),
+]);
+export type IssueContinuationResult = typeof IssueContinuationResult.Type;
 
 /** What a thread needs to link an issue: the issue's key, the project it is read through, and its name. */
 export const ThreadIssueLinkTarget = Schema.Struct({

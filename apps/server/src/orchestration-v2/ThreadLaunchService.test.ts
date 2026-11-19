@@ -16,6 +16,7 @@ import {
   ComposerContextId,
   type ChatAttachment,
   CommandId,
+  IssueTrackerKind,
   DEFAULT_SERVER_SETTINGS,
   EnvironmentId,
   GitCommandError,
@@ -252,6 +253,8 @@ function makeHarness(options: HarnessOptions = {}) {
       Layer.mergeAll(
         layerExternalServices,
         layerThreadManagement,
+        NodeServices.layer,
+        Layer.mock(GitVcsDriver.GitVcsDriver)({}),
         layerReceipts,
         layerOrchestrator,
         IdAllocator.layer,
@@ -958,6 +961,46 @@ it.effect("a rejected initial message leaves no title change and no new thread",
       assert.isNull(yield* threads.getThreadShell(newThreadId));
     }).pipe(Effect.provide(harness.layer));
   }),
+);
+
+it.effect(
+  "rejects a continuation before creating a thread when the original link is unavailable",
+  () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const threadId = ThreadId.make("thread:launch:missing-continuation-source");
+      const rejected = yield* launches
+        .launch(
+          launchInput({
+            command: "command:launch:missing-continuation-source",
+            thread: threadId,
+            message: "Continue this issue",
+            workspace: {
+              type: "existing_worktree",
+              worktreePath: "/existing-worktree",
+              branch: "feature/old",
+              issueContinuation: {
+                threadId: ThreadId.make("thread:launch:missing-original"),
+                issue: {
+                  tracker: IssueTrackerKind.make("beads"),
+                  host: "beads",
+                  scope: "example",
+                  key: "example-1",
+                },
+              },
+            },
+          }),
+        )
+        .pipe(Effect.flip);
+      assert.strictEqual(rejected._tag, "ThreadLaunchError");
+      if (rejected._tag !== "ThreadLaunchError") return;
+      assert.strictEqual(rejected.operation, "check-continuation");
+      assert.isNull(yield* threads.getThreadShell(threadId));
+      assert.equal(harness.createWorktree.mock.calls.length, 0);
+    }).pipe(Effect.provide(harness.layer));
+  },
 );
 
 // Stands `projectId` in for a plain folder, not a Git repository, so Git fails
@@ -2499,6 +2542,7 @@ it.effect("shared intake preserves durable attachment bytes after a lost launch 
             ),
           ),
         checkWorktreeBase: launches.checkWorktreeBase,
+        checkIssueContinuation: launches.checkIssueContinuation,
         isNonGitProject: launches.isNonGitProject,
         retryPreparation: launches.retryPreparation,
         prepareRun: launches.prepareRun,

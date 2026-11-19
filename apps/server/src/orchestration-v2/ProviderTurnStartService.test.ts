@@ -4,6 +4,9 @@ import { expect, it, vi } from "vite-plus/test";
 import { it as effectIt } from "@effect/vitest";
 import {
   CheckpointScopeId,
+  IssueTrackerKind,
+  type IssueContinuationSource,
+  type OrchestrationV2ThreadShell,
   CommandId,
   ContextHandoffId,
   ContextTransferId,
@@ -105,6 +108,7 @@ function startWithMissingWorktree(
     [managedWorktreesDir]: managedWorktreesDir,
     [`${managedWorktreesDir}/project`]: `${managedWorktreesDir}/project`,
   },
+  issueContinuation?: IssueContinuationSource,
 ) {
   const threadId = ThreadId.make("thread_provider_turn_start_projection_failure");
   const runId = RunId.make("run_provider_turn_start_projection_failure");
@@ -137,6 +141,16 @@ function startWithMissingWorktree(
         providerThreadId,
         userMessageId: messageId,
         ordinal: 2,
+        ...(issueContinuation
+          ? {
+              workspacePreparation: {
+                type: "existing_worktree",
+                worktreePath,
+                branch: "feature/restore",
+                issueContinuation,
+              },
+            }
+          : {}),
       },
     ],
     nodes: [{ id: rootNodeId, checkpointScopeId }],
@@ -159,6 +173,9 @@ function startWithMissingWorktree(
   const layer = ProviderTurnStart.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
+        Layer.mock(GitVcsDriver.GitVcsDriver)({
+          listWorktreePaths: () => Effect.succeed([]),
+        }),
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({}),
         Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
         IdAllocator.layer,
@@ -188,6 +205,16 @@ function startWithMissingWorktree(
             Effect.succeedSome({ workspaceRoot: "/tmp/provider-turn-start-project" } as never),
         }),
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getThreadShell: () =>
+            Effect.succeed({
+              ...projection.thread,
+              id: issueContinuation?.threadId,
+              deletedAt: null,
+              pendingRuntimeRequest: null,
+              activeRunId: null,
+              status: "interrupted",
+              issues: issueContinuation ? [issueContinuation.issue] : [],
+            } as unknown as OrchestrationV2ThreadShell),
           getThreadRecords: () => {
             projectionReadCount += 1;
             return Effect.succeed(projection);
@@ -237,6 +264,31 @@ function startWithMissingWorktree(
     projectionReads: () => projectionReadCount,
   };
 }
+
+it("fails a continuation if the original managed worktree disappeared", async () => {
+  const test = startWithMissingWorktree(
+    `${managedWorktreesDir}/project/feature-restore`,
+    undefined,
+    {
+      threadId: ThreadId.make("original-stopped-thread"),
+      issue: {
+        tracker: IssueTrackerKind.make("beads"),
+        host: "beads",
+        scope: "example",
+        key: "example-1",
+      },
+    },
+  );
+
+  const failure = await test.start;
+  expect(failure.cause).toMatchObject({
+    _tag: "IssueContinuationError",
+    message: "The original Git worktree or branch could not be verified.",
+  });
+  expect(test.pruneWorktrees).not.toHaveBeenCalled();
+  expect(test.createWorktree).not.toHaveBeenCalled();
+  expect(test.startRootRun).not.toHaveBeenCalled();
+});
 
 it.each([
   {
@@ -1290,6 +1342,7 @@ function makeLocalCommandHarness(input: {
   const layer = ProviderTurnStart.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
+        Layer.mock(GitVcsDriver.GitVcsDriver)({}),
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({
           prepareProviderHandoff: (handoff) =>
             input.sideChat?.nativeForkFrom === undefined

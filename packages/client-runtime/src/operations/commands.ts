@@ -160,6 +160,7 @@ export interface SetThreadInteractionModeInput extends ThreadCommandInput {
 }
 
 interface StartThreadBootstrap {
+  readonly issueContinuation?: import("@t3tools/contracts").IssueContinuationSource;
   readonly createThread?: {
     readonly projectId: ProjectId;
     readonly title: string;
@@ -764,6 +765,10 @@ export const startThreadTurn = Effect.fn("EnvironmentCommands.startThreadTurn")(
   );
   const bootstrap = input.bootstrap?.createThread;
   const prepareWorktree = input.bootstrap?.prepareWorktree;
+  const issueContinuation = input.bootstrap?.issueContinuation;
+  if (issueContinuation !== undefined && (!bootstrap?.worktreePath || prepareWorktree)) {
+    return yield* Effect.die("Issue continuation requires its original worktree.");
+  }
   if (bootstrap !== undefined || prepareWorktree !== undefined) {
     const existingProjection =
       bootstrap === undefined ? yield* getProjection(input.threadId) : null;
@@ -782,6 +787,7 @@ export const startThreadTurn = Effect.fn("EnvironmentCommands.startThreadTurn")(
           ? {
               type: "existing_worktree" as const,
               worktreePath: bootstrap.worktreePath,
+              ...(issueContinuation === undefined ? {} : { issueContinuation }),
               ...(bootstrap.branch === null ? {} : { branch: bootstrap.branch }),
             }
           : {

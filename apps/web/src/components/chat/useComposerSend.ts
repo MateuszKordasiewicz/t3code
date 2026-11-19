@@ -1,4 +1,5 @@
 import { msg } from "gt-react";
+import * as Schema from "effect/Schema";
 import { thrownErrorMessage } from "@t3tools/client-runtime/errors";
 import { m } from "~/i18n/messages";
 import { isClearComposerCommand, parseSideChatCommand } from "@t3tools/shared/composerTrigger";
@@ -22,6 +23,7 @@ import { isUsageLimitsCommand } from "@t3tools/shared/usageLimits";
 import {
   AuthOrchestrationOperateScope,
   DEFAULT_MODEL,
+  OrchestrationV2ThreadLaunchError,
   type EnvironmentId,
   type ModelSelection,
   type PreviewAnnotationPayload,
@@ -272,6 +274,8 @@ interface ComposerSendInput {
  * thread, a feedback upload, and resuming an interrupted run. Each path restores the draft
  * when it fails.
  */
+const isThreadLaunchError = Schema.is(OrchestrationV2ThreadLaunchError);
+
 export function useComposerSend(input: ComposerSendInput) {
   const {
     environmentId,
@@ -1306,7 +1310,7 @@ export function useComposerSend(input: ComposerSendInput) {
       failure = turnAttachmentsResult;
     }
 
-    if (failure === null && compactBeforeSend) {
+    if (failure === null && compactBeforeSend && !draftThread?.issueContinuation) {
       const compactResult = await startThreadTurn({
         environmentId,
         input: {
@@ -1336,6 +1340,9 @@ export function useComposerSend(input: ComposerSendInput) {
           ? {
               ...(isLocalDraftThread
                 ? {
+                    ...(draftThread?.issueContinuation
+                      ? { issueContinuation: draftThread.issueContinuation }
+                      : {}),
                     createThread: {
                       projectId: activeProject.id,
                       title,
@@ -1403,11 +1410,13 @@ export function useComposerSend(input: ComposerSendInput) {
           backgroundDraftOpened = Boolean(
             await handleNewThread(
               scopeProjectRef(activeProject.environmentId, activeProject.id),
-              resolveBackgroundDraftWorkspaceOptions({
-                envMode: sendEnvMode,
-                branch: activeThreadBranch,
-                startFromOrigin,
-              }),
+              draftThread?.issueContinuation
+                ? undefined
+                : resolveBackgroundDraftWorkspaceOptions({
+                    envMode: sendEnvMode,
+                    branch: activeThreadBranch,
+                    startFromOrigin,
+                  }),
             ),
           );
         } catch (error) {
@@ -1556,6 +1565,31 @@ export function useComposerSend(input: ComposerSendInput) {
           thrownErrorMessage(error, m) ?? m(msg("Failed to send message.")),
         );
         if (
+          isLocalDraftThread &&
+          draftThread?.issueContinuation &&
+          isThreadLaunchError(error) &&
+          error.reason === "issue-continuation"
+        ) {
+          const source = scopeThreadRef(environmentId, draftThread.issueContinuation.threadId);
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: m(msg("Could not continue in this worktree")),
+              timeout: 0,
+              description:
+                thrownErrorMessage(error, m) ??
+                m(msg("The original worktree could not be verified.")),
+              actionProps: {
+                children: m(msg("Open original thread")),
+                onClick: () =>
+                  void navigate({
+                    to: "/$environmentId/$threadId",
+                    params: buildThreadRouteParams(source),
+                  }),
+              },
+            }),
+          );
+        } else if (
           draftId &&
           (backgroundDraftOpened || currentRouteThreadKeyRef.current !== routeThreadKey)
         ) {

@@ -39,6 +39,12 @@ import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import {
+  IssueContinuationError,
+  issueContinuationBlockMessage,
+  issueContinuationCheck,
+} from "../issue/checkContinuation.ts";
+import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import { makeRestoreMissingWorktree } from "../workspace/restoreMissingWorktree.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ProviderUsageAnalytics from "../telemetry/ProviderUsageAnalytics.ts";
@@ -224,6 +230,7 @@ export const layer: Layer.Layer<
   | ServerConfig.ServerConfig
   | ServerSettings.ServerSettingsService
   | GitWorkflowService.GitWorkflowService
+  | GitVcsDriver.GitVcsDriver
   | ProjectService.ProjectService
   | ProviderAuthService.ProviderAuthService
   | ProjectionStore.ProjectionStoreV2
@@ -247,6 +254,7 @@ export const layer: Layer.Layer<
     const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
     const restoreMissingWorktree = yield* makeRestoreMissingWorktree;
+    const checkContinuation = yield* issueContinuationCheck;
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
 
     // Build draining callbacks outside startup scope so they cannot retain full thread history.
@@ -693,12 +701,68 @@ export const layer: Layer.Layer<
           return;
         }
       }
-      const recreateResult = yield* Effect.result(restoreMissingWorktree(projection.thread));
+      const preparation = run.workspacePreparation;
+      const continuation =
+        preparation?.type === "existing_worktree" && preparation.issueContinuation
+          ? { source: preparation.issueContinuation, preparation }
+          : null;
+      const recreateResult = yield* Effect.result(
+        Effect.gen(function* () {
+          if (continuation === null) return yield* restoreMissingWorktree(projection.thread);
+          if (
+            projection.thread.worktreePath !== continuation.preparation.worktreePath ||
+            projection.thread.branch !== continuation.preparation.branch
+          ) {
+            return yield* new IssueContinuationError({
+              message: issueContinuationBlockMessage["worktree-unavailable"],
+            });
+          }
+          const result = yield* checkContinuation(
+            {
+              getThread: projectionStore.getThreadShell,
+              getProjectRoot: (id) =>
+                projects.getById(id).pipe(
+                  Effect.map(
+                    Option.match({
+                      onNone: () => null,
+                      onSome: (project) => project.workspaceRoot,
+                    }),
+                  ),
+                ),
+              getWorktreeThreads: (worktreePath) =>
+                projectionStore.readShellSnapshot({ worktreePath }).pipe(Effect.flatten),
+            },
+            continuation.source,
+            {
+              projectId: projection.thread.projectId,
+              worktreePath: projection.thread.worktreePath,
+              branch: projection.thread.branch,
+              targetThreadId: projection.thread.id,
+            },
+          ).pipe(
+            Effect.mapError(
+              (cause) =>
+                new IssueContinuationError({
+                  message: "Could not check the original thread and worktree.",
+                  cause,
+                }),
+            ),
+          );
+          if (result.status !== "ready") {
+            return yield* new IssueContinuationError({
+              message: issueContinuationBlockMessage[result.status],
+            });
+          }
+        }),
+      );
       if (recreateResult._tag === "Failure") {
         if (input.willRetry === true) return yield* recreateResult.failure;
         yield* settleStartFailure({
           signal: "worktree-recreate-failure",
-          title: "Couldn't recreate thread workspace",
+          title:
+            continuation === null
+              ? "Couldn't recreate thread workspace"
+              : "Couldn't continue in the original worktree",
           error: recreateResult.failure,
           message: recreateResult.failure.message,
         });

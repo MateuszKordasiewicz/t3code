@@ -45,11 +45,16 @@ import {
   MenuItemLabel,
   MenuPopup,
   MenuSeparator,
+  MenuSub,
+  MenuSubPopup,
+  MenuSubTrigger,
   MenuTrigger,
 } from "../ui/menu";
 import { toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { readableFailure } from "../pullRequest/pullRequestDetail.logic";
+
+import { useIssueContinuation } from "./useIssueContinuation";
 
 const STATUS_ICON: Record<IssueThreadStatus, typeof ActivityIcon> = {
   running: ActivityIcon,
@@ -75,6 +80,7 @@ export function IssueThreadStatusButton({
   const navigate = useNavigate();
   const canOperate = useEnvironmentScope(environmentId, AuthOrchestrationOperateScope);
   const newThread = useNewThreadHandler();
+  const continuation = useIssueContinuation(environmentId);
   const [pending, setPending] = useState(false);
   const { tracker, host, scope, key } = issueThreadLinkTarget(reference, issue);
   const linked = useEnvironmentQuery(
@@ -165,6 +171,32 @@ export function IssueThreadStatusButton({
             <MenuGroupLabel>{gt("Linked threads")}</MenuGroupLabel>
             {threads.map((thread) => {
               const Icon = STATUS_ICON[thread.status];
+              if (canOperate && tracker === "beads") {
+                return (
+                  <MenuSub key={thread.id}>
+                    <MenuSubTrigger>
+                      <Icon aria-hidden />
+                      <MenuItemLabel>{thread.title}</MenuItemLabel>
+                      <MenuItemDetail>{statusLabel(thread.status)}</MenuItemDetail>
+                    </MenuSubTrigger>
+                    <MenuSubPopup>
+                      <MenuItem onClick={() => open(thread)}>{gt("Open original thread")}</MenuItem>
+                      <MenuItem
+                        disabled={continuation.pending}
+                        onClick={() =>
+                          void continuation.start(
+                            thread,
+                            issue,
+                            issueThreadLinkTarget(reference, issue),
+                          )
+                        }
+                      >
+                        {gt("Continue in this worktree")}
+                      </MenuItem>
+                    </MenuSubPopup>
+                  </MenuSub>
+                );
+              }
               return (
                 <MenuItem key={thread.id} onClick={() => open(thread)}>
                   <Icon aria-hidden />

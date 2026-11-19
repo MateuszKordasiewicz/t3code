@@ -1978,6 +1978,7 @@ export const layerWsRpc = (
         [WS_METHODS.issuesDetail]: (input) => issues.detail(input),
         [WS_METHODS.issuesLinkedThreads]: (input) =>
           listLinkedIssueThreads(input).pipe(Effect.provideService(SqlClient.SqlClient, sql)),
+        [WS_METHODS.issuesCheckContinuation]: (input) => threadLaunch.checkIssueContinuation(input),
         [WS_METHODS.issuesComments]: (input) => issues.comments(input),
         [WS_METHODS.issuesTemplates]: (input) => issues.templates(input),
         [WS_METHODS.issuesCandidates]: (input) => issues.candidates(input),
@@ -2262,7 +2263,13 @@ export const layerWsRpc = (
                       new OrchestrationV2ThreadLaunchError({
                         commandId: input.commandId,
                         projectId: input.projectId,
-                        message: "Failed to launch thread",
+                        ...(cause.operation === "check-continuation"
+                          ? { reason: "issue-continuation" as const }
+                          : {}),
+                        message:
+                          cause.operation === "check-continuation" && cause.cause instanceof Error
+                            ? cause.cause.message
+                            : "Failed to launch thread",
                         cause,
                       }),
                     ServerRuntimeStartupError: (cause) =>

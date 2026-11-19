@@ -121,7 +121,10 @@ export function DraftHeroHeadline({
         ) ?? null);
   const activeProjectKey = activeProjectGroup?.projectKey ?? "";
   const hasResolvedProject = activeProjectTitle !== null;
-  const canChooseProject = projectPickerEntries.length > 0;
+  const continuingIssue = useComposerDraftStore(
+    (store) => draftId !== null && store.getDraftSession(draftId)?.issueContinuation !== undefined,
+  );
+  const canChooseProject = !continuingIssue && projectPickerEntries.length > 0;
   const shouldShowProjectMenu = canChooseProject;
   const menuEntries = projectPickerEntries.filter(
     ({ targetProject }) =>
@@ -202,7 +205,9 @@ export function DraftHeroHeadline({
     return true;
   };
 
-  const projectSelector = shouldShowProjectMenu ? (
+  const projectSelector = continuingIssue ? (
+    <DraftProjectName value={activeProjectTitle ?? gt("Choose a project")} singleLine />
+  ) : shouldShowProjectMenu ? (
     <Combobox
       items={pickerItems}
       filteredItems={filteredPickerItems}
@@ -322,7 +327,10 @@ export function DraftHeroHeadline({
 
   const noProjectShortcut = shortcutLabelForCommand(keybindings, "chat.newWithoutProject");
   const orStartWithoutProject =
-    scratchWorkspaceRoot !== null && !isScratchDraft && (hasResolvedProject || canChooseProject) ? (
+    !continuingIssue &&
+    scratchWorkspaceRoot !== null &&
+    !isScratchDraft &&
+    (hasResolvedProject || canChooseProject) ? (
       <Tooltip>
         <TooltipTrigger
           render={

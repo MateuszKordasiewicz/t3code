@@ -58,6 +58,7 @@ import {
 } from "./checkpointDiff.ts";
 import { ModelSelection } from "./modelSelection.ts";
 import {
+  IssueContinuationSource,
   ThreadIssueKey,
   ThreadIssueLink,
   ThreadIssueLinkSource,
@@ -718,6 +719,7 @@ export const OrchestrationV2ThreadLaunchWorkspaceStrategy = Schema.Union([
     type: Schema.Literal("existing_worktree"),
     worktreePath: TrimmedNonEmptyString,
     branch: Schema.optional(TrimmedNonEmptyString),
+    issueContinuation: Schema.optional(IssueContinuationSource),
   }),
   Schema.Struct({
     type: Schema.Literal("worktree"),
@@ -4253,6 +4255,7 @@ export class OrchestrationV2ThreadLaunchError extends Schema.TaggedError<Orchest
     commandId: CommandId,
     projectId: ProjectId,
     message: Schema.String,
+    reason: Schema.optional(Schema.Literal("issue-continuation")),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {}
