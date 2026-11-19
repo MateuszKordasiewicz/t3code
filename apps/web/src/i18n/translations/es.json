@@ -5733,6 +5733,8 @@
   "309a68dc21af399d": "Cualquiera",
   "4dc86e84bb5ece63": "No se pudieron leer las personas",
   "4103b6b8e0ff3f46": "Hay más personas de las que se muestran aquí.",
+  "e8f453a3a26649b2": "{count, plural, one {# hilo vinculado más} other {# hilos vinculados más}}",
+  "2025fc2a5f89a7fb": "Abrir hilo {title}",
   "dba4868fa4829e79": "No se pudo iniciar un hilo",
   "b1a119151d281893": "Vuelve a intentarlo desde la incidencia.",
   "7342bfc328008926": "Running",
