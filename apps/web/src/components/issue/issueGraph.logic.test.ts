@@ -285,19 +285,64 @@ describe("layoutIssueGraph", () => {
       ],
       "tree",
     );
-    const [b, x, y] = ["b", "x", "y"].map((key) => nodeOf(fanOut, key));
+    const [epic, b, x, y] = ["epic", "b", "x", "y"].map((key) => nodeOf(fanOut, key));
     expect(x!.y).toBe(b!.y);
-    // y gets its own row, lined up under x, with no tree tick.
+    // y gets its own row, lined up under x.
     expect(y!.x).toBe(x!.x);
     expect(y!.y).toBeGreaterThan(b!.y + b!.height);
-    expect(edgeBetween(fanOut, "epic", "y")).toBeUndefined();
+    expect(edgeBetween(fanOut, "epic", "x")).toBeUndefined();
     const out = legsOf(edgeBetween(fanOut, "b", "y")!.path);
     expect(out.x1).toBe(b!.x + b!.width);
     expect(out.y1).toBeGreaterThan(b!.y + b!.height / 2);
     expect(out.x).toBeGreaterThan(b!.x + b!.width);
     expect(out.x).toBeLessThan(y!.x);
     expect(out.x2).toBe(y!.x);
+    // A row that starts further right still hangs off its parent's trunk: the tick runs along
+    // the row into y's left edge, below the bent arrow's entry.
+    const tick = treeOf(edgeBetween(fanOut, "epic", "y")!.path);
+    expect(tick).toMatchObject({ x: epic!.x + 12, end: y!.x });
+    expect(tick.bottom).toBeGreaterThan(out.y2);
+    expect(tick.bottom).toBeLessThan(y!.y + y!.height);
     expectSpacedEnds(fanOut);
+
+    // With a sub-task under x, the arrow to y falls back to y's label, and y keeps its tick. A
+    // third sibling's arrow would cross y's tick, so it falls back to its label too.
+    const crowded = layoutIssueGraph(
+      [
+        issue("epic", { issueType: "epic" }),
+        issue("b", { parentKey: "epic" }),
+        issue("x", { parentKey: "epic", dependsOnKeys: ["b"] }),
+        issue("x1", { parentKey: "x" }),
+        issue("y", { parentKey: "epic", dependsOnKeys: ["b"] }),
+      ],
+      "tree",
+    );
+    expect(nodeOf(crowded, "y").externalBlockers?.keys).toEqual(["b"]);
+    expect(treeOf(edgeBetween(crowded, "epic", "y")!.path).end).toBe(nodeOf(crowded, "y").x);
+    const three = layoutIssueGraph(
+      [
+        issue("epic", { issueType: "epic" }),
+        issue("b", { parentKey: "epic" }),
+        issue("x", { parentKey: "epic", dependsOnKeys: ["b"] }),
+        issue("y", { parentKey: "epic", dependsOnKeys: ["b"] }),
+        issue("z", { parentKey: "epic", dependsOnKeys: ["b"] }),
+      ],
+      "tree",
+    );
+    const ticks = edgesOf(three)
+      .filter((edge) => edge.kind === "parent")
+      .map((edge) => treeOf(edge.path));
+    // b, y and z start rows; x follows b on its row.
+    expect(ticks).toHaveLength(3);
+    for (const edge of edgesOf(three).filter((e) => e.kind === "blocks" && e.path.includes("Q"))) {
+      const bend = legsOf(edge.path);
+      for (const t of ticks) {
+        const crosses =
+          t.x < bend.x && bend.x < t.end && bend.top < t.bottom && t.bottom < bend.bottom;
+        expect(crosses, `${edge.id} crosses a tick`).toBe(false);
+      }
+    }
+    expect(nodeOf(three, "z").externalBlockers?.keys).toEqual(["b"]);
 
     const fanIn = layoutIssueGraph(
       [
@@ -411,33 +456,71 @@ describe("layoutIssueGraph", () => {
     expect(nodesOf(first)).toHaveLength(5);
     expect(layoutIssueGraph(cycle, "tree")).toEqual(first);
     expectSpacedEnds(first);
+
+    // a and b are each other's parent. The loop's earliest card, a, tops the tree, as the region's
+    // header says; only b -> a, the link closing the loop, is cut, and a keeps c.
+    const parentLoop = layoutIssueGraph(
+      [
+        issue("c", { parentKey: "a", priority: 0 }),
+        issue("a", { parentKey: "b", priority: 1 }),
+        issue("b", { parentKey: "a", priority: 2 }),
+      ],
+      "tree",
+    );
+    const loopRegion = regionsOf(parentLoop)[0]!;
+    expect(loopRegion.root?.key).toBe("a");
+    expect(loopRegion.nodes.map((node) => [node.entry.key, node.x])).toEqual([
+      ["a", 12],
+      ["c", 36],
+      ["b", 36],
+    ]);
+    expect(
+      loopRegion.edges
+        .map((edge) => `${edge.from.split("\u0000").pop()}>${edge.to.split("\u0000").pop()}`)
+        .toSorted(),
+    ).toEqual(["a>b", "a>c"]);
   });
 
   it("grows a card's row to keep many arc ends apart, and puts unlinked cards in the grid below", () => {
-    const blockers = Array.from({ length: 8 }, (_, i) =>
-      issue(`b${i}`, { issueType: "task", dependsOnKeys: i === 0 ? [] : [`b${i - 1}`] }),
-    );
+    const sources = ["a0", "a1", "a2", "a3", "a4", "a5"];
     const layout = layoutIssueGraph(
       [
-        ...blockers,
-        issue("hub", { issueType: "task", dependsOnKeys: blockers.map((entry) => entry.key) }),
+        issue("epic", { issueType: "epic" }),
+        issue("a", { parentKey: "epic" }),
+        ...sources.map((key) => issue(key, { parentKey: "a" })),
+        issue("b", { parentKey: "epic" }),
+        issue("hub", { parentKey: "b", dependsOnKeys: sources }),
+      ],
+      "tree",
+      { nodeWidth: 100, nodeHeight: 40, labelHeight: 16 },
+    );
+    // Six arcs from cousins end on hub's right edge, 12 apart: it grows past its 40px height.
+    const hub = nodeOf(layout, "hub");
+    expect(
+      edgesOf(layout).filter((edge) => edge.kind === "blocks" && edge.to === hub.id),
+    ).toHaveLength(6);
+    expect(hub.externalBlockers).toBeNull();
+    expect(hub.height).toBe(5 * 12 + 2 * 8);
+    expectSpacedEnds(layout);
+
+    const grid = layoutIssueGraph(
+      [
+        issue("t0", { issueType: "task" }),
+        issue("t1", { issueType: "task", dependsOnKeys: ["t0"] }),
         issue("alone", { issueType: "task" }),
         issue("bug-1", { issueType: "bug", dependsOnKeys: ["elsewhere"] }),
       ],
       "type",
       { nodeWidth: 100, nodeHeight: 40, labelHeight: 16 },
     );
-    expectSpacedEnds(layout);
-    const hub = nodeOf(layout, "hub");
-    const drawnInto = edgesOf(layout).filter((edge) => edge.to === hub.id).length;
-    expect(drawnInto + (hub.externalBlockers?.keys.length ?? 0)).toBe(8);
-    const tasks = regionsOf(layout)[0]!;
-    const alone = nodeOf(layout, "alone");
+    const tasks = regionsOf(grid).find((region) => region.label === "task")!;
+    const alone = nodeOf(grid, "alone");
+    expect(tasks.nodes).toContain(alone);
     expect(alone.y).toBeGreaterThan(
       Math.max(...tasks.nodes.filter((node) => node !== alone).map((n) => n.y + n.height)),
     );
-    expect(nodeOf(layout, "bug-1").height).toBe(56);
-    expect(regionsOf(layout).find((region) => region.label === "bug")!.height).toBe(12 + 56 + 12);
+    expect(nodeOf(grid, "bug-1").height).toBe(56);
+    expect(regionsOf(grid).find((region) => region.label === "bug")!.height).toBe(12 + 56 + 12);
   });
 
   it("keeps a dense region of 200 issues and about 3,800 links bounded, and accounts for every link", () => {
@@ -470,6 +553,41 @@ describe("layoutIssueGraph", () => {
     const cardsRight = Math.max(...region.nodes.map((node) => node.x + node.width));
     expect(cardsRight).toBeLessThanOrEqual(12 + 6 * 240 + 5 * 56);
     expectSpacedEnds(layout);
+
+    // Dense links between two sibling sub-trees are all cousin arcs: the gutter keeps at most
+    // eight levels and the rest are named on their cards.
+    const cousins = [
+      issue("epic", { issueType: "epic" }),
+      issue("a", { parentKey: "epic" }),
+      issue("b", { parentKey: "epic" }),
+      ...Array.from({ length: 99 }, (_, i) => issue(`a${i}`, { parentKey: "a" })),
+      ...Array.from({ length: 99 }, (_, j) =>
+        issue(`b${j}`, {
+          parentKey: "b",
+          dependsOnKeys: Array.from({ length: 38 }, (_, k) => `a${(j + k) % 99}`),
+        }),
+      ),
+    ];
+    const dense = layoutIssueGraph(cousins, "tree");
+    const tree = regionsOf(dense)[0]!;
+    expect(tree.nodes).toHaveLength(201);
+    const right = Math.max(...tree.nodes.map((node) => node.x + node.width));
+    expect(tree.width).toBeLessThanOrEqual(right + 16 + 7 * 8 + 12);
+    const drawnLinks = new Set(tree.edges.map((edge) => `${edge.from}>${edge.to}`));
+    let cousinLinks = 0;
+    for (const entry of cousins) {
+      const node = nodeOf(dense, entry.key);
+      for (const key of entry.dependsOnKeys ?? []) {
+        cousinLinks++;
+        const named = node.externalBlockers?.keys.includes(key) ?? false;
+        expect(
+          drawnLinks.has(`${nodeId(key)}>${node.id}`) !== named,
+          `${key} -> ${entry.key}`,
+        ).toBe(true);
+      }
+    }
+    expect(cousinLinks).toBe(3762);
+    expectSpacedEnds(dense);
   });
 
   it("groups regions under one row per project, keeping a shared scope in the project that listed it first", () => {

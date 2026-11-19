@@ -91,6 +91,8 @@ const MAX_CHAIN = 6;
 // Arcs leave the widest card by GUTTER_GAP before their first level; levels sit LEVEL_GAP apart.
 const GUTTER_GAP = 16;
 const LEVEL_GAP = 8;
+/** Arcs beyond this many gutter levels are named on their card instead, so the gutter stays narrow. */
+const MAX_ARC_LEVELS = 8;
 // Link ends on one card edge sit further apart than an 8px arrowhead, and clear of its corners.
 const ENDPOINT_GAP = 12;
 const ENDPOINT_MARGIN = 8;
@@ -471,43 +473,37 @@ function pushTo<K, V>(map: Map<K, Array<V>>, key: K, value: V) {
   else list.push(value);
 }
 
-/** Levels in the right-hand gutter: the shortest span takes the lowest level free in its rows. */
+/**
+ * Levels in the right-hand gutter: the shortest span takes the lowest level whose arcs leave its
+ * rows free. An arc that finds no free level among the first MAX_ARC_LEVELS keeps level -1.
+ */
 function assignArcLevels(
   arcs: ReadonlyArray<{ readonly low: number; readonly high: number; level: number }>,
-  rowCount: number,
 ): number {
-  let words = 1;
-  let levelCount = 0;
-  let used = Array.from({ length: rowCount }, () => new Uint32Array(words));
-  const seen = new Uint32Array(Math.ceil(arcs.length / 32) + 1);
+  // Each level keeps its arcs' row spans sorted; spans on one level never overlap.
+  const levels: Array<Array<readonly [number, number]>> = [];
+  const fits = (spans: ReadonlyArray<readonly [number, number]>, low: number, high: number) => {
+    let lo = 0;
+    let hi = spans.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (spans[mid]![1] < low) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo === spans.length || spans[lo]![0] > high ? lo : -1;
+  };
   for (const arc of arcs) {
-    const active = Math.ceil(levelCount / 32);
-    seen.fill(0, 0, active);
-    for (let row = arc.low; row <= arc.high; row++) {
-      const bits = used[row]!;
-      for (let word = 0; word < active; word++) seen[word]! |= bits[word]!;
+    arc.level = -1;
+    for (let level = 0; level < MAX_ARC_LEVELS; level++) {
+      const spans = (levels[level] ??= []);
+      const at = fits(spans, arc.low, arc.high);
+      if (at === -1) continue;
+      spans.splice(at, 0, [arc.low, arc.high]);
+      arc.level = level;
+      break;
     }
-    let level = active * 32;
-    for (let word = 0; word < active; word++) {
-      const free = ~seen[word]! >>> 0;
-      if (free !== 0) {
-        level = word * 32 + 31 - Math.clz32(free & -free);
-        break;
-      }
-    }
-    if (level >= words * 32) {
-      words *= 2;
-      used = used.map((bits) => {
-        const grown = new Uint32Array(words);
-        grown.set(bits);
-        return grown;
-      });
-    }
-    for (let row = arc.low; row <= arc.high; row++) used[row]![level >> 5]! |= 1 << (level & 31);
-    levelCount = Math.max(levelCount, level + 1);
-    arc.level = level;
   }
-  return levelCount;
+  return levels.filter((spans) => spans.length > 0).length;
 }
 
 /**
@@ -544,7 +540,8 @@ function placeRegion(
     if (parent !== undefined) pushTo(childrenOf, parent, index);
   }
 
-  // The tree the list follows. A parent cycle has no top; its earliest card starts at the top level.
+  // The tree the list follows. A parent cycle has no top: its earliest card starts at the top level
+  // and only the link into it, which closes the cycle, is cut.
   const treeParent = new Map<number, number>();
   const reached = new Set<number>();
   const visit = (root: number) => {
@@ -561,7 +558,21 @@ function placeRegion(
     }
   };
   for (const index of listed) if (!parentOf.has(index)) visit(index);
-  for (const index of listed) if (!reached.has(index)) visit(index);
+  for (const index of listed) {
+    if (reached.has(index)) continue;
+    // Unreached, so its parents lead up into a cycle rather than to a top.
+    const path = new Set<number>();
+    let current = index;
+    while (!path.has(current)) {
+      path.add(current);
+      current = parentOf.get(current)!;
+    }
+    let top = current;
+    for (let member = parentOf.get(current)!; member !== current; member = parentOf.get(member)!) {
+      if (order(member) < order(top)) top = member;
+    }
+    visit(top);
+  }
   // Sibling groups, keyed by their parent; -1 holds the top level.
   const groupOf = (index: number) => treeParent.get(index) ?? -1;
   const groups = new Map<number, Array<number>>();
@@ -602,6 +613,8 @@ function placeRegion(
   for (const [key, ordered] of orderedGroups) {
     const rows: Array<Array<number>> = [];
     const rowHasChildren: Array<boolean> = [];
+    // The column each row starts at; a row starting right of column 0 has a tick running along it.
+    const rowStart: Array<number> = [];
     const tracks = new Map<number, number>();
     const spans: Array<readonly [number, number]> = [];
     const farthestBend = new Map<number, number>();
@@ -639,6 +652,7 @@ function placeRegion(
         slot.set(card, { row: rows.length, column: wrapped ? 0 : right + 1 });
         rows.push([card]);
         rowHasChildren.push(hasChildren(card));
+        rowStart.push(slot.get(card)!.column);
       }
       const at = slot.get(card)!;
       for (const edge of sources) {
@@ -653,7 +667,12 @@ function placeRegion(
           from.column < at.column &&
           (from.column === at.column - 1 || !followerOf.has(edge.from)) &&
           used < MAX_GAP_TRACKS &&
-          rowHasChildren.slice(from.row, at.row).every((children) => !children);
+          rowHasChildren.slice(from.row, at.row).every((children) => !children) &&
+          // Nor across a tick that runs along a row to a card at or right of this gap.
+          (key === -1 ||
+            rowStart
+              .slice(from.row + 1, at.row)
+              .every((start) => start === 0 || start < at.column));
         if (clear) {
           route.set(edge, "bend");
           bends.push(edge);
@@ -688,6 +707,20 @@ function placeRegion(
     for (const card of row) rowOf.set(card, index);
   });
 
+  const arcs = [...route]
+    .filter(([, kind]) => kind === "arc")
+    .map(([edge]) => {
+      const [a, b] = [rowOf.get(edge.from)!, rowOf.get(edge.to)!];
+      return { edge, low: Math.min(a, b), high: Math.max(a, b), level: 0 };
+    })
+    .toSorted(
+      (a, b) =>
+        a.high - a.low - (b.high - b.low) || a.low - b.low || compareIds(a.edge.id, b.edge.id),
+    );
+  const levelCount = assignArcLevels(arcs);
+  for (const arc of arcs) if (arc.level === -1) route.set(arc.edge, "label");
+  const placedArcs = arcs.filter((arc) => arc.level !== -1);
+
   const drawnInto = new Map<number, Set<number>>();
   for (const [edge, kind] of route) {
     if (kind === "label") continue;
@@ -701,19 +734,7 @@ function placeRegion(
       externalBlockersOf(items, blockers[index]!, drawnInto.get(index)),
     ]),
   );
-
-  const arcs = [...route]
-    .filter(([, kind]) => kind === "arc")
-    .map(([edge]) => {
-      const [a, b] = [rowOf.get(edge.from)!, rowOf.get(edge.to)!];
-      return { edge, low: Math.min(a, b), high: Math.max(a, b), level: 0 };
-    })
-    .toSorted(
-      (a, b) =>
-        a.high - a.low - (b.high - b.low) || a.low - b.low || compareIds(a.edge.id, b.edge.id),
-    );
-  const levelCount = assignArcLevels(arcs, rowList.length);
-  const levelOf = new Map(arcs.map((arc) => [arc.edge, arc.level]));
+  const levelOf = new Map(placedArcs.map((arc) => [arc.edge, arc.level]));
 
   // Link ends along each card edge, top to bottom. On the right: arcs (up, inner first; then down,
   // outer first), the chain arrow, then bent arrows by target row. On the left: bent arrows by
@@ -723,7 +744,7 @@ function placeRegion(
   const leftEnds = new Map<number, Array<End>>();
   const goesUp = (edge: RawEdge, from: number) =>
     rowOf.get(edge.from === from ? edge.to : edge.from)! < rowOf.get(from)!;
-  for (const arc of arcs) {
+  for (const arc of placedArcs) {
     pushTo(rightEnds, arc.edge.from, { edge: arc.edge, anchor: false });
     pushTo(rightEnds, arc.edge.to, { edge: arc.edge, anchor: false });
   }
@@ -753,6 +774,16 @@ function placeRegion(
     (a, b) => byRows(rowOf.get(a.from)!, rowOf.get(b.from)!, 0, 0) || compareIds(a.id, b.id),
   )) {
     pushTo(leftEnds, edge.to, { edge, anchor: false });
+  }
+  // A row that starts right of its parent's indent takes its tick along the row, entering below
+  // the bent arrows so it never crosses their tracks.
+  const startsRow = (card: number) => rowsOf.get(groupOf(card))![slot.get(card)!.row]![0] === card;
+  const ticked = (edge: RawEdge) =>
+    edge.kind === "parent" && treeParent.get(edge.to) === edge.from && startsRow(edge.to);
+  for (const edge of regionEdges) {
+    if (ticked(edge) && slot.get(edge.to)!.column > 0) {
+      pushTo(leftEnds, edge.to, { edge, anchor: false });
+    }
   }
   for (const list of leftEnds.values()) list.sort((a, b) => Number(a.anchor) - Number(b.anchor));
   const spread = (list: ReadonlyArray<End>) => {
@@ -848,9 +879,12 @@ function placeRegion(
     const to = nodeAt.get(edge.to)!;
     const base = { id: edge.id, from: from.id, to: to.id };
     if (edge.kind === "parent") {
-      // Only cards that start a row at their parent's indent hang off its trunk.
-      if (treeParent.get(edge.to) !== edge.from || slot.get(edge.to)!.column !== 0) continue;
-      const entry = to.y + Math.min(TREE_ENTRY, to.height / 2);
+      // Cards that start a row hang off their parent's trunk; a follower's row is its blocker's.
+      if (!ticked(edge)) continue;
+      const entry =
+        slot.get(edge.to)!.column === 0
+          ? to.y + Math.min(TREE_ENTRY, to.height / 2)
+          : leftY(edge.to, edge);
       const path = `M ${from.x + TRUNK_INSET} ${from.y + from.height} V ${entry} H ${to.x}`;
       placedEdges.push({ ...base, kind: "parent", path });
       continue;

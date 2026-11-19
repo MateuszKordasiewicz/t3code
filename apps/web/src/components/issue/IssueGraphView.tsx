@@ -6,6 +6,7 @@ import { useId, useState } from "react";
 import { cn } from "~/lib/utils";
 
 import { PULL_REQUEST_ROW_NUMBER_CLASS } from "../pullRequest/PullRequestListRow";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import type { IssueRowTarget } from "./IssueRow";
 import {
   layoutIssueGraph,
@@ -288,73 +289,86 @@ function IssueGraphCard({
   const { entry, externalBlockers } = node;
   const blockers = entry.dependsOnKeys ?? [];
   const threadStatus = useIssueThreadStatus(entry.environmentId, entry);
+  const blockedBy = externalBlockers
+    ? gt("Blocked by {keys}", { keys: externalBlockers.keys.join(", ") })
+    : null;
+  const card = (
+    <button
+      type="button"
+      aria-current={selected ? "true" : undefined}
+      onClick={() => onSelect(entry)}
+      className={cn(
+        // A raised tile in both themes: in dark the card token is near the black canvas, so the
+        // fill and border come from the foreground colour instead.
+        "flex size-full flex-col justify-center gap-1 rounded-lg border bg-card px-2.5 text-left shadow-xs/5 outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset dark:bg-foreground/8",
+        selected
+          ? "border-primary bg-accent ring-1 ring-primary ring-inset dark:bg-foreground/12"
+          : "border-foreground/15 hover:border-foreground/30 hover:bg-accent dark:hover:bg-foreground/12",
+        entry.state.category === "closed" && !selected ? "opacity-70" : null,
+      )}
+    >
+      <span className="flex min-w-0 items-center gap-1.5">
+        <IssueStateGlyph state={entry.state} className="size-3.5" />
+        <span
+          className={cn(
+            PULL_REQUEST_ROW_NUMBER_CLASS,
+            "rounded border border-border bg-muted/40 px-1 leading-4",
+          )}
+        >
+          {entry.displayKey}
+        </span>
+        <span className="min-w-0 flex-1" />
+        {showType && entry.issueType ? (
+          <span className="truncate text-2xs text-muted-foreground">{entry.issueType}</span>
+        ) : null}
+        {entry.priority === undefined ? null : (
+          <span className="shrink-0 rounded bg-muted px-1 font-mono text-2xs leading-4 text-muted-foreground">
+            <span aria-hidden>P{entry.priority}</span>
+            <span className="sr-only">
+              {gt("Priority {priority}", { priority: entry.priority })}
+            </span>
+          </span>
+        )}
+      </span>
+      <span className="flex min-w-0 items-center gap-1.5">
+        <span className="min-w-0 flex-1 truncate text-sm text-foreground">{entry.title}</span>
+        {/* Holds the title clear of the box, which cannot sit inside this button. */}
+        {threadStatus ? <IssueThreadStatusBoxSpacer box={threadStatus} /> : null}
+      </span>
+      {externalBlockers ? (
+        // Names only the blockers with no arrow here; the sr-only line below names them all.
+        // Struck through once every one is closed; plain grey when some are not in the list.
+        <span
+          aria-hidden
+          className={cn(
+            "truncate text-2xs leading-4",
+            externalBlockers.tone === "open" ? "text-warning-foreground" : "text-muted-foreground",
+            externalBlockers.tone === "closed" ? "line-through" : null,
+          )}
+        >
+          {blockedBy}
+        </span>
+      ) : null}
+      {blockers.length > 0 ? (
+        <span className="sr-only">{gt("Blocked by {keys}", { keys: blockers.join(", ") })}</span>
+      ) : null}
+    </button>
+  );
   return (
     <div
       className="absolute"
       style={{ left: node.x, top: node.y, width: node.width, height: node.height }}
     >
-      <button
-        type="button"
-        aria-current={selected ? "true" : undefined}
-        onClick={() => onSelect(entry)}
-        className={cn(
-          // A raised tile in both themes: in dark the card token is near the black canvas, so the
-          // fill and border come from the foreground colour instead.
-          "flex size-full flex-col justify-center gap-1 rounded-lg border bg-card px-2.5 text-left shadow-xs/5 outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset dark:bg-foreground/8",
-          selected
-            ? "border-primary bg-accent ring-1 ring-primary ring-inset dark:bg-foreground/12"
-            : "border-foreground/15 hover:border-foreground/30 hover:bg-accent dark:hover:bg-foreground/12",
-          entry.state.category === "closed" && !selected ? "opacity-70" : null,
-        )}
-      >
-        <span className="flex min-w-0 items-center gap-1.5">
-          <IssueStateGlyph state={entry.state} className="size-3.5" />
-          <span
-            className={cn(
-              PULL_REQUEST_ROW_NUMBER_CLASS,
-              "rounded border border-border bg-muted/40 px-1 leading-4",
-            )}
-          >
-            {entry.displayKey}
-          </span>
-          <span className="min-w-0 flex-1" />
-          {showType && entry.issueType ? (
-            <span className="truncate text-2xs text-muted-foreground">{entry.issueType}</span>
-          ) : null}
-          {entry.priority === undefined ? null : (
-            <span className="shrink-0 rounded bg-muted px-1 font-mono text-2xs leading-4 text-muted-foreground">
-              <span aria-hidden>P{entry.priority}</span>
-              <span className="sr-only">
-                {gt("Priority {priority}", { priority: entry.priority })}
-              </span>
-            </span>
-          )}
-        </span>
-        <span className="flex min-w-0 items-center gap-1.5">
-          <span className="min-w-0 flex-1 truncate text-sm text-foreground">{entry.title}</span>
-          {/* Holds the title clear of the box, which cannot sit inside this button. */}
-          {threadStatus ? <IssueThreadStatusBoxSpacer box={threadStatus} /> : null}
-        </span>
-        {externalBlockers ? (
-          // Names only the blockers with no arrow here; the sr-only line below names them all.
-          // Struck through once every one is closed; plain grey when some are not in the list.
-          <span
-            aria-hidden
-            className={cn(
-              "truncate text-2xs leading-4",
-              externalBlockers.tone === "open"
-                ? "text-warning-foreground"
-                : "text-muted-foreground",
-              externalBlockers.tone === "closed" ? "line-through" : null,
-            )}
-          >
-            {gt("Blocked by {keys}", { keys: externalBlockers.keys.join(", ") })}
-          </span>
-        ) : null}
-        {blockers.length > 0 ? (
-          <span className="sr-only">{gt("Blocked by {keys}", { keys: blockers.join(", ") })}</span>
-        ) : null}
-      </button>
+      {externalBlockers ? (
+        // The label truncates on a narrow card; hover or focus shows every name. Screen readers
+        // already hear them in the button's sr-only line, so the popup stays hidden from them.
+        <Tooltip>
+          <TooltipTrigger render={card} />
+          <TooltipPopup aria-hidden>{blockedBy}</TooltipPopup>
+        </Tooltip>
+      ) : (
+        card
+      )}
       {threadStatus ? (
         // On the title line at any text size: 1px border plus px-2.5 across, and below the 2.5rem
         // of content centred in the card's fixed height, or above the 1.25rem blocked-by line.
