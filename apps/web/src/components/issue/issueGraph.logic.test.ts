@@ -127,10 +127,15 @@ describe("layoutIssueGraph", () => {
     expect(nodeOf(chain, "a").x).toBeLessThan(nodeOf(chain, "b").x);
     expect(nodeOf(chain, "b").x).toBeLessThan(nodeOf(chain, "c").x);
     expect(nodeOf(chain, "side").x).toBe(nodeOf(chain, "b").x);
-    // a -> c skips b's column, so it arcs above the row instead of running behind b.
+    // a -> c skips b's column: it turns inside the column gaps and crosses above b's card.
     const skip = chain.edges.find((edge) => edge.from === nodeId("a") && edge.to === nodeId("c"))!;
-    const controlY = Number(skip.path.split(/[ ,]+/)[5]);
-    expect(controlY).toBeLessThan(nodeOf(chain, "b").y);
+    const b = nodeOf(chain, "b");
+    const [, riseEndX, crossY, crossEndX] = skip.path
+      .match(/, ([\d.-]+) ([\d.-]+) L ([\d.-]+) [\d.-]+ C/)!
+      .map(Number);
+    expect(riseEndX).toBeLessThanOrEqual(b.x);
+    expect(crossEndX).toBeGreaterThanOrEqual(b.x + b.width);
+    expect(crossY).toBeLessThan(b.y);
 
     const cycle = [
       issue("x", { dependsOnKeys: ["z"], parentKey: "y" }),

@@ -497,9 +497,14 @@ function edgePath(from: IssueGraphNode, to: IssueGraphNode): string {
   }
   const tx = to.x;
   if (tx - sx > from.width + EDGE_BOW) {
-    // Skips a column: arc so the curve peaks in the row gap above, not behind the cards between.
-    const lift = Math.min(sy, ty) - (from.height / 2 + ROW_GAP / 2) / 0.75;
-    return `M ${sx} ${sy} C ${sx + EDGE_BOW} ${lift}, ${tx - EDGE_BOW} ${lift}, ${tx} ${ty}`;
+    // Skips a column: rise inside the column gap, cross in the row gap above, then come down,
+    // so the edge never runs behind the cards in between.
+    const gapY = Math.min(from.y, to.y) - ROW_GAP / 2;
+    const half = EDGE_BOW / 2;
+    return (
+      `M ${sx} ${sy} C ${sx + half} ${sy}, ${sx + half} ${gapY}, ${sx + EDGE_BOW} ${gapY} ` +
+      `L ${tx - EDGE_BOW} ${gapY} C ${tx - half} ${gapY}, ${tx - half} ${ty}, ${tx} ${ty}`
+    );
   }
   const pull = tx > sx ? Math.max(EDGE_BOW / 2, (tx - sx) / 2) : EDGE_BOW + (sx - tx) / 4;
   return `M ${sx} ${sy} C ${sx + pull} ${sy}, ${tx - pull} ${ty}, ${tx} ${ty}`;
