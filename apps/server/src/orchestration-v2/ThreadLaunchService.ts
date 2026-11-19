@@ -5,6 +5,9 @@ import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
   CommandId,
   type ChatAttachment,
+  IssueOperationError,
+  type IssueContinuationResult,
+  type IssueContinuationSource,
   type MessageId,
   type ModelSelection,
   type OrchestrationV2Actor,
@@ -43,6 +46,10 @@ import {
 } from "@t3tools/shared/git";
 
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
+import {
+  issueContinuationBlockMessage,
+  issueContinuationCheck,
+} from "../issue/checkContinuation.ts";
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
 import { parseGitCloneProgressLine } from "../project/gitCloneProgress.ts";
 import * as ProjectService from "../project/ProjectService.ts";
@@ -68,6 +75,7 @@ export type ThreadLaunchWorkspaceStrategy =
   | {
       readonly type: "existing_worktree";
       readonly worktreePath: string;
+      readonly issueContinuation?: IssueContinuationSource | undefined;
       readonly branch?: string | undefined;
     }
   | {
@@ -140,6 +148,7 @@ export class ThreadLaunchError extends Schema.TaggedError<ThreadLaunchError>()(
   {
     operation: Schema.Literals([
       "resolve-project",
+      "check-continuation",
       "read-receipt",
       "generate-metadata",
       "provision-worktree",
@@ -225,6 +234,9 @@ export class ThreadLaunchService extends Context.Service<
       ThreadLaunchResult,
       ThreadLaunchError | ThreadManagement.ThreadManagementProviderInstanceDisabledError
     >;
+    readonly checkIssueContinuation: (
+      input: IssueContinuationSource,
+    ) => Effect.Effect<IssueContinuationResult, IssueOperationError>;
     /** Check a new worktree's base ref and branch name before creation for early errors; launch otherwise accepts and reports these failures inside the thread. */
     readonly checkWorktreeBase: (
       input: Pick<ThreadLaunchInput, "projectId" | "workspaceStrategy"> & {
@@ -278,6 +290,19 @@ const make = Effect.gen(function* () {
   const threads = yield* ThreadManagement.ThreadManagementService;
   const eventSink = yield* EventSink.EventSinkV2;
   const managedFolders = yield* ManagedProjectFolders.ManagedProjectFolders;
+  const checkContinuation = yield* issueContinuationCheck;
+  const continuationLookup = {
+    getThread: threads.getThreadShell,
+    getProjectRoot: (id: ProjectId) =>
+      projects
+        .getById(id)
+        .pipe(
+          Effect.map(
+            Option.match({ onNone: () => null, onSome: (project) => project.workspaceRoot }),
+          ),
+        ),
+    getWorktreeThreads: (worktreePath: string) => threads.getShellSnapshot({ worktreePath }),
+  };
   // A project-folder launch that names no branch records the folder's checkout, as the composer does.
   const launchBranch = (strategy: ThreadLaunchWorkspaceStrategy, workspaceRoot: string) =>
     strategy.type === "root" && strategy.branch === undefined
@@ -613,6 +638,9 @@ const make = Effect.gen(function* () {
         },
       );
 
+      const continuingIssue =
+        input.workspaceStrategy.type === "existing_worktree" &&
+        input.workspaceStrategy.issueContinuation !== undefined;
       const requestedBranch = input.workspaceStrategy.branch;
       const generatedTemporaryBranch =
         input.workspaceStrategy.type === "worktree" && requestedBranch === undefined;
@@ -835,6 +863,7 @@ const make = Effect.gen(function* () {
       workspaceRecorded = true;
 
       if (
+        !continuingIssue &&
         reused === undefined &&
         worktreePath !== null &&
         branch !== null &&
@@ -944,7 +973,7 @@ const make = Effect.gen(function* () {
       }
       yield* setupTracker.stageStatus(threadId, "setup-script", "running");
       const setup =
-        worktreePath === null
+        worktreePath === null || continuingIssue
           ? ({ status: "no-script" } as const)
           : yield* setupScripts
               .runForThread({
@@ -1232,6 +1261,31 @@ const make = Effect.gen(function* () {
       }
 
       const launchReceipt = yield* readReceipt(input, input.commandId);
+      const strategy = input.workspaceStrategy;
+      if (
+        Option.isNone(launchReceipt) &&
+        strategy.type === "existing_worktree" &&
+        strategy.issueContinuation !== undefined
+      ) {
+        const failCheck = mapError(input, "check-continuation");
+        if (input.reuseExistingThread === true || input.initialMessage === undefined) {
+          return yield* failCheck(
+            new Error("Continuing an issue requires a new thread and a message."),
+          );
+        }
+        const checked = yield* checkContinuation(continuationLookup, strategy.issueContinuation, {
+          projectId: input.projectId,
+          worktreePath: strategy.worktreePath,
+          branch: strategy.branch ?? null,
+        }).pipe(
+          Effect.mapError(() =>
+            failCheck(new Error("Could not check the original thread and worktree.")),
+          ),
+        );
+        if (checked.status !== "ready") {
+          return yield* failCheck(new Error(issueContinuationBlockMessage[checked.status]));
+        }
+      }
       yield* threads.assertProviderInstanceEnabled({
         projectId: input.projectId,
         commandId: input.commandId,
@@ -1553,6 +1607,20 @@ const make = Effect.gen(function* () {
   return ThreadLaunchService.of({
     launch,
     checkWorktreeBase,
+    checkIssueContinuation: Effect.fn("ThreadLaunchService.checkIssueContinuation")(
+      function* (input) {
+        return yield* checkContinuation(continuationLookup, input).pipe(
+          Effect.mapError(
+            (cause) =>
+              new IssueOperationError({
+                operation: "checkContinuation",
+                detail: "Could not check the original thread and worktree.",
+                cause,
+              }),
+          ),
+        );
+      },
+    ),
     isNonGitProject,
     retryPreparation,
     prepareRun,
