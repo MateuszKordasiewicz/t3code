@@ -35,12 +35,16 @@ export function threadWithTriageLabelRetired(
   return thread.triageLabel == null ? null : { ...thread, triageLabel: null };
 }
 
-/** Only a message the user sends acts on "my move"; wakes, agents and schedules leave it. */
+/**
+ * Only a message the user sends acts on "my move". Wakes, agents, schedules and server-written
+ * answers to pending questions (which agents can give for the user) leave it.
+ */
 export function sentByUser(
   command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
 ): boolean {
   return (
     command.createdBy === "user" &&
+    command.creationSource !== "server" &&
     command.notification === undefined &&
     command.delegatedCompletion === undefined &&
     command.scheduledTaskId === undefined &&

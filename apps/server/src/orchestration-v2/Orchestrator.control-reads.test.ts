@@ -2329,7 +2329,12 @@ it.effect(
       assert.isNull((yield* projections.getThread(threadId)).triageLabel);
 
       yield* setLabel("relabel-triage-label", label);
-      const send = (id: string, text: string, createdBy: "user" | "agent" = "user") =>
+      const send = (
+        id: string,
+        text: string,
+        createdBy: "user" | "agent" = "user",
+        creationSource: "web" | "server" = "web",
+      ) =>
         orchestrator.dispatch({
           type: "message.dispatch",
           commandId: CommandId.make(id),
@@ -2339,10 +2344,11 @@ it.effect(
           attachments: [],
           dispatchMode: { type: "defer_start" },
           createdBy,
-          creationSource: "web",
+          creationSource,
         });
       yield* send("compact-triage-label", "/compact");
       yield* send("agent-triage-label", "Status update", "agent");
+      yield* send("answer-triage-label", "Use the staging database", "user", "server");
       assert.deepEqual((yield* projections.getThread(threadId)).triageLabel, label);
       yield* send("message-triage-label", "Carry on");
       assert.isNull((yield* projections.getThread(threadId)).triageLabel);
