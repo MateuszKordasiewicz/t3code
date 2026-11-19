@@ -131,7 +131,7 @@ export function IssueGraphView({
                 onClick={() => toggle("projects", project.id)}
                 className={cn(
                   ROW_BUTTON_CLASS,
-                  "h-8 border-primary/25 bg-primary/8 px-2 text-sm font-semibold text-foreground hover:bg-primary/12",
+                  "h-8 border-primary/25 bg-primary/10 px-2 text-sm font-semibold text-foreground hover:bg-primary/15 dark:bg-primary/20 dark:hover:bg-primary/25",
                 )}
               >
                 <Chevron aria-hidden className="size-4 shrink-0 text-primary" />

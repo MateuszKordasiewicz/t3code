@@ -294,6 +294,9 @@ describe("layoutIssueGraph", () => {
       columns: new Set(grid.map((node) => node.x)).size,
       rows: new Set(grid.map((node) => node.y)).size,
     }).toEqual({ columns: 4, rows: 2 });
+    // Unlinked grid columns sit close together; only ranked columns leave room for edges.
+    const gridXs = [...new Set(grid.map((node) => node.x))].toSorted((a, b) => a - b);
+    expect(gridXs[1]! - gridXs[0]!).toBe(grid[0]!.width + 16);
     expect(regionsOf(layoutIssueGraph(entries, "status")).map((c) => c.label)).toEqual([
       "open",
       "in_progress",

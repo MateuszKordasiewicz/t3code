@@ -51,6 +51,8 @@ const REGION_PADDING = 12;
 const RANK_GAP = 64;
 const ROW_GAP = 12;
 const GRID_COLUMNS = 4;
+// Grid issues have no links between them, so their columns need no room for edges.
+const GRID_GAP = 16;
 const EDGE_BOW = 48;
 
 const TYPE_ORDER = ["epic", "feature", "bug", "task", "chore"];
@@ -446,7 +448,7 @@ function placeRegion(
     column.set(index, columns.length + (position % GRID_COLUMNS));
   });
 
-  const columnCount = columns.length + Math.min(loose.length, GRID_COLUMNS);
+  const gridColumns = Math.min(loose.length, GRID_COLUMNS);
   const rows = Math.max(
     Math.ceil(loose.length / GRID_COLUMNS),
     ...columns.map((members) => members.length),
@@ -462,7 +464,7 @@ function placeRegion(
     const node: IssueGraphNode = {
       id: items[index]!.id,
       entry: items[index]!.entry,
-      x: left + column.get(index)! * (nodeWidth + RANK_GAP),
+      x: left + columnX(column.get(index)!, columns.length, nodeWidth),
       y: REGION_PADDING + row.get(index)! * (nodeHeight + ROW_GAP),
       width: nodeWidth,
       height: nodeHeight,
@@ -470,7 +472,11 @@ function placeRegion(
     nodeAt.set(index, node);
     return node;
   });
-  let width = left + REGION_PADDING + columnCount * nodeWidth + (columnCount - 1) * RANK_GAP;
+  const lastColumn = columns.length + gridColumns - 1;
+  let width =
+    lastColumn < 0
+      ? left + REGION_PADDING
+      : left + columnX(lastColumn, columns.length, nodeWidth) + nodeWidth + REGION_PADDING;
   const placedEdges = regionEdges.map((edge): IssueGraphEdge => {
     const from = nodeAt.get(edge.from)!;
     const to = nodeAt.get(edge.to)!;
@@ -493,6 +499,11 @@ function placeRegion(
     nodes,
     edges: placedEdges,
   };
+}
+
+function columnX(column: number, rankedColumns: number, nodeWidth: number): number {
+  if (column < rankedColumns) return column * (nodeWidth + RANK_GAP);
+  return rankedColumns * (nodeWidth + RANK_GAP) + (column - rankedColumns) * (nodeWidth + GRID_GAP);
 }
 
 function edgePath(
