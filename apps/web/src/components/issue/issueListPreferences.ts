@@ -2,6 +2,8 @@ import * as Schema from "effect/Schema";
 
 import { IssueInvolvement, IssueListState } from "@t3tools/contracts";
 
+import type { IssueGraphGroupBy } from "./issueGraph.logic";
+
 /**
  * What the issues page remembers between visits; the selection in the URL is not part of it.
  * `who` and `status` rather than `involvement` and `state`: the router merges every route's
@@ -17,6 +19,9 @@ export interface IssueListPreferences {
   readonly label?: ReadonlyArray<string> | undefined;
   readonly assignee?: string | undefined;
   readonly order?: "created" | undefined;
+  /** Left out for the list; `group` is left out for the epic tree. */
+  readonly view?: "graph" | undefined;
+  readonly group?: Exclude<IssueGraphGroupBy, "tree"> | undefined;
 }
 
 const DEFAULT_ISSUE_LIST_PREFERENCES = {
@@ -35,6 +40,8 @@ export const IssueListPreferencesSchema = Schema.Struct({
   label: Schema.optional(Schema.Array(BoundedPreference).check(Schema.isMaxLength(20))),
   assignee: Schema.optional(BoundedPreference),
   order: Schema.optional(Schema.Literal("created")),
+  view: Schema.optional(Schema.Literal("graph")),
+  group: Schema.optional(Schema.Literals(["type", "status"])),
 });
 const decodePreferences = Schema.decodeUnknownOption(IssueListPreferencesSchema);
 
@@ -53,6 +60,8 @@ export function issueListPreferences(search: {
   readonly label?: ReadonlyArray<string> | undefined;
   readonly assignee?: string | undefined;
   readonly order?: "created" | undefined;
+  readonly view?: "graph" | undefined;
+  readonly group?: Exclude<IssueGraphGroupBy, "tree"> | undefined;
 }): IssueListPreferences {
   return {
     who: search.who,
@@ -62,6 +71,8 @@ export function issueListPreferences(search: {
     ...(search.label?.length ? { label: search.label } : {}),
     ...(search.assignee ? { assignee: search.assignee } : {}),
     ...(search.order ? { order: search.order } : {}),
+    ...(search.view ? { view: search.view } : {}),
+    ...(search.group ? { group: search.group } : {}),
   };
 }
 

@@ -109,6 +109,18 @@ const BeadRow = Schema.Struct({
 });
 type BeadRow = typeof BeadRow.Type;
 
+/** `bd list` names each edge by id; `bd show` embeds the issue at its other end instead. */
+const BeadListRow = Schema.Struct({
+  ...BeadRow.fields,
+  dependencies: Schema.optional(
+    Schema.NullOr(
+      Schema.Array(
+        Schema.Struct({ depends_on_id: Schema.String, type: Schema.optional(Schema.String) }),
+      ),
+    ),
+  ),
+});
+
 const BeadRelation = Schema.Struct({
   id: Schema.String,
   title: Schema.String,
@@ -141,7 +153,7 @@ type BeadDetail = typeof BeadDetail.Type;
 const BeadFailure = Schema.Struct({ error: Schema.String });
 
 const decodeContext = decodeJsonResult(BeadContext);
-const decodeRows = decodeJsonResult(Schema.Array(BeadRow));
+const decodeRows = decodeJsonResult(Schema.Array(BeadListRow));
 const decodeDetail = decodeJsonResult(Schema.Array(BeadDetail));
 const decodeFailure = decodeJsonResult(BeadFailure);
 
@@ -190,8 +202,19 @@ function toActor(login: string | undefined): IssueActor | null {
   return trimmed ? { login: trimmed, name: null, avatarUrl: null } : null;
 }
 
-export function toSummary(scope: string, row: BeadRow): TrackerIssueSummary {
+/** Only `blocks` holds a bead back; an edge without a type is one, as `bd dep add` defaults. */
+const isBlockingType = (type: string | undefined) => type === undefined || type === "blocks";
+
+export function toSummary(
+  scope: string,
+  row: BeadRow,
+  blockerKeys: ReadonlyArray<string>,
+): TrackerIssueSummary {
   const assignee = toActor(row.assignee);
+  const parentKey = row.parent?.trim();
+  const dependsOnKeys = [...new Set(blockerKeys.map((key) => key.trim()).filter(Boolean))];
+  const issueType = row.issue_type?.trim();
+  const priority = row.priority;
   return {
     key: row.id,
     displayKey: row.id,
@@ -205,6 +228,10 @@ export function toSummary(scope: string, row: BeadRow): TrackerIssueSummary {
     assignees: assignee === null ? [] : [assignee],
     labels: (row.labels ?? []).map((name) => ({ name, color: null })),
     commentCount: row.comment_count ?? 0,
+    ...(parentKey ? { parentKey } : {}),
+    ...(dependsOnKeys.length > 0 ? { dependsOnKeys } : {}),
+    ...(issueType ? { issueType } : {}),
+    ...(priority !== undefined && Number.isInteger(priority) && priority >= 0 ? { priority } : {}),
   };
 }
 
@@ -224,9 +251,7 @@ function relationList(
 const typedRelationLine = (relation: BeadRelation) =>
   `${relation.dependency_type} · ${relationLine(relation)}`;
 
-/** Only `blocks` holds a bead back; an edge without a type is one, as `bd dep add` defaults. */
-const isBlocking = (relation: BeadRelation) =>
-  relation.dependency_type === undefined || relation.dependency_type === "blocks";
+const isBlocking = (relation: BeadRelation) => isBlockingType(relation.dependency_type);
 const isParentChild = (relation: BeadRelation) => relation.dependency_type === "parent-child";
 const isOtherLink = (relation: BeadRelation) => !isBlocking(relation) && !isParentChild(relation);
 
@@ -460,7 +485,15 @@ export const make: Effect.Effect<IssueTrackerApi, never, SourceControlHost.Sourc
         const page = matching.slice(offset, offset + input.limit);
         const next = offset + input.limit;
         return {
-          items: page.map((row) => toSummary(input.scope, row)),
+          items: page.map((row) =>
+            toSummary(
+              input.scope,
+              row,
+              (row.dependencies ?? [])
+                .filter((edge) => isBlockingType(edge.type))
+                .map((edge) => edge.depends_on_id),
+            ),
+          ),
           nextCursor: next < matching.length ? String(next) : null,
         };
       },
@@ -479,7 +512,11 @@ export const make: Effect.Effect<IssueTrackerApi, never, SourceControlHost.Sourc
           return yield* failure("getIssue", "not-found", `Bead ${input.key} was not found.`);
         }
         return {
-          ...toSummary(input.scope, bead),
+          ...toSummary(
+            input.scope,
+            bead,
+            (bead.dependencies ?? []).filter(isBlocking).map((relation) => relation.id),
+          ),
           body: detailBody(bead),
           viewer: null,
           viewerPermissions: VIEWER_PERMISSIONS,

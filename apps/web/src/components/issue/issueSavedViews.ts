@@ -15,7 +15,12 @@ export function issueViewMatches(
 ): boolean {
   const key = (value: IssueListPreferences) => {
     const normalized = issueListPreferences(value);
-    return JSON.stringify({ ...normalized, label: normalized.label?.toSorted() });
+    // The list ignores the graph's grouping, so a remembered grouping does not tell views apart.
+    return JSON.stringify({
+      ...normalized,
+      label: normalized.label?.toSorted(),
+      group: normalized.view === "graph" ? normalized.group : undefined,
+    });
   };
   return key(issueListPreferences(view.preferences)) === key(preferences);
 }

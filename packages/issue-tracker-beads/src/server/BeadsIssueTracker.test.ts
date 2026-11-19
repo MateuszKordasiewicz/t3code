@@ -141,6 +141,11 @@ describe("BeadsIssueTracker", () => {
           { name: "ui", color: null },
         ],
         commentCount: 1,
+        // The parent-child edge to demo-ku6 is the parent, not a blocker.
+        parentKey: "demo-ku6",
+        dependsOnKeys: ["demo-ku6.2"],
+        issueType: "feature",
+        priority: 1,
       });
       const rest = yield* beads.listIssues({ ...listInput, limit: 3, cursor: "3" });
       assert.deepStrictEqual(
@@ -151,6 +156,11 @@ describe("BeadsIssueTracker", () => {
         ],
       );
       assert.isNull(rest.nextCursor);
+      const epic = rest.items.find((item) => item.key === "demo-ku6")!;
+      assert.deepStrictEqual(
+        [epic.parentKey, epic.dependsOnKeys, epic.issueType, epic.priority],
+        [undefined, undefined, "epic", 2],
+      );
     }),
   );
 
@@ -270,6 +280,10 @@ describe("BeadsIssueTracker", () => {
             },
           ]),
       }).api).getIssue({ cwd: "/repo", host: "beads", scope: SCOPE, key: "demo-ku6.1" });
+      assert.deepStrictEqual(
+        [linked.parentKey, linked.dependsOnKeys, linked.issueType, linked.priority],
+        ["demo-ku6", ["demo-ku6.2"], "feature", 1],
+      );
       assert.notInclude(linked.body, "Required by");
       assert.include(
         linked.body,

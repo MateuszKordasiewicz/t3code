@@ -1,0 +1,503 @@
+import type { EnvironmentIssueEntry } from "@t3tools/client-runtime/issue-list";
+import { issueEntryKey } from "@t3tools/client-runtime/state/issues";
+
+export type IssueGraphGroupBy = "tree" | "type" | "status";
+
+export interface IssueGraphNode {
+  readonly id: string;
+  readonly entry: EnvironmentIssueEntry;
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+}
+
+export interface IssueGraphEdge {
+  readonly id: string;
+  readonly from: string;
+  readonly to: string;
+  readonly kind: "parent" | "blocks";
+  /** SVG path `d` attribute. */
+  readonly path: string;
+}
+
+export interface IssueGraphCluster {
+  readonly id: string;
+  readonly kind: "tree" | "loose" | "type" | "status";
+  /** Raw value: root displayKey or missing parent key, the issue type, or the state name. */
+  readonly label: string;
+  /** The root issue of a tree; null when that root is not among the entries. */
+  readonly rootNodeId: string | null;
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+  readonly nodeIds: ReadonlyArray<string>;
+}
+
+export interface IssueGraphLayout {
+  readonly nodes: ReadonlyArray<IssueGraphNode>;
+  readonly edges: ReadonlyArray<IssueGraphEdge>;
+  readonly clusters: ReadonlyArray<IssueGraphCluster>;
+  readonly width: number;
+  readonly height: number;
+}
+
+const DEFAULT_SIZE = { nodeWidth: 240, nodeHeight: 56 };
+const CLUSTER_HEADER = 28;
+const CLUSTER_PADDING = 12;
+const CLUSTER_GAP = 24;
+const RANK_GAP = 64;
+const ROW_GAP = 12;
+const GRID_COLUMNS = 4;
+const EDGE_BOW = 48;
+
+const TYPE_ORDER = ["epic", "feature", "bug", "task", "chore"];
+const OPEN_STATUS_ORDER = [
+  "backlog",
+  "todo",
+  "open",
+  "in progress",
+  "in review",
+  "blocked",
+  "deferred",
+];
+const collator = new Intl.Collator("en", { numeric: true });
+
+type ClusterKind = IssueGraphCluster["kind"];
+
+interface Item {
+  readonly id: string;
+  readonly entry: EnvironmentIssueEntry;
+  /** Position in the global priority-then-key order, used for every tie-break. */
+  order: number;
+}
+
+interface PendingCluster {
+  readonly id: string;
+  readonly kind: ClusterKind;
+  readonly label: string;
+  readonly rootNodeId: string | null;
+  readonly members: Array<number>;
+}
+
+interface RawEdge {
+  readonly id: string;
+  readonly from: number;
+  readonly to: number;
+  readonly kind: "parent" | "blocks";
+}
+
+/** Keys in parentKey and dependsOnKeys name issues of the same environment and tracker scope. */
+function scopeRef(entry: EnvironmentIssueEntry, key: string): string {
+  return `${entry.environmentId}\u0000${entry.tracker}\u0000${entry.host.toLowerCase()}\u0000${entry.scope.toLowerCase()}\u0000${key}`;
+}
+
+function priorityOf(entry: EnvironmentIssueEntry): number {
+  return entry.priority ?? Number.POSITIVE_INFINITY;
+}
+
+function compareEntries(a: Item, b: Item): number {
+  return (
+    priorityOf(a.entry) - priorityOf(b.entry) ||
+    collator.compare(a.entry.key, b.entry.key) ||
+    (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+  );
+}
+
+function typeRank(type: string): [number, string] {
+  if (type === "") return [TYPE_ORDER.length + 1, ""];
+  const known = TYPE_ORDER.indexOf(type.toLowerCase());
+  return known === -1 ? [TYPE_ORDER.length, type] : [known, ""];
+}
+
+function compareTypes(a: string, b: string): number {
+  const [ra, na] = typeRank(a);
+  const [rb, nb] = typeRank(b);
+  return ra - rb || collator.compare(na, nb);
+}
+
+function statusRank(category: "open" | "closed", name: string): number {
+  if (category === "closed") return OPEN_STATUS_ORDER.length + 1;
+  const known = OPEN_STATUS_ORDER.indexOf(name.toLowerCase().replace(/[_-]+/g, " "));
+  return known === -1 ? OPEN_STATUS_ORDER.length : known;
+}
+
+function compareIds(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+export function layoutIssueGraph(
+  entries: ReadonlyArray<EnvironmentIssueEntry>,
+  groupBy: IssueGraphGroupBy,
+  size: { nodeWidth: number; nodeHeight: number } = DEFAULT_SIZE,
+): IssueGraphLayout {
+  // One node per issue: the same issue read through two projects of one scope is drawn once.
+  const items: Array<Item> = [];
+  const byRef = new Map<string, number>();
+  const seenIds = new Set<string>();
+  for (const entry of entries) {
+    const ref = scopeRef(entry, entry.key);
+    const id = `${entry.environmentId}:${issueEntryKey(entry)}`;
+    if (byRef.has(ref) || seenIds.has(id)) continue;
+    byRef.set(ref, items.length);
+    seenIds.add(id);
+    items.push({ id, entry, order: 0 });
+  }
+  const sorted = items
+    .map((_, index) => index)
+    .toSorted((a, b) => compareEntries(items[a]!, items[b]!));
+  sorted.forEach((index, order) => {
+    items[index]!.order = order;
+  });
+
+  const edges = collectEdges(items, byRef);
+  const clusters =
+    groupBy === "tree" ? treeClusters(items, byRef) : attributeClusters(items, groupBy);
+
+  return placeClusters(items, edges, clusters, size);
+}
+
+function collectEdges(
+  items: ReadonlyArray<Item>,
+  byRef: ReadonlyMap<string, number>,
+): Array<RawEdge> {
+  const edges = new Map<string, RawEdge>();
+  const add = (from: number | undefined, to: number, kind: RawEdge["kind"]) => {
+    if (from === undefined || from === to) return;
+    const id = `${kind}:${items[from]!.id}->${items[to]!.id}`;
+    if (!edges.has(id)) edges.set(id, { id, from, to, kind });
+  };
+  items.forEach(({ entry }, index) => {
+    if (entry.parentKey !== undefined)
+      add(byRef.get(scopeRef(entry, entry.parentKey)), index, "parent");
+    for (const key of entry.dependsOnKeys ?? [])
+      add(byRef.get(scopeRef(entry, key)), index, "blocks");
+  });
+  return [...edges.values()].toSorted((a, b) => compareIds(a.id, b.id));
+}
+
+type Root =
+  | { readonly kind: "node"; readonly index: number }
+  | { readonly kind: "missing"; readonly ref: string; readonly key: string };
+
+function treeClusters(
+  items: ReadonlyArray<Item>,
+  byRef: ReadonlyMap<string, number>,
+): Array<PendingCluster> {
+  const parentOf = items.map(({ entry }): Root | null => {
+    if (entry.parentKey === undefined) return null;
+    const ref = scopeRef(entry, entry.parentKey);
+    const index = byRef.get(ref);
+    if (index === undefined) return { kind: "missing", ref, key: entry.parentKey };
+    return items[index]!.entry === entry ? null : { kind: "node", index };
+  });
+  const hasChildren = new Set<number>();
+  for (const parent of parentOf) if (parent?.kind === "node") hasChildren.add(parent.index);
+
+  const roots: Array<Root | undefined> = Array.from({ length: items.length });
+  for (let start = 0; start < items.length; start++) {
+    const path: Array<number> = [];
+    const onPath = new Map<number, number>();
+    let current = start;
+    let root: Root;
+    for (;;) {
+      const known = roots[current];
+      if (known !== undefined) {
+        root = known;
+        break;
+      }
+      const cycleStart = onPath.get(current);
+      if (cycleStart !== undefined) {
+        // A parent cycle has no top; its earliest member in the global order stands in for one.
+        const cycle = path.slice(cycleStart);
+        const top = cycle.reduce((best, index) =>
+          items[index]!.order < items[best]!.order ? index : best,
+        );
+        root = { kind: "node", index: top };
+        break;
+      }
+      onPath.set(current, path.length);
+      path.push(current);
+      const parent = parentOf[current];
+      if (parent == null) {
+        root = { kind: "node", index: current };
+        break;
+      }
+      if (parent.kind === "missing") {
+        root = parent;
+        break;
+      }
+      current = parent.index;
+    }
+    for (const index of path) roots[index] = root;
+  }
+
+  const clusters = new Map<string, PendingCluster>();
+  const sortKey = new Map<
+    string,
+    { group: number; priority: number; updated: number; type: string }
+  >();
+  items.forEach(({ entry }, index) => {
+    const root = roots[index]!;
+    let cluster: Omit<PendingCluster, "members">;
+    let group = 0;
+    if (root.kind === "missing") {
+      cluster = { id: `tree:missing:${root.ref}`, kind: "tree", label: root.key, rootNodeId: null };
+    } else if (root.index === index && parentOf[index] === null && !hasChildren.has(index)) {
+      const type = entry.issueType ?? "";
+      cluster = { id: `loose:${type}`, kind: "loose", label: type, rootNodeId: null };
+      group = 1;
+    } else {
+      const rootItem = items[root.index]!;
+      cluster = {
+        id: `tree:${rootItem.id}`,
+        kind: "tree",
+        label: rootItem.entry.displayKey,
+        rootNodeId: rootItem.id,
+      };
+    }
+    let target = clusters.get(cluster.id);
+    if (target === undefined) {
+      target = { ...cluster, members: [] };
+      clusters.set(cluster.id, target);
+    }
+    target.members.push(index);
+    const rootPriority =
+      root.kind === "node" ? priorityOf(items[root.index]!.entry) : priorityOf(entry);
+    const updated = Date.parse(entry.updatedAt) || 0;
+    const previous = sortKey.get(cluster.id);
+    sortKey.set(cluster.id, {
+      group,
+      // A tree whose root is hidden ranks by its most urgent visible member.
+      priority:
+        root.kind === "node"
+          ? rootPriority
+          : Math.min(previous?.priority ?? rootPriority, rootPriority),
+      updated: Math.max(previous?.updated ?? updated, updated),
+      type: cluster.label,
+    });
+  });
+
+  return [...clusters.values()].toSorted((a, b) => {
+    const ka = sortKey.get(a.id)!;
+    const kb = sortKey.get(b.id)!;
+    if (ka.group !== kb.group) return ka.group - kb.group;
+    if (ka.group === 1) return compareTypes(ka.type, kb.type);
+    return ka.priority - kb.priority || kb.updated - ka.updated || compareIds(a.id, b.id);
+  });
+}
+
+function attributeClusters(
+  items: ReadonlyArray<Item>,
+  groupBy: "type" | "status",
+): Array<PendingCluster> {
+  const clusters = new Map<string, PendingCluster & { category: "open" | "closed" }>();
+  items.forEach(({ entry }, index) => {
+    const label = groupBy === "type" ? (entry.issueType ?? "") : entry.state.name;
+    const id = `${groupBy}:${label}`;
+    let cluster = clusters.get(id);
+    if (cluster === undefined) {
+      cluster = {
+        id,
+        kind: groupBy,
+        label,
+        rootNodeId: null,
+        members: [],
+        category: entry.state.category,
+      };
+      clusters.set(id, cluster);
+    }
+    if (entry.state.category === "open") cluster.category = "open";
+    cluster.members.push(index);
+  });
+  return [...clusters.values()].toSorted((a, b) =>
+    groupBy === "type"
+      ? compareTypes(a.label, b.label)
+      : statusRank(a.category, a.label) - statusRank(b.category, b.label) ||
+        collator.compare(a.label, b.label),
+  );
+}
+
+/** Ranks are longest paths from the sources; back edges found by a DFS in global order are ignored. */
+function rankCluster(
+  items: ReadonlyArray<Item>,
+  members: ReadonlyArray<number>,
+  edges: ReadonlyArray<RawEdge>,
+): { ranks: Map<number, number>; predecessors: Map<number, Array<number>> } {
+  const ordered = members.toSorted((a, b) => items[a]!.order - items[b]!.order);
+  const successors = new Map<number, Array<number>>(ordered.map((index) => [index, []]));
+  for (const edge of edges) successors.get(edge.from)?.push(edge.to);
+  for (const next of successors.values()) next.sort((a, b) => items[a]!.order - items[b]!.order);
+
+  const state = new Map<number, "active" | "done">();
+  const finished: Array<number> = [];
+  const dagEdges: Array<[number, number]> = [];
+  for (const start of ordered) {
+    if (state.has(start)) continue;
+    const stack: Array<{ node: number; next: number }> = [{ node: start, next: 0 }];
+    state.set(start, "active");
+    while (stack.length > 0) {
+      const frame = stack[stack.length - 1]!;
+      const next = successors.get(frame.node)!;
+      if (frame.next < next.length) {
+        const to = next[frame.next++]!;
+        const seen = state.get(to);
+        if (seen === "active") continue;
+        dagEdges.push([frame.node, to]);
+        if (seen === undefined) {
+          state.set(to, "active");
+          stack.push({ node: to, next: 0 });
+        }
+      } else {
+        state.set(frame.node, "done");
+        finished.push(frame.node);
+        stack.pop();
+      }
+    }
+  }
+
+  const predecessors = new Map<number, Array<number>>(ordered.map((index) => [index, []]));
+  for (const [from, to] of dagEdges) predecessors.get(to)!.push(from);
+  const ranks = new Map<number, number>();
+  for (let i = finished.length - 1; i >= 0; i--) {
+    const node = finished[i]!;
+    let rank = 0;
+    for (const from of predecessors.get(node)!) rank = Math.max(rank, ranks.get(from)! + 1);
+    ranks.set(node, rank);
+  }
+  return { ranks, predecessors };
+}
+
+function placeClusters(
+  items: ReadonlyArray<Item>,
+  edges: ReadonlyArray<RawEdge>,
+  clusters: ReadonlyArray<PendingCluster>,
+  size: { nodeWidth: number; nodeHeight: number },
+): IssueGraphLayout {
+  const { nodeWidth, nodeHeight } = size;
+  const clusterOf = new Map<number, string>();
+  for (const cluster of clusters)
+    for (const index of cluster.members) clusterOf.set(index, cluster.id);
+  const innerEdges = new Map<string, Array<RawEdge>>();
+  for (const edge of edges) {
+    const cluster = clusterOf.get(edge.from);
+    if (cluster === undefined || cluster !== clusterOf.get(edge.to)) continue;
+    const list = innerEdges.get(cluster) ?? [];
+    list.push(edge);
+    innerEdges.set(cluster, list);
+  }
+
+  const nodes: Array<IssueGraphNode> = [];
+  const nodeAt = new Map<number, IssueGraphNode>();
+  const placed: Array<IssueGraphCluster> = [];
+  let top = 0;
+  let width = 0;
+  for (const cluster of clusters) {
+    const clusterEdges = innerEdges.get(cluster.id) ?? [];
+    const linked = new Set<number>();
+    for (const edge of clusterEdges) linked.add(edge.from).add(edge.to);
+    const { ranks, predecessors } = rankCluster(
+      items,
+      cluster.members.filter((index) => linked.has(index)),
+      clusterEdges,
+    );
+    const columns: Array<Array<number>> = [];
+    for (const [index, rank] of ranks) (columns[rank] ??= []).push(index);
+    const row = new Map<number, number>();
+    const column = new Map<number, number>();
+    columns.forEach((members, rank) => {
+      const barycenter = new Map<number, number>();
+      if (rank > 0) {
+        for (const index of members) {
+          const preds = predecessors.get(index)!;
+          barycenter.set(
+            index,
+            preds.reduce((sum, from) => sum + row.get(from)!, 0) / preds.length,
+          );
+        }
+      }
+      members.sort(
+        (a, b) =>
+          (barycenter.get(a) ?? 0) - (barycenter.get(b) ?? 0) || items[a]!.order - items[b]!.order,
+      );
+      members.forEach((index, position) => {
+        row.set(index, position);
+        column.set(index, rank);
+      });
+    });
+    // Issues with no link inside the band fill a grid beside the ranked part, not one tall column.
+    const loose = cluster.members
+      .filter((index) => !linked.has(index))
+      .toSorted((a, b) => items[a]!.order - items[b]!.order);
+    loose.forEach((index, position) => {
+      row.set(index, Math.floor(position / GRID_COLUMNS));
+      column.set(index, columns.length + (position % GRID_COLUMNS));
+    });
+
+    const columnCount = columns.length + Math.min(loose.length, GRID_COLUMNS);
+    const rows = Math.max(
+      Math.ceil(loose.length / GRID_COLUMNS),
+      ...columns.map((members) => members.length),
+    );
+    const clusterWidth =
+      CLUSTER_PADDING * 2 + columnCount * nodeWidth + (columnCount - 1) * RANK_GAP;
+    const clusterHeight =
+      CLUSTER_HEADER + CLUSTER_PADDING + rows * nodeHeight + (rows - 1) * ROW_GAP;
+    const nodeIds: Array<string> = [];
+    for (const index of [...columns.flat(), ...loose]) {
+      const node: IssueGraphNode = {
+        id: items[index]!.id,
+        entry: items[index]!.entry,
+        x: CLUSTER_PADDING + column.get(index)! * (nodeWidth + RANK_GAP),
+        y: top + CLUSTER_HEADER + row.get(index)! * (nodeHeight + ROW_GAP),
+        width: nodeWidth,
+        height: nodeHeight,
+      };
+      nodes.push(node);
+      nodeAt.set(index, node);
+      nodeIds.push(node.id);
+    }
+    placed.push({
+      id: cluster.id,
+      kind: cluster.kind,
+      label: cluster.label,
+      rootNodeId: cluster.rootNodeId,
+      x: 0,
+      y: top,
+      width: clusterWidth,
+      height: clusterHeight,
+      nodeIds,
+    });
+    width = Math.max(width, clusterWidth);
+    top += clusterHeight + CLUSTER_GAP;
+  }
+
+  return {
+    nodes,
+    edges: edges.map((edge) => ({
+      id: edge.id,
+      from: items[edge.from]!.id,
+      to: items[edge.to]!.id,
+      kind: edge.kind,
+      path: edgePath(nodeAt.get(edge.from)!, nodeAt.get(edge.to)!),
+    })),
+    clusters: placed,
+    width,
+    height: placed.length === 0 ? 0 : top - CLUSTER_GAP,
+  };
+}
+
+function edgePath(from: IssueGraphNode, to: IssueGraphNode): string {
+  const sx = from.x + from.width;
+  const sy = from.y + from.height / 2;
+  const ty = to.y + to.height / 2;
+  if (to.x === from.x) {
+    // Same column: leave and enter on the right, bowing out past both nodes.
+    const bow = EDGE_BOW + Math.abs(ty - sy) / 4;
+    return `M ${sx} ${sy} C ${sx + bow} ${sy}, ${sx + bow} ${ty}, ${sx} ${ty}`;
+  }
+  const tx = to.x;
+  const pull = tx > sx ? Math.max(EDGE_BOW / 2, (tx - sx) / 2) : EDGE_BOW + (sx - tx) / 4;
+  return `M ${sx} ${sy} C ${sx + pull} ${sy}, ${tx - pull} ${ty}, ${tx} ${ty}`;
+}
