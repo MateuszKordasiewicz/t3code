@@ -5,12 +5,14 @@
 # release-desktop.yml. Kept outside .github/ so upstream merges never conflict.
 # Azure DevOps pipeline: Instablinds/t3code -> t3code-linux-server.
 
-trigger: none
+# Every merge to main builds; manual runs work on any branch.
+trigger:
+  branches:
+    include: [main]
 pr: none
 
-# The only line to change when moving to a self-hosted pool, e.g.
-#   pool: { name: instablinds-pr-validation-canadacentral }
-# The agent must be Ubuntu 24.04 (node-pty's glibc ceiling, scripts/linux-glibc.ts)
+# The only line to change for a self-hosted pool: pool: { name: <pool> }.
+# Any agent must be Ubuntu 24.04 (node-pty's glibc ceiling, scripts/linux-glibc.ts)
 # with passwordless sudo for apt, and about 6 GB of free disk.
 pool: { vmImage: ubuntu-24.04 }
 
@@ -42,9 +44,11 @@ jobs:
           vp_version="$(sed -nE 's/^  vite-plus: ([0-9][^ ]*)$/\1/p' pnpm-workspace.yaml)"
           node_version="$(jq -r '.engines.node' package.json)"
           echo "Installing Vite+ $vp_version with Node.js $node_version"
-          curl -fsSL https://vite.plus | VP_VERSION="$vp_version" bash
-          "$HOME/.vite-plus/bin/vp" env use "$node_version"
-          echo "##vso[task.prependpath]$HOME/.vite-plus/bin"
+          export VP_HOME="$HOME/.vite-plus"
+          curl -fsSL https://vite.plus | VP_VERSION="$vp_version" VP_NODE_MANAGER=yes bash
+          "$VP_HOME/bin/vp" env use "$node_version"
+          echo "##vso[task.setvariable variable=VP_HOME]$VP_HOME"
+          echo "##vso[task.prependpath]$VP_HOME/bin"
         displayName: Install Vite+ and Node.js
 
       - bash: |
