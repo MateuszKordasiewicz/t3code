@@ -9,6 +9,7 @@ import { PULL_REQUEST_ROW_NUMBER_CLASS } from "../pullRequest/PullRequestListRow
 import type { IssueRowTarget } from "./IssueRow";
 import {
   layoutIssueGraph,
+  type IssueGraphEdge,
   type IssueGraphGroupBy,
   type IssueGraphNode,
   type IssueGraphRegion,
@@ -19,6 +20,13 @@ import {
   writeCollapsedIssueGraphRows,
   type CollapsedIssueGraphRows,
 } from "./issueGraphCollapsedRows";
+import {
+  ARROW_FILL_CLASS,
+  IssueGraphLegend,
+  LINK_STROKE_CLASS,
+  linkTone,
+  TREE_LINK_GROUP_CLASS,
+} from "./IssueGraphLegend";
 import { IssueStateGlyph } from "./issuePresentation";
 import {
   IssueThreadStatusBoxSpacer,
@@ -119,6 +127,7 @@ export function IssueGraphView({
 
   return (
     <div role="group" aria-label={gt("Issue graph")} className="border-t border-border">
+      <IssueGraphLegend />
       {projects.map((project) => {
         const projectOpen = !collapsed.projects.includes(project.id);
         const Chevron = projectOpen ? ChevronDownIcon : ChevronRightIcon;
@@ -178,10 +187,27 @@ function IssueGraphRegionRow({
   const Chevron = open ? ChevronDownIcon : ChevronRightIcon;
   const touchesSelection = (edge: { from: string; to: string }) =>
     selectedId !== null && (edge.from === selectedId || edge.to === selectedId);
-  // Edges at the selected issue are drawn last, so they sit on top.
-  const edges = region.edges.toSorted(
-    (a, b) => Number(touchesSelection(a)) - Number(touchesSelection(b)),
+  const treeEdges = region.edges.filter(
+    (edge) => edge.kind === "parent" && !touchesSelection(edge),
   );
+  // Edges at the selected issue are drawn last, so they sit on top.
+  const edges = region.edges
+    .filter((edge) => edge.kind === "blocks" || touchesSelection(edge))
+    .toSorted((a, b) => Number(touchesSelection(a)) - Number(touchesSelection(b)));
+  const drawEdge = (edge: IssueGraphEdge) => {
+    const tone = linkTone(edge, touchesSelection(edge));
+    return (
+      <path
+        key={edge.id}
+        d={edge.path}
+        fill="none"
+        strokeWidth={tone === "selected" ? 2 : 1.25}
+        strokeLinejoin="round"
+        markerEnd={edge.kind === "blocks" ? `url(#${markerId}-${tone})` : undefined}
+        className={LINK_STROKE_CLASS[tone]}
+      />
+    );
+  };
   return (
     <>
       <h4>
@@ -211,7 +237,7 @@ function IssueGraphRegionRow({
               height={region.height}
             >
               <defs>
-                {(["muted", "selected"] as const).map((tone) => (
+                {(["open", "closed", "selected"] as const).map((tone) => (
                   <marker
                     key={tone}
                     id={`${markerId}-${tone}`}
@@ -222,37 +248,12 @@ function IssueGraphRegionRow({
                     markerHeight="7"
                     orient="auto-start-reverse"
                   >
-                    <path
-                      d="M 0 0 L 8 4 L 0 8 z"
-                      className={tone === "selected" ? "fill-primary" : "fill-muted-foreground"}
-                    />
+                    <path d="M 0 0 L 8 4 L 0 8 z" className={ARROW_FILL_CLASS[tone]} />
                   </marker>
                 ))}
               </defs>
-              {edges.map((edge) => {
-                const selected = touchesSelection(edge);
-                return (
-                  <path
-                    key={edge.id}
-                    d={edge.path}
-                    fill="none"
-                    strokeWidth={selected ? 2 : 1.25}
-                    strokeDasharray={edge.kind === "parent" ? "4 4" : undefined}
-                    markerEnd={
-                      edge.kind === "blocks"
-                        ? `url(#${markerId}-${selected ? "selected" : "muted"})`
-                        : undefined
-                    }
-                    className={cn(
-                      selected
-                        ? "stroke-primary"
-                        : edge.kind === "blocks"
-                          ? "stroke-muted-foreground/70"
-                          : "stroke-muted-foreground/35",
-                    )}
-                  />
-                );
-              })}
+              <g className={TREE_LINK_GROUP_CLASS}>{treeEdges.map(drawEdge)}</g>
+              {edges.map(drawEdge)}
             </svg>
             {region.nodes.map((node) => (
               <IssueGraphCard
@@ -282,7 +283,7 @@ function IssueGraphCard({
   onSelect: (entry: IssueRowTarget) => void;
 }) {
   const gt = useGT();
-  const { entry } = node;
+  const { entry, externalBlockers } = node;
   const blockers = entry.dependsOnKeys ?? [];
   const threadStatus = useIssueThreadStatus(entry.environmentId, entry);
   return (
@@ -330,18 +331,36 @@ function IssueGraphCard({
           {/* Holds the title clear of the box, which cannot sit inside this button. */}
           {threadStatus ? <IssueThreadStatusBoxSpacer box={threadStatus} /> : null}
         </span>
+        {externalBlockers ? (
+          // Names only the blockers with no arrow here; the sr-only line below names them all.
+          // Struck through once every one is closed; plain grey when some are not in the list.
+          <span
+            aria-hidden
+            className={cn(
+              "truncate text-2xs leading-4",
+              externalBlockers.tone === "open"
+                ? "text-warning-foreground"
+                : "text-muted-foreground",
+              externalBlockers.tone === "closed" ? "line-through" : null,
+            )}
+          >
+            {gt("Blocked by {keys}", { keys: externalBlockers.keys.join(", ") })}
+          </span>
+        ) : null}
         {blockers.length > 0 ? (
           <span className="sr-only">{gt("Blocked by {keys}", { keys: blockers.join(", ") })}</span>
         ) : null}
       </button>
       {threadStatus ? (
         // On the title line at any text size: 1px border plus px-2.5 across, and below the 2.5rem
-        // of content centred in the card's fixed height.
+        // of content centred in the card's fixed height, or above the 1.25rem blocked-by line.
         <span
           className="absolute flex"
           style={{
             right: "calc(1px + 0.625rem)",
-            bottom: `calc((${node.height}px - 2.5rem) / 2)`,
+            bottom: externalBlockers
+              ? `calc((${node.height}px - 3.75rem) / 2 + 1.25rem)`
+              : `calc((${node.height}px - 2.5rem) / 2)`,
           }}
         >
           <IssueThreadStatusBoxView box={threadStatus} />

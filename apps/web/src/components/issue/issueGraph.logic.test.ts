@@ -91,27 +91,111 @@ describe("layoutIssueGraph", () => {
     expect(nodesOf(layout)).toHaveLength(10);
   });
 
-  it("draws parent and blocks edges inside a region and drops the rest", () => {
+  it("draws parent and blocks edges inside a region, toned by the blocker, and labels the rest on the card", () => {
     const layout = layoutIssueGraph(
       [
         issue("epic", { issueType: "epic" }),
         issue("one", { parentKey: "epic" }),
-        issue("two", { parentKey: "epic", dependsOnKeys: ["one", "gone"] }),
-        issue("loose", { dependsOnKeys: ["two"] }),
+        issue("two", { parentKey: "epic", dependsOnKeys: ["one", "gone", "shipped"] }),
+        issue("fixed", { parentKey: "epic", closed: true }),
+        issue("three", { parentKey: "epic", dependsOnKeys: ["fixed", "three"] }),
+        issue("loose", { dependsOnKeys: ["two", "gone"] }),
+        issue("shipped", { issueType: "bug", closed: true }),
+        issue("later", { issueType: "task", dependsOnKeys: ["shipped"] }),
       ],
       "tree",
     );
 
-    expect(edgesOf(layout).map(({ kind, from, to }) => ({ kind, from, to }))).toEqual(
+    expect(
+      edgesOf(layout).map((edge) => ({
+        kind: edge.kind,
+        from: edge.from,
+        to: edge.to,
+        blockerOpen: edge.kind === "blocks" ? edge.blockerOpen : null,
+      })),
+    ).toEqual(
       expect.arrayContaining([
-        { kind: "blocks", from: nodeId("one"), to: nodeId("two") },
-        { kind: "parent", from: nodeId("epic"), to: nodeId("one") },
-        { kind: "parent", from: nodeId("epic"), to: nodeId("two") },
+        { kind: "blocks", from: nodeId("one"), to: nodeId("two"), blockerOpen: true },
+        { kind: "blocks", from: nodeId("fixed"), to: nodeId("three"), blockerOpen: false },
+        { kind: "parent", from: nodeId("epic"), to: nodeId("one"), blockerOpen: null },
+        { kind: "parent", from: nodeId("epic"), to: nodeId("two"), blockerOpen: null },
+        { kind: "parent", from: nodeId("epic"), to: nodeId("fixed"), blockerOpen: null },
+        { kind: "parent", from: nodeId("epic"), to: nodeId("three"), blockerOpen: null },
       ]),
     );
     // two -> loose crosses into the loose region, which scrolls on its own: not drawn.
-    expect(edgesOf(layout)).toHaveLength(3);
-    for (const edge of edgesOf(layout)) expect(edge.path).toMatch(/^M [\d.]+ [\d.]+ C /);
+    expect(edgesOf(layout)).toHaveLength(6);
+    for (const edge of edgesOf(layout)) {
+      expect(edge.path).toMatch(edge.kind === "blocks" ? /^M [\d.]+ [\d.]+ C / : /^M [^C]+$/);
+    }
+
+    // Blockers with no arrow show on the card: amber if one is open, grey only when all are
+    // known closed, and neutral when one is not in the list, as its state is unknown.
+    expect(
+      Object.fromEntries(nodesOf(layout).map((node) => [node.entry.key, node.externalBlockers])),
+    ).toEqual({
+      epic: null,
+      one: null,
+      two: { keys: ["gone", "shipped"], tone: "unknown" },
+      fixed: null,
+      three: null,
+      loose: { keys: ["two", "gone"], tone: "open" },
+      shipped: null,
+      later: { keys: ["shipped"], tone: "closed" },
+    });
+  });
+
+  it("draws sub-tasks as a tree: below the parent, joined by orthogonal connectors that pass no card", () => {
+    const layout = layoutIssueGraph(
+      [
+        issue("epic", { issueType: "epic" }),
+        issue("a", { parentKey: "epic" }),
+        // Blocked by its sibling, so it sits two columns right of its parent.
+        issue("b", { parentKey: "epic", dependsOnKeys: ["a"] }),
+        issue("c", { parentKey: "a" }),
+        issue("d", { parentKey: "epic" }),
+      ],
+      "tree",
+    );
+    const nodes = nodesOf(layout);
+    const byId = new Map(nodes.map((node) => [node.id, node]));
+    const tree = edgesOf(layout).filter((edge) => edge.kind === "parent");
+    expect(tree).toHaveLength(4);
+    for (const edge of tree) {
+      const from = byId.get(edge.from)!;
+      const to = byId.get(edge.to)!;
+      expect(to.x).toBeGreaterThan(from.x);
+      expect(to.y).toBeGreaterThan(from.y + from.height);
+
+      const [start, ...steps] = edge.path.match(/[MHV] [^MHV]+/g)!.map((step) => step.trim());
+      const [sx, sy] = start!.slice(2).split(" ").map(Number);
+      expect(start).toMatch(/^M /);
+      // Leaves the parent's bottom edge and ends on the child's left edge, at its middle.
+      expect(sy).toBe(from.y + from.height);
+      expect(sx).toBeGreaterThan(from.x);
+      expect(sx).toBeLessThan(from.x + from.width);
+      const points = [{ x: sx!, y: sy! }];
+      for (const step of steps) {
+        const last = points[points.length - 1]!;
+        const value = Number(step.slice(2));
+        points.push(step.startsWith("H") ? { x: value, y: last.y } : { x: last.x, y: value });
+      }
+      expect(points[points.length - 1]).toEqual({ x: to.x, y: to.y + to.height / 2 });
+      for (let i = 1; i < points.length; i++) {
+        const [p, q] = [points[i - 1]!, points[i]!];
+        for (const node of nodes) {
+          const crossesX = Math.max(p.x, q.x) > node.x && Math.min(p.x, q.x) < node.x + node.width;
+          const crossesY = Math.max(p.y, q.y) > node.y && Math.min(p.y, q.y) < node.y + node.height;
+          expect(crossesX && crossesY, `${edge.id} passes behind ${node.entry.key}`).toBe(false);
+        }
+      }
+    }
+    // Siblings in the next column share the parent's drop and trunk: `M … V … H trunkX`.
+    const trunk = (key: string) => {
+      const path = tree.find((edge) => edge.to === nodeId(key))!.path;
+      return path.slice(0, path.indexOf(" V ", path.indexOf(" H ")));
+    };
+    expect(trunk("a")).toBe(trunk("d"));
   });
 
   it("ranks blockers left of what they block and survives dependency cycles", () => {
@@ -169,15 +253,29 @@ describe("layoutIssueGraph", () => {
         issue("bug-1", { issueType: "bug" }),
       ],
       "tree",
-      { nodeWidth: 100, nodeHeight: 40 },
+      { nodeWidth: 100, nodeHeight: 40, labelHeight: 16 },
     );
     const [tree, loose] = regionsOf(layout);
-    // epic in column 0; one and two stacked in column 1: two rows of 40 with a 12 gap, 12 padding.
-    expect(tree!.height).toBe(12 + 40 + 12 + 40 + 12);
+    // epic in column 0; one and two stacked below it in column 1: three rows of 40 with 12 gaps.
+    expect(tree!.height).toBe(12 + 40 + 12 + 40 + 12 + 40 + 12);
     expect(Math.min(...tree!.nodes.map((node) => node.y))).toBe(12);
     expect(Math.max(...tree!.nodes.map((node) => node.y + node.height))).toBe(tree!.height - 12);
     expect(tree!.width).toBe(12 + 100 + 64 + 100 + 12);
     expect(loose).toMatchObject({ height: 12 + 40 + 12, width: 12 + 100 + 12, edges: [] });
+
+    // A card with a blocked-by line is taller, and so is its row.
+    const labelled = regionsOf(
+      layoutIssueGraph(
+        [
+          issue("bug-1", { issueType: "bug", dependsOnKeys: ["elsewhere"] }),
+          issue("bug-2", { issueType: "bug" }),
+        ],
+        "tree",
+        { nodeWidth: 100, nodeHeight: 40, labelHeight: 16 },
+      ),
+    )[0]!;
+    expect(labelled.nodes.map((node) => node.height)).toEqual([56, 40]);
+    expect(labelled.height).toBe(12 + 56 + 12);
 
     // A backward edge leaves the last column to its right and enters the first from its left;
     // the region makes room on both sides.
@@ -189,7 +287,7 @@ describe("layoutIssueGraph", () => {
           issue("z", { dependsOnKeys: ["y"] }),
         ],
         "tree",
-        { nodeWidth: 100, nodeHeight: 40 },
+        { nodeWidth: 100, nodeHeight: 40, labelHeight: 16 },
       ),
     )[0]!;
     const cardsRight = Math.max(...cycle.nodes.map((node) => node.x + node.width));

@@ -3,23 +3,38 @@ import { issueEntryKey } from "@t3tools/client-runtime/state/issues";
 
 export type IssueGraphGroupBy = "tree" | "type" | "status";
 
+/** Blockers of a card that have no arrow to it, because they sit outside its region. */
+export interface IssueGraphExternalBlockers {
+  /** Display keys; the raw key for a blocker that is not in the list. */
+  readonly keys: ReadonlyArray<string>;
+  /** open: one is known open. closed: all are known closed. unknown: none open, some not listed. */
+  readonly tone: "open" | "closed" | "unknown";
+}
+
 export interface IssueGraphNode {
   readonly id: string;
   readonly entry: EnvironmentIssueEntry;
   readonly x: number;
   readonly y: number;
   readonly width: number;
+  /** Taller by the size's labelHeight when the card shows its external blockers. */
   readonly height: number;
+  readonly externalBlockers: IssueGraphExternalBlockers | null;
 }
 
-export interface IssueGraphEdge {
+interface IssueGraphEdgeBase {
   readonly id: string;
   readonly from: string;
   readonly to: string;
-  readonly kind: "parent" | "blocks";
   /** SVG path `d` attribute. */
   readonly path: string;
 }
+
+export type IssueGraphEdge =
+  /** Parent to child: an orthogonal tree connector into the child's left edge. */
+  | (IssueGraphEdgeBase & { readonly kind: "parent" })
+  /** Blocker to blocked issue: a curve that ends in an arrowhead. */
+  | (IssueGraphEdgeBase & { readonly kind: "blocks"; readonly blockerOpen: boolean });
 
 export interface IssueGraphRegion {
   /** Unique across projects, so a region's collapse is remembered for its own project only. */
@@ -46,7 +61,14 @@ export interface IssueGraphProject {
   readonly regions: ReadonlyArray<IssueGraphRegion>;
 }
 
-const DEFAULT_SIZE = { nodeWidth: 240, nodeHeight: 56 };
+export interface IssueGraphSize {
+  readonly nodeWidth: number;
+  readonly nodeHeight: number;
+  /** Extra height of a card that shows a line of external blockers. */
+  readonly labelHeight: number;
+}
+
+const DEFAULT_SIZE: IssueGraphSize = { nodeWidth: 240, nodeHeight: 56, labelHeight: 20 };
 const REGION_PADDING = 12;
 const RANK_GAP = 64;
 const ROW_GAP = 12;
@@ -54,6 +76,8 @@ const GRID_COLUMNS = 4;
 // Grid issues have no links between them, so their columns need no room for edges.
 const GRID_GAP = 16;
 const EDGE_BOW = 48;
+// How far in from the parent's right edge a tree connector drops out of its bottom.
+const TREE_DROP_INSET = 16;
 
 const TYPE_ORDER = ["epic", "feature", "bug", "task", "chore"];
 const OPEN_STATUS_ORDER = [
@@ -89,6 +113,12 @@ interface RawEdge {
   readonly from: number;
   readonly to: number;
   readonly kind: "parent" | "blocks";
+}
+
+/** A resolved dependsOnKeys entry; index is undefined when the blocker is not in the list. */
+interface Blocker {
+  readonly key: string;
+  readonly index: number | undefined;
 }
 
 /** Keys in parentKey and dependsOnKeys name issues of the same environment and tracker scope. */
@@ -130,7 +160,7 @@ function compareIds(a: string, b: string): number {
 export function layoutIssueGraph(
   entries: ReadonlyArray<EnvironmentIssueEntry>,
   groupBy: IssueGraphGroupBy,
-  size: { nodeWidth: number; nodeHeight: number } = DEFAULT_SIZE,
+  size: IssueGraphSize = DEFAULT_SIZE,
 ): ReadonlyArray<IssueGraphProject> {
   // One node per issue: the same issue read through two projects of one scope is drawn once.
   const items: Array<Item> = [];
@@ -174,13 +204,16 @@ export function layoutIssueGraph(
         members.map((item, index) => [scopeRef(item.entry, item.entry.key), index]),
       );
       const edges = collectEdges(members, byRef);
+      const blockers = members.map((item, index) => resolveBlockers(item.entry, index, byRef));
       const clusters =
         groupBy === "tree" ? treeClusters(members, byRef) : attributeClusters(members, groupBy);
       return {
         id,
         title,
         issueCount: members.length,
-        regions: clusters.map((cluster) => placeRegion(id, members, edges, cluster, size)),
+        regions: clusters.map((cluster) =>
+          placeRegion(id, members, edges, blockers, cluster, size),
+        ),
       };
     });
 }
@@ -202,6 +235,41 @@ function collectEdges(
       add(byRef.get(scopeRef(entry, key)), index, "blocks");
   });
   return [...edges.values()].toSorted((a, b) => compareIds(a.id, b.id));
+}
+
+function resolveBlockers(
+  entry: EnvironmentIssueEntry,
+  self: number,
+  byRef: ReadonlyMap<string, number>,
+): Array<Blocker> {
+  const blockers = new Map<string, Blocker>();
+  for (const key of entry.dependsOnKeys ?? []) {
+    const index = byRef.get(scopeRef(entry, key));
+    if (index !== self && !blockers.has(key)) blockers.set(key, { key, index });
+  }
+  return [...blockers.values()];
+}
+
+function externalBlockersOf(
+  items: ReadonlyArray<Item>,
+  blockers: ReadonlyArray<Blocker>,
+  memberSet: ReadonlySet<number>,
+): IssueGraphExternalBlockers | null {
+  const outside = blockers.filter(({ index }) => index === undefined || !memberSet.has(index));
+  if (outside.length === 0) return null;
+  const categories = outside.map(({ index }) =>
+    index === undefined ? undefined : items[index]!.entry.state.category,
+  );
+  return {
+    keys: outside.map(({ key, index }) =>
+      index === undefined ? key : items[index]!.entry.displayKey,
+    ),
+    tone: categories.includes("open")
+      ? "open"
+      : categories.every((category) => category === "closed")
+        ? "closed"
+        : "unknown",
+  };
 }
 
 type Root =
@@ -405,14 +473,20 @@ function placeRegion(
   projectId: string,
   items: ReadonlyArray<Item>,
   edges: ReadonlyArray<RawEdge>,
+  blockers: ReadonlyArray<ReadonlyArray<Blocker>>,
   cluster: PendingCluster,
-  size: { nodeWidth: number; nodeHeight: number },
+  size: IssueGraphSize,
 ): IssueGraphRegion {
-  const { nodeWidth, nodeHeight } = size;
+  const { nodeWidth, nodeHeight, labelHeight } = size;
   const memberSet = new Set(cluster.members);
   const regionEdges = edges.filter((edge) => memberSet.has(edge.from) && memberSet.has(edge.to));
   const linked = new Set<number>();
-  for (const edge of regionEdges) linked.add(edge.from).add(edge.to);
+  const parentsOf = new Map<number, Array<number>>();
+  for (const edge of regionEdges) {
+    linked.add(edge.from).add(edge.to);
+    if (edge.kind === "parent")
+      parentsOf.set(edge.to, [...(parentsOf.get(edge.to) ?? []), edge.from]);
+  }
   const { ranks, predecessors } = rankCluster(
     items,
     cluster.members.filter((index) => linked.has(index)),
@@ -434,10 +508,16 @@ function placeRegion(
       (a, b) =>
         (barycenter.get(a) ?? 0) - (barycenter.get(b) ?? 0) || items[a]!.order - items[b]!.order,
     );
-    members.forEach((index, position) => {
-      row.set(index, position);
+    let next = 0;
+    for (const index of members) {
+      // A sub-task sits below its parent, as in a folder tree, so its connector can turn down.
+      for (const parent of parentsOf.get(index) ?? []) {
+        if (column.has(parent)) next = Math.max(next, row.get(parent)! + 1);
+      }
+      row.set(index, next);
       column.set(index, rank);
-    });
+      next++;
+    }
   });
   // Issues with no link inside the region fill a grid beside the ranked part, not one tall column.
   const loose = cluster.members
@@ -448,11 +528,22 @@ function placeRegion(
     column.set(index, columns.length + (position % GRID_COLUMNS));
   });
 
-  const gridColumns = Math.min(loose.length, GRID_COLUMNS);
-  const rows = Math.max(
-    Math.ceil(loose.length / GRID_COLUMNS),
-    ...columns.map((members) => members.length),
+  const external = new Map(
+    cluster.members.map((index) => [index, externalBlockersOf(items, blockers[index]!, memberSet)]),
   );
+  // Rows stay aligned across columns, so row and column gaps stay free for links to run in.
+  const rowCount = Math.max(...cluster.members.map((index) => row.get(index)! + 1));
+  const rowHeights = Array.from({ length: rowCount }, () => nodeHeight);
+  for (const index of cluster.members) {
+    if (external.get(index) !== null) rowHeights[row.get(index)!] = nodeHeight + labelHeight;
+  }
+  const rowTops: Array<number> = [];
+  rowHeights.reduce((top, height, index) => {
+    rowTops[index] = top;
+    return top + height + ROW_GAP;
+  }, REGION_PADDING);
+
+  const gridColumns = Math.min(loose.length, GRID_COLUMNS);
   // A link back into the first column turns left of it, so that column moves right to make room.
   const left =
     REGION_PADDING +
@@ -461,13 +552,15 @@ function placeRegion(
       : 0);
   const nodeAt = new Map<number, IssueGraphNode>();
   const nodes = [...columns.flat(), ...loose].map((index) => {
+    const externalBlockers = external.get(index)!;
     const node: IssueGraphNode = {
       id: items[index]!.id,
       entry: items[index]!.entry,
       x: left + columnX(column.get(index)!, columns.length, nodeWidth),
-      y: REGION_PADDING + row.get(index)! * (nodeHeight + ROW_GAP),
+      y: rowTops[row.get(index)!]!,
       width: nodeWidth,
-      height: nodeHeight,
+      height: nodeHeight + (externalBlockers === null ? 0 : labelHeight),
+      externalBlockers,
     };
     nodeAt.set(index, node);
     return node;
@@ -480,10 +573,21 @@ function placeRegion(
   const placedEdges = regionEdges.map((edge): IssueGraphEdge => {
     const from = nodeAt.get(edge.from)!;
     const to = nodeAt.get(edge.to)!;
+    const base = { id: edge.id, from: from.id, to: to.id };
+    if (edge.kind === "parent") {
+      const { path, maxX } = treePath(from, to);
+      width = Math.max(width, maxX + REGION_PADDING);
+      return { ...base, kind: "parent", path };
+    }
     const { path, maxX } = edgePath(from, to);
     // A same-column bow leaves the last column; the region scrolls far enough to show it.
     width = Math.max(width, maxX + REGION_PADDING);
-    return { id: edge.id, from: from.id, to: to.id, kind: edge.kind, path };
+    return {
+      ...base,
+      kind: "blocks",
+      blockerOpen: items[edge.from]!.entry.state.category !== "closed",
+      path,
+    };
   });
   return {
     id: `${projectId}:${cluster.id}`,
@@ -495,7 +599,10 @@ function placeRegion(
         : (items.find((item) => item.id === cluster.rootNodeId)?.entry ?? null),
     issueCount: cluster.members.length,
     width,
-    height: REGION_PADDING * 2 + rows * nodeHeight + (rows - 1) * ROW_GAP,
+    height:
+      REGION_PADDING * 2 +
+      rowHeights.reduce((sum, height) => sum + height, 0) +
+      (rowCount - 1) * ROW_GAP,
     nodes,
     edges: placedEdges,
   };
@@ -536,4 +643,28 @@ function edgePath(
   }
   const pull = Math.max(EDGE_BOW / 2, (tx - sx) / 2);
   return { path: `M ${sx} ${sy} C ${sx + pull} ${sy}, ${tx - pull} ${ty}, ${tx} ${ty}`, maxX: tx };
+}
+
+/**
+ * Down out of the parent's bottom into the row gap below it, right into the column gap, then down
+ * that gap and right into the child's left edge. Siblings share the drop and the trunk. Every leg
+ * runs in a row or column gap, so it never passes behind a card.
+ */
+function treePath(
+  from: IssueGraphNode,
+  to: IssueGraphNode,
+): { readonly path: string; readonly maxX: number } {
+  const half = RANK_GAP / 2;
+  const dropX = from.x + from.width - TREE_DROP_INSET;
+  const dropY = from.y + from.height + ROW_GAP / 2;
+  const trunkX = from.x + from.width + half;
+  const ty = to.y + to.height / 2;
+  const tx = to.x;
+  // Only a child further away than the next column (or behind, in a cycle) needs to cross over
+  // to the column gap before it, in the row gap above it.
+  const cross = tx - half === trunkX ? "" : `V ${to.y - ROW_GAP / 2} H ${tx - half} `;
+  return {
+    path: `M ${dropX} ${from.y + from.height} V ${dropY} H ${trunkX} ${cross}V ${ty} H ${tx}`,
+    maxX: Math.max(trunkX, tx),
+  };
 }
