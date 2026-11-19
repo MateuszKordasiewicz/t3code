@@ -2282,7 +2282,7 @@ it.effect("explicit settle clears snooze atomically and stays idempotent after r
 );
 
 it.effect(
-  "my move revives a settled snoozed thread and a sent message, not /compact, clears it",
+  "my move revives a settled snoozed thread and only a message the user sends clears it",
   () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -2329,7 +2329,7 @@ it.effect(
       assert.isNull((yield* projections.getThread(threadId)).triageLabel);
 
       yield* setLabel("relabel-triage-label", label);
-      const send = (id: string, text: string) =>
+      const send = (id: string, text: string, createdBy: "user" | "agent" = "user") =>
         orchestrator.dispatch({
           type: "message.dispatch",
           commandId: CommandId.make(id),
@@ -2338,10 +2338,11 @@ it.effect(
           text,
           attachments: [],
           dispatchMode: { type: "defer_start" },
-          createdBy: "user",
+          createdBy,
           creationSource: "web",
         });
       yield* send("compact-triage-label", "/compact");
+      yield* send("agent-triage-label", "Status update", "agent");
       assert.deepEqual((yield* projections.getThread(threadId)).triageLabel, label);
       yield* send("message-triage-label", "Carry on");
       assert.isNull((yield* projections.getThread(threadId)).triageLabel);

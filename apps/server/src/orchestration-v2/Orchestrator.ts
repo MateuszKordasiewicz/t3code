@@ -206,7 +206,11 @@ import {
   ThreadForkServiceV2,
 } from "./ThreadForkService.ts";
 import { planThreadDeletion } from "./ThreadDeletion.ts";
-import { applyThreadTriageLabel, threadWithTriageLabelRetired } from "./threadTriage.ts";
+import {
+  applyThreadTriageLabel,
+  sentByUser,
+  threadWithTriageLabelRetired,
+} from "./threadTriage.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ServerSettings from "../serverSettings.ts";
 
@@ -7099,9 +7103,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
       projection = applyToProjection(projection, event);
     }
-    const retiredTriage = isNativeMaintenanceCommand(command)
-      ? null
-      : threadWithTriageLabelRetired(projection.thread);
+    const retiredTriage = sentByUser(command)
+      ? threadWithTriageLabelRetired(projection.thread)
+      : null;
     if (retiredTriage !== null) {
       const event = yield* emit(
         events,

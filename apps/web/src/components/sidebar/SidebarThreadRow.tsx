@@ -1088,7 +1088,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
   const accessibility = resolveSidebarRowAccessibility({
     title: thread.title,
     statusLabel:
-      triage?.kind === "my-move" && triage.note !== null
+      topStatus?.icon === "myMove" && triage?.kind === "my-move" && triage.note !== null
         ? gt("My move: {note}", { note: triage.note })
         : (topStatus?.label ?? null),
     projectDisplayName: props.projectDisplayName,
