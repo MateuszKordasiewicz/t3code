@@ -48,7 +48,7 @@ function RegionLabel({ region }: { region: IssueGraphRegion }) {
         <span
           className={cn(
             PULL_REQUEST_ROW_NUMBER_CLASS,
-            "rounded border border-border bg-background px-1 leading-4",
+            "max-w-1/3 min-w-0 shrink truncate rounded border border-border bg-background px-1 leading-4",
           )}
         >
           {region.root?.displayKey ?? region.label}

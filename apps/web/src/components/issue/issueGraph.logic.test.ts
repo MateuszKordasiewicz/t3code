@@ -179,7 +179,8 @@ describe("layoutIssueGraph", () => {
     expect(tree!.width).toBe(12 + 100 + 64 + 100 + 12);
     expect(loose).toMatchObject({ height: 12 + 40 + 12, width: 12 + 100 + 12, edges: [] });
 
-    // A backward edge out of the last column turns right of it; the region scrolls far enough.
+    // A backward edge leaves the last column to its right and enters the first from its left;
+    // the region makes room on both sides.
     const cycle = regionsOf(
       layoutIssueGraph(
         [
@@ -197,8 +198,14 @@ describe("layoutIssueGraph", () => {
         [...edge.path.matchAll(/(-?[\d.]+) -?[\d.]+/g)].map((match) => Number(match[1])),
       ),
     );
+    const pathLeft = Math.min(
+      ...cycle.edges.flatMap((edge) =>
+        [...edge.path.matchAll(/(-?[\d.]+) -?[\d.]+/g)].map((match) => Number(match[1])),
+      ),
+    );
     expect(pathRight).toBeGreaterThan(cardsRight);
     expect(cycle.width).toBe(pathRight + 12);
+    expect(pathLeft).toBe(12);
   });
 
   it("groups regions under one row per project, keeping a shared scope in the project that listed it first", () => {

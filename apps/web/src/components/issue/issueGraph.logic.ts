@@ -451,12 +451,18 @@ function placeRegion(
     Math.ceil(loose.length / GRID_COLUMNS),
     ...columns.map((members) => members.length),
   );
+  // A link back into the first column turns left of it, so that column moves right to make room.
+  const left =
+    REGION_PADDING +
+    (regionEdges.some((edge) => column.get(edge.to) === 0 && column.get(edge.from)! > 0)
+      ? EDGE_BOW
+      : 0);
   const nodeAt = new Map<number, IssueGraphNode>();
   const nodes = [...columns.flat(), ...loose].map((index) => {
     const node: IssueGraphNode = {
       id: items[index]!.id,
       entry: items[index]!.entry,
-      x: REGION_PADDING + column.get(index)! * (nodeWidth + RANK_GAP),
+      x: left + column.get(index)! * (nodeWidth + RANK_GAP),
       y: REGION_PADDING + row.get(index)! * (nodeHeight + ROW_GAP),
       width: nodeWidth,
       height: nodeHeight,
@@ -464,7 +470,7 @@ function placeRegion(
     nodeAt.set(index, node);
     return node;
   });
-  let width = REGION_PADDING * 2 + columnCount * nodeWidth + (columnCount - 1) * RANK_GAP;
+  let width = left + REGION_PADDING + columnCount * nodeWidth + (columnCount - 1) * RANK_GAP;
   const placedEdges = regionEdges.map((edge): IssueGraphEdge => {
     const from = nodeAt.get(edge.from)!;
     const to = nodeAt.get(edge.to)!;

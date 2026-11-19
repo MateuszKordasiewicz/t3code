@@ -14,7 +14,7 @@ describe("collapsed issue graph rows", () => {
       ...empty,
       status: ["status:closed"],
     });
-    // A store written before project rows existed keeps its regions.
+    // A store written before project rows existed still decodes.
     expect(decodeCollapsedIssueGraphRows({ tree: ["a"], type: [], status: [] })).toEqual({
       ...empty,
       tree: ["a"],
