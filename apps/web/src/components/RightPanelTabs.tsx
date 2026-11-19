@@ -70,6 +70,7 @@ import type { RightPanelSurface } from "~/rightPanelStore";
 import { cn } from "~/lib/utils";
 import { issueStatePresentation } from "~/components/issue/issuePresentation";
 import { issueEnvironment } from "~/state/issues";
+import { useQueuedIssueTabState } from "~/components/issue/useQueuedIssueTabState";
 import { resolveShortcutCommand, type ShortcutMatchContext } from "~/keybindings";
 import { readLocalApi } from "~/localApi";
 import { useStableCallback } from "~/hooks/useStableCallback";
@@ -666,6 +667,7 @@ function SurfaceIcon({
   theme,
   environmentId,
   pullRequestStatusSeed,
+  active,
 }: {
   surface: RightPanelSurface;
   previewUrl: string | null;
@@ -673,6 +675,7 @@ function SurfaceIcon({
   theme: "light" | "dark";
   environmentId: EnvironmentId | null;
   pullRequestStatusSeed: PullRequestTabStatusSeed | undefined;
+  active: boolean;
 }) {
   switch (surface.kind) {
     case "preview":
@@ -703,7 +706,7 @@ function SurfaceIcon({
     case "pull-requests":
       return <PullRequestGlyph.link className="size-3 shrink-0" />;
     case "issue":
-      return <IssueSurfaceIcon surface={surface} environmentId={environmentId} />;
+      return <IssueSurfaceIcon surface={surface} environmentId={environmentId} active={active} />;
     case "side-chat":
       return <SideChatTabIcon environmentId={environmentId} threadId={surface.threadId} />;
     case "device":
@@ -786,13 +789,17 @@ export function resolvePullRequestTabLink(
 function IssueSurfaceIcon({
   surface,
   environmentId,
+  active,
 }: {
   surface: Extract<RightPanelSurface, { kind: "issue" }>;
   environmentId: EnvironmentId | null;
+  active: boolean;
 }) {
   const resolvedEnvironmentId =
     (surface.environmentId as EnvironmentId | undefined) ?? environmentId;
-  const detail = useEnvironmentQuery(
+  const { state, iconRef } = useQueuedIssueTabState(
+    resolvedEnvironmentId,
+    active,
     resolvedEnvironmentId === null
       ? null
       : issueEnvironment.detail({
@@ -805,11 +812,12 @@ function IssueSurfaceIcon({
             key: surface.key,
           },
         }),
-  ).data;
-  if (detail === null) return <CircleDotIcon className="size-3 shrink-0" />;
-  const presentation = issueStatePresentation(detail.state);
+  );
+  if (state === null) return <CircleDotIcon ref={iconRef} className="size-3 shrink-0" />;
+  const presentation = issueStatePresentation(state);
   return (
     <presentation.Icon
+      ref={iconRef}
       role="img"
       aria-label={presentation.label}
       className={cn("size-3 shrink-0", presentation.toneClassName)}
@@ -977,6 +985,7 @@ function RightPanelTab(
           theme={props.theme}
           environmentId={props.environmentId}
           pullRequestStatusSeed={props.pullRequestStatusSeed}
+          active={props.active}
         />
         {props.pending ? (
           <span
