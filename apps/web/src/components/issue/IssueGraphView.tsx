@@ -244,8 +244,10 @@ function IssueGraphRegionRow({
                     viewBox="0 0 8 8"
                     refX="7"
                     refY="4"
-                    markerWidth="7"
-                    markerHeight="7"
+                    // 8px at any stroke width, under the 12px between arc ends on a card.
+                    markerUnits="userSpaceOnUse"
+                    markerWidth="8"
+                    markerHeight="8"
                     orient="auto-start-reverse"
                   >
                     <path d="M 0 0 L 8 4 L 0 8 z" className={ARROW_FILL_CLASS[tone]} />

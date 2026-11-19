@@ -56,58 +56,50 @@ function nodeOf(layout: Layout, key: string) {
   return nodesOf(layout).find((node) => node.entry.key === key)!;
 }
 
-interface Point {
-  readonly x: number;
-  readonly y: number;
-}
-interface Segment {
-  readonly from: Point;
-  readonly to: Point;
-}
-
-/** The legs of a path made only of M, H and V commands. */
-function orthogonalSegments(path: string): Array<Segment> {
-  expect(path).toMatch(/^M [^CLQAS]+$/);
-  const [start, ...steps] = path.match(/[MHV] [^MHV]+/g)!.map((step) => step.trim());
-  const [x, y] = start!.slice(2).split(" ").map(Number);
-  let at: Point = { x: x!, y: y! };
-  return steps.map((step) => {
-    const value = Number(step.slice(2));
-    const next = step.startsWith("H") ? { x: value, y: at.y } : { x: at.x, y: value };
-    const segment = { from: at, to: next };
-    at = next;
-    return segment;
-  });
+/** `M x1 y1 H … Q gx … V … Q gx y2 … H x2`: an arc out to the gutter at gx and back. */
+function arcOf(path: string) {
+  expect(path).toMatch(/^M [\d.-]+ [\d.-]+ H [\d.-]+ Q .+ V .+ Q .+ H [\d.-]+$/);
+  const n = path.match(/-?[\d.]+/g)!.map(Number);
+  return {
+    x1: n[0]!,
+    y1: n[1]!,
+    gutter: n[3]!,
+    top: Math.min(n[1]!, n[9]!),
+    bottom: Math.max(n[1]!, n[9]!),
+    y2: n[9]!,
+    x2: n[12]!,
+  };
 }
 
-/** Two collinear legs that share more than a point. */
-function overlaps(a: Segment, b: Segment): boolean {
-  const span = (s: Segment, axis: "x" | "y") =>
-    [Math.min(s.from[axis], s.to[axis]), Math.max(s.from[axis], s.to[axis])] as const;
-  for (const [along, across] of [
-    ["x", "y"],
-    ["y", "x"],
-  ] as const) {
-    if (a.from[across] !== a.to[across] || b.from[across] !== b.to[across]) continue;
-    if (a.from[across] !== b.from[across]) continue;
-    const [a0, a1] = span(a, along);
-    const [b0, b1] = span(b, along);
-    if (Math.min(a1, b1) - Math.max(a0, b0) > 0) return true;
+/** `M x top V bottom H x2`: a trunk at x from the parent's bottom, then a tick into the child. */
+function treeOf(path: string) {
+  const match = path.match(/^M ([\d.-]+) ([\d.-]+) V ([\d.-]+) H ([\d.-]+)$/);
+  expect(match, path).not.toBeNull();
+  const [, x, top, bottom, end] = match!.map(Number);
+  return { x: x!, top: top!, bottom: bottom!, end: end! };
+}
+
+/** Every arc end on each card's right edge keeps more than an arrowhead from the next. */
+function expectSpacedEnds(layout: Layout) {
+  const byId = new Map(nodesOf(layout).map((node) => [node.id, node]));
+  const ends = new Map<string, Array<number>>();
+  for (const edge of edgesOf(layout).filter((e) => e.kind === "blocks")) {
+    const arc = arcOf(edge.path);
+    const [from, to] = [byId.get(edge.from)!, byId.get(edge.to)!];
+    expect(arc.x1).toBe(from.x + from.width);
+    expect(arc.x2).toBe(to.x + to.width);
+    ends.set(from.id, [...(ends.get(from.id) ?? []), arc.y1]);
+    ends.set(to.id, [...(ends.get(to.id) ?? []), arc.y2]);
   }
-  return false;
-}
-
-function arrowEnd(path: string): Point {
-  const numbers = path.match(/-?[\d.]+/g)!.map(Number);
-  return { x: numbers[numbers.length - 2]!, y: numbers[numbers.length - 1]! };
-}
-
-/** The straight crossing of a blocks curve that skips a column: `…, x1 y L x2 y C …`. */
-function arrowCrossing(path: string): Segment | null {
-  const match = path.match(/, ([\d.-]+) ([\d.-]+) L ([\d.-]+) ([\d.-]+) C/);
-  if (!match) return null;
-  const [, x1, y1, x2, y2] = match.map(Number);
-  return { from: { x: x1!, y: y1! }, to: { x: x2!, y: y2! } };
+  for (const [id, ys] of ends) {
+    const node = byId.get(id)!;
+    const sorted = ys.toSorted((a, b) => a - b);
+    expect(sorted[0]).toBeGreaterThan(node.y);
+    expect(sorted[sorted.length - 1]).toBeLessThan(node.y + node.height);
+    for (let i = 1; i < sorted.length; i++) {
+      expect(sorted[i]! - sorted[i - 1]!).toBeGreaterThanOrEqual(10);
+    }
+  }
 }
 
 describe("layoutIssueGraph", () => {
@@ -180,7 +172,8 @@ describe("layoutIssueGraph", () => {
     // two -> loose crosses into the loose region, which scrolls on its own: not drawn.
     expect(edgesOf(layout)).toHaveLength(6);
     for (const edge of edgesOf(layout)) {
-      expect(edge.path).toMatch(edge.kind === "blocks" ? /^M [\d.]+ [\d.]+ C / : /^M [^C]+$/);
+      if (edge.kind === "blocks") arcOf(edge.path);
+      else treeOf(edge.path);
     }
 
     // Blockers with no arrow show on the card: amber if one is open, grey only when all are
@@ -199,229 +192,163 @@ describe("layoutIssueGraph", () => {
     });
   });
 
-  it("draws sub-tasks as a tree: below the parent, joined by orthogonal connectors that pass no card", () => {
+  it("lists linked issues depth-first, each sub-task indented under its parent and joined by a trunk on the left", () => {
     const layout = layoutIssueGraph(
       [
         issue("epic", { issueType: "epic" }),
-        issue("a", { parentKey: "epic" }),
+        issue("b", { parentKey: "epic" }),
+        issue("a", { parentKey: "epic", priority: 1 }),
+        issue("b1", { parentKey: "b" }),
         issue("a1", { parentKey: "a" }),
         issue("a2", { parentKey: "a" }),
-        issue("b", { parentKey: "epic" }),
-        issue("b1", { parentKey: "b" }),
-        issue("c", { parentKey: "epic" }),
-        // Blocked by a sibling, so each sits two columns right of its parent.
-        issue("far1", { parentKey: "epic", dependsOnKeys: ["a"] }),
-        issue("far2", { parentKey: "epic", dependsOnKeys: ["c"] }),
+        issue("a1x", { parentKey: "a1" }),
       ],
       "tree",
+      { nodeWidth: 100, nodeHeight: 40, labelHeight: 16 },
     );
-    const nodes = nodesOf(layout);
-    const byId = new Map(nodes.map((node) => [node.id, node]));
-    const tree = edgesOf(layout).filter((edge) => edge.kind === "parent");
-    expect(tree).toHaveLength(8);
-    const legs = new Map<string, Array<Segment>>();
-    for (const edge of tree) {
-      const from = byId.get(edge.from)!;
-      const to = byId.get(edge.to)!;
-      expect(to.x).toBeGreaterThan(from.x);
-      expect(to.y).toBeGreaterThan(from.y + from.height);
+    const region = regionsOf(layout)[0]!;
+    expect(region.nodes.map((node) => [node.entry.key, node.x])).toEqual([
+      ["epic", 12],
+      ["a", 36],
+      ["a1", 60],
+      ["a1x", 84],
+      ["a2", 60],
+      ["b", 36],
+      ["b1", 60],
+    ]);
+    const ys = region.nodes.map((node) => node.y);
+    expect(ys).toEqual(ys.toSorted((a, b) => a - b));
+    expect(new Set(ys).size).toBe(ys.length);
+    // One card per row of 40, 12 apart, inside 12 of padding; nothing scrolls sideways.
+    expect(region.height).toBe(12 + 7 * 40 + 6 * 12 + 12);
+    expect(region.width).toBe(84 + 100 + 12);
 
-      const segments = orthogonalSegments(edge.path);
-      legs.set(edge.id, segments);
-      const start = segments[0]!.from;
-      const end = segments[segments.length - 1]!.to;
-      // Leaves the parent's bottom edge and ends on the child's left edge.
-      expect(start.y).toBe(from.y + from.height);
-      expect(start.x).toBeGreaterThan(from.x);
-      expect(start.x).toBeLessThan(from.x + from.width);
-      expect(end.x).toBe(to.x);
-      expect(end.y).toBeGreaterThan(to.y);
-      expect(end.y).toBeLessThan(to.y + to.height);
-      for (const { from: p, to: q } of segments) {
-        for (const node of nodes) {
-          const overX = Math.max(p.x, q.x) > node.x && Math.min(p.x, q.x) < node.x + node.width;
-          const overY = Math.max(p.y, q.y) > node.y && Math.min(p.y, q.y) < node.y + node.height;
-          expect(overX && overY, `${edge.id} passes behind ${node.entry.key}`).toBe(false);
-          // Crossing a column, it keeps a row gap clear of the cards there, so it never reads
-          // as a link between two of them.
-          if (
-            p.y === q.y &&
-            Math.min(p.x, q.x) <= node.x &&
-            Math.max(p.x, q.x) >= node.x + node.width
-          ) {
-            const clearance = Math.max(node.y - p.y, p.y - (node.y + node.height));
-            expect(clearance, `${edge.id} hugs ${node.entry.key}`).toBeGreaterThanOrEqual(16);
-          }
-        }
+    const byId = new Map(region.nodes.map((node) => [node.id, node]));
+    const trunks = region.edges.map((edge) => {
+      expect(edge.kind).toBe("parent");
+      const [from, to] = [byId.get(edge.from)!, byId.get(edge.to)!];
+      const tree = treeOf(edge.path);
+      // Under the parent's left edge, left of every card below it, ticking into the child.
+      expect(tree.x).toBeGreaterThan(from.x);
+      expect(tree.x).toBeLessThan(to.x);
+      expect(tree.top).toBe(from.y + from.height);
+      expect(tree.bottom).toBeGreaterThan(to.y);
+      expect(tree.bottom).toBeLessThan(to.y + to.height);
+      expect(tree.end).toBe(to.x);
+      return { parent: edge.from, ...tree };
+    });
+    expect(trunks).toHaveLength(6);
+    // Siblings share their parent's trunk; trunks of different parents never overlap.
+    for (const a of trunks) {
+      for (const b of trunks) {
+        if (a.parent === b.parent) expect(a.x).toBe(b.x);
+        else if (a.x === b.x) expect(a.bottom < b.top || b.bottom < a.top).toBe(true);
       }
     }
-    // Different parents never share a leg, so one branch cannot look attached to another.
-    for (const a of tree) {
-      for (const b of tree) {
-        if (a.from === b.from) continue;
-        for (const p of legs.get(a.id)!) {
-          for (const q of legs.get(b.id)!) {
-            expect(overlaps(p, q), `${a.id} shares a leg with ${b.id}`).toBe(false);
-          }
-        }
-      }
-    }
-    // Siblings in the next column share the parent's drop and trunk: `M … V … H trunkX`.
-    const trunk = (key: string) => {
-      const path = tree.find((edge) => edge.to === nodeId(key))!.path;
-      return path.slice(0, path.indexOf(" V ", path.indexOf(" H ")));
-    };
-    expect(trunk("a1")).toBe(trunk("a2"));
-
-    // A child that blocks its own parent still sits right of and below it; the dependency is the
-    // link drawn backward.
-    const loop = layoutIssueGraph(
-      [
-        issue("kid", { parentKey: "boss", priority: 0 }),
-        issue("boss", { issueType: "epic", dependsOnKeys: ["kid"] }),
-      ],
-      "tree",
-    );
-    const [kid, boss] = [nodeOf(loop, "kid"), nodeOf(loop, "boss")];
-    expect(kid.x).toBeGreaterThan(boss.x);
-    expect(kid.y).toBeGreaterThan(boss.y);
-    const back = edgesOf(loop).find((edge) => edge.kind === "blocks")!;
-    expect(back.path).toMatch(/ L /);
-    expect(arrowEnd(back.path).x).toBe(boss.x);
   });
 
-  it("ranks blockers left of what they block and survives dependency cycles", () => {
-    const chain = layoutIssueGraph(
+  it("puts a blocker above the card it blocks, and lays a cycle out the same way every time", () => {
+    const siblings = layoutIssueGraph(
       [
-        issue("c", { issueType: "task", dependsOnKeys: ["b", "a"] }),
-        issue("b", { issueType: "task", dependsOnKeys: ["a"] }),
-        issue("a", { issueType: "task" }),
-        issue("side", { issueType: "task", dependsOnKeys: ["a"] }),
+        issue("epic", { issueType: "epic" }),
+        issue("urgent", { parentKey: "epic", priority: 0, dependsOnKeys: ["first"] }),
+        issue("first", { parentKey: "epic", priority: 3 }),
+        issue("other", { parentKey: "epic", priority: 1 }),
       ],
-      "type",
+      "tree",
     );
-    expect(nodeOf(chain, "a").x).toBeLessThan(nodeOf(chain, "b").x);
-    expect(nodeOf(chain, "b").x).toBeLessThan(nodeOf(chain, "c").x);
-    expect(nodeOf(chain, "side").x).toBe(nodeOf(chain, "b").x);
-
-    // Arrows into one card enter at their own points, on their own tracks, so an open arrow
-    // never hides a closed one.
-    const fan = layoutIssueGraph(
-      [
-        issue("closed", { issueType: "task", closed: true }),
-        issue("open", { issueType: "task" }),
-        issue("mid", { issueType: "task", dependsOnKeys: ["closed"] }),
-        issue("target", { issueType: "task", dependsOnKeys: ["closed", "open", "mid"] }),
-      ],
-      "type",
-    );
-    const target = nodeOf(fan, "target");
-    const into = edgesOf(fan).filter((edge) => edge.to === nodeId("target"));
-    expect(into).toHaveLength(3);
-    const ends = into.map((edge) => arrowEnd(edge.path));
-    for (const end of ends) {
-      expect(end.x).toBe(target.x);
-      expect(end.y).toBeGreaterThan(target.y);
-      expect(end.y).toBeLessThan(target.y + target.height);
-    }
-    expect(new Set(ends.map((end) => end.y)).size).toBe(3);
-    const crossings = into.flatMap((edge) => arrowCrossing(edge.path) ?? []);
-    expect(crossings).toHaveLength(2);
-    expect(overlaps(crossings[0]!, crossings[1]!)).toBe(false);
-    // a -> c skips b's column: it turns inside the column gaps and crosses above b's card.
-    const skip = edgesOf(chain).find(
-      (edge) => edge.from === nodeId("a") && edge.to === nodeId("c"),
-    )!;
-    const b = nodeOf(chain, "b");
-    const [, riseEndX, crossY, crossEndX] = skip.path
-      .match(/, ([\d.-]+) ([\d.-]+) L ([\d.-]+) [\d.-]+ C/)!
-      .map(Number);
-    expect(riseEndX).toBeLessThanOrEqual(b.x);
-    expect(crossEndX).toBeGreaterThanOrEqual(b.x + b.width);
-    expect(crossY).toBeLessThan(b.y);
+    expect(regionsOf(siblings)[0]!.nodes.map((node) => node.entry.key)).toEqual([
+      "epic",
+      "other",
+      "first",
+      "urgent",
+    ]);
 
     const cycle = [
       issue("x", { dependsOnKeys: ["z"], parentKey: "y" }),
       issue("y", { dependsOnKeys: ["x"], parentKey: "z" }),
       issue("z", { dependsOnKeys: ["y"], parentKey: "y" }),
+      issue("p", { dependsOnKeys: ["q"] }),
+      issue("q", { dependsOnKeys: ["p"] }),
     ];
     const first = layoutIssueGraph(cycle, "tree");
-    const firstNodes = nodesOf(first);
-    expect(firstNodes).toHaveLength(3);
-    expect(new Set(firstNodes.map((node) => node.x)).size).toBe(3);
-    // A backward edge crosses in the row gap too, above the card it passes, inside the region.
-    const back = edgesOf(first).find((edge) => {
-      const from = firstNodes.find((node) => node.id === edge.from)!;
-      const to = firstNodes.find((node) => node.id === edge.to)!;
-      return to.x < from.x - from.width;
-    })!;
-    const backY = Number(back.path.match(/ L [\d.-]+ ([\d.-]+) C/)![1]);
-    expect(backY).toBeLessThan(Math.min(...firstNodes.map((node) => node.y)));
-    expect(backY).toBeGreaterThan(0);
+    expect(nodesOf(first)).toHaveLength(5);
+    for (const region of regionsOf(first)) {
+      expect(new Set(region.nodes.map((node) => node.y)).size).toBe(region.nodes.length);
+    }
     expect(layoutIssueGraph(cycle, "tree")).toEqual(first);
+    expectSpacedEnds(first);
   });
 
-  it("sizes each region to its cards plus padding, and widens it for an edge past the last column", () => {
+  it("nests arcs in the right gutter by span, so overlapping spans never share a segment", () => {
     const layout = layoutIssueGraph(
       [
-        issue("epic", { issueType: "epic" }),
-        issue("one", { parentKey: "epic" }),
-        issue("two", { parentKey: "epic" }),
-        issue("bug-1", { issueType: "bug" }),
+        issue("closed", { issueType: "task", closed: true }),
+        issue("open", { issueType: "task" }),
+        issue("mid", { issueType: "task", dependsOnKeys: ["closed"] }),
+        issue("target", { issueType: "task", dependsOnKeys: ["closed", "open", "mid"] }),
+        issue("side", { issueType: "task", dependsOnKeys: ["open"] }),
+        issue("alone", { issueType: "task" }),
       ],
-      "tree",
+      "type",
+    );
+    const region = regionsOf(layout)[0]!;
+    const nodes = region.nodes;
+    const cardsRight = Math.max(...nodes.map((node) => node.x + node.width));
+    const arcs = region.edges.map((edge) => ({ edge, ...arcOf(edge.path) }));
+    expect(arcs).toHaveLength(5);
+    for (const a of arcs) {
+      expect(a.gutter).toBeGreaterThan(cardsRight);
+      expect(region.width).toBeGreaterThanOrEqual(a.gutter + 12);
+      for (const b of arcs) {
+        if (a === b || a.bottom < b.top || b.bottom < a.top) continue;
+        expect(a.gutter, `${a.edge.id} and ${b.edge.id}`).not.toBe(b.gutter);
+        // A span inside another nests inside its arc.
+        if (b.top <= a.top && a.bottom <= b.bottom) expect(a.gutter).toBeLessThan(b.gutter);
+      }
+    }
+    expectSpacedEnds(layout);
+    // The unlinked card waits in the grid below the list.
+    const alone = nodeOf(layout, "alone");
+    expect(alone.y).toBeGreaterThan(
+      Math.max(...nodes.filter((node) => node !== alone).map((node) => node.y + node.height)),
+    );
+  });
+
+  it("grows a card's row to keep many arc ends apart, and a blocked-by line's row", () => {
+    const blockers = Array.from({ length: 8 }, (_, i) => issue(`b${i}`, { issueType: "task" }));
+    const layout = layoutIssueGraph(
+      [
+        ...blockers,
+        issue("hub", { issueType: "task", dependsOnKeys: blockers.map((entry) => entry.key) }),
+        issue("bug-1", { issueType: "bug", dependsOnKeys: ["elsewhere"] }),
+      ],
+      "type",
       { nodeWidth: 100, nodeHeight: 40, labelHeight: 16 },
     );
-    const [tree, loose] = regionsOf(layout);
-    // epic in column 0; one and two stacked below it in column 1: three rows of 40 with 16 gaps,
-    // inside 16 of padding.
-    expect(tree!.height).toBe(16 + 40 + 16 + 40 + 16 + 40 + 16);
-    expect(Math.min(...tree!.nodes.map((node) => node.y))).toBe(16);
-    expect(Math.max(...tree!.nodes.map((node) => node.y + node.height))).toBe(tree!.height - 16);
-    expect(tree!.width).toBe(16 + 100 + 64 + 100 + 16);
-    expect(loose).toMatchObject({ height: 16 + 40 + 16, width: 16 + 100 + 16, edges: [] });
+    expect(nodeOf(layout, "hub").height).toBe(7 * 12 + 2 * 8);
+    expect(nodeOf(layout, "b0").height).toBe(40);
+    expectSpacedEnds(layout);
+    expect(nodeOf(layout, "bug-1").height).toBe(56);
+    const bugs = regionsOf(layout).find((region) => region.label === "bug")!;
+    expect(bugs.height).toBe(12 + 56 + 12);
+  });
 
-    // A card with a blocked-by line is taller, and so is its row.
-    const labelled = regionsOf(
-      layoutIssueGraph(
-        [
-          issue("bug-1", { issueType: "bug", dependsOnKeys: ["elsewhere"] }),
-          issue("bug-2", { issueType: "bug" }),
-        ],
-        "tree",
-        { nodeWidth: 100, nodeHeight: 40, labelHeight: 16 },
-      ),
-    )[0]!;
-    expect(labelled.nodes.map((node) => node.height)).toEqual([56, 40]);
-    expect(labelled.height).toBe(16 + 56 + 16);
-
-    // A backward edge leaves the last column to its right and enters the first from its left;
-    // the region makes room on both sides.
-    const cycle = regionsOf(
-      layoutIssueGraph(
-        [
-          issue("x", { dependsOnKeys: ["z"] }),
-          issue("y", { dependsOnKeys: ["x"] }),
-          issue("z", { dependsOnKeys: ["y"] }),
-        ],
-        "tree",
-        { nodeWidth: 100, nodeHeight: 40, labelHeight: 16 },
-      ),
-    )[0]!;
-    const cardsRight = Math.max(...cycle.nodes.map((node) => node.x + node.width));
-    const pathRight = Math.max(
-      ...cycle.edges.flatMap((edge) =>
-        [...edge.path.matchAll(/(-?[\d.]+) -?[\d.]+/g)].map((match) => Number(match[1])),
-      ),
+  it("lays out a dense region of 200 issues and about 3,800 links in one list", () => {
+    const entries = Array.from({ length: 200 }, (_, i) =>
+      issue(`t${i}`, {
+        issueType: "task",
+        dependsOnKeys: Array.from({ length: Math.min(i, 20) }, (_, k) => `t${i - k - 1}`),
+      }),
     );
-    const pathLeft = Math.min(
-      ...cycle.edges.flatMap((edge) =>
-        [...edge.path.matchAll(/(-?[\d.]+) -?[\d.]+/g)].map((match) => Number(match[1])),
-      ),
-    );
-    expect(pathRight).toBeGreaterThan(cardsRight);
-    expect(cycle.width).toBe(pathRight + 16);
-    expect(pathLeft).toBe(16);
+    const layout = layoutIssueGraph(entries, "type");
+    const region = regionsOf(layout)[0]!;
+    expect(region.nodes).toHaveLength(200);
+    expect(region.edges).toHaveLength(3790);
+    const y = new Map(region.nodes.map((node) => [node.id, node.y]));
+    expect(new Set(y.values()).size).toBe(200);
+    for (const edge of region.edges) expect(y.get(edge.from)!).toBeLessThan(y.get(edge.to)!);
+    expectSpacedEnds(layout);
   });
 
   it("groups regions under one row per project, keeping a shared scope in the project that listed it first", () => {

@@ -17,7 +17,7 @@ export interface IssueGraphNode {
   readonly x: number;
   readonly y: number;
   readonly width: number;
-  /** Taller by the size's labelHeight when the card shows its external blockers. */
+  /** Taller by the size's labelHeight with a blocked-by line, or to space many arc ends. */
   readonly height: number;
   readonly externalBlockers: IssueGraphExternalBlockers | null;
 }
@@ -31,9 +31,9 @@ interface IssueGraphEdgeBase {
 }
 
 export type IssueGraphEdge =
-  /** Parent to child: an orthogonal tree connector into the child's left edge. */
+  /** Parent to child: a folder-tree line from the parent's trunk into the child's left edge. */
   | (IssueGraphEdgeBase & { readonly kind: "parent" })
-  /** Blocker to blocked issue: a curve that ends in an arrowhead. */
+  /** Blocker to blocked issue: an arc through the right-hand gutter ending in an arrowhead. */
   | (IssueGraphEdgeBase & { readonly kind: "blocks"; readonly blockerOpen: boolean });
 
 export interface IssueGraphRegion {
@@ -69,24 +69,23 @@ export interface IssueGraphSize {
 }
 
 const DEFAULT_SIZE: IssueGraphSize = { nodeWidth: 240, nodeHeight: 56, labelHeight: 20 };
-const REGION_PADDING = 16;
-const RANK_GAP = 64;
-// Wide enough for three parallel arrow tracks with clearance from the cards on both sides.
-const ROW_GAP = 16;
+const REGION_PADDING = 12;
+const ROW_GAP = 12;
 const GRID_COLUMNS = 4;
-// Grid issues have no links between them, so their columns need no room for edges.
 const GRID_GAP = 16;
-const EDGE_BOW = 48;
-// How far in from the parent's right edge a tree connector drops out of its bottom.
-const TREE_DROP_INSET = 16;
-// A tree connector enters the child beside its first line, as in a folder tree.
+/** Each level of the sub-task tree moves a card this far right. */
+const INDENT = 24;
+// A parent's trunk runs this far in from its left edge, so it stays left of every card below it.
+const TRUNK_INSET = 12;
+// A sub-task's tick enters beside its first line, as in a folder tree.
 const TREE_ENTRY = 16;
-// Spacing of parallel tracks: tree tracks step left from the column gap's middle; arrow tracks
-// sit either side of the row gap's middle; a lane through empty cells keeps off their middle.
-const TRACK_GAP = 8;
-const TREE_TRACK_OFFSETS = [0, -8, -16, -24];
-const ARROW_TRACK_OFFSETS = [-4, 4, 0];
-const LANE_TRACK_OFFSETS = [-8, 8, -16, 16];
+// Arcs leave the widest card by GUTTER_GAP before their first level; levels sit LEVEL_GAP apart.
+const GUTTER_GAP = 16;
+const LEVEL_GAP = 8;
+// Arc ends on one card sit further apart than an 8px arrowhead, and clear of its corners.
+const ENDPOINT_GAP = 12;
+const ENDPOINT_MARGIN = 8;
+const ARC_RADIUS = 4;
 
 const TYPE_ORDER = ["epic", "feature", "bug", "task", "chore"];
 const OPEN_STATUS_ORDER = [
@@ -428,57 +427,38 @@ function attributeClusters(
   );
 }
 
-/**
- * Ranks are longest paths from the sources. Links join the ranking one by one, parent links first,
- * and a link that would close a loop is left out, so the hierarchy always reads left to right and
- * a dependency against it is drawn backward.
- */
-function rankCluster(
-  items: ReadonlyArray<Item>,
-  members: ReadonlyArray<number>,
-  edges: ReadonlyArray<RawEdge>,
-): { ranks: Map<number, number>; predecessors: Map<number, Array<number>> } {
-  const order = (index: number) => items[index]!.order;
-  const successors = new Map<number, Array<number>>(members.map((index) => [index, []]));
-  const predecessors = new Map<number, Array<number>>(members.map((index) => [index, []]));
-  const reaches = (start: number, target: number) => {
-    const seen = new Set<number>([start]);
-    const stack = [start];
-    while (stack.length > 0) {
-      const node = stack.pop()!;
-      if (node === target) return true;
-      for (const next of successors.get(node)!) {
-        if (!seen.has(next)) {
-          seen.add(next);
-          stack.push(next);
-        }
-      }
+/** Blockers above what they block where the links allow, else the current order. */
+function orderSiblings(
+  group: ReadonlyArray<number>,
+  blocks: ReadonlyMap<number, ReadonlyArray<number>>,
+  order: (index: number) => number,
+): Array<number> {
+  const pending = group.toSorted((a, b) => order(a) - order(b));
+  const members = new Set(group);
+  const waiting = new Map<number, number>(group.map((index) => [index, 0]));
+  for (const index of group) {
+    for (const next of blocks.get(index) ?? []) {
+      if (members.has(next)) waiting.set(next, waiting.get(next)! + 1);
     }
-    return false;
-  };
-  const candidates = edges.toSorted(
-    (a, b) =>
-      Number(a.kind === "blocks") - Number(b.kind === "blocks") ||
-      order(a.from) - order(b.from) ||
-      order(a.to) - order(b.to),
-  );
-  for (const { from, to } of candidates) {
-    if (successors.get(from)!.includes(to) || reaches(to, from)) continue;
-    successors.get(from)!.push(to);
-    predecessors.get(to)!.push(from);
   }
-  const ranks = new Map<number, number>();
-  const rankOf = (node: number): number => {
-    const known = ranks.get(node);
-    if (known !== undefined) return known;
-    const rank = Math.max(0, ...predecessors.get(node)!.map((from) => rankOf(from) + 1));
-    ranks.set(node, rank);
-    return rank;
-  };
-  for (const index of members.toSorted((a, b) => order(a) - order(b))) rankOf(index);
-  return { ranks, predecessors };
+  const ordered: Array<number> = [];
+  while (pending.length > 0) {
+    // In a cycle nothing is free; the earliest card goes next and the rest follow.
+    const free = pending.findIndex((index) => waiting.get(index) === 0);
+    const [next] = pending.splice(Math.max(free, 0), 1);
+    ordered.push(next!);
+    for (const blocked of blocks.get(next!) ?? []) {
+      if (members.has(blocked)) waiting.set(blocked, waiting.get(blocked)! - 1);
+    }
+  }
+  return ordered;
 }
 
+/**
+ * Linked issues form an indented list: each parent, then its sub-tasks in depth-first order, joined
+ * by folder-tree lines on the left. Blocking links are arcs on the right, nested by span in a
+ * gutter past the widest card. Issues with no link in the region fill a grid below the list.
+ */
 function placeRegion(
   projectId: string,
   items: ReadonlyArray<Item>,
@@ -488,108 +468,220 @@ function placeRegion(
   size: IssueGraphSize,
 ): IssueGraphRegion {
   const { nodeWidth, nodeHeight, labelHeight } = size;
+  const order = (index: number) => items[index]!.order;
   const memberSet = new Set(cluster.members);
   const regionEdges = edges.filter((edge) => memberSet.has(edge.from) && memberSet.has(edge.to));
   const linked = new Set<number>();
-  const parentsOf = new Map<number, Array<number>>();
+  const parentOf = new Map<number, number>();
+  const blocks = new Map<number, Array<number>>();
   for (const edge of regionEdges) {
     linked.add(edge.from).add(edge.to);
-    if (edge.kind === "parent")
-      parentsOf.set(edge.to, [...(parentsOf.get(edge.to) ?? []), edge.from]);
+    if (edge.kind === "parent") {
+      if (!parentOf.has(edge.to)) parentOf.set(edge.to, edge.from);
+    } else {
+      let next = blocks.get(edge.from);
+      if (next === undefined) blocks.set(edge.from, (next = []));
+      next.push(edge.to);
+    }
   }
-  const { ranks, predecessors } = rankCluster(
-    items,
-    cluster.members.filter((index) => linked.has(index)),
-    regionEdges,
-  );
-  const columns: Array<Array<number>> = [];
-  for (const [index, rank] of ranks) (columns[rank] ??= []).push(index);
-  const row = new Map<number, number>();
-  const column = new Map<number, number>();
-  columns.forEach((members, rank) => {
-    const barycenter = new Map<number, number>();
-    if (rank > 0) {
-      for (const index of members) {
-        const preds = predecessors.get(index)!;
-        barycenter.set(index, preds.reduce((sum, from) => sum + row.get(from)!, 0) / preds.length);
+  const listed = [...linked].toSorted((a, b) => order(a) - order(b));
+  const childrenOf = new Map<number, Array<number>>();
+  for (const index of listed) {
+    const parent = parentOf.get(index);
+    if (parent === undefined) continue;
+    let children = childrenOf.get(parent);
+    if (children === undefined) childrenOf.set(parent, (children = []));
+    children.push(index);
+  }
+
+  // Depth-first pre-order. A parent cycle has no top; its earliest card starts it at depth 0.
+  const rows: Array<number> = [];
+  const depth = new Map<number, number>();
+  const treeParent = new Map<number, number>();
+  const visit = (root: number) => {
+    const stack = [{ index: root, level: 0, parent: -1 }];
+    while (stack.length > 0) {
+      const { index, level, parent } = stack.pop()!;
+      if (depth.has(index)) continue;
+      depth.set(index, level);
+      if (parent !== -1) treeParent.set(index, parent);
+      rows.push(index);
+      const children = orderSiblings(childrenOf.get(index) ?? [], blocks, order);
+      for (let i = children.length - 1; i >= 0; i--) {
+        if (!depth.has(children[i]!))
+          stack.push({ index: children[i]!, level: level + 1, parent: index });
       }
     }
-    members.sort(
+  };
+  const roots = listed.filter((index) => !parentOf.has(index));
+  for (const root of orderSiblings(roots, blocks, order)) visit(root);
+  for (const index of listed) if (!depth.has(index)) visit(index);
+  const rowOf = new Map(rows.map((index, row) => [index, row]));
+
+  // Arcs nest by span: the shortest takes the innermost free level, so arcs on one level never
+  // share a row and arcs on different levels never share a gutter segment.
+  const arcs = regionEdges
+    .filter((edge) => edge.kind === "blocks")
+    .map((edge) => {
+      const [a, b] = [rowOf.get(edge.from)!, rowOf.get(edge.to)!];
+      return { edge, low: Math.min(a, b), high: Math.max(a, b), level: 0 };
+    })
+    .toSorted(
       (a, b) =>
-        (barycenter.get(a) ?? 0) - (barycenter.get(b) ?? 0) || items[a]!.order - items[b]!.order,
+        a.high - a.low - (b.high - b.low) || a.low - b.low || compareIds(a.edge.id, b.edge.id),
     );
-    let next = 0;
-    for (const index of members) {
-      // A sub-task sits below its parent, as in a folder tree, so its connector can turn down.
-      for (const parent of parentsOf.get(index) ?? []) {
-        if (column.has(parent)) next = Math.max(next, row.get(parent)! + 1);
-      }
-      row.set(index, next);
-      column.set(index, rank);
-      next++;
+  // Each row keeps a bitset of the levels its arcs use; an arc takes the lowest level free in
+  // every row of its span.
+  let words = 1;
+  let levelCount = 0;
+  let used = Array.from({ length: rows.length }, () => new Uint32Array(words));
+  const seen = new Uint32Array(Math.ceil(arcs.length / 32) + 1);
+  for (const arc of arcs) {
+    const active = Math.ceil(levelCount / 32);
+    seen.fill(0, 0, active);
+    for (let row = arc.low; row <= arc.high; row++) {
+      const bits = used[row]!;
+      for (let word = 0; word < active; word++) seen[word]! |= bits[word]!;
     }
-  });
-  // Issues with no link inside the region fill a grid beside the ranked part, not one tall column.
-  const loose = cluster.members
-    .filter((index) => !linked.has(index))
-    .toSorted((a, b) => items[a]!.order - items[b]!.order);
-  loose.forEach((index, position) => {
-    row.set(index, Math.floor(position / GRID_COLUMNS));
-    column.set(index, columns.length + (position % GRID_COLUMNS));
-  });
+    let level = active * 32;
+    for (let word = 0; word < active; word++) {
+      const free = ~seen[word]! >>> 0;
+      if (free !== 0) {
+        level = word * 32 + 31 - Math.clz32(free & -free);
+        break;
+      }
+    }
+    if (level >= words * 32) {
+      words *= 2;
+      used = used.map((bits) => {
+        const grown = new Uint32Array(words);
+        grown.set(bits);
+        return grown;
+      });
+    }
+    for (let row = arc.low; row <= arc.high; row++) used[row]![level >> 5]! |= 1 << (level & 31);
+    levelCount = Math.max(levelCount, level + 1);
+    arc.level = level;
+  }
+
+  // Ends on one card: arcs going up above arcs going down; inner arcs nearer the far side, so
+  // no arc's leg crosses another arc of the same card.
+  const ends = new Map<
+    number,
+    Array<{ readonly arc: (typeof arcs)[number]; readonly up: boolean }>
+  >();
+  for (const arc of arcs) {
+    for (const [index, other] of [
+      [arc.edge.from, arc.edge.to],
+      [arc.edge.to, arc.edge.from],
+    ] as const) {
+      let list = ends.get(index);
+      if (list === undefined) ends.set(index, (list = []));
+      list.push({ arc, up: rowOf.get(other)! < rowOf.get(index)! });
+    }
+  }
+  for (const list of ends.values()) {
+    list.sort(
+      (a, b) =>
+        Number(a.up ? 0 : 1) - Number(b.up ? 0 : 1) ||
+        (a.up ? a.arc.level - b.arc.level : b.arc.level - a.arc.level) ||
+        compareIds(a.arc.edge.id, b.arc.edge.id),
+    );
+  }
 
   const external = new Map(
     cluster.members.map((index) => [index, externalBlockersOf(items, blockers[index]!, memberSet)]),
   );
-  // Rows stay aligned across columns, so row and column gaps stay free for links to run in.
-  const rowCount = Math.max(...cluster.members.map((index) => row.get(index)! + 1));
-  const rowHeights = Array.from({ length: rowCount }, () => nodeHeight);
-  for (const index of cluster.members) {
-    if (external.get(index) !== null) rowHeights[row.get(index)!] = nodeHeight + labelHeight;
-  }
-  const rowTops: Array<number> = [];
-  rowHeights.reduce((top, height, index) => {
-    rowTops[index] = top;
-    return top + height + ROW_GAP;
-  }, REGION_PADDING);
-
-  const gridColumns = Math.min(loose.length, GRID_COLUMNS);
-  // A link back into the first column turns left of it, so that column moves right to make room.
-  const left =
-    REGION_PADDING +
-    (regionEdges.some((edge) => column.get(edge.to) === 0 && column.get(edge.from)! > 0)
-      ? EDGE_BOW
-      : 0);
+  const cardHeight = (index: number) =>
+    Math.max(
+      nodeHeight + (external.get(index) === null ? 0 : labelHeight),
+      ((ends.get(index)?.length ?? 1) - 1) * ENDPOINT_GAP + 2 * ENDPOINT_MARGIN,
+    );
   const nodeAt = new Map<number, IssueGraphNode>();
-  const nodes = [...columns.flat(), ...loose].map((index) => {
-    const externalBlockers = external.get(index)!;
+  const place = (index: number, x: number, y: number, height: number) => {
     const node: IssueGraphNode = {
       id: items[index]!.id,
       entry: items[index]!.entry,
-      x: left + columnX(column.get(index)!, columns.length, nodeWidth),
-      y: rowTops[row.get(index)!]!,
+      x,
+      y,
       width: nodeWidth,
-      height: nodeHeight + (externalBlockers === null ? 0 : labelHeight),
-      externalBlockers,
+      height,
+      externalBlockers: external.get(index)!,
     };
     nodeAt.set(index, node);
     return node;
+  };
+  let bottom = REGION_PADDING - ROW_GAP;
+  for (const index of rows) {
+    const height = cardHeight(index);
+    place(index, REGION_PADDING + depth.get(index)! * INDENT, bottom + ROW_GAP, height);
+    bottom += ROW_GAP + height;
+  }
+  const listRight = Math.max(0, ...rows.map((index) => nodeAt.get(index)!.x + nodeWidth));
+  const gutterX = (level: number) => listRight + GUTTER_GAP + level * LEVEL_GAP;
+
+  // Issues with no link inside the region fill a grid below the list.
+  const loose = cluster.members
+    .filter((index) => !linked.has(index))
+    .toSorted((a, b) => order(a) - order(b));
+  for (let start = 0; start < loose.length; start += GRID_COLUMNS) {
+    const line = loose.slice(start, start + GRID_COLUMNS);
+    const height = Math.max(...line.map(cardHeight));
+    line.forEach((index, column) => {
+      place(
+        index,
+        REGION_PADDING + column * (nodeWidth + GRID_GAP),
+        bottom + ROW_GAP,
+        cardHeight(index),
+      );
+    });
+    bottom += ROW_GAP + height;
+  }
+
+  const endY = (index: number, arc: (typeof arcs)[number]) => {
+    const node = nodeAt.get(index)!;
+    const list = ends.get(index)!;
+    const position = list.findIndex((end) => end.arc === arc);
+    return node.y + node.height / 2 + (position - (list.length - 1) / 2) * ENDPOINT_GAP;
+  };
+  const arcPath = new Map(
+    arcs.map((arc) => {
+      const [from, to] = [nodeAt.get(arc.edge.from)!, nodeAt.get(arc.edge.to)!];
+      const [y1, y2] = [endY(arc.edge.from, arc), endY(arc.edge.to, arc)];
+      const x = gutterX(arc.level);
+      const turn = Math.sign(y2 - y1) * Math.min(ARC_RADIUS, Math.abs(y2 - y1) / 2);
+      const radius = Math.abs(turn);
+      return [
+        arc.edge.id,
+        `M ${from.x + from.width} ${y1} H ${x - radius} Q ${x} ${y1} ${x} ${y1 + turn} ` +
+          `V ${y2 - turn} Q ${x} ${y2} ${x - radius} ${y2} H ${to.x + to.width}`,
+      ] as const;
+    }),
+  );
+  const placedEdges = regionEdges.flatMap((edge): Array<IssueGraphEdge> => {
+    const from = nodeAt.get(edge.from)!;
+    const to = nodeAt.get(edge.to)!;
+    const base = { id: edge.id, from: from.id, to: to.id };
+    if (edge.kind === "blocks") {
+      const blockerOpen = items[edge.from]!.entry.state.category !== "closed";
+      return [{ ...base, kind: "blocks", blockerOpen, path: arcPath.get(edge.id)! }];
+    }
+    // Only the link the list follows; a parent cycle's closing link is not drawn.
+    if (treeParent.get(edge.to) !== edge.from) return [];
+    const entry = to.y + Math.min(TREE_ENTRY, to.height / 2);
+    return [
+      {
+        ...base,
+        kind: "parent",
+        path: `M ${from.x + TRUNK_INSET} ${from.y + from.height} V ${entry} H ${to.x}`,
+      },
+    ];
   });
-  const lastColumn = columns.length + gridColumns - 1;
-  const cardsRight =
-    lastColumn < 0
-      ? left + REGION_PADDING
-      : left + columnX(lastColumn, columns.length, nodeWidth) + nodeWidth + REGION_PADDING;
-  const routed = routeEdges({
-    items,
-    edges: regionEdges,
-    nodeAt,
-    column,
-    row,
-    rowTops,
-    rowHeights,
-    gapLeft: (index) => left + columnX(index, columns.length, nodeWidth) + nodeWidth,
-  });
+
+  const gridRight =
+    loose.length === 0
+      ? 0
+      : REGION_PADDING + Math.min(loose.length, GRID_COLUMNS) * (nodeWidth + GRID_GAP) - GRID_GAP;
   return {
     id: `${projectId}:${cluster.id}`,
     kind: cluster.kind,
@@ -599,263 +691,11 @@ function placeRegion(
         ? null
         : (items.find((item) => item.id === cluster.rootNodeId)?.entry ?? null),
     issueCount: cluster.members.length,
-    // A link can run past the last column; the region scrolls far enough to show it.
-    width: Math.max(cardsRight, routed.maxX + REGION_PADDING),
-    height: Math.max(
-      REGION_PADDING * 2 +
-        rowHeights.reduce((sum, height) => sum + height, 0) +
-        (rowCount - 1) * ROW_GAP,
-      routed.maxY + REGION_PADDING,
-    ),
-    nodes,
-    edges: routed.edges,
+    width:
+      Math.max(listRight, gridRight, levelCount === 0 ? 0 : gutterX(levelCount - 1)) +
+      REGION_PADDING,
+    height: bottom + REGION_PADDING,
+    nodes: [...rows, ...loose].map((index) => nodeAt.get(index)!),
+    edges: placedEdges,
   };
-}
-
-function columnX(column: number, rankedColumns: number, nodeWidth: number): number {
-  if (column < rankedColumns) return column * (nodeWidth + RANK_GAP);
-  return rankedColumns * (nodeWidth + RANK_GAP) + (column - rankedColumns) * (nodeWidth + GRID_GAP);
-}
-
-interface Run {
-  readonly channel: string;
-  readonly owner: string;
-  readonly from: number;
-  readonly to: number;
-  /** A run that only passes through a gap takes tracks after the gap's own trunks. */
-  readonly passing?: boolean;
-}
-
-/**
- * Parallel tracks inside the gaps links run in. One owner keeps one track per gap, so siblings
- * share their parent's trunk; owners whose runs overlap in a gap get different tracks.
- */
-function assignTracks(runs: ReadonlyArray<Run>): (channel: string, owner: string) => number {
-  const key = (channel: string, owner: string) => `${channel}\u0000${owner}`;
-  const merged = new Map<string, Run>();
-  for (const run of runs) {
-    const previous = merged.get(key(run.channel, run.owner));
-    const low = Math.min(run.from, run.to, previous?.from ?? Infinity);
-    const high = Math.max(run.from, run.to, previous?.to ?? -Infinity);
-    merged.set(key(run.channel, run.owner), { ...run, from: low, to: high });
-  }
-  const byChannel = new Map<string, Array<Run>>();
-  for (const run of merged.values()) {
-    byChannel.set(run.channel, [...(byChannel.get(run.channel) ?? []), run]);
-  }
-  const tracks = new Map<string, number>();
-  for (const channelRuns of byChannel.values()) {
-    const taken: Array<Array<Run>> = [];
-    const sorted = channelRuns.toSorted(
-      (a, b) =>
-        Number(a.passing ?? false) - Number(b.passing ?? false) ||
-        a.from - b.from ||
-        a.to - b.to ||
-        compareIds(a.owner, b.owner),
-    );
-    for (const run of sorted) {
-      let track = 0;
-      while (taken[track]?.some((other) => other.from <= run.to && run.from <= other.to)) track++;
-      (taken[track] ??= []).push(run);
-      tracks.set(key(run.channel, run.owner), track);
-    }
-  }
-  return (channel, owner) => tracks.get(key(channel, owner)) ?? 0;
-}
-
-const offsetOf = (offsets: ReadonlyArray<number>, track: number) =>
-  offsets[track % offsets.length]!;
-
-function routeEdges({
-  items,
-  edges,
-  nodeAt,
-  column,
-  row,
-  rowTops,
-  rowHeights,
-  gapLeft,
-}: {
-  items: ReadonlyArray<Item>;
-  edges: ReadonlyArray<RawEdge>;
-  nodeAt: ReadonlyMap<number, IssueGraphNode>;
-  column: ReadonlyMap<number, number>;
-  row: ReadonlyMap<number, number>;
-  rowTops: ReadonlyArray<number>;
-  rowHeights: ReadonlyArray<number>;
-  /** Left side of the gap to the right of a column. */
-  gapLeft: (column: number) => number;
-}): { edges: Array<IssueGraphEdge>; maxX: number; maxY: number } {
-  const half = RANK_GAP / 2;
-  const contentBottom = rowTops[rowTops.length - 1]! + rowHeights[rowHeights.length - 1]!;
-  const occupied = new Set(
-    [...nodeAt.keys()].map((index) => `${column.get(index)}:${row.get(index)}`),
-  );
-  const treeEntryY = (to: IssueGraphNode) => to.y + Math.min(TREE_ENTRY, to.height / 2);
-
-  // Tree connectors. A child more than one column right reaches its column through a lane: the
-  // first row below the parent with no card in the columns it crosses, else a lane under them all.
-  const parentEdges = edges.filter((edge) => edge.kind === "parent");
-  const forward = (edge: RawEdge) => column.get(edge.to)! > column.get(edge.from)!;
-  const farthest = new Map<number, number>();
-  for (const edge of parentEdges) {
-    if (forward(edge) && column.get(edge.to)! > column.get(edge.from)! + 1) {
-      farthest.set(edge.from, Math.max(farthest.get(edge.from) ?? 0, column.get(edge.to)!));
-    }
-  }
-  const lanes = new Map<number, { channel: string; row: number | null }>();
-  const laneRuns: Array<Run> = [];
-  for (const [parent, last] of farthest) {
-    const first = column.get(parent)! + 1;
-    let laneRow: number | null = null;
-    for (let r = row.get(parent)! + 1; r < rowTops.length && laneRow === null; r++) {
-      let free = true;
-      for (let c = first; c < last; c++) if (occupied.has(`${c}:${r}`)) free = false;
-      if (free) laneRow = r;
-    }
-    const channel = laneRow === null ? "lane:bottom" : `lane:${laneRow}`;
-    lanes.set(parent, { channel, row: laneRow });
-    laneRuns.push({ channel, owner: String(parent), from: first - 1, to: last - 1 });
-  }
-  const laneTrack = assignTracks(laneRuns);
-  const laneY = (parent: number) => {
-    const lane = lanes.get(parent)!;
-    const track = laneTrack(lane.channel, String(parent));
-    return lane.row === null
-      ? contentBottom + ROW_GAP + track * TRACK_GAP
-      : rowTops[lane.row]! + rowHeights[lane.row]! / 2 + offsetOf(LANE_TRACK_OFFSETS, track);
-  };
-  const treeRuns: Array<Run> = [];
-  for (const edge of parentEdges.filter(forward)) {
-    const from = nodeAt.get(edge.from)!;
-    const to = nodeAt.get(edge.to)!;
-    const [start, end] = [column.get(edge.from)!, column.get(edge.to)!];
-    const dropY = from.y + from.height + ROW_GAP / 2;
-    const owner = String(edge.from);
-    if (end === start + 1) {
-      treeRuns.push({ channel: `${start}`, owner, from: dropY, to: treeEntryY(to) });
-    } else {
-      const lane = laneY(edge.from);
-      treeRuns.push({ channel: `${start}`, owner, from: dropY, to: lane });
-      // Left of the trunks there, so their entries into children never cross it.
-      treeRuns.push({
-        channel: `${end - 1}`,
-        owner,
-        from: lane,
-        to: treeEntryY(to),
-        passing: true,
-      });
-    }
-  }
-  const treeTrack = assignTracks(treeRuns);
-  const trackX = (gap: number, owner: number) =>
-    gapLeft(gap) + half + offsetOf(TREE_TRACK_OFFSETS, treeTrack(`${gap}`, String(owner)));
-
-  // Arrows into one card spread along its left edge, below a tree connector's entry, in the
-  // order of their sources, so none ends under another's arrowhead.
-  const blocksEdges = edges.filter((edge) => edge.kind === "blocks");
-  const entryY = new Map<string, number>();
-  const hasTreeEntry = new Set(parentEdges.map((edge) => edge.to));
-  const incomingOf = new Map<number, Array<RawEdge>>();
-  for (const edge of blocksEdges)
-    incomingOf.set(edge.to, [...(incomingOf.get(edge.to) ?? []), edge]);
-  for (const [target, incoming] of incomingOf) {
-    const to = nodeAt.get(target)!;
-    const top = hasTreeEntry.has(target) ? treeEntryY(to) : to.y;
-    const sorted = incoming.toSorted((a, b) => {
-      const [fa, fb] = [nodeAt.get(a.from)!, nodeAt.get(b.from)!];
-      return fa.y + fa.height / 2 - (fb.y + fb.height / 2) || fa.x - fb.x || compareIds(a.id, b.id);
-    });
-    sorted.forEach((edge, position) => {
-      entryY.set(edge.id, top + ((to.y + to.height - top) * (position + 1)) / (sorted.length + 1));
-    });
-  }
-  // A backward arrow, or one skipping a column, crosses in the row gap above the higher of its two
-  // cards, on its own track there.
-  const crossesGap = (from: IssueGraphNode, to: IssueGraphNode) =>
-    to.x < from.x + from.width || to.x - (from.x + from.width) > from.width + EDGE_BOW;
-  const crossingRow = (edge: RawEdge) => Math.min(row.get(edge.from)!, row.get(edge.to)!);
-  const arrowTrack = assignTracks(
-    blocksEdges.flatMap((edge) => {
-      const [from, to] = [nodeAt.get(edge.from)!, nodeAt.get(edge.to)!];
-      if (!crossesGap(from, to)) return [];
-      const sx = from.x + from.width;
-      return [
-        {
-          channel: `${crossingRow(edge)}`,
-          owner: edge.id,
-          from: sx + EDGE_BOW,
-          to: to.x - EDGE_BOW,
-        },
-      ];
-    }),
-  );
-
-  let maxX = 0;
-  let maxY = 0;
-  const routed = edges.map((edge): IssueGraphEdge => {
-    const from = nodeAt.get(edge.from)!;
-    const to = nodeAt.get(edge.to)!;
-    const base = { id: edge.id, from: from.id, to: to.id };
-    if (edge.kind === "parent") {
-      const start = column.get(edge.from)!;
-      const end = column.get(edge.to)!;
-      const dropX = from.x + from.width - TREE_DROP_INSET;
-      const bottom = from.y + from.height;
-      const dropY = bottom + ROW_GAP / 2;
-      const ty = treeEntryY(to);
-      let legs: string;
-      if (end === start + 1) {
-        legs = `H ${trackX(start, edge.from)} V ${ty}`;
-      } else if (end > start) {
-        const lane = laneY(edge.from);
-        maxY = Math.max(maxY, lane);
-        legs = `H ${trackX(start, edge.from)} V ${lane} H ${trackX(end - 1, edge.from)} V ${ty}`;
-      } else {
-        // Behind its parent, only possible in a parent cycle: over in the row gap above it.
-        legs = `H ${from.x + from.width + half} V ${to.y - ROW_GAP / 2} H ${to.x - half} V ${ty}`;
-      }
-      maxX = Math.max(maxX, from.x + from.width + half);
-      return { ...base, kind: "parent", path: `M ${dropX} ${bottom} V ${dropY} ${legs} H ${to.x}` };
-    }
-    const ty = entryY.get(edge.id)!;
-    const gapY = crossesGap(from, to)
-      ? rowTops[crossingRow(edge)]! -
-        ROW_GAP / 2 +
-        offsetOf(ARROW_TRACK_OFFSETS, arrowTrack(`${crossingRow(edge)}`, edge.id))
-      : null;
-    const { path, maxX: right } = edgePath(from, to, ty, gapY);
-    maxX = Math.max(maxX, right);
-    return {
-      ...base,
-      kind: "blocks",
-      blockerOpen: items[edge.from]!.entry.state.category !== "closed",
-      path,
-    };
-  });
-  return { edges: routed, maxX, maxY };
-}
-
-function edgePath(
-  from: IssueGraphNode,
-  to: IssueGraphNode,
-  ty: number,
-  gapY: number | null,
-): { readonly path: string; readonly maxX: number } {
-  const sx = from.x + from.width;
-  const sy = from.y + from.height / 2;
-  const tx = to.x;
-  if (gapY !== null) {
-    // Backward or skipping a column: rise inside the column gap, cross in the row gap above,
-    // then come down, so the edge never runs behind the cards it passes.
-    const bow = EDGE_BOW / 2;
-    return {
-      path:
-        `M ${sx} ${sy} C ${sx + bow} ${sy}, ${sx + bow} ${gapY}, ${sx + EDGE_BOW} ${gapY} ` +
-        `L ${tx - EDGE_BOW} ${gapY} C ${tx - bow} ${gapY}, ${tx - bow} ${ty}, ${tx} ${ty}`,
-      maxX: Math.max(sx + EDGE_BOW, tx),
-    };
-  }
-  const pull = Math.max(EDGE_BOW / 2, (tx - sx) / 2);
-  return { path: `M ${sx} ${sy} C ${sx + pull} ${sy}, ${tx - pull} ${ty}, ${tx} ${ty}`, maxX: tx };
 }
