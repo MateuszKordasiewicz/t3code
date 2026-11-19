@@ -51,9 +51,11 @@ jobs:
           echo "##vso[task.prependpath]$VP_HOME/bin"
         displayName: Install Vite+ and Node.js
 
+      - bash: vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/scripts... --frozen-lockfile
+        displayName: Install dependencies
+
       - bash: |
           set -euo pipefail
-          node --version
           sha="$(Build.SourceVersion)"
           # The commit's date, not the clock, so a re-run cannot rank an old commit above newer builds.
           date="$(TZ=UTC git show -s --format=%cd --date=format-local:%Y%m%d "$sha")"
@@ -75,9 +77,6 @@ jobs:
             echo "##vso[task.setvariable variable=T3CODE_${key}]$value"
           done
         displayName: Resolve version
-
-      - bash: vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/scripts... --frozen-lockfile
-        displayName: Install dependencies
 
       # Otherwise the binary reports the previous version and the smoke test fails.
       - bash: node scripts/update-release-package-versions.ts "$(T3_VERSION)"
