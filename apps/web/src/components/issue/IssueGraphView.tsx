@@ -287,7 +287,8 @@ function IssueGraphCard({
 }) {
   const gt = useGT();
   const { entry, externalBlockers } = node;
-  const blockers = entry.dependsOnKeys ?? [];
+  // An issue listed as its own blocker is malformed data; the layout drops it, so this does too.
+  const blockers = (entry.dependsOnKeys ?? []).filter((key) => key !== entry.key);
   const threadStatus = useIssueThreadStatus(entry.environmentId, entry);
   const blockedBy = externalBlockers
     ? gt("Blocked by {keys}", { keys: externalBlockers.keys.join(", ") })
@@ -359,16 +360,13 @@ function IssueGraphCard({
       className="absolute"
       style={{ left: node.x, top: node.y, width: node.width, height: node.height }}
     >
-      {externalBlockers ? (
-        // The label truncates on a narrow card; hover or focus shows every name. Screen readers
-        // already hear them in the button's sr-only line, so the popup stays hidden from them.
-        <Tooltip>
-          <TooltipTrigger render={card} />
-          <TooltipPopup aria-hidden>{blockedBy}</TooltipPopup>
-        </Tooltip>
-      ) : (
-        card
-      )}
+      {/* The label truncates on a narrow card; hover or focus shows every name. Screen readers
+          already hear them in the button's sr-only line, so the popup stays hidden from them.
+          Always mounted, so a refresh that adds or drops the label keeps the card's focus. */}
+      <Tooltip disabled={!externalBlockers}>
+        <TooltipTrigger render={card} />
+        <TooltipPopup aria-hidden>{blockedBy}</TooltipPopup>
+      </Tooltip>
       {threadStatus ? (
         // On the title line at any text size: 1px border plus px-2.5 across, and below the 2.5rem
         // of content centred in the card's fixed height, or above the 1.25rem blocked-by line.

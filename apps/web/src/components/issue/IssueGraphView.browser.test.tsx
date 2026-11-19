@@ -64,3 +64,36 @@ it("shows every blocked-by name on hover and on keyboard focus, and announces th
   expect(document.activeElement).toBe(card.element());
   await vi.waitFor(() => expect(popupText()).toBe(full));
 });
+
+it("keeps keyboard focus on a card when a refresh draws its missing blocker", async () => {
+  const blocked = { ...entry, dependsOnKeys: ["t3-b"] };
+  const blocker = {
+    ...entry,
+    key: "t3-b",
+    displayKey: "t3-b",
+    title: "Blocker card",
+    url: "beads://t3-b",
+    dependsOnKeys: [],
+  };
+  const onSelect = vi.fn();
+  await using screen = await render(
+    <IssueGraphView entries={[blocked]} groupBy="tree" selectedId={null} onSelect={onSelect} />,
+  );
+  const card = page.getByRole("button", { name: /Blocked card/ });
+  for (let i = 0; i < 5 && document.activeElement !== card.element(); i++) await userEvent.tab();
+  await expect.element(card).toHaveFocus();
+
+  await screen.rerender(
+    <IssueGraphView
+      entries={[blocker, blocked]}
+      groupBy="tree"
+      selectedId={null}
+      onSelect={onSelect}
+    />,
+  );
+  // The blocker is now drawn as an arrow, so the label and its tooltip are gone.
+  await expect.element(page.getByText("Blocker card")).toBeVisible();
+  await expect.element(card).toHaveFocus();
+  await userEvent.keyboard("{Enter}");
+  expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ key: "t3-x" }));
+});
