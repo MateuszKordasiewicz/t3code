@@ -69,7 +69,7 @@ type ClusterKind = IssueGraphCluster["kind"];
 interface Item {
   readonly id: string;
   readonly entry: EnvironmentIssueEntry;
-  /** Position in the global priority-then-key order, used for every tie-break. */
+  /** Position in the global priority-then-input order, used for every tie-break. */
   order: number;
 }
 
@@ -95,14 +95,6 @@ function scopeRef(entry: EnvironmentIssueEntry, key: string): string {
 
 function priorityOf(entry: EnvironmentIssueEntry): number {
   return entry.priority ?? Number.POSITIVE_INFINITY;
-}
-
-function compareEntries(a: Item, b: Item): number {
-  return (
-    priorityOf(a.entry) - priorityOf(b.entry) ||
-    collator.compare(a.entry.key, b.entry.key) ||
-    (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
-  );
 }
 
 function typeRank(type: string): [number, string] {
@@ -144,9 +136,10 @@ export function layoutIssueGraph(
     seenIds.add(id);
     items.push({ id, entry, order: 0 });
   }
+  // Within a priority, the list's chosen sort order decides, so the Sort control applies here too.
   const sorted = items
     .map((_, index) => index)
-    .toSorted((a, b) => compareEntries(items[a]!, items[b]!));
+    .toSorted((a, b) => priorityOf(items[a]!.entry) - priorityOf(items[b]!.entry) || a - b);
   sorted.forEach((index, order) => {
     items[index]!.order = order;
   });
@@ -244,7 +237,12 @@ function treeClusters(
     let group = 0;
     if (root.kind === "missing") {
       cluster = { id: `tree:missing:${root.ref}`, kind: "tree", label: root.key, rootNodeId: null };
-    } else if (root.index === index && parentOf[index] === null && !hasChildren.has(index)) {
+    } else if (
+      root.index === index &&
+      parentOf[index] === null &&
+      !hasChildren.has(index) &&
+      entry.issueType !== "epic"
+    ) {
       const type = entry.issueType ?? "";
       cluster = { id: `loose:${type}`, kind: "loose", label: type, rootNodeId: null };
       group = 1;
@@ -498,6 +496,11 @@ function edgePath(from: IssueGraphNode, to: IssueGraphNode): string {
     return `M ${sx} ${sy} C ${sx + bow} ${sy}, ${sx + bow} ${ty}, ${sx} ${ty}`;
   }
   const tx = to.x;
+  if (tx - sx > from.width + EDGE_BOW) {
+    // Skips a column: arc so the curve peaks in the row gap above, not behind the cards between.
+    const lift = Math.min(sy, ty) - (from.height / 2 + ROW_GAP / 2) / 0.75;
+    return `M ${sx} ${sy} C ${sx + EDGE_BOW} ${lift}, ${tx - EDGE_BOW} ${lift}, ${tx} ${ty}`;
+  }
   const pull = tx > sx ? Math.max(EDGE_BOW / 2, (tx - sx) / 2) : EDGE_BOW + (sx - tx) / 4;
   return `M ${sx} ${sy} C ${sx + pull} ${sy}, ${tx - pull} ${ty}, ${tx} ${ty}`;
 }

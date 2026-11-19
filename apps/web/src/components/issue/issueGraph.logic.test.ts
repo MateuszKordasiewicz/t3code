@@ -65,6 +65,8 @@ describe("layoutIssueGraph", () => {
         issue("chore-1", { issueType: "chore" }),
         issue("bug-2", { issueType: "bug" }),
         issue("gh-1"),
+        // An epic with every slice filtered out still gets its own band.
+        issue("epic-solo", { issueType: "epic" }),
         // Same issue read twice: drawn once.
         issue("bug-2", { issueType: "bug" }),
       ],
@@ -74,13 +76,14 @@ describe("layoutIssueGraph", () => {
     expect(clusterKeys(layout)).toEqual([
       { kind: "tree", label: "epic-hidden", keys: ["h.1", "h.2"] },
       { kind: "tree", label: "epic-a", keys: ["a.1", "a.1.1", "epic-a"] },
+      { kind: "tree", label: "epic-solo", keys: ["epic-solo"] },
       { kind: "loose", label: "bug", keys: ["bug-1", "bug-2"] },
       { kind: "loose", label: "chore", keys: ["chore-1"] },
       { kind: "loose", label: "", keys: ["gh-1"] },
     ]);
     expect(layout.clusters[0]!.rootNodeId).toBeNull();
     expect(layout.clusters[1]!.rootNodeId).toBe(nodeId("epic-a"));
-    expect(layout.nodes).toHaveLength(9);
+    expect(layout.nodes).toHaveLength(10);
     // Bands stack top to bottom without overlapping.
     for (let i = 1; i < layout.clusters.length; i++) {
       const above = layout.clusters[i - 1]!;
@@ -114,7 +117,7 @@ describe("layoutIssueGraph", () => {
   it("ranks blockers left of what they block and survives dependency cycles", () => {
     const chain = layoutIssueGraph(
       [
-        issue("c", { issueType: "task", dependsOnKeys: ["b"] }),
+        issue("c", { issueType: "task", dependsOnKeys: ["b", "a"] }),
         issue("b", { issueType: "task", dependsOnKeys: ["a"] }),
         issue("a", { issueType: "task" }),
         issue("side", { issueType: "task", dependsOnKeys: ["a"] }),
@@ -124,6 +127,10 @@ describe("layoutIssueGraph", () => {
     expect(nodeOf(chain, "a").x).toBeLessThan(nodeOf(chain, "b").x);
     expect(nodeOf(chain, "b").x).toBeLessThan(nodeOf(chain, "c").x);
     expect(nodeOf(chain, "side").x).toBe(nodeOf(chain, "b").x);
+    // a -> c skips b's column, so it arcs above the row instead of running behind b.
+    const skip = chain.edges.find((edge) => edge.from === nodeId("a") && edge.to === nodeId("c"))!;
+    const controlY = Number(skip.path.split(/[ ,]+/)[5]);
+    expect(controlY).toBeLessThan(nodeOf(chain, "b").y);
 
     const cycle = [
       issue("x", { dependsOnKeys: ["z"], parentKey: "y" }),
@@ -133,7 +140,7 @@ describe("layoutIssueGraph", () => {
     const first = layoutIssueGraph(cycle, "tree");
     expect(first.nodes).toHaveLength(3);
     expect(new Set(first.nodes.map((node) => node.x)).size).toBe(3);
-    expect(layoutIssueGraph(cycle.toReversed(), "tree")).toEqual(first);
+    expect(layoutIssueGraph(cycle, "tree")).toEqual(first);
   });
 
   it("groups by type and by status in a stable order", () => {
