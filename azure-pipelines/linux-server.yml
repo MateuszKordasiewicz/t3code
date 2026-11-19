@@ -5,8 +5,11 @@
 # release-desktop.yml. Kept outside .github/ so upstream merges never conflict.
 # Azure DevOps pipeline: Instablinds/t3code -> t3code-linux-server.
 
-# Every merge to main builds; manual runs work on any branch.
+# Every merge to main builds; manual runs work on any branch. batch: merges that
+# land during a run share one follow-up build, since the org's 2 hosted parallel
+# jobs are shared with other projects.
 trigger:
+  batch: true
   branches:
     include: [main]
 pr: none
@@ -120,11 +123,11 @@ jobs:
           jq -n \
             --arg version "$(T3_VERSION)" \
             --arg commit "$(Build.SourceVersion)" \
-            --arg branch "$(Build.SourceBranchName)" \
+            --arg branch "${BUILD_SOURCEBRANCH#refs/heads/}" \
             --arg runUrl "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)" \
             --arg builtAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --arg agentPool "$(Agent.Name)" \
-            '{version: $version, commit: $commit, branch: $branch, runUrl: $runUrl, builtAt: $builtAt, agent: $agentPool}' \
+            --arg agent "$(Agent.Name)" \
+            '{version: $version, commit: $commit, branch: $branch, runUrl: $runUrl, builtAt: $builtAt, agent: $agent}' \
             > "$out/build-info.json"
           (cd "$out" && sha256sum * > SHA256SUMS && cat SHA256SUMS build-info.json)
         displayName: Write checksums and build info
