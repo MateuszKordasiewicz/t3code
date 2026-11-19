@@ -496,9 +496,9 @@ function edgePath(from: IssueGraphNode, to: IssueGraphNode): string {
     return `M ${sx} ${sy} C ${sx + bow} ${sy}, ${sx + bow} ${ty}, ${sx} ${ty}`;
   }
   const tx = to.x;
-  if (tx - sx > from.width + EDGE_BOW) {
-    // Skips a column: rise inside the column gap, cross in the row gap above, then come down,
-    // so the edge never runs behind the cards in between.
+  if (tx < sx || tx - sx > from.width + EDGE_BOW) {
+    // Backward or skipping a column: rise inside the column gap, cross in the row gap above,
+    // then come down, so the edge never runs behind the cards it passes.
     const gapY = Math.min(from.y, to.y) - ROW_GAP / 2;
     const half = EDGE_BOW / 2;
     return (
@@ -506,6 +506,6 @@ function edgePath(from: IssueGraphNode, to: IssueGraphNode): string {
       `L ${tx - EDGE_BOW} ${gapY} C ${tx - half} ${gapY}, ${tx - half} ${ty}, ${tx} ${ty}`
     );
   }
-  const pull = tx > sx ? Math.max(EDGE_BOW / 2, (tx - sx) / 2) : EDGE_BOW + (sx - tx) / 4;
+  const pull = Math.max(EDGE_BOW / 2, (tx - sx) / 2);
   return `M ${sx} ${sy} C ${sx + pull} ${sy}, ${tx - pull} ${ty}, ${tx} ${ty}`;
 }

@@ -145,6 +145,14 @@ describe("layoutIssueGraph", () => {
     const first = layoutIssueGraph(cycle, "tree");
     expect(first.nodes).toHaveLength(3);
     expect(new Set(first.nodes.map((node) => node.x)).size).toBe(3);
+    // A backward edge crosses in the row gap too, above the card it passes.
+    const back = first.edges.find((edge) => {
+      const from = first.nodes.find((node) => node.id === edge.from)!;
+      const to = first.nodes.find((node) => node.id === edge.to)!;
+      return to.x < from.x - from.width;
+    })!;
+    const backY = Number(back.path.match(/ L [\d.-]+ ([\d.-]+) C/)![1]);
+    expect(backY).toBeLessThan(Math.min(...first.nodes.map((node) => node.y)));
     expect(layoutIssueGraph(cycle, "tree")).toEqual(first);
   });
 
