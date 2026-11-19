@@ -558,7 +558,10 @@ export function useComposerSend(input: ComposerSendInput) {
       notifyDirectAnnotationAttached();
       return;
     }
-    const multipleModelSelections = sendCtx.multipleModelSelections;
+    // A continuation must stay in the source worktree with its issue link, so it never fans out.
+    const multipleModelSelections = draftThread?.issueContinuation
+      ? null
+      : sendCtx.multipleModelSelections;
     const approvalFeedbackTarget = pendingApprovalsRef.current.find(
       (approval) =>
         approval.supportsFeedback && approval.requestId === sendCtx.shownPendingApprovalIds[0],

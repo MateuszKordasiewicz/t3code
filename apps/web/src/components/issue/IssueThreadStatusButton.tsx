@@ -9,13 +9,14 @@ import {
 } from "@t3tools/client-runtime/issue-threads";
 import { visibleLinkedThreads } from "@t3tools/client-runtime/state/threads";
 import { AuthOrchestrationOperateScope } from "@t3tools/contracts";
-import type { EnvironmentId, IssueDetail, IssueRef } from "@t3tools/contracts";
+import type { EnvironmentId, IssueDetail, IssueRef, ThreadId } from "@t3tools/contracts";
 import { useNavigate } from "@tanstack/react-router";
 import {
   ActivityIcon,
   CheckIcon,
   ChevronDownIcon,
   MessageSquareIcon,
+  PlayIcon,
   SquarePenIcon,
 } from "lucide-react";
 import { msg, useGT } from "gt-react";
@@ -65,7 +66,7 @@ const STATUS_ICON: Record<IssueThreadStatus, typeof ActivityIcon> = {
 /**
  * Whether an agent is on the issue, as one control: with no linked thread it starts one (a
  * worktree draft with the issue as an unsent prompt); otherwise it opens the running or most
- * recent linked thread, and its menu lists every linked thread.
+ * recent linked thread, and its menu lists the linked threads and resumes the newest idle one.
  */
 export function IssueThreadStatusButton({
   environmentId,
@@ -91,6 +92,8 @@ export function IssueThreadStatusButton({
   const hidingAnywhere = useAnyEnvironmentHiding();
   const loadedThreadRefs = useEnvironmentThreadRefs(environmentId);
 
+  const shellOf = (threadId: ThreadId) =>
+    shells.find((shell) => shell.environmentId === environmentId && shell.id === threadId);
   const answered = linked.data !== null || linked.error !== null;
   const { threads, primary } = issueThreads(
     visibleLinkedThreads(
@@ -100,8 +103,7 @@ export function IssueThreadStatusButton({
       hiddenKeys,
       hidingAnywhere,
     ),
-    (threadId) =>
-      shells.find((shell) => shell.environmentId === environmentId && shell.id === threadId),
+    shellOf,
   );
 
   const start = () => {
@@ -144,8 +146,23 @@ export function IssueThreadStatusButton({
     );
   }
   const PrimaryIcon = STATUS_ICON[primary.status];
-  // A running thread is answered in place; only a stopped one can be continued.
-  const stopped = threads.filter((thread) => thread.status !== "running");
+  const earlier = threads.filter((thread) => thread.id !== primary.id);
+  // Running threads are answered in place and done ones were settled, so only the newest idle
+  // thread can be resumed.
+  const resumable =
+    canOperate && tracker === "beads"
+      ? (threads.find((thread) => thread.status === "idle") ?? null)
+      : null;
+  const threadItem = (thread: IssueThread) => {
+    const Icon = STATUS_ICON[thread.status];
+    return (
+      <MenuItem key={thread.id} onClick={() => open(thread)}>
+        <Icon aria-hidden />
+        <MenuItemLabel>{thread.title}</MenuItemLabel>
+        <MenuItemDetail>{statusLabel(thread.status)}</MenuItemDetail>
+      </MenuItem>
+    );
+  };
   return (
     <Group aria-label={gt("Linked threads")}>
       <Tooltip>
@@ -171,47 +188,31 @@ export function IssueThreadStatusButton({
         <MenuPopup align="end">
           <MenuGroup>
             <MenuGroupLabel>{gt("Linked threads")}</MenuGroupLabel>
-            {threads.map((thread) => {
-              const Icon = STATUS_ICON[thread.status];
-              return (
-                <MenuItem key={thread.id} onClick={() => open(thread)}>
-                  <Icon aria-hidden />
-                  <MenuItemLabel>{thread.title}</MenuItemLabel>
-                  <MenuItemDetail>{statusLabel(thread.status)}</MenuItemDetail>
-                </MenuItem>
-              );
-            })}
-          </MenuGroup>
-          {canOperate && tracker === "beads" && stopped.length > 0 ? (
-            <>
-              <MenuSeparator />
+            {threadItem(primary)}
+            {earlier.length > 0 ? (
               <MenuSub>
                 <MenuSubTrigger>
-                  <MenuItemLabel>{gt("Continue in this worktree")}</MenuItemLabel>
+                  <MenuItemLabel>
+                    {gt("Earlier threads ({count})", { count: earlier.length })}
+                  </MenuItemLabel>
                 </MenuSubTrigger>
-                <MenuSubPopup>
-                  {stopped.map((thread) => {
-                    const Icon = STATUS_ICON[thread.status];
-                    return (
-                      <MenuItem
-                        key={thread.id}
-                        disabled={continuation.pending}
-                        onClick={() =>
-                          void continuation.start(
-                            thread,
-                            issue,
-                            issueThreadLinkTarget(reference, issue),
-                          )
-                        }
-                      >
-                        <Icon aria-hidden />
-                        <MenuItemLabel>{thread.title}</MenuItemLabel>
-                        <MenuItemDetail>{statusLabel(thread.status)}</MenuItemDetail>
-                      </MenuItem>
-                    );
-                  })}
-                </MenuSubPopup>
+                <MenuSubPopup>{earlier.map(threadItem)}</MenuSubPopup>
               </MenuSub>
+            ) : null}
+          </MenuGroup>
+          {resumable !== null ? (
+            <>
+              <MenuSeparator />
+              <MenuItem
+                disabled={continuation.pending}
+                onClick={() =>
+                  void continuation.start(resumable, issue, issueThreadLinkTarget(reference, issue))
+                }
+              >
+                <PlayIcon aria-hidden />
+                <MenuItemLabel>{gt("Resume in a new thread")}</MenuItemLabel>
+                <MenuItemDetail>{shellOf(resumable.id)?.branch ?? resumable.title}</MenuItemDetail>
+              </MenuItem>
             </>
           ) : null}
           {canOperate ? (

@@ -3697,6 +3697,7 @@ export default function ChatView(props: ChatViewProps) {
                                 reportedModelSelection={reportedModelSelection}
                                 multipleModelSelections={multipleModelSelections}
                                 supportsMultipleModels={
+                                  !draftThread?.issueContinuation &&
                                   serverConfig?.environment.capabilities
                                     .requiredWorktreeBootstrap === true
                                 }
