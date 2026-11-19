@@ -298,10 +298,12 @@ function IssueGraphCard({
         aria-current={selected ? "true" : undefined}
         onClick={() => onSelect(entry)}
         className={cn(
-          "flex size-full flex-col justify-center gap-1 rounded-lg border bg-background px-2.5 text-left shadow-xs/5 outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+          // A raised tile in both themes: in dark the card token is near the black canvas, so the
+          // fill and border come from the foreground colour instead.
+          "flex size-full flex-col justify-center gap-1 rounded-lg border bg-card px-2.5 text-left shadow-xs/5 outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset dark:bg-foreground/8",
           selected
-            ? "border-primary bg-accent ring-1 ring-primary ring-inset"
-            : "border-border hover:bg-accent",
+            ? "border-primary bg-accent ring-1 ring-primary ring-inset dark:bg-foreground/12"
+            : "border-foreground/15 hover:border-foreground/30 hover:bg-accent dark:hover:bg-foreground/12",
           entry.state.category === "closed" && !selected ? "opacity-70" : null,
         )}
       >

@@ -3,7 +3,7 @@ import { issueEntryKey } from "@t3tools/client-runtime/state/issues";
 
 export type IssueGraphGroupBy = "tree" | "type" | "status";
 
-/** Blockers of a card that have no arrow to it, because they sit outside its region. */
+/** Blockers of a card with no arrow to it: outside its region, or with no clean route here. */
 export interface IssueGraphExternalBlockers {
   /** Display keys; the raw key for a blocker that is not in the list. */
   readonly keys: ReadonlyArray<string>;
@@ -33,7 +33,10 @@ interface IssueGraphEdgeBase {
 export type IssueGraphEdge =
   /** Parent to child: a folder-tree line from the parent's trunk into the child's left edge. */
   | (IssueGraphEdgeBase & { readonly kind: "parent" })
-  /** Blocker to blocked issue: an arc through the right-hand gutter ending in an arrowhead. */
+  /**
+   * Blocker to blocked issue, ending in an arrowhead: straight along a chain, bent through the gap
+   * before the blocked card, or an arc through the right-hand gutter.
+   */
   | (IssueGraphEdgeBase & { readonly kind: "blocks"; readonly blockerOpen: boolean });
 
 export interface IssueGraphRegion {
@@ -79,13 +82,19 @@ const INDENT = 24;
 const TRUNK_INSET = 12;
 // A sub-task's tick enters beside its first line, as in a folder tree.
 const TREE_ENTRY = 16;
+// Gap between cards of one dependency chain; it widens when its bent arrows need more tracks.
+const CHAIN_GAP = 32;
+const TRACK_GAP = 8;
+const MAX_GAP_TRACKS = 6;
+/** A row holds at most this many chained cards, so a long chain wraps instead of widening. */
+const MAX_CHAIN = 6;
 // Arcs leave the widest card by GUTTER_GAP before their first level; levels sit LEVEL_GAP apart.
 const GUTTER_GAP = 16;
 const LEVEL_GAP = 8;
-// Arc ends on one card sit further apart than an 8px arrowhead, and clear of its corners.
+// Link ends on one card edge sit further apart than an 8px arrowhead, and clear of its corners.
 const ENDPOINT_GAP = 12;
 const ENDPOINT_MARGIN = 8;
-const ARC_RADIUS = 4;
+const CORNER_RADIUS = 4;
 
 const TYPE_ORDER = ["epic", "feature", "bug", "task", "chore"];
 const OPEN_STATUS_ORDER = [
@@ -261,9 +270,9 @@ function resolveBlockers(
 function externalBlockersOf(
   items: ReadonlyArray<Item>,
   blockers: ReadonlyArray<Blocker>,
-  memberSet: ReadonlySet<number>,
+  drawn: ReadonlySet<number> | undefined,
 ): IssueGraphExternalBlockers | null {
-  const outside = blockers.filter(({ index }) => index === undefined || !memberSet.has(index));
+  const outside = blockers.filter(({ index }) => index === undefined || !drawn?.has(index));
   if (outside.length === 0) return null;
   const categories = outside.map(({ index }) =>
     index === undefined ? undefined : items[index]!.entry.state.category,
@@ -454,87 +463,22 @@ function orderSiblings(
   return ordered;
 }
 
-/**
- * Linked issues form an indented list: each parent, then its sub-tasks in depth-first order, joined
- * by folder-tree lines on the left. Blocking links are arcs on the right, nested by span in a
- * gutter past the widest card. Issues with no link in the region fill a grid below the list.
- */
-function placeRegion(
-  projectId: string,
-  items: ReadonlyArray<Item>,
-  edges: ReadonlyArray<RawEdge>,
-  blockers: ReadonlyArray<ReadonlyArray<Blocker>>,
-  cluster: PendingCluster,
-  size: IssueGraphSize,
-): IssueGraphRegion {
-  const { nodeWidth, nodeHeight, labelHeight } = size;
-  const order = (index: number) => items[index]!.order;
-  const memberSet = new Set(cluster.members);
-  const regionEdges = edges.filter((edge) => memberSet.has(edge.from) && memberSet.has(edge.to));
-  const linked = new Set<number>();
-  const parentOf = new Map<number, number>();
-  const blocks = new Map<number, Array<number>>();
-  for (const edge of regionEdges) {
-    linked.add(edge.from).add(edge.to);
-    if (edge.kind === "parent") {
-      if (!parentOf.has(edge.to)) parentOf.set(edge.to, edge.from);
-    } else {
-      let next = blocks.get(edge.from);
-      if (next === undefined) blocks.set(edge.from, (next = []));
-      next.push(edge.to);
-    }
-  }
-  const listed = [...linked].toSorted((a, b) => order(a) - order(b));
-  const childrenOf = new Map<number, Array<number>>();
-  for (const index of listed) {
-    const parent = parentOf.get(index);
-    if (parent === undefined) continue;
-    let children = childrenOf.get(parent);
-    if (children === undefined) childrenOf.set(parent, (children = []));
-    children.push(index);
-  }
+type Route = "chain" | "bend" | "arc" | "label";
 
-  // Depth-first pre-order. A parent cycle has no top; its earliest card starts it at depth 0.
-  const rows: Array<number> = [];
-  const depth = new Map<number, number>();
-  const treeParent = new Map<number, number>();
-  const visit = (root: number) => {
-    const stack = [{ index: root, level: 0, parent: -1 }];
-    while (stack.length > 0) {
-      const { index, level, parent } = stack.pop()!;
-      if (depth.has(index)) continue;
-      depth.set(index, level);
-      if (parent !== -1) treeParent.set(index, parent);
-      rows.push(index);
-      const children = orderSiblings(childrenOf.get(index) ?? [], blocks, order);
-      for (let i = children.length - 1; i >= 0; i--) {
-        if (!depth.has(children[i]!))
-          stack.push({ index: children[i]!, level: level + 1, parent: index });
-      }
-    }
-  };
-  const roots = listed.filter((index) => !parentOf.has(index));
-  for (const root of orderSiblings(roots, blocks, order)) visit(root);
-  for (const index of listed) if (!depth.has(index)) visit(index);
-  const rowOf = new Map(rows.map((index, row) => [index, row]));
+function pushTo<K, V>(map: Map<K, Array<V>>, key: K, value: V) {
+  const list = map.get(key);
+  if (list === undefined) map.set(key, [value]);
+  else list.push(value);
+}
 
-  // Arcs nest by span: the shortest takes the innermost free level, so arcs on one level never
-  // share a row and arcs on different levels never share a gutter segment.
-  const arcs = regionEdges
-    .filter((edge) => edge.kind === "blocks")
-    .map((edge) => {
-      const [a, b] = [rowOf.get(edge.from)!, rowOf.get(edge.to)!];
-      return { edge, low: Math.min(a, b), high: Math.max(a, b), level: 0 };
-    })
-    .toSorted(
-      (a, b) =>
-        a.high - a.low - (b.high - b.low) || a.low - b.low || compareIds(a.edge.id, b.edge.id),
-    );
-  // Each row keeps a bitset of the levels its arcs use; an arc takes the lowest level free in
-  // every row of its span.
+/** Levels in the right-hand gutter: the shortest span takes the lowest level free in its rows. */
+function assignArcLevels(
+  arcs: ReadonlyArray<{ readonly low: number; readonly high: number; level: number }>,
+  rowCount: number,
+): number {
   let words = 1;
   let levelCount = 0;
-  let used = Array.from({ length: rows.length }, () => new Uint32Array(words));
+  let used = Array.from({ length: rowCount }, () => new Uint32Array(words));
   const seen = new Uint32Array(Math.ceil(arcs.length / 32) + 1);
   for (const arc of arcs) {
     const active = Math.ceil(levelCount / 32);
@@ -563,43 +507,291 @@ function placeRegion(
     levelCount = Math.max(levelCount, level + 1);
     arc.level = level;
   }
+  return levelCount;
+}
 
-  // Ends on one card: arcs going up above arcs going down; inner arcs nearer the far side, so
-  // no arc's leg crosses another arc of the same card.
-  const ends = new Map<
-    number,
-    Array<{ readonly arc: (typeof arcs)[number]; readonly up: boolean }>
-  >();
-  for (const arc of arcs) {
-    for (const [index, other] of [
-      [arc.edge.from, arc.edge.to],
-      [arc.edge.to, arc.edge.from],
-    ] as const) {
-      let list = ends.get(index);
-      if (list === undefined) ends.set(index, (list = []));
-      list.push({ arc, up: rowOf.get(other)! < rowOf.get(index)! });
+/**
+ * Linked issues form an indented tree: each parent, then its sub-tasks, joined by folder-tree
+ * lines on the left. A sibling an issue blocks sits to its right, on its row when it can follow it
+ * in a chain, else on its own row in the next column with a bent arrow. Other blocking links are
+ * arcs through a gutter on the right. Issues with no link in the region fill a grid below.
+ */
+function placeRegion(
+  projectId: string,
+  items: ReadonlyArray<Item>,
+  edges: ReadonlyArray<RawEdge>,
+  blockers: ReadonlyArray<ReadonlyArray<Blocker>>,
+  cluster: PendingCluster,
+  size: IssueGraphSize,
+): IssueGraphRegion {
+  const { nodeWidth, nodeHeight, labelHeight } = size;
+  const order = (index: number) => items[index]!.order;
+  const byOrder = (a: number, b: number) => order(a) - order(b);
+  const memberSet = new Set(cluster.members);
+  const regionEdges = edges.filter((edge) => memberSet.has(edge.from) && memberSet.has(edge.to));
+  const linked = new Set<number>();
+  const parentOf = new Map<number, number>();
+  const blocks = new Map<number, Array<number>>();
+  for (const edge of regionEdges) {
+    linked.add(edge.from).add(edge.to);
+    if (edge.kind === "blocks") pushTo(blocks, edge.from, edge.to);
+    else if (!parentOf.has(edge.to)) parentOf.set(edge.to, edge.from);
+  }
+  const listed = [...linked].toSorted(byOrder);
+  const childrenOf = new Map<number, Array<number>>();
+  for (const index of listed) {
+    const parent = parentOf.get(index);
+    if (parent !== undefined) pushTo(childrenOf, parent, index);
+  }
+
+  // The tree the list follows. A parent cycle has no top; its earliest card starts at the top level.
+  const treeParent = new Map<number, number>();
+  const reached = new Set<number>();
+  const visit = (root: number) => {
+    reached.add(root);
+    const stack = [root];
+    while (stack.length > 0) {
+      const index = stack.pop()!;
+      for (const child of childrenOf.get(index) ?? []) {
+        if (reached.has(child)) continue;
+        reached.add(child);
+        treeParent.set(child, index);
+        stack.push(child);
+      }
+    }
+  };
+  for (const index of listed) if (!parentOf.has(index)) visit(index);
+  for (const index of listed) if (!reached.has(index)) visit(index);
+  // Sibling groups, keyed by their parent; -1 holds the top level.
+  const groupOf = (index: number) => treeParent.get(index) ?? -1;
+  const groups = new Map<number, Array<number>>();
+  for (const index of listed) pushTo(groups, groupOf(index), index);
+  const siblingRank = new Map<number, number>();
+  const orderedGroups = new Map<number, Array<number>>();
+  for (const [key, group] of groups) {
+    const ordered = orderSiblings(group, blocks, order);
+    orderedGroups.set(key, ordered);
+    ordered.forEach((index, rank) => siblingRank.set(index, rank));
+  }
+
+  // A link between siblings in order can run sideways; the rest, links between cousins and links
+  // closing a cycle, are arcs, and a card with an arc keeps the row to its right free for it.
+  const route = new Map<RawEdge, Route>();
+  const arcCards = new Set<number>();
+  const sidewaysInto = new Map<number, Array<RawEdge>>();
+  for (const edge of regionEdges) {
+    if (edge.kind !== "blocks") continue;
+    if (
+      groupOf(edge.from) === groupOf(edge.to) &&
+      siblingRank.get(edge.from)! < siblingRank.get(edge.to)!
+    ) {
+      pushTo(sidewaysInto, edge.to, edge);
+    } else {
+      route.set(edge, "arc");
+      arcCards.add(edge.from).add(edge.to);
     }
   }
-  for (const list of ends.values()) {
-    list.sort(
-      (a, b) =>
-        Number(a.up ? 0 : 1) - Number(b.up ? 0 : 1) ||
-        (a.up ? a.arc.level - b.arc.level : b.arc.level - a.arc.level) ||
-        compareIds(a.arc.edge.id, b.arc.edge.id),
-    );
+
+  // Each group lays out its own rows; a card's slot is its row in the group and its chain column.
+  const slot = new Map<number, { readonly row: number; readonly column: number }>();
+  const followerOf = new Map<number, number>();
+  const rowsOf = new Map<number, Array<Array<number>>>();
+  const tracksOf = new Map<number, Map<number, number>>();
+  const bends: Array<RawEdge> = [];
+  const hasChildren = (index: number) => groups.has(index);
+  for (const [key, ordered] of orderedGroups) {
+    const rows: Array<Array<number>> = [];
+    const rowHasChildren: Array<boolean> = [];
+    const tracks = new Map<number, number>();
+    const spans: Array<readonly [number, number]> = [];
+    const farthestBend = new Map<number, number>();
+    for (const card of ordered) {
+      const sources = sidewaysInto.get(card) ?? [];
+      let lead: RawEdge | undefined;
+      if (sources.length > 0) {
+        // It follows the blocker last in row order, when that one is free to take it.
+        lead = sources.reduce((best, edge) => {
+          const [a, b] = [slot.get(edge.from)!, slot.get(best.from)!];
+          return a.row > b.row || (a.row === b.row && a.column > b.column) ? edge : best;
+        });
+        const at = slot.get(lead.from)!;
+        const free =
+          !followerOf.has(lead.from) &&
+          !arcCards.has(lead.from) &&
+          rows[at.row]!.length < MAX_CHAIN &&
+          (farthestBend.get(lead.from) ?? 0) <= at.column + 1 &&
+          // Its sub-tasks would come between the rows a bent arrow already spans.
+          (!hasChildren(card) || !spans.some(([low, high]) => low <= at.row && at.row < high));
+        if (free) {
+          slot.set(card, { row: at.row, column: at.column + 1 });
+          rows[at.row]!.push(card);
+          followerOf.set(lead.from, card);
+          route.set(lead, "chain");
+          if (hasChildren(card)) rowHasChildren[at.row] = true;
+        } else {
+          lead = undefined;
+        }
+      }
+      let wrapped = false;
+      if (!slot.has(card)) {
+        const right = Math.max(-1, ...sources.map((edge) => slot.get(edge.from)!.column));
+        wrapped = right + 1 >= MAX_CHAIN;
+        slot.set(card, { row: rows.length, column: wrapped ? 0 : right + 1 });
+        rows.push([card]);
+        rowHasChildren.push(hasChildren(card));
+      }
+      const at = slot.get(card)!;
+      for (const edge of sources) {
+        if (edge === lead) continue;
+        const from = slot.get(edge.from)!;
+        const used = tracks.get(at.column) ?? 0;
+        // A bent arrow runs right from its blocker into the gap before this card's column, down
+        // that gap past rows of this group only, and into the card.
+        const clear =
+          at.column > 0 &&
+          from.row < at.row &&
+          from.column < at.column &&
+          (from.column === at.column - 1 || !followerOf.has(edge.from)) &&
+          used < MAX_GAP_TRACKS &&
+          rowHasChildren.slice(from.row, at.row).every((children) => !children);
+        if (clear) {
+          route.set(edge, "bend");
+          bends.push(edge);
+          tracks.set(at.column, used + 1);
+          spans.push([from.row, at.row]);
+          farthestBend.set(edge.from, Math.max(farthestBend.get(edge.from) ?? 0, at.column));
+        } else if (!followerOf.has(edge.from) && !wrapped) {
+          // A card that wrapped to a new row keeps its right edge free to go on chaining there.
+          route.set(edge, "arc");
+          arcCards.add(edge.from).add(card);
+        } else {
+          route.set(edge, "label");
+        }
+      }
+    }
+    rowsOf.set(key, rows);
+    tracksOf.set(key, tracks);
   }
 
+  // Rows in tree order: a group's row, then the sub-tasks of its cards, rightmost card first, so
+  // each trunk drops straight into its own sub-tasks and passes only cards to its right.
+  const rowList: Array<Array<number>> = [];
+  const emit = (key: number) => {
+    for (const row of rowsOf.get(key) ?? []) {
+      rowList.push(row);
+      for (let i = row.length - 1; i >= 0; i--) if (groups.has(row[i]!)) emit(row[i]!);
+    }
+  };
+  emit(-1);
+  const rowOf = new Map<number, number>();
+  rowList.forEach((row, index) => {
+    for (const card of row) rowOf.set(card, index);
+  });
+
+  const drawnInto = new Map<number, Set<number>>();
+  for (const [edge, kind] of route) {
+    if (kind === "label") continue;
+    let drawn = drawnInto.get(edge.to);
+    if (drawn === undefined) drawnInto.set(edge.to, (drawn = new Set()));
+    drawn.add(edge.from);
+  }
   const external = new Map(
-    cluster.members.map((index) => [index, externalBlockersOf(items, blockers[index]!, memberSet)]),
+    cluster.members.map((index) => [
+      index,
+      externalBlockersOf(items, blockers[index]!, drawnInto.get(index)),
+    ]),
   );
+
+  const arcs = [...route]
+    .filter(([, kind]) => kind === "arc")
+    .map(([edge]) => {
+      const [a, b] = [rowOf.get(edge.from)!, rowOf.get(edge.to)!];
+      return { edge, low: Math.min(a, b), high: Math.max(a, b), level: 0 };
+    })
+    .toSorted(
+      (a, b) =>
+        a.high - a.low - (b.high - b.low) || a.low - b.low || compareIds(a.edge.id, b.edge.id),
+    );
+  const levelCount = assignArcLevels(arcs, rowList.length);
+  const levelOf = new Map(arcs.map((arc) => [arc.edge, arc.level]));
+
+  // Link ends along each card edge, top to bottom. On the right: arcs (up, inner first; then down,
+  // outer first), the chain arrow, then bent arrows by target row. On the left: bent arrows by
+  // source row, then the chain arrow. In that order no two links of one card cross.
+  type End = { readonly edge: RawEdge; readonly anchor: boolean };
+  const rightEnds = new Map<number, Array<End>>();
+  const leftEnds = new Map<number, Array<End>>();
+  const goesUp = (edge: RawEdge, from: number) =>
+    rowOf.get(edge.from === from ? edge.to : edge.from)! < rowOf.get(from)!;
+  for (const arc of arcs) {
+    pushTo(rightEnds, arc.edge.from, { edge: arc.edge, anchor: false });
+    pushTo(rightEnds, arc.edge.to, { edge: arc.edge, anchor: false });
+  }
+  for (const [card, list] of rightEnds) {
+    list.sort((a, b) => {
+      const [upA, upB] = [goesUp(a.edge, card), goesUp(b.edge, card)];
+      const [la, lb] = [levelOf.get(a.edge)!, levelOf.get(b.edge)!];
+      return (
+        Number(!upA) - Number(!upB) || (upA ? la - lb : lb - la) || compareIds(a.edge.id, b.edge.id)
+      );
+    });
+  }
+  for (const [edge, kind] of route) {
+    if (kind !== "chain") continue;
+    pushTo(rightEnds, edge.from, { edge, anchor: true });
+    pushTo(leftEnds, edge.to, { edge, anchor: true });
+  }
+  const byRows = (a: number, b: number, c: number, d: number) => a - b || c - d;
+  for (const edge of bends.toSorted(
+    (a, b) =>
+      byRows(rowOf.get(a.to)!, rowOf.get(b.to)!, rowOf.get(a.from)!, rowOf.get(b.from)!) ||
+      compareIds(a.id, b.id),
+  )) {
+    pushTo(rightEnds, edge.from, { edge, anchor: false });
+  }
+  for (const edge of bends.toSorted(
+    (a, b) => byRows(rowOf.get(a.from)!, rowOf.get(b.from)!, 0, 0) || compareIds(a.id, b.id),
+  )) {
+    pushTo(leftEnds, edge.to, { edge, anchor: false });
+  }
+  for (const list of leftEnds.values()) list.sort((a, b) => Number(a.anchor) - Number(b.anchor));
+  const spread = (list: ReadonlyArray<End>) => {
+    const anchor = list.findIndex((end) => end.anchor);
+    const centre = anchor === -1 ? (list.length - 1) / 2 : anchor;
+    const reach = Math.max(centre, list.length - 1 - centre);
+    return {
+      need: 2 * reach * ENDPOINT_GAP + 2 * ENDPOINT_MARGIN,
+      offsets: new Map(list.map((end, i) => [end.edge, (i - centre) * ENDPOINT_GAP])),
+    };
+  };
+  const rightSpread = new Map([...rightEnds].map(([card, list]) => [card, spread(list)]));
+  const leftSpread = new Map([...leftEnds].map(([card, list]) => [card, spread(list)]));
   const cardHeight = (index: number) =>
     Math.max(
       nodeHeight + (external.get(index) === null ? 0 : labelHeight),
-      ((ends.get(index)?.length ?? 1) - 1) * ENDPOINT_GAP + 2 * ENDPOINT_MARGIN,
+      rightSpread.get(index)?.need ?? 0,
+      leftSpread.get(index)?.need ?? 0,
     );
+
+  // Columns of a group start at its parent's indent; a gap widens for its bent-arrow tracks.
+  const gapWidth = (key: number, column: number) =>
+    Math.max(CHAIN_GAP, ((tracksOf.get(key)?.get(column) ?? 0) + 1) * TRACK_GAP);
+  const xOf = new Map<number, number>();
+  const xFor = (index: number): number => {
+    const known = xOf.get(index);
+    if (known !== undefined) return known;
+    const key = groupOf(index);
+    let x = key === -1 ? REGION_PADDING : xFor(key) + INDENT;
+    for (let column = 1; column <= slot.get(index)!.column; column++) {
+      x += nodeWidth + gapWidth(key, column);
+    }
+    xOf.set(index, x);
+    return x;
+  };
+
   const nodeAt = new Map<number, IssueGraphNode>();
   const place = (index: number, x: number, y: number, height: number) => {
-    const node: IssueGraphNode = {
+    nodeAt.set(index, {
       id: items[index]!.id,
       entry: items[index]!.entry,
       x,
@@ -607,76 +799,87 @@ function placeRegion(
       width: nodeWidth,
       height,
       externalBlockers: external.get(index)!,
-    };
-    nodeAt.set(index, node);
-    return node;
+    });
   };
   let bottom = REGION_PADDING - ROW_GAP;
-  for (const index of rows) {
-    const height = cardHeight(index);
-    place(index, REGION_PADDING + depth.get(index)! * INDENT, bottom + ROW_GAP, height);
+  for (const row of rowList) {
+    // One height per row, so a chain's arrows run straight between the middles of its cards.
+    const height = Math.max(...row.map(cardHeight));
+    for (const card of row) place(card, xFor(card), bottom + ROW_GAP, height);
     bottom += ROW_GAP + height;
   }
-  const listRight = Math.max(0, ...rows.map((index) => nodeAt.get(index)!.x + nodeWidth));
+  const listRight = Math.max(0, ...listed.map((index) => nodeAt.get(index)!.x + nodeWidth));
   const gutterX = (level: number) => listRight + GUTTER_GAP + level * LEVEL_GAP;
 
-  // Issues with no link inside the region fill a grid below the list.
-  const loose = cluster.members
-    .filter((index) => !linked.has(index))
-    .toSorted((a, b) => order(a) - order(b));
+  const loose = cluster.members.filter((index) => !linked.has(index)).toSorted(byOrder);
   for (let start = 0; start < loose.length; start += GRID_COLUMNS) {
     const line = loose.slice(start, start + GRID_COLUMNS);
     const height = Math.max(...line.map(cardHeight));
     line.forEach((index, column) => {
-      place(
-        index,
-        REGION_PADDING + column * (nodeWidth + GRID_GAP),
-        bottom + ROW_GAP,
-        cardHeight(index),
-      );
+      const x = REGION_PADDING + column * (nodeWidth + GRID_GAP);
+      place(index, x, bottom + ROW_GAP, cardHeight(index));
     });
     bottom += ROW_GAP + height;
   }
 
-  const endY = (index: number, arc: (typeof arcs)[number]) => {
-    const node = nodeAt.get(index)!;
-    const list = ends.get(index)!;
-    const position = list.findIndex((end) => end.arc === arc);
-    return node.y + node.height / 2 + (position - (list.length - 1) / 2) * ENDPOINT_GAP;
-  };
-  const arcPath = new Map(
-    arcs.map((arc) => {
-      const [from, to] = [nodeAt.get(arc.edge.from)!, nodeAt.get(arc.edge.to)!];
-      const [y1, y2] = [endY(arc.edge.from, arc), endY(arc.edge.to, arc)];
-      const x = gutterX(arc.level);
-      const turn = Math.sign(y2 - y1) * Math.min(ARC_RADIUS, Math.abs(y2 - y1) / 2);
-      const radius = Math.abs(turn);
-      return [
-        arc.edge.id,
-        `M ${from.x + from.width} ${y1} H ${x - radius} Q ${x} ${y1} ${x} ${y1 + turn} ` +
-          `V ${y2 - turn} Q ${x} ${y2} ${x - radius} ${y2} H ${to.x + to.width}`,
-      ] as const;
-    }),
-  );
-  const placedEdges = regionEdges.flatMap((edge): Array<IssueGraphEdge> => {
+  const mid = (node: IssueGraphNode) => node.y + node.height / 2;
+  const rightY = (index: number, edge: RawEdge) =>
+    mid(nodeAt.get(index)!) + rightSpread.get(index)!.offsets.get(edge)!;
+  const leftY = (index: number, edge: RawEdge) =>
+    mid(nodeAt.get(index)!) + leftSpread.get(index)!.offsets.get(edge)!;
+  // Tracks in one gap: the arrow into the earliest row sits rightmost, so none crosses another
+  // arrow of the same blocker or the same blocked card.
+  const trackX = new Map<RawEdge, number>();
+  const byGap = new Map<string, Array<RawEdge>>();
+  for (const edge of bends) pushTo(byGap, `${groupOf(edge.to)}:${slot.get(edge.to)!.column}`, edge);
+  for (const gap of byGap.values()) {
+    gap
+      .toSorted(
+        (a, b) =>
+          byRows(rowOf.get(a.to)!, rowOf.get(b.to)!, rowOf.get(a.from)!, rowOf.get(b.from)!) ||
+          compareIds(a.id, b.id),
+      )
+      .forEach((edge, track) => trackX.set(edge, nodeAt.get(edge.to)!.x - (track + 1) * TRACK_GAP));
+  }
+
+  const placedEdges: Array<IssueGraphEdge> = [];
+  for (const edge of regionEdges) {
     const from = nodeAt.get(edge.from)!;
     const to = nodeAt.get(edge.to)!;
     const base = { id: edge.id, from: from.id, to: to.id };
-    if (edge.kind === "blocks") {
-      const blockerOpen = items[edge.from]!.entry.state.category !== "closed";
-      return [{ ...base, kind: "blocks", blockerOpen, path: arcPath.get(edge.id)! }];
+    if (edge.kind === "parent") {
+      // Only cards that start a row at their parent's indent hang off its trunk.
+      if (treeParent.get(edge.to) !== edge.from || slot.get(edge.to)!.column !== 0) continue;
+      const entry = to.y + Math.min(TREE_ENTRY, to.height / 2);
+      const path = `M ${from.x + TRUNK_INSET} ${from.y + from.height} V ${entry} H ${to.x}`;
+      placedEdges.push({ ...base, kind: "parent", path });
+      continue;
     }
-    // Only the link the list follows; a parent cycle's closing link is not drawn.
-    if (treeParent.get(edge.to) !== edge.from) return [];
-    const entry = to.y + Math.min(TREE_ENTRY, to.height / 2);
-    return [
-      {
-        ...base,
-        kind: "parent",
-        path: `M ${from.x + TRUNK_INSET} ${from.y + from.height} V ${entry} H ${to.x}`,
-      },
-    ];
-  });
+    const kind = route.get(edge)!;
+    if (kind === "label") continue;
+    const blockerOpen = items[edge.from]!.entry.state.category !== "closed";
+    const sx = from.x + from.width;
+    let path: string;
+    if (kind === "chain") {
+      path = `M ${sx} ${rightY(edge.from, edge)} H ${to.x}`;
+    } else if (kind === "bend") {
+      const [y1, y2] = [rightY(edge.from, edge), leftY(edge.to, edge)];
+      const x = trackX.get(edge)!;
+      const r = Math.min(CORNER_RADIUS, (y2 - y1) / 2, x - sx, to.x - x);
+      path =
+        `M ${sx} ${y1} H ${x - r} Q ${x} ${y1} ${x} ${y1 + r} ` +
+        `V ${y2 - r} Q ${x} ${y2} ${x + r} ${y2} H ${to.x}`;
+    } else {
+      const [y1, y2] = [rightY(edge.from, edge), rightY(edge.to, edge)];
+      const x = gutterX(levelOf.get(edge)!);
+      const turn = Math.sign(y2 - y1) * Math.min(CORNER_RADIUS, Math.abs(y2 - y1) / 2);
+      const r = Math.abs(turn);
+      path =
+        `M ${sx} ${y1} H ${x - r} Q ${x} ${y1} ${x} ${y1 + turn} ` +
+        `V ${y2 - turn} Q ${x} ${y2} ${x - r} ${y2} H ${to.x + to.width}`;
+    }
+    placedEdges.push({ ...base, kind: "blocks", blockerOpen, path });
+  }
 
   const gridRight =
     loose.length === 0
@@ -695,7 +898,7 @@ function placeRegion(
       Math.max(listRight, gridRight, levelCount === 0 ? 0 : gutterX(levelCount - 1)) +
       REGION_PADDING,
     height: bottom + REGION_PADDING,
-    nodes: [...rows, ...loose].map((index) => nodeAt.get(index)!),
+    nodes: [...rowList.flat(), ...loose].map((index) => nodeAt.get(index)!),
     edges: placedEdges,
   };
 }
