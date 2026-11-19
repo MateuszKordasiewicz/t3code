@@ -56,6 +56,60 @@ function nodeOf(layout: Layout, key: string) {
   return nodesOf(layout).find((node) => node.entry.key === key)!;
 }
 
+interface Point {
+  readonly x: number;
+  readonly y: number;
+}
+interface Segment {
+  readonly from: Point;
+  readonly to: Point;
+}
+
+/** The legs of a path made only of M, H and V commands. */
+function orthogonalSegments(path: string): Array<Segment> {
+  expect(path).toMatch(/^M [^CLQAS]+$/);
+  const [start, ...steps] = path.match(/[MHV] [^MHV]+/g)!.map((step) => step.trim());
+  const [x, y] = start!.slice(2).split(" ").map(Number);
+  let at: Point = { x: x!, y: y! };
+  return steps.map((step) => {
+    const value = Number(step.slice(2));
+    const next = step.startsWith("H") ? { x: value, y: at.y } : { x: at.x, y: value };
+    const segment = { from: at, to: next };
+    at = next;
+    return segment;
+  });
+}
+
+/** Two collinear legs that share more than a point. */
+function overlaps(a: Segment, b: Segment): boolean {
+  const span = (s: Segment, axis: "x" | "y") =>
+    [Math.min(s.from[axis], s.to[axis]), Math.max(s.from[axis], s.to[axis])] as const;
+  for (const [along, across] of [
+    ["x", "y"],
+    ["y", "x"],
+  ] as const) {
+    if (a.from[across] !== a.to[across] || b.from[across] !== b.to[across]) continue;
+    if (a.from[across] !== b.from[across]) continue;
+    const [a0, a1] = span(a, along);
+    const [b0, b1] = span(b, along);
+    if (Math.min(a1, b1) - Math.max(a0, b0) > 0) return true;
+  }
+  return false;
+}
+
+function arrowEnd(path: string): Point {
+  const numbers = path.match(/-?[\d.]+/g)!.map(Number);
+  return { x: numbers[numbers.length - 2]!, y: numbers[numbers.length - 1]! };
+}
+
+/** The straight crossing of a blocks curve that skips a column: `…, x1 y L x2 y C …`. */
+function arrowCrossing(path: string): Segment | null {
+  const match = path.match(/, ([\d.-]+) ([\d.-]+) L ([\d.-]+) ([\d.-]+) C/);
+  if (!match) return null;
+  const [, x1, y1, x2, y2] = match.map(Number);
+  return { from: { x: x1!, y: y1! }, to: { x: x2!, y: y2! } };
+}
+
 describe("layoutIssueGraph", () => {
   it("clusters epic trees, keys hidden-parent siblings by the missing key, and groups loose issues by type", () => {
     const layout = layoutIssueGraph(
@@ -150,43 +204,65 @@ describe("layoutIssueGraph", () => {
       [
         issue("epic", { issueType: "epic" }),
         issue("a", { parentKey: "epic" }),
-        // Blocked by its sibling, so it sits two columns right of its parent.
-        issue("b", { parentKey: "epic", dependsOnKeys: ["a"] }),
-        issue("c", { parentKey: "a" }),
-        issue("d", { parentKey: "epic" }),
+        issue("a1", { parentKey: "a" }),
+        issue("a2", { parentKey: "a" }),
+        issue("b", { parentKey: "epic" }),
+        issue("b1", { parentKey: "b" }),
+        issue("c", { parentKey: "epic" }),
+        // Blocked by a sibling, so each sits two columns right of its parent.
+        issue("far1", { parentKey: "epic", dependsOnKeys: ["a"] }),
+        issue("far2", { parentKey: "epic", dependsOnKeys: ["c"] }),
       ],
       "tree",
     );
     const nodes = nodesOf(layout);
     const byId = new Map(nodes.map((node) => [node.id, node]));
     const tree = edgesOf(layout).filter((edge) => edge.kind === "parent");
-    expect(tree).toHaveLength(4);
+    expect(tree).toHaveLength(8);
+    const legs = new Map<string, Array<Segment>>();
     for (const edge of tree) {
       const from = byId.get(edge.from)!;
       const to = byId.get(edge.to)!;
       expect(to.x).toBeGreaterThan(from.x);
       expect(to.y).toBeGreaterThan(from.y + from.height);
 
-      const [start, ...steps] = edge.path.match(/[MHV] [^MHV]+/g)!.map((step) => step.trim());
-      const [sx, sy] = start!.slice(2).split(" ").map(Number);
-      expect(start).toMatch(/^M /);
-      // Leaves the parent's bottom edge and ends on the child's left edge, at its middle.
-      expect(sy).toBe(from.y + from.height);
-      expect(sx).toBeGreaterThan(from.x);
-      expect(sx).toBeLessThan(from.x + from.width);
-      const points = [{ x: sx!, y: sy! }];
-      for (const step of steps) {
-        const last = points[points.length - 1]!;
-        const value = Number(step.slice(2));
-        points.push(step.startsWith("H") ? { x: value, y: last.y } : { x: last.x, y: value });
-      }
-      expect(points[points.length - 1]).toEqual({ x: to.x, y: to.y + to.height / 2 });
-      for (let i = 1; i < points.length; i++) {
-        const [p, q] = [points[i - 1]!, points[i]!];
+      const segments = orthogonalSegments(edge.path);
+      legs.set(edge.id, segments);
+      const start = segments[0]!.from;
+      const end = segments[segments.length - 1]!.to;
+      // Leaves the parent's bottom edge and ends on the child's left edge.
+      expect(start.y).toBe(from.y + from.height);
+      expect(start.x).toBeGreaterThan(from.x);
+      expect(start.x).toBeLessThan(from.x + from.width);
+      expect(end.x).toBe(to.x);
+      expect(end.y).toBeGreaterThan(to.y);
+      expect(end.y).toBeLessThan(to.y + to.height);
+      for (const { from: p, to: q } of segments) {
         for (const node of nodes) {
-          const crossesX = Math.max(p.x, q.x) > node.x && Math.min(p.x, q.x) < node.x + node.width;
-          const crossesY = Math.max(p.y, q.y) > node.y && Math.min(p.y, q.y) < node.y + node.height;
-          expect(crossesX && crossesY, `${edge.id} passes behind ${node.entry.key}`).toBe(false);
+          const overX = Math.max(p.x, q.x) > node.x && Math.min(p.x, q.x) < node.x + node.width;
+          const overY = Math.max(p.y, q.y) > node.y && Math.min(p.y, q.y) < node.y + node.height;
+          expect(overX && overY, `${edge.id} passes behind ${node.entry.key}`).toBe(false);
+          // Crossing a column, it keeps a row gap clear of the cards there, so it never reads
+          // as a link between two of them.
+          if (
+            p.y === q.y &&
+            Math.min(p.x, q.x) <= node.x &&
+            Math.max(p.x, q.x) >= node.x + node.width
+          ) {
+            const clearance = Math.max(node.y - p.y, p.y - (node.y + node.height));
+            expect(clearance, `${edge.id} hugs ${node.entry.key}`).toBeGreaterThanOrEqual(16);
+          }
+        }
+      }
+    }
+    // Different parents never share a leg, so one branch cannot look attached to another.
+    for (const a of tree) {
+      for (const b of tree) {
+        if (a.from === b.from) continue;
+        for (const p of legs.get(a.id)!) {
+          for (const q of legs.get(b.id)!) {
+            expect(overlaps(p, q), `${a.id} shares a leg with ${b.id}`).toBe(false);
+          }
         }
       }
     }
@@ -195,7 +271,23 @@ describe("layoutIssueGraph", () => {
       const path = tree.find((edge) => edge.to === nodeId(key))!.path;
       return path.slice(0, path.indexOf(" V ", path.indexOf(" H ")));
     };
-    expect(trunk("a")).toBe(trunk("d"));
+    expect(trunk("a1")).toBe(trunk("a2"));
+
+    // A child that blocks its own parent still sits right of and below it; the dependency is the
+    // link drawn backward.
+    const loop = layoutIssueGraph(
+      [
+        issue("kid", { parentKey: "boss", priority: 0 }),
+        issue("boss", { issueType: "epic", dependsOnKeys: ["kid"] }),
+      ],
+      "tree",
+    );
+    const [kid, boss] = [nodeOf(loop, "kid"), nodeOf(loop, "boss")];
+    expect(kid.x).toBeGreaterThan(boss.x);
+    expect(kid.y).toBeGreaterThan(boss.y);
+    const back = edgesOf(loop).find((edge) => edge.kind === "blocks")!;
+    expect(back.path).toMatch(/ L /);
+    expect(arrowEnd(back.path).x).toBe(boss.x);
   });
 
   it("ranks blockers left of what they block and survives dependency cycles", () => {
@@ -211,6 +303,31 @@ describe("layoutIssueGraph", () => {
     expect(nodeOf(chain, "a").x).toBeLessThan(nodeOf(chain, "b").x);
     expect(nodeOf(chain, "b").x).toBeLessThan(nodeOf(chain, "c").x);
     expect(nodeOf(chain, "side").x).toBe(nodeOf(chain, "b").x);
+
+    // Arrows into one card enter at their own points, on their own tracks, so an open arrow
+    // never hides a closed one.
+    const fan = layoutIssueGraph(
+      [
+        issue("closed", { issueType: "task", closed: true }),
+        issue("open", { issueType: "task" }),
+        issue("mid", { issueType: "task", dependsOnKeys: ["closed"] }),
+        issue("target", { issueType: "task", dependsOnKeys: ["closed", "open", "mid"] }),
+      ],
+      "type",
+    );
+    const target = nodeOf(fan, "target");
+    const into = edgesOf(fan).filter((edge) => edge.to === nodeId("target"));
+    expect(into).toHaveLength(3);
+    const ends = into.map((edge) => arrowEnd(edge.path));
+    for (const end of ends) {
+      expect(end.x).toBe(target.x);
+      expect(end.y).toBeGreaterThan(target.y);
+      expect(end.y).toBeLessThan(target.y + target.height);
+    }
+    expect(new Set(ends.map((end) => end.y)).size).toBe(3);
+    const crossings = into.flatMap((edge) => arrowCrossing(edge.path) ?? []);
+    expect(crossings).toHaveLength(2);
+    expect(overlaps(crossings[0]!, crossings[1]!)).toBe(false);
     // a -> c skips b's column: it turns inside the column gaps and crosses above b's card.
     const skip = edgesOf(chain).find(
       (edge) => edge.from === nodeId("a") && edge.to === nodeId("c"),
@@ -256,12 +373,13 @@ describe("layoutIssueGraph", () => {
       { nodeWidth: 100, nodeHeight: 40, labelHeight: 16 },
     );
     const [tree, loose] = regionsOf(layout);
-    // epic in column 0; one and two stacked below it in column 1: three rows of 40 with 12 gaps.
-    expect(tree!.height).toBe(12 + 40 + 12 + 40 + 12 + 40 + 12);
-    expect(Math.min(...tree!.nodes.map((node) => node.y))).toBe(12);
-    expect(Math.max(...tree!.nodes.map((node) => node.y + node.height))).toBe(tree!.height - 12);
-    expect(tree!.width).toBe(12 + 100 + 64 + 100 + 12);
-    expect(loose).toMatchObject({ height: 12 + 40 + 12, width: 12 + 100 + 12, edges: [] });
+    // epic in column 0; one and two stacked below it in column 1: three rows of 40 with 16 gaps,
+    // inside 16 of padding.
+    expect(tree!.height).toBe(16 + 40 + 16 + 40 + 16 + 40 + 16);
+    expect(Math.min(...tree!.nodes.map((node) => node.y))).toBe(16);
+    expect(Math.max(...tree!.nodes.map((node) => node.y + node.height))).toBe(tree!.height - 16);
+    expect(tree!.width).toBe(16 + 100 + 64 + 100 + 16);
+    expect(loose).toMatchObject({ height: 16 + 40 + 16, width: 16 + 100 + 16, edges: [] });
 
     // A card with a blocked-by line is taller, and so is its row.
     const labelled = regionsOf(
@@ -275,7 +393,7 @@ describe("layoutIssueGraph", () => {
       ),
     )[0]!;
     expect(labelled.nodes.map((node) => node.height)).toEqual([56, 40]);
-    expect(labelled.height).toBe(12 + 56 + 12);
+    expect(labelled.height).toBe(16 + 56 + 16);
 
     // A backward edge leaves the last column to its right and enters the first from its left;
     // the region makes room on both sides.
@@ -302,8 +420,8 @@ describe("layoutIssueGraph", () => {
       ),
     );
     expect(pathRight).toBeGreaterThan(cardsRight);
-    expect(cycle.width).toBe(pathRight + 12);
-    expect(pathLeft).toBe(12);
+    expect(cycle.width).toBe(pathRight + 16);
+    expect(pathLeft).toBe(16);
   });
 
   it("groups regions under one row per project, keeping a shared scope in the project that listed it first", () => {

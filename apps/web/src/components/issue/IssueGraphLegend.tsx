@@ -37,12 +37,13 @@ function DependencyMark({ tone }: { tone: "open" | "closed" }) {
   );
 }
 
-/** One line naming the link marks drawn between the graph's cards. */
+/** Names the link marks drawn between the graph's cards. */
 export function IssueGraphLegend() {
   const gt = useGT();
-  const item = "flex items-center gap-1.5";
+  const item = "flex items-center gap-1.5 whitespace-nowrap";
   return (
-    <div className="flex h-7 items-center gap-4 overflow-hidden border-b border-border px-2 text-xs whitespace-nowrap text-muted-foreground">
+    // Wraps onto more lines in a narrow pane rather than cutting off a long translation.
+    <div className="flex min-h-7 flex-wrap items-center gap-x-4 gap-y-1 border-b border-border px-2 py-1 text-xs text-muted-foreground">
       <span className={item}>
         <svg aria-hidden width="16" height="12" viewBox="0 0 16 12" className="shrink-0">
           <path

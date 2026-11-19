@@ -69,15 +69,24 @@ export interface IssueGraphSize {
 }
 
 const DEFAULT_SIZE: IssueGraphSize = { nodeWidth: 240, nodeHeight: 56, labelHeight: 20 };
-const REGION_PADDING = 12;
+const REGION_PADDING = 16;
 const RANK_GAP = 64;
-const ROW_GAP = 12;
+// Wide enough for three parallel arrow tracks with clearance from the cards on both sides.
+const ROW_GAP = 16;
 const GRID_COLUMNS = 4;
 // Grid issues have no links between them, so their columns need no room for edges.
 const GRID_GAP = 16;
 const EDGE_BOW = 48;
 // How far in from the parent's right edge a tree connector drops out of its bottom.
 const TREE_DROP_INSET = 16;
+// A tree connector enters the child beside its first line, as in a folder tree.
+const TREE_ENTRY = 16;
+// Spacing of parallel tracks: tree tracks step left from the column gap's middle; arrow tracks
+// sit either side of the row gap's middle; a lane through empty cells keeps off their middle.
+const TRACK_GAP = 8;
+const TREE_TRACK_OFFSETS = [0, -8, -16, -24];
+const ARROW_TRACK_OFFSETS = [-4, 4, 0];
+const LANE_TRACK_OFFSETS = [-8, 8, -16, 16];
 
 const TYPE_ORDER = ["epic", "feature", "bug", "task", "chore"];
 const OPEN_STATUS_ORDER = [
@@ -419,53 +428,54 @@ function attributeClusters(
   );
 }
 
-/** Ranks are longest paths from the sources; back edges found by a DFS in global order are ignored. */
+/**
+ * Ranks are longest paths from the sources. Links join the ranking one by one, parent links first,
+ * and a link that would close a loop is left out, so the hierarchy always reads left to right and
+ * a dependency against it is drawn backward.
+ */
 function rankCluster(
   items: ReadonlyArray<Item>,
   members: ReadonlyArray<number>,
   edges: ReadonlyArray<RawEdge>,
 ): { ranks: Map<number, number>; predecessors: Map<number, Array<number>> } {
-  const ordered = members.toSorted((a, b) => items[a]!.order - items[b]!.order);
-  const successors = new Map<number, Array<number>>(ordered.map((index) => [index, []]));
-  for (const edge of edges) successors.get(edge.from)?.push(edge.to);
-  for (const next of successors.values()) next.sort((a, b) => items[a]!.order - items[b]!.order);
-
-  const state = new Map<number, "active" | "done">();
-  const finished: Array<number> = [];
-  const dagEdges: Array<[number, number]> = [];
-  for (const start of ordered) {
-    if (state.has(start)) continue;
-    const stack: Array<{ node: number; next: number }> = [{ node: start, next: 0 }];
-    state.set(start, "active");
+  const order = (index: number) => items[index]!.order;
+  const successors = new Map<number, Array<number>>(members.map((index) => [index, []]));
+  const predecessors = new Map<number, Array<number>>(members.map((index) => [index, []]));
+  const reaches = (start: number, target: number) => {
+    const seen = new Set<number>([start]);
+    const stack = [start];
     while (stack.length > 0) {
-      const frame = stack[stack.length - 1]!;
-      const next = successors.get(frame.node)!;
-      if (frame.next < next.length) {
-        const to = next[frame.next++]!;
-        const seen = state.get(to);
-        if (seen === "active") continue;
-        dagEdges.push([frame.node, to]);
-        if (seen === undefined) {
-          state.set(to, "active");
-          stack.push({ node: to, next: 0 });
+      const node = stack.pop()!;
+      if (node === target) return true;
+      for (const next of successors.get(node)!) {
+        if (!seen.has(next)) {
+          seen.add(next);
+          stack.push(next);
         }
-      } else {
-        state.set(frame.node, "done");
-        finished.push(frame.node);
-        stack.pop();
       }
     }
+    return false;
+  };
+  const candidates = edges.toSorted(
+    (a, b) =>
+      Number(a.kind === "blocks") - Number(b.kind === "blocks") ||
+      order(a.from) - order(b.from) ||
+      order(a.to) - order(b.to),
+  );
+  for (const { from, to } of candidates) {
+    if (successors.get(from)!.includes(to) || reaches(to, from)) continue;
+    successors.get(from)!.push(to);
+    predecessors.get(to)!.push(from);
   }
-
-  const predecessors = new Map<number, Array<number>>(ordered.map((index) => [index, []]));
-  for (const [from, to] of dagEdges) predecessors.get(to)!.push(from);
   const ranks = new Map<number, number>();
-  for (let i = finished.length - 1; i >= 0; i--) {
-    const node = finished[i]!;
-    let rank = 0;
-    for (const from of predecessors.get(node)!) rank = Math.max(rank, ranks.get(from)! + 1);
+  const rankOf = (node: number): number => {
+    const known = ranks.get(node);
+    if (known !== undefined) return known;
+    const rank = Math.max(0, ...predecessors.get(node)!.map((from) => rankOf(from) + 1));
     ranks.set(node, rank);
-  }
+    return rank;
+  };
+  for (const index of members.toSorted((a, b) => order(a) - order(b))) rankOf(index);
   return { ranks, predecessors };
 }
 
@@ -566,28 +576,19 @@ function placeRegion(
     return node;
   });
   const lastColumn = columns.length + gridColumns - 1;
-  let width =
+  const cardsRight =
     lastColumn < 0
       ? left + REGION_PADDING
       : left + columnX(lastColumn, columns.length, nodeWidth) + nodeWidth + REGION_PADDING;
-  const placedEdges = regionEdges.map((edge): IssueGraphEdge => {
-    const from = nodeAt.get(edge.from)!;
-    const to = nodeAt.get(edge.to)!;
-    const base = { id: edge.id, from: from.id, to: to.id };
-    if (edge.kind === "parent") {
-      const { path, maxX } = treePath(from, to);
-      width = Math.max(width, maxX + REGION_PADDING);
-      return { ...base, kind: "parent", path };
-    }
-    const { path, maxX } = edgePath(from, to);
-    // A same-column bow leaves the last column; the region scrolls far enough to show it.
-    width = Math.max(width, maxX + REGION_PADDING);
-    return {
-      ...base,
-      kind: "blocks",
-      blockerOpen: items[edge.from]!.entry.state.category !== "closed",
-      path,
-    };
+  const routed = routeEdges({
+    items,
+    edges: regionEdges,
+    nodeAt,
+    column,
+    row,
+    rowTops,
+    rowHeights,
+    gapLeft: (index) => left + columnX(index, columns.length, nodeWidth) + nodeWidth,
   });
   return {
     id: `${projectId}:${cluster.id}`,
@@ -598,13 +599,16 @@ function placeRegion(
         ? null
         : (items.find((item) => item.id === cluster.rootNodeId)?.entry ?? null),
     issueCount: cluster.members.length,
-    width,
-    height:
+    // A link can run past the last column; the region scrolls far enough to show it.
+    width: Math.max(cardsRight, routed.maxX + REGION_PADDING),
+    height: Math.max(
       REGION_PADDING * 2 +
-      rowHeights.reduce((sum, height) => sum + height, 0) +
-      (rowCount - 1) * ROW_GAP,
+        rowHeights.reduce((sum, height) => sum + height, 0) +
+        (rowCount - 1) * ROW_GAP,
+      routed.maxY + REGION_PADDING,
+    ),
     nodes,
-    edges: placedEdges,
+    edges: routed.edges,
   };
 }
 
@@ -613,58 +617,245 @@ function columnX(column: number, rankedColumns: number, nodeWidth: number): numb
   return rankedColumns * (nodeWidth + RANK_GAP) + (column - rankedColumns) * (nodeWidth + GRID_GAP);
 }
 
+interface Run {
+  readonly channel: string;
+  readonly owner: string;
+  readonly from: number;
+  readonly to: number;
+  /** A run that only passes through a gap takes tracks after the gap's own trunks. */
+  readonly passing?: boolean;
+}
+
+/**
+ * Parallel tracks inside the gaps links run in. One owner keeps one track per gap, so siblings
+ * share their parent's trunk; owners whose runs overlap in a gap get different tracks.
+ */
+function assignTracks(runs: ReadonlyArray<Run>): (channel: string, owner: string) => number {
+  const key = (channel: string, owner: string) => `${channel}\u0000${owner}`;
+  const merged = new Map<string, Run>();
+  for (const run of runs) {
+    const previous = merged.get(key(run.channel, run.owner));
+    const low = Math.min(run.from, run.to, previous?.from ?? Infinity);
+    const high = Math.max(run.from, run.to, previous?.to ?? -Infinity);
+    merged.set(key(run.channel, run.owner), { ...run, from: low, to: high });
+  }
+  const byChannel = new Map<string, Array<Run>>();
+  for (const run of merged.values()) {
+    byChannel.set(run.channel, [...(byChannel.get(run.channel) ?? []), run]);
+  }
+  const tracks = new Map<string, number>();
+  for (const channelRuns of byChannel.values()) {
+    const taken: Array<Array<Run>> = [];
+    const sorted = channelRuns.toSorted(
+      (a, b) =>
+        Number(a.passing ?? false) - Number(b.passing ?? false) ||
+        a.from - b.from ||
+        a.to - b.to ||
+        compareIds(a.owner, b.owner),
+    );
+    for (const run of sorted) {
+      let track = 0;
+      while (taken[track]?.some((other) => other.from <= run.to && run.from <= other.to)) track++;
+      (taken[track] ??= []).push(run);
+      tracks.set(key(run.channel, run.owner), track);
+    }
+  }
+  return (channel, owner) => tracks.get(key(channel, owner)) ?? 0;
+}
+
+const offsetOf = (offsets: ReadonlyArray<number>, track: number) =>
+  offsets[track % offsets.length]!;
+
+function routeEdges({
+  items,
+  edges,
+  nodeAt,
+  column,
+  row,
+  rowTops,
+  rowHeights,
+  gapLeft,
+}: {
+  items: ReadonlyArray<Item>;
+  edges: ReadonlyArray<RawEdge>;
+  nodeAt: ReadonlyMap<number, IssueGraphNode>;
+  column: ReadonlyMap<number, number>;
+  row: ReadonlyMap<number, number>;
+  rowTops: ReadonlyArray<number>;
+  rowHeights: ReadonlyArray<number>;
+  /** Left side of the gap to the right of a column. */
+  gapLeft: (column: number) => number;
+}): { edges: Array<IssueGraphEdge>; maxX: number; maxY: number } {
+  const half = RANK_GAP / 2;
+  const contentBottom = rowTops[rowTops.length - 1]! + rowHeights[rowHeights.length - 1]!;
+  const occupied = new Set(
+    [...nodeAt.keys()].map((index) => `${column.get(index)}:${row.get(index)}`),
+  );
+  const treeEntryY = (to: IssueGraphNode) => to.y + Math.min(TREE_ENTRY, to.height / 2);
+
+  // Tree connectors. A child more than one column right reaches its column through a lane: the
+  // first row below the parent with no card in the columns it crosses, else a lane under them all.
+  const parentEdges = edges.filter((edge) => edge.kind === "parent");
+  const forward = (edge: RawEdge) => column.get(edge.to)! > column.get(edge.from)!;
+  const farthest = new Map<number, number>();
+  for (const edge of parentEdges) {
+    if (forward(edge) && column.get(edge.to)! > column.get(edge.from)! + 1) {
+      farthest.set(edge.from, Math.max(farthest.get(edge.from) ?? 0, column.get(edge.to)!));
+    }
+  }
+  const lanes = new Map<number, { channel: string; row: number | null }>();
+  const laneRuns: Array<Run> = [];
+  for (const [parent, last] of farthest) {
+    const first = column.get(parent)! + 1;
+    let laneRow: number | null = null;
+    for (let r = row.get(parent)! + 1; r < rowTops.length && laneRow === null; r++) {
+      let free = true;
+      for (let c = first; c < last; c++) if (occupied.has(`${c}:${r}`)) free = false;
+      if (free) laneRow = r;
+    }
+    const channel = laneRow === null ? "lane:bottom" : `lane:${laneRow}`;
+    lanes.set(parent, { channel, row: laneRow });
+    laneRuns.push({ channel, owner: String(parent), from: first - 1, to: last - 1 });
+  }
+  const laneTrack = assignTracks(laneRuns);
+  const laneY = (parent: number) => {
+    const lane = lanes.get(parent)!;
+    const track = laneTrack(lane.channel, String(parent));
+    return lane.row === null
+      ? contentBottom + ROW_GAP + track * TRACK_GAP
+      : rowTops[lane.row]! + rowHeights[lane.row]! / 2 + offsetOf(LANE_TRACK_OFFSETS, track);
+  };
+  const treeRuns: Array<Run> = [];
+  for (const edge of parentEdges.filter(forward)) {
+    const from = nodeAt.get(edge.from)!;
+    const to = nodeAt.get(edge.to)!;
+    const [start, end] = [column.get(edge.from)!, column.get(edge.to)!];
+    const dropY = from.y + from.height + ROW_GAP / 2;
+    const owner = String(edge.from);
+    if (end === start + 1) {
+      treeRuns.push({ channel: `${start}`, owner, from: dropY, to: treeEntryY(to) });
+    } else {
+      const lane = laneY(edge.from);
+      treeRuns.push({ channel: `${start}`, owner, from: dropY, to: lane });
+      // Left of the trunks there, so their entries into children never cross it.
+      treeRuns.push({
+        channel: `${end - 1}`,
+        owner,
+        from: lane,
+        to: treeEntryY(to),
+        passing: true,
+      });
+    }
+  }
+  const treeTrack = assignTracks(treeRuns);
+  const trackX = (gap: number, owner: number) =>
+    gapLeft(gap) + half + offsetOf(TREE_TRACK_OFFSETS, treeTrack(`${gap}`, String(owner)));
+
+  // Arrows into one card spread along its left edge, below a tree connector's entry, in the
+  // order of their sources, so none ends under another's arrowhead.
+  const blocksEdges = edges.filter((edge) => edge.kind === "blocks");
+  const entryY = new Map<string, number>();
+  const hasTreeEntry = new Set(parentEdges.map((edge) => edge.to));
+  const incomingOf = new Map<number, Array<RawEdge>>();
+  for (const edge of blocksEdges)
+    incomingOf.set(edge.to, [...(incomingOf.get(edge.to) ?? []), edge]);
+  for (const [target, incoming] of incomingOf) {
+    const to = nodeAt.get(target)!;
+    const top = hasTreeEntry.has(target) ? treeEntryY(to) : to.y;
+    const sorted = incoming.toSorted((a, b) => {
+      const [fa, fb] = [nodeAt.get(a.from)!, nodeAt.get(b.from)!];
+      return fa.y + fa.height / 2 - (fb.y + fb.height / 2) || fa.x - fb.x || compareIds(a.id, b.id);
+    });
+    sorted.forEach((edge, position) => {
+      entryY.set(edge.id, top + ((to.y + to.height - top) * (position + 1)) / (sorted.length + 1));
+    });
+  }
+  // A backward arrow, or one skipping a column, crosses in the row gap above the higher of its two
+  // cards, on its own track there.
+  const crossesGap = (from: IssueGraphNode, to: IssueGraphNode) =>
+    to.x < from.x + from.width || to.x - (from.x + from.width) > from.width + EDGE_BOW;
+  const crossingRow = (edge: RawEdge) => Math.min(row.get(edge.from)!, row.get(edge.to)!);
+  const arrowTrack = assignTracks(
+    blocksEdges.flatMap((edge) => {
+      const [from, to] = [nodeAt.get(edge.from)!, nodeAt.get(edge.to)!];
+      if (!crossesGap(from, to)) return [];
+      const sx = from.x + from.width;
+      return [
+        {
+          channel: `${crossingRow(edge)}`,
+          owner: edge.id,
+          from: sx + EDGE_BOW,
+          to: to.x - EDGE_BOW,
+        },
+      ];
+    }),
+  );
+
+  let maxX = 0;
+  let maxY = 0;
+  const routed = edges.map((edge): IssueGraphEdge => {
+    const from = nodeAt.get(edge.from)!;
+    const to = nodeAt.get(edge.to)!;
+    const base = { id: edge.id, from: from.id, to: to.id };
+    if (edge.kind === "parent") {
+      const start = column.get(edge.from)!;
+      const end = column.get(edge.to)!;
+      const dropX = from.x + from.width - TREE_DROP_INSET;
+      const bottom = from.y + from.height;
+      const dropY = bottom + ROW_GAP / 2;
+      const ty = treeEntryY(to);
+      let legs: string;
+      if (end === start + 1) {
+        legs = `H ${trackX(start, edge.from)} V ${ty}`;
+      } else if (end > start) {
+        const lane = laneY(edge.from);
+        maxY = Math.max(maxY, lane);
+        legs = `H ${trackX(start, edge.from)} V ${lane} H ${trackX(end - 1, edge.from)} V ${ty}`;
+      } else {
+        // Behind its parent, only possible in a parent cycle: over in the row gap above it.
+        legs = `H ${from.x + from.width + half} V ${to.y - ROW_GAP / 2} H ${to.x - half} V ${ty}`;
+      }
+      maxX = Math.max(maxX, from.x + from.width + half);
+      return { ...base, kind: "parent", path: `M ${dropX} ${bottom} V ${dropY} ${legs} H ${to.x}` };
+    }
+    const ty = entryY.get(edge.id)!;
+    const gapY = crossesGap(from, to)
+      ? rowTops[crossingRow(edge)]! -
+        ROW_GAP / 2 +
+        offsetOf(ARROW_TRACK_OFFSETS, arrowTrack(`${crossingRow(edge)}`, edge.id))
+      : null;
+    const { path, maxX: right } = edgePath(from, to, ty, gapY);
+    maxX = Math.max(maxX, right);
+    return {
+      ...base,
+      kind: "blocks",
+      blockerOpen: items[edge.from]!.entry.state.category !== "closed",
+      path,
+    };
+  });
+  return { edges: routed, maxX, maxY };
+}
+
 function edgePath(
   from: IssueGraphNode,
   to: IssueGraphNode,
+  ty: number,
+  gapY: number | null,
 ): { readonly path: string; readonly maxX: number } {
   const sx = from.x + from.width;
   const sy = from.y + from.height / 2;
-  const ty = to.y + to.height / 2;
-  if (to.x === from.x) {
-    // Same column: leave and enter on the right, bowing out past both nodes.
-    const bow = EDGE_BOW + Math.abs(ty - sy) / 4;
-    return {
-      path: `M ${sx} ${sy} C ${sx + bow} ${sy}, ${sx + bow} ${ty}, ${sx} ${ty}`,
-      maxX: sx + bow,
-    };
-  }
   const tx = to.x;
-  if (tx < sx || tx - sx > from.width + EDGE_BOW) {
+  if (gapY !== null) {
     // Backward or skipping a column: rise inside the column gap, cross in the row gap above,
     // then come down, so the edge never runs behind the cards it passes.
-    const gapY = Math.min(from.y, to.y) - ROW_GAP / 2;
-    const half = EDGE_BOW / 2;
+    const bow = EDGE_BOW / 2;
     return {
       path:
-        `M ${sx} ${sy} C ${sx + half} ${sy}, ${sx + half} ${gapY}, ${sx + EDGE_BOW} ${gapY} ` +
-        `L ${tx - EDGE_BOW} ${gapY} C ${tx - half} ${gapY}, ${tx - half} ${ty}, ${tx} ${ty}`,
+        `M ${sx} ${sy} C ${sx + bow} ${sy}, ${sx + bow} ${gapY}, ${sx + EDGE_BOW} ${gapY} ` +
+        `L ${tx - EDGE_BOW} ${gapY} C ${tx - bow} ${gapY}, ${tx - bow} ${ty}, ${tx} ${ty}`,
       maxX: Math.max(sx + EDGE_BOW, tx),
     };
   }
   const pull = Math.max(EDGE_BOW / 2, (tx - sx) / 2);
   return { path: `M ${sx} ${sy} C ${sx + pull} ${sy}, ${tx - pull} ${ty}, ${tx} ${ty}`, maxX: tx };
-}
-
-/**
- * Down out of the parent's bottom into the row gap below it, right into the column gap, then down
- * that gap and right into the child's left edge. Siblings share the drop and the trunk. Every leg
- * runs in a row or column gap, so it never passes behind a card.
- */
-function treePath(
-  from: IssueGraphNode,
-  to: IssueGraphNode,
-): { readonly path: string; readonly maxX: number } {
-  const half = RANK_GAP / 2;
-  const dropX = from.x + from.width - TREE_DROP_INSET;
-  const dropY = from.y + from.height + ROW_GAP / 2;
-  const trunkX = from.x + from.width + half;
-  const ty = to.y + to.height / 2;
-  const tx = to.x;
-  // Only a child further away than the next column (or behind, in a cycle) needs to cross over
-  // to the column gap before it, in the row gap above it.
-  const cross = tx - half === trunkX ? "" : `V ${to.y - ROW_GAP / 2} H ${tx - half} `;
-  return {
-    path: `M ${dropX} ${from.y + from.height} V ${dropY} H ${trunkX} ${cross}V ${ty} H ${tx}`,
-    maxX: Math.max(trunkX, tx),
-  };
 }
