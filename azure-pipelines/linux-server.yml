@@ -1,0 +1,131 @@
+# Insta Blinds fork: builds the self-contained Linux x64 T3 server archive
+# (t3-<version>-linux-x64.tar.gz), smoke-tests it, and publishes it with
+# SHA256SUMS and build-info.json as the pipeline artifact "t3-linux-server".
+# Mirrors the Linux CLI-archive steps of .github/workflows/release.yml and
+# release-desktop.yml. Kept outside .github/ so upstream merges never conflict.
+# Azure DevOps pipeline: Instablinds/t3code -> t3code-linux-server.
+
+trigger: none
+pr: none
+
+# The only line to change when moving to a self-hosted pool, e.g.
+#   pool: { name: instablinds-pr-validation-canadacentral }
+# The agent must be Ubuntu 24.04 (node-pty's glibc ceiling, scripts/linux-glibc.ts)
+# with passwordless sudo for apt, and about 6 GB of free disk.
+pool: { vmImage: ubuntu-24.04 }
+
+variables:
+  # Increases by one per run of this pipeline; becomes the last version field.
+  runNumber: $[counter('t3code-linux-server', 1)]
+  T3CODE_TELEMETRY_CHANNEL: dev
+
+jobs:
+  - job: linux_server
+    displayName: Build Linux server archive
+    timeoutInMinutes: 60
+    steps:
+      - checkout: self
+        fetchDepth: 1
+
+      - bash: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y patchelf libatomic1
+          if ! command -v cargo >/dev/null; then
+            curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+            echo "##vso[task.prependpath]$HOME/.cargo/bin"
+          fi
+        displayName: Install system packages and Rust
+
+      - bash: |
+          set -euo pipefail
+          vp_version="$(sed -nE 's/^  vite-plus: ([0-9][^ ]*)$/\1/p' pnpm-workspace.yaml)"
+          node_version="$(jq -r '.engines.node' package.json)"
+          echo "Installing Vite+ $vp_version with Node.js $node_version"
+          curl -fsSL https://vite.plus | VP_VERSION="$vp_version" bash
+          "$HOME/.vite-plus/bin/vp" env use "$node_version"
+          echo "##vso[task.prependpath]$HOME/.vite-plus/bin"
+        displayName: Install Vite+ and Node.js
+
+      - bash: |
+          set -euo pipefail
+          node --version
+          sha="$(Build.SourceVersion)"
+          # The commit's date, not the clock, so a re-run cannot rank an old commit above newer builds.
+          date="$(TZ=UTC git show -s --format=%cd --date=format-local:%Y%m%d "$sha")"
+          version="$(node scripts/resolve-nightly-release.ts --date "$date" --run-number "$(runNumber)" --sha "$sha" | sed -n 's/^version=//p')"
+          if [[ -z "$version" ]]; then
+            echo "Could not resolve the nightly version" >&2
+            exit 1
+          fi
+          echo "Version: $version"
+          echo "##vso[task.setvariable variable=T3_VERSION]$version"
+          echo "##vso[build.updatebuildnumber]$version"
+          # The same public T3 Connect settings upstream's builds read.
+          for key in CLERK_PUBLISHABLE_KEY CLERK_JWT_TEMPLATE CLERK_CLI_OAUTH_CLIENT_ID RELAY_URL; do
+            value="$(sed -n "s|^T3CODE_${key}=||p" .env.example)"
+            if [[ -z "$value" ]]; then
+              echo "Missing T3CODE_${key} in .env.example" >&2
+              exit 1
+            fi
+            echo "##vso[task.setvariable variable=T3CODE_${key}]$value"
+          done
+        displayName: Resolve version
+
+      - bash: vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/scripts... --frozen-lockfile
+        displayName: Install dependencies
+
+      # Otherwise the binary reports the previous version and the smoke test fails.
+      - bash: node scripts/update-release-package-versions.ts "$(T3_VERSION)"
+        displayName: Align package versions
+
+      - bash: |
+          set -euo pipefail
+          vp run --filter t3 build
+          node scripts/apply-web-brand-assets.ts nightly apps/server/dist/client
+        displayName: Build server and web client
+
+      - bash: |
+          set -euo pipefail
+          cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml
+          rm_dir="$(Agent.TempDirectory)/cli-resource-monitor"
+          mkdir -p "$rm_dir/linux-x64"
+          cp native/resource-monitor/target/release/t3-resource-monitor "$rm_dir/linux-x64/"
+          echo "##vso[task.setvariable variable=RESOURCE_MONITOR_DIR]$rm_dir"
+        displayName: Build resource monitor
+
+      - bash: node apps/server/scripts/cli.ts build-exe --verbose
+        displayName: Build CLI single-executable
+
+      - bash: |
+          node scripts/build-cli-archive.ts \
+            --platform linux --arch x64 \
+            --version "$(T3_VERSION)" \
+            --resource-monitor-dir "$(RESOURCE_MONITOR_DIR)" \
+            --output-dir release-cli
+        displayName: Build CLI archive
+
+      # Starts `t3 serve` from the extracted archive and waits for HTTP 200.
+      - bash: node scripts/smoke-cli-archive.ts --archive release-cli/*.tar.gz --expect-version "$(T3_VERSION)"
+        displayName: Smoke-test CLI archive
+
+      - bash: |
+          set -euo pipefail
+          out="$(Build.ArtifactStagingDirectory)/t3-linux-server"
+          mkdir -p "$out"
+          cp release-cli/*.tar.gz "$out/"
+          jq -n \
+            --arg version "$(T3_VERSION)" \
+            --arg commit "$(Build.SourceVersion)" \
+            --arg branch "$(Build.SourceBranchName)" \
+            --arg runUrl "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)" \
+            --arg builtAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg agentPool "$(Agent.Name)" \
+            '{version: $version, commit: $commit, branch: $branch, runUrl: $runUrl, builtAt: $builtAt, agent: $agentPool}' \
+            > "$out/build-info.json"
+          (cd "$out" && sha256sum * > SHA256SUMS && cat SHA256SUMS build-info.json)
+        displayName: Write checksums and build info
+
+      - publish: $(Build.ArtifactStagingDirectory)/t3-linux-server
+        artifact: t3-linux-server
+        displayName: Publish artifact
