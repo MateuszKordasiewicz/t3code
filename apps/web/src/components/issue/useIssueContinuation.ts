@@ -33,7 +33,7 @@ export function useIssueContinuation(environmentId: EnvironmentId) {
   const checking = useRef(false);
   const [pending, setPending] = useState(false);
 
-  const start = async (
+  const start = (
     thread: { id: ThreadId; title: string },
     issue: IssueDetail,
     link: ThreadIssueLinkTarget,
@@ -58,7 +58,7 @@ export function useIssueContinuation(environmentId: EnvironmentId) {
             }),
         },
       });
-    try {
+    const prepareDraft = async () => {
       const checked = await check({ environmentId, input: source });
       if (router.state.location.href !== href) return;
       if (checked._tag === "Failure") {
@@ -86,12 +86,13 @@ export function useIssueContinuation(environmentId: EnvironmentId) {
         ].join("\n\n"),
         continuation: { source, title: thread.title },
       });
-    } catch {
-      showBlocked(m(msg("The continuation draft could not be opened.")));
-    } finally {
-      checking.current = false;
-      setPending(false);
-    }
+    };
+    void prepareDraft()
+      .catch(() => showBlocked(m(msg("The continuation draft could not be opened."))))
+      .finally(() => {
+        checking.current = false;
+        setPending(false);
+      });
   };
   return { pending, start };
 }
