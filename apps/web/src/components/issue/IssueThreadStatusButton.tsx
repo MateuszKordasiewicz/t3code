@@ -144,6 +144,8 @@ export function IssueThreadStatusButton({
     );
   }
   const PrimaryIcon = STATUS_ICON[primary.status];
+  // A running thread is answered in place; only a stopped one can be continued.
+  const stopped = threads.filter((thread) => thread.status !== "running");
   return (
     <Group aria-label={gt("Linked threads")}>
       <Tooltip>
@@ -171,32 +173,6 @@ export function IssueThreadStatusButton({
             <MenuGroupLabel>{gt("Linked threads")}</MenuGroupLabel>
             {threads.map((thread) => {
               const Icon = STATUS_ICON[thread.status];
-              if (canOperate && tracker === "beads") {
-                return (
-                  <MenuSub key={thread.id}>
-                    <MenuSubTrigger>
-                      <Icon aria-hidden />
-                      <MenuItemLabel>{thread.title}</MenuItemLabel>
-                      <MenuItemDetail>{statusLabel(thread.status)}</MenuItemDetail>
-                    </MenuSubTrigger>
-                    <MenuSubPopup>
-                      <MenuItem onClick={() => open(thread)}>{gt("Open original thread")}</MenuItem>
-                      <MenuItem
-                        disabled={continuation.pending}
-                        onClick={() =>
-                          void continuation.start(
-                            thread,
-                            issue,
-                            issueThreadLinkTarget(reference, issue),
-                          )
-                        }
-                      >
-                        {gt("Continue in this worktree")}
-                      </MenuItem>
-                    </MenuSubPopup>
-                  </MenuSub>
-                );
-              }
               return (
                 <MenuItem key={thread.id} onClick={() => open(thread)}>
                   <Icon aria-hidden />
@@ -206,6 +182,38 @@ export function IssueThreadStatusButton({
               );
             })}
           </MenuGroup>
+          {canOperate && tracker === "beads" && stopped.length > 0 ? (
+            <>
+              <MenuSeparator />
+              <MenuSub>
+                <MenuSubTrigger>
+                  <MenuItemLabel>{gt("Continue in this worktree")}</MenuItemLabel>
+                </MenuSubTrigger>
+                <MenuSubPopup>
+                  {stopped.map((thread) => {
+                    const Icon = STATUS_ICON[thread.status];
+                    return (
+                      <MenuItem
+                        key={thread.id}
+                        disabled={continuation.pending}
+                        onClick={() =>
+                          void continuation.start(
+                            thread,
+                            issue,
+                            issueThreadLinkTarget(reference, issue),
+                          )
+                        }
+                      >
+                        <Icon aria-hidden />
+                        <MenuItemLabel>{thread.title}</MenuItemLabel>
+                        <MenuItemDetail>{statusLabel(thread.status)}</MenuItemDetail>
+                      </MenuItem>
+                    );
+                  })}
+                </MenuSubPopup>
+              </MenuSub>
+            </>
+          ) : null}
           {canOperate ? (
             <>
               <MenuSeparator />
