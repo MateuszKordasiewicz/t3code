@@ -51,6 +51,7 @@ import { useCopyToClipboard } from "./useCopyToClipboard";
 import { useNewThreadHandler } from "./useHandleNewThread";
 import { useClientSettings } from "./useSettings";
 import { canTurnThreadIntoProject, useThreadActions } from "./useThreadActions";
+import { useThreadTriageActions } from "./useThreadTriageActions";
 
 function failureToast(title: string, error: unknown) {
   toastManager.add(
@@ -92,6 +93,7 @@ export function useThreadActionMenu(input: {
     markThreadUnread,
     turnThreadIntoProject,
   } = useThreadActions();
+  const { markMyMove, clearLabel } = useThreadTriageActions();
   const regenerateThreadTitle = useOrchestrationCommand(threadEnvironment.regenerateTitle, {
     reportFailure: false,
   });
@@ -147,6 +149,7 @@ export function useThreadActionMenu(input: {
         isSettled: supports.settlement && thread.settledOverride === "settled",
         autoSettleEnabled: thread.autoSettleDisabledAt == null,
         isSnoozed: supports.snooze && effectiveSnoozed(thread, { now: now.toISOString() }),
+        triageLabel: thread.triageLabel ?? null,
         canSnoozeNow: canSnooze(thread, { now: now.toISOString() }),
         isRegeneratingTitle,
         isRunning: !threadRuntimeCanArchive(thread.runtime),
@@ -252,6 +255,12 @@ export function useThreadActionMenu(input: {
           await reportFailure(m(msg("Failed to update auto-settle")), () =>
             setThreadAutoSettle(threadRef, action === "auto-settle:enabled"),
           );
+          return;
+        case "triage:my-move":
+          await markMyMove(threadRef, thread.triageLabel ?? null);
+          return;
+        case "triage:clear":
+          await clearLabel(threadRef);
           return;
         case "rename":
           onStartRename();
