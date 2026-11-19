@@ -120,7 +120,7 @@ export function IssueGraphView({
       className="max-h-[calc(100dvh-10rem)] overflow-auto rounded-lg border border-border"
     >
       <div className="relative min-w-full" style={{ width: layout.width, height: layout.height }}>
-        {layout.clusters.map((cluster) => (
+        {layout.clusters.map((cluster, index) => (
           <section
             key={cluster.id}
             className={cn(
@@ -145,11 +145,14 @@ export function IssueGraphView({
                     ? gt("Expand group", { $context: "issue graph" })
                     : gt("Collapse group", { $context: "issue graph" })
                 }
+                aria-describedby={`${markerId}-band-${index}`}
                 onClick={() => toggleBand(cluster.id)}
               >
                 {cluster.collapsed ? <ChevronRightIcon /> : <ChevronDownIcon />}
               </Button>
-              <ClusterLabel cluster={cluster} />
+              <span id={`${markerId}-band-${index}`} className="contents">
+                <ClusterLabel cluster={cluster} />
+              </span>
               <span className="shrink-0 font-normal">
                 ·{" "}
                 {gt("{count, plural, one {{count} issue} other {{count} issues}}", {

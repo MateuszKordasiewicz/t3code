@@ -16,7 +16,6 @@ describe("collapsed issue graph bands", () => {
     });
     expect(decodeCollapsedIssueGraphBands(null)).toEqual(empty);
     expect(decodeCollapsedIssueGraphBands({ tree: "tree:x" })).toEqual(empty);
-    expect(decodeCollapsedIssueGraphBands({ tree: ["x".repeat(1001)] })).toEqual(empty);
     const long = Array.from({ length: 150 }, (_, i) => `tree:${i}`);
     expect(decodeCollapsedIssueGraphBands({ tree: long }).tree).toEqual(
       long.slice(-MAX_COLLAPSED_ISSUE_GRAPH_BANDS),

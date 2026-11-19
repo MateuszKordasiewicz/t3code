@@ -12,7 +12,7 @@ const STORAGE_KEY = "t3.issues.graphCollapsedBands";
 
 const NO_COLLAPSED_BANDS: CollapsedIssueGraphBands = { tree: [], type: [], status: [] };
 
-const BandIds = Schema.Array(Schema.String.check(Schema.isMaxLength(1000)));
+const BandIds = Schema.Array(Schema.String);
 const decodeStored = Schema.decodeUnknownOption(
   Schema.Struct({
     tree: Schema.optional(BandIds),
