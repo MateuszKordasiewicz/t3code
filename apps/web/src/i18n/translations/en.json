@@ -5737,6 +5737,8 @@
   "309a68dc21af399d": "Anyone",
   "4dc86e84bb5ece63": "The people could not be read",
   "4103b6b8e0ff3f46": "More people exist than are listed here.",
+  "e8f453a3a26649b2": "{count, plural, one {# more linked thread} other {# more linked threads}}",
+  "2025fc2a5f89a7fb": "Open thread {title}",
   "dba4868fa4829e79": "Could not start a thread",
   "b1a119151d281893": "Try again from the issue.",
   "7342bfc328008926": "Running",
