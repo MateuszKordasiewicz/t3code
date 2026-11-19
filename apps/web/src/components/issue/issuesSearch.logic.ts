@@ -24,6 +24,8 @@ export const issuesSearchFromUrl = (raw: Record<string, unknown>): IssuesSearch 
   label: labels(raw.label),
   assignee: bounded(raw.assignee),
   order: raw.order === "created" ? "created" : undefined,
+  view: raw.view === "graph" ? "graph" : undefined,
+  group: raw.group === "type" || raw.group === "status" ? raw.group : undefined,
   selectedEnvironmentId: bounded(raw.selectedEnvironmentId) as EnvironmentId | undefined,
   selectedProjectId: bounded(raw.selectedProjectId) as ProjectId | undefined,
   selectedHost: bounded(raw.selectedHost),

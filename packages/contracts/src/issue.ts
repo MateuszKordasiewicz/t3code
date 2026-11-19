@@ -111,6 +111,14 @@ export const IssueSummary = Schema.Struct({
   assignees: Schema.Array(IssueActor),
   labels: Schema.Array(IssueLabel),
   commentCount: NonNegativeInt,
+  // Trackers that model hierarchy and dependencies fill these; the rest leave them out.
+  parentKey: Schema.optional(TrimmedNonEmptyString),
+  /** Keys of the issues in this scope that block this one. */
+  dependsOnKeys: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
+  /** The tracker's own type name, such as epic, feature, bug, task or chore. */
+  issueType: Schema.optional(TrimmedNonEmptyString),
+  /** 0 is highest. */
+  priority: Schema.optional(NonNegativeInt),
 });
 export type IssueSummary = typeof IssueSummary.Type;
 

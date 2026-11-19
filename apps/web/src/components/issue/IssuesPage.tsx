@@ -56,6 +56,8 @@ import {
 import { m, type MessageResolver } from "~/i18n/messages";
 import { resolveFilterOptions } from "../pullRequest/pullRequestListOptions";
 import { IssueFiltersMenu } from "./IssueListFilterPickers";
+import { ISSUE_GRAPH_PAGE_SIZE, IssueGraphView } from "./IssueGraphView";
+import { IssueViewControls } from "./IssueViewControls";
 import { ISSUE_SAVED_VIEWS } from "./issueSavedViews";
 import { SavedViewsMenu } from "~/components/SavedViewsMenu";
 import { PullRequestCompactFilterMenu } from "../pullRequest/PullRequestCompactFilterMenu";
@@ -205,7 +207,7 @@ export function IssuesPage() {
   const listInput: IssueListInput = {
     state: search.status,
     involvement: search.who,
-    limit: PAGE_SIZE,
+    limit: search.view === "graph" ? ISSUE_GRAPH_PAGE_SIZE : PAGE_SIZE,
     ...(search.host ? { host: search.host } : {}),
     ...(debouncedQuery ? { query: debouncedQuery } : {}),
     ...(search.label?.length ? { labels: search.label } : {}),
@@ -297,6 +299,8 @@ export function IssuesPage() {
       ...(merged.label?.length ? { label: merged.label } : {}),
       ...(merged.assignee ? { assignee: merged.assignee } : {}),
       ...(merged.order ? { order: merged.order } : {}),
+      ...(merged.view ? { view: merged.view } : {}),
+      ...(merged.group ? { group: merged.group } : {}),
       ...(merged.selectedEnvironmentId
         ? { selectedEnvironmentId: merged.selectedEnvironmentId }
         : {}),
@@ -458,6 +462,15 @@ export function IssuesPage() {
   // Every writable scope the workspace has, for the composer.
 
   const showTracker = groups.length > 1;
+  const graph = search.view === "graph";
+  const selectedIssueId =
+    renderedSurface?.kind === "issue"
+      ? `${renderedSurface.environmentId}:${issueEntryKey({
+          ...renderedSurface,
+          host: renderedSurface.host ?? "",
+          projectId: renderedSurface.projectId as ProjectId,
+        })}`
+      : null;
   const noneAnswered = list.answers.length === 0;
 
   const listBody: ReactNode = !issuesSupported ? (
@@ -501,7 +514,24 @@ export function IssuesPage() {
           </Button>
         </div>
       ) : null}
+      {graph ? (
+        <IssueGraphView
+          entries={groups.flatMap((group) => group.rows)}
+          groupBy={search.group ?? "tree"}
+          selectedId={selectedIssueId}
+          onSelect={selectEntry}
+        />
+      ) : null}
       {groups.map((group) => {
+        // The graph draws the rows; a tracker's section stays only to say something about it.
+        if (
+          graph &&
+          group.rows.length > 0 &&
+          group.tracker.configured &&
+          group.errors.length === 0 &&
+          group.more.length === 0
+        )
+          return null;
         const presentation = issueTrackerPresentation(group.tracker.tracker);
         const showScope = new Set(group.rows.map((row) => row.scope.toLowerCase())).size > 1;
         return (
@@ -543,7 +573,7 @@ export function IssuesPage() {
                 )}
               </p>
             ) : null}
-            {group.rows.map((row) => {
+            {(graph ? [] : group.rows).map((row) => {
               const key = issueEntryKey(row);
               const selected =
                 renderedSurface?.kind === "issue" &&
@@ -655,6 +685,12 @@ export function IssuesPage() {
                     onSubmit={(q) => updateSearch({ q: q || undefined })}
                   />
                 </div>
+                <IssueViewControls
+                  view={graph ? "graph" : "list"}
+                  group={search.group ?? "tree"}
+                  onView={(view) => updateSearch({ view: view === "graph" ? "graph" : undefined })}
+                  onGroup={(group) => updateSearch({ group: group === "tree" ? undefined : group })}
+                />
                 <PullRequestCompactFilterMenu
                   label={gt("Sort issues")}
                   triggerIcon={<ArrowDownUpIcon aria-hidden className="size-4" />}
@@ -693,6 +729,8 @@ export function IssuesPage() {
                       label: view.label,
                       assignee: view.assignee,
                       order: view.order,
+                      view: view.view,
+                      group: view.group,
                     })
                   }
                 />

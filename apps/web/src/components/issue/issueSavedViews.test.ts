@@ -21,4 +21,12 @@ describe("saved issue views", () => {
     expect(issueViewMatches(view, { ...preferences, assignee: undefined })).toBe(false);
     expect(issueViewMatches(view, { ...preferences, label: ["bug"] })).toBe(false);
   });
+
+  it("tells views apart by graph grouping only while the graph is shown", () => {
+    expect(issueViewMatches(view, { ...preferences, view: "graph" })).toBe(false);
+    expect(issueViewMatches(view, { ...preferences, group: "status" })).toBe(true);
+    const graph = { ...view, preferences: { ...preferences, view: "graph" as const } };
+    expect(issueViewMatches(graph, { ...preferences, view: "graph" })).toBe(true);
+    expect(issueViewMatches(graph, { ...preferences, view: "graph", group: "type" })).toBe(false);
+  });
 });
