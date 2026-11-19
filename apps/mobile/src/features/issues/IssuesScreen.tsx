@@ -216,6 +216,10 @@ export function IssuesScreen(
   const sidebar = props.sidebar === true || (primaryColumn !== null && paneRole === "sidebar");
   const selectedKey = props.selectedIssueKey ?? primaryColumn?.selectedIssueKey;
   const selectDetail = useSelectWorkspaceDetail();
+  const openThread = (params: ReactNavigation.RootParamList["Thread"]) => {
+    Keyboard.dismiss();
+    selectDetail({ name: "Thread", params });
+  };
   const selectIssue = (item: EnvironmentIssueEntry) => {
     Keyboard.dismiss();
     selectDetail({
@@ -345,6 +349,7 @@ export function IssuesScreen(
           <IssueListRow
             item={item}
             onSelect={selectIssue}
+            onOpenThread={openThread}
             selected={selectedKey === rowKey(item)}
             sidebar={sidebar}
           />

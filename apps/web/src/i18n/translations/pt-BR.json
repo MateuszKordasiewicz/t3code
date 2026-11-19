@@ -5733,6 +5733,8 @@
   "309a68dc21af399d": "Qualquer pessoa",
   "4dc86e84bb5ece63": "Não foi possível ler as pessoas",
   "4103b6b8e0ff3f46": "Há mais pessoas do que as listadas aqui.",
+  "e8f453a3a26649b2": "{count, plural, one {mais # conversa vinculada} other {mais # conversas vinculadas}}",
+  "2025fc2a5f89a7fb": "Abrir conversa {title}",
   "dba4868fa4829e79": "Não foi possível iniciar uma conversa",
   "b1a119151d281893": "Tente novamente pela issue.",
   "7342bfc328008926": "Running",

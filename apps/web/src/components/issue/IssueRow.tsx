@@ -15,6 +15,7 @@ import {
   PullRequestActorAvatar,
 } from "../pullRequest/pullRequestPresentation";
 import { IssueStateGlyph, issueTrackerPresentation } from "./issuePresentation";
+import { IssueThreadStatusBox } from "./IssueThreadStatusBox";
 
 export type IssueRowTarget = Pick<
   EnvironmentIssueEntry,
@@ -116,6 +117,7 @@ function IssueRowImpl({
           updatedAt={entry.updatedAt}
         />
       </button>
+      <IssueThreadStatusBox environmentId={entry.environmentId} issue={entry} className="mr-2" />
     </div>
   );
 }

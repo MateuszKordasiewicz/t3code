@@ -5734,6 +5734,8 @@
   "309a68dc21af399d": "Vem som helst",
   "4dc86e84bb5ece63": "Personerna kunde inte läsas",
   "4103b6b8e0ff3f46": "Det finns fler personer än som listas här.",
+  "e8f453a3a26649b2": "{count, plural, one {# länkad tråd till} other {# länkade trådar till}}",
+  "2025fc2a5f89a7fb": "Öppna tråden {title}",
   "dba4868fa4829e79": "Kunde inte starta en tråd",
   "b1a119151d281893": "Försök igen från ärendet.",
   "7342bfc328008926": "Running",

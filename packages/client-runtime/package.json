@@ -607,6 +607,10 @@
       "types": "./src/issueThreads.ts",
       "default": "./src/issueThreads.ts"
     },
+    "./issue-thread-status": {
+      "types": "./src/issueThreadStatus.ts",
+      "default": "./src/issueThreadStatus.ts"
+    },
     "./issue-selection": {
       "types": "./src/issueSelection.ts",
       "default": "./src/issueSelection.ts"

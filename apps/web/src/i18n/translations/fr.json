@@ -5734,6 +5734,8 @@
   "309a68dc21af399d": "N’importe qui",
   "4dc86e84bb5ece63": "Les personnes n’ont pas pu être lues",
   "4103b6b8e0ff3f46": "Il existe plus de personnes que celles listées ici.",
+  "e8f453a3a26649b2": "{count, plural, one {# autre fil lié} other {# autres fils liés}}",
+  "2025fc2a5f89a7fb": "Ouvrir le fil {title}",
   "dba4868fa4829e79": "Impossible de démarrer un fil",
   "b1a119151d281893": "Réessayez depuis le ticket.",
   "7342bfc328008926": "Running",

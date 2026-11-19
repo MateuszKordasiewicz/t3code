@@ -5734,6 +5734,8 @@
   "309a68dc21af399d": "Beliebig",
   "4dc86e84bb5ece63": "Die Personen konnten nicht gelesen werden",
   "4103b6b8e0ff3f46": "Es gibt mehr Personen, als hier aufgeführt sind.",
+  "e8f453a3a26649b2": "{count, plural, one {# weiterer verknüpfter Thread} other {# weitere verknüpfte Threads}}",
+  "2025fc2a5f89a7fb": "Thread {title} öffnen",
   "dba4868fa4829e79": "Thread konnte nicht gestartet werden",
   "b1a119151d281893": "Versuche es erneut über das Issue.",
   "7342bfc328008926": "Running",

@@ -15,10 +15,16 @@ import {
   THREAD_LIST_V2_SIDEBAR_ROW_STYLE,
 } from "../threads/thread-list-v2-row-appearance";
 import { issueStatus } from "./issuePresentation";
+import {
+  IssueThreadStatusBox,
+  useIssueThreadStatusBox,
+  type IssueThreadTarget,
+} from "./IssueThreadStatusBox";
 
 export const IssueListRow = memo(function IssueListRow(props: {
   readonly item: EnvironmentIssueEntry;
   readonly onSelect: (item: EnvironmentIssueEntry) => void;
+  readonly onOpenThread: (target: IssueThreadTarget) => void;
   readonly selected: boolean;
   readonly sidebar: boolean;
 }) {
@@ -35,6 +41,7 @@ export const IssueListRow = memo(function IssueListRow(props: {
       ? "text-drawer-foreground-muted"
       : "text-foreground-muted";
   const status = issueStatus(item.state);
+  const threadBox = useIssueThreadStatusBox(item);
   return (
     <View style={props.sidebar ? THREAD_LIST_V2_SIDEBAR_ROW_CONTAINER_STYLE : undefined}>
       <Pressable
@@ -51,10 +58,19 @@ export const IssueListRow = memo(function IssueListRow(props: {
                 count: item.commentCount,
               })
             : null,
+          threadBox?.label,
         ]
           .filter(Boolean)
           .join(", ")}
         onPress={() => props.onSelect(item)}
+        // Speech reads the row as one element, so the box's tap is offered as an action on it.
+        accessibilityActions={
+          threadBox ? [{ name: "openThread", label: threadBox.accessibilityLabel }] : undefined
+        }
+        onAccessibilityAction={(event) => {
+          if (threadBox && event.nativeEvent.actionName === "openThread")
+            props.onOpenThread(threadBox.target);
+        }}
         style={props.sidebar ? THREAD_LIST_V2_SIDEBAR_ROW_STYLE : undefined}
         className={cn(
           "flex-row gap-3 overflow-hidden",
@@ -81,6 +97,13 @@ export const IssueListRow = memo(function IssueListRow(props: {
                 ? item.displayKey
                 : `${item.scope} ${item.displayKey}`}
             </Text>
+            {threadBox ? (
+              <IssueThreadStatusBox
+                box={threadBox}
+                mutedClassName={muted}
+                onOpenThread={props.onOpenThread}
+              />
+            ) : null}
             <Text className={cn("text-2xs tabular-nums", muted)}>
               <RelativeTime timestamp={item.updatedAt} />
             </Text>

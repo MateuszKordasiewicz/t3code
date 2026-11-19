@@ -13,6 +13,7 @@ import {
   type IssueGraphNode,
 } from "./issueGraph.logic";
 import { IssueStateGlyph } from "./issuePresentation";
+import { IssueThreadStatusBox } from "./IssueThreadStatusBox";
 
 /** The contract's most, so a whole beads project usually lands in one page. */
 export const ISSUE_GRAPH_PAGE_SIZE = 200;
@@ -185,6 +186,16 @@ export function IssueGraphView({
             showType={groupBy !== "type"}
             selected={node.id === selectedId}
             onSelect={onSelect}
+          />
+        ))}
+        {/* Outside the cards, which are buttons themselves: it sits on each card's top-right edge. */}
+        {layout.nodes.map((node) => (
+          <IssueThreadStatusBox
+            key={node.id}
+            environmentId={node.entry.environmentId}
+            issue={node.entry}
+            className="absolute -translate-x-full -translate-y-1/2"
+            style={{ left: node.x + node.width - 8, top: node.y - 2 }}
           />
         ))}
       </div>
