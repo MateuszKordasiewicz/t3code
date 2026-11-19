@@ -2281,6 +2281,80 @@ it.effect("explicit settle clears snooze atomically and stays idempotent after r
   }).pipe(Effect.provide(layerTest)),
 );
 
+it.effect(
+  "my move revives a settled snoozed thread and only a message the user sends clears it",
+  () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = ThreadId.make("thread:triage-label");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("create-triage-label"),
+        threadId,
+        projectId: ProjectId.make("project:triage-label"),
+        title: "Triaged thread",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "user",
+        creationSource: "web",
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.settle",
+        commandId: CommandId.make("settle-triage-label"),
+        threadId,
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.snooze",
+        commandId: CommandId.make("snooze-triage-label"),
+        threadId,
+        snoozedUntil: DateTime.formatIso(DateTime.add(yield* DateTime.now, { hours: 1 })),
+      });
+      const label = { kind: "my-move", note: "Review the migration" } as const;
+      const setLabel = (id: string, triageLabel: typeof label | null) =>
+        orchestrator.dispatch({
+          type: "thread.triage-label.set",
+          commandId: CommandId.make(id),
+          threadId,
+          label: triageLabel,
+        });
+      yield* setLabel("set-triage-label", label);
+      const labelled = yield* projections.getThread(threadId);
+      assert.deepInclude(labelled, { triageLabel: label, snoozedUntil: null });
+      assert.notEqual(labelled.settledOverride, "settled");
+      yield* setLabel("clear-triage-label", null);
+      assert.isNull((yield* projections.getThread(threadId)).triageLabel);
+
+      yield* setLabel("relabel-triage-label", label);
+      const send = (
+        id: string,
+        text: string,
+        createdBy: "user" | "agent" = "user",
+        creationSource: "web" | "server" = "web",
+      ) =>
+        orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(id),
+          threadId,
+          messageId: MessageId.make(id),
+          text,
+          attachments: [],
+          dispatchMode: { type: "defer_start" },
+          createdBy,
+          creationSource,
+        });
+      yield* send("compact-triage-label", "/compact");
+      yield* send("agent-triage-label", "Status update", "agent");
+      yield* send("answer-triage-label", "Use the staging database", "user", "server");
+      assert.deepEqual((yield* projections.getThread(threadId)).triageLabel, label);
+      yield* send("message-triage-label", "Carry on");
+      assert.isNull((yield* projections.getThread(threadId)).triageLabel);
+    }).pipe(Effect.provide(layerTest)),
+);
+
 it.effect("keeps a snooze when a live question is cancelled or an approval is answered", () =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;

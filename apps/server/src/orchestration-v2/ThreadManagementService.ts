@@ -41,6 +41,7 @@ import {
   RunId,
   type ScheduledTaskId,
   ThreadId,
+  type ThreadTriageLabel,
   type TurnItemId,
 } from "@t3tools/contracts";
 import { delegatedTaskProgress } from "@t3tools/provider-core/server/subagentProjection";
@@ -489,6 +490,15 @@ export interface ThreadManagementServiceShape {
     readonly byOwnAgent: boolean;
   }) => Effect.Effect<
     { readonly sequence: number } | { readonly settlesWhenTurnEnds: true },
+    Orchestrator.OrchestratorV2Error | ThreadManagementProviderInstanceDisabledError
+  >;
+  /** Sets or clears who acts next on a thread; `null` clears it. */
+  readonly setTriageLabel: (input: {
+    readonly threadId: ThreadId;
+    readonly commandId: CommandId;
+    readonly label: ThreadTriageLabel | null;
+  }) => Effect.Effect<
+    { readonly sequence: number },
     Orchestrator.OrchestratorV2Error | ThreadManagementProviderInstanceDisabledError
   >;
   readonly interruptThread: (
@@ -1248,6 +1258,18 @@ const make = Effect.gen(function* () {
     return { sequence: result.sequence };
   });
 
+  const setTriageLabel: ThreadManagementServiceShape["setTriageLabel"] = Effect.fn(
+    "ThreadManagementService.setTriageLabel",
+  )(function* (input) {
+    const result = yield* dispatch({
+      type: "thread.triage-label.set",
+      commandId: input.commandId,
+      threadId: input.threadId,
+      label: input.label,
+    });
+    return { sequence: result.sequence };
+  });
+
   const interruptThread: ThreadManagementServiceShape["interruptThread"] = Effect.fn(
     "ThreadManagementService.interruptThread",
   )(function* (input) {
@@ -1777,6 +1799,7 @@ const make = Effect.gen(function* () {
     waitForThread,
     settleAfterRun,
     settleThread,
+    setTriageLabel,
     interruptThread,
     stopDelegatedTasks,
     stopWorkflow,

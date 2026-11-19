@@ -160,6 +160,16 @@ Pinned threads stay above the folders, and Snoozed and Settled stay below them. 
 can drag a thread onto the composer to mention it, but not within the sidebar, and the Working
 section is off. Each device keeps its own choice.
 
+## Sort stopped threads
+
+A thread that has stopped and that nobody has sorted shows **Unsorted** in the sidebar. Sort it
+from its menu: choose **My move…** when you need to act next, with an optional short note such
+as "try PR #49", which the row then shows. Choose **Snooze** to come back to it later, or
+**Settle thread** when it is finished. On web and desktop, `mod+shift+y` marks the open thread
+as your move. Sending the thread a new message clears its label, so its next stop needs sorting
+again; **Clear label** removes it by hand. Labels are saved on the server and show on every
+device. The mobile app shows labels but cannot set them yet.
+
 ## Settle finished work
 
 Choose **Settle thread** from its menu to move finished work out of the active list
