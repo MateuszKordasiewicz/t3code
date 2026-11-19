@@ -147,10 +147,10 @@ export function IssueThreadStatusButton({
   }
   const PrimaryIcon = STATUS_ICON[primary.status];
   const earlier = threads.filter((thread) => thread.id !== primary.id);
-  // Running threads are answered in place and done ones were settled, so only the newest idle
-  // thread can be resumed.
+  // Only the newest idle thread can be resumed: done ones were settled, and while a thread runs
+  // it is the current attempt, answered in place.
   const resumable =
-    canOperate && tracker === "beads"
+    canOperate && tracker === "beads" && primary.status !== "running"
       ? (threads.find((thread) => thread.status === "idle") ?? null)
       : null;
   const threadItem = (thread: IssueThread) => {
