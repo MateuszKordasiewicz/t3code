@@ -5,10 +5,12 @@ import {
 } from "@t3tools/client-runtime/environment";
 import {
   DEFAULT_SERVER_SETTINGS,
+  type IssueContinuationSource,
   type ScopedProjectRef,
   type ThreadId,
   type ThreadIssueLinkTarget,
 } from "@t3tools/contracts";
+import { threadContextRecord } from "@t3tools/shared/composerContextReferences";
 import { type AnyRouter, useRouter } from "@tanstack/react-router";
 import {
   composerDraftHasUserContent,
@@ -112,6 +114,7 @@ export function createNewThreadHandler(router: AnyRouter) {
        * keeps its own text gets neither.
        */
       issueLink?: ThreadIssueLinkTarget;
+      continuation?: { source: IssueContinuationSource; title: string };
     },
   ): Promise<{ draftId: DraftId; threadId: ThreadId } | null> => {
     const projects = readProjects();
@@ -121,6 +124,7 @@ export function createNewThreadHandler(router: AnyRouter) {
     const targetServerSettings =
       environmentServerConfigs.get(projectRef.environmentId)?.settings ?? DEFAULT_SERVER_SETTINGS;
     const {
+      addThreadContexts,
       getComposerDraft,
       getDraftSessionByLogicalProjectKey,
       getDraftSession,
@@ -263,7 +267,10 @@ export function createNewThreadHandler(router: AnyRouter) {
     const hasWorktreePathOption = options?.worktreePath !== undefined;
     const hasEnvModeOption = options?.envMode !== undefined;
     const hasStartFromOriginOption = options?.startFromOrigin !== undefined;
-    const storedDraftThread = getDraftSessionByLogicalProjectKey(logicalProjectKey);
+    const continuation = options?.continuation;
+    const storedDraftThread = continuation
+      ? null
+      : getDraftSessionByLogicalProjectKey(logicalProjectKey);
     const storedDraftThreadRef = storedDraftThread
       ? scopeThreadRef(storedDraftThread.environmentId, storedDraftThread.threadId)
       : null;
@@ -382,7 +389,9 @@ export function createNewThreadHandler(router: AnyRouter) {
     }
 
     if (
+      !continuation &&
       latestActiveDraftThread &&
+      !latestActiveDraftThread.issueContinuation &&
       currentRouteTarget?.kind === "draft" &&
       latestActiveDraftThread.logicalProjectKey === logicalProjectKey &&
       latestActiveDraftThread.promotedTo == null &&
@@ -421,6 +430,7 @@ export function createNewThreadHandler(router: AnyRouter) {
       // Reuse drafts registered while awaiting so their pending navigation cannot lose them.
       const racedDraft = getDraftSessionByLogicalProjectKey(logicalProjectKey);
       if (
+        !continuation &&
         racedDraft &&
         racedDraft.draftId !== storedDraftThread?.draftId &&
         readThreadShell(scopeThreadRef(racedDraft.environmentId, racedDraft.threadId)) === null
@@ -453,6 +463,13 @@ export function createNewThreadHandler(router: AnyRouter) {
             newWorktreesStartFromOrigin: projectSettings.settings.newWorktreesStartFromOrigin,
           }),
         runtimeMode: defaultRuntimeMode,
+        ...(continuation
+          ? {
+              issueContinuation: continuation.source,
+              issueLink: options?.issueLink ?? null,
+              environmentSelection: "manual" as const,
+            }
+          : {}),
         ...(carryInteractionMode ? { interactionMode: carryInteractionMode } : {}),
       });
       applyStickyState(draftId);
@@ -460,7 +477,21 @@ export function createNewThreadHandler(router: AnyRouter) {
       if (modelSelectionOverride) {
         setModelSelection(draftId, modelSelectionOverride, { replaceOptions: true });
       }
-      seedPrompt(draftId);
+      if (continuation) {
+        if (options?.prompt !== undefined) setPrompt(draftId, options.prompt);
+        addThreadContexts(
+          draftId,
+          [
+            threadContextRecord(
+              scopeThreadRef(projectRef.environmentId, continuation.source.threadId),
+              continuation.title,
+            ),
+          ],
+          { insertAtCaret: false },
+        );
+      } else {
+        seedPrompt(draftId);
+      }
       await router.navigate({
         to: "/draft/$draftId",
         params: { draftId },

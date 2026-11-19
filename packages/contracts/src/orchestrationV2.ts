@@ -58,6 +58,7 @@ import {
 } from "./checkpointDiff.ts";
 import { ModelSelection } from "./modelSelection.ts";
 import {
+  IssueContinuationSource,
   ThreadIssueKey,
   ThreadIssueLink,
   ThreadIssueLinkSource,
@@ -746,25 +747,39 @@ export const OrchestrationV2RunBackgroundWorkCancelled = Schema.Struct({
 export type OrchestrationV2RunBackgroundWorkCancelled =
   typeof OrchestrationV2RunBackgroundWorkCancelled.Type;
 
+const RootWorkspaceStrategy = Schema.Struct({
+  type: Schema.Literal("root"),
+  branch: Schema.optional(TrimmedNonEmptyString),
+});
+const ExistingWorktreeStrategy = Schema.Struct({
+  type: Schema.Literal("existing_worktree"),
+  worktreePath: TrimmedNonEmptyString,
+  branch: Schema.optional(TrimmedNonEmptyString),
+});
+const NewWorktreeStrategy = Schema.Struct({
+  type: Schema.Literal("worktree"),
+  baseRef: TrimmedNonEmptyString,
+  branch: Schema.optional(TrimmedNonEmptyString),
+  startFromOrigin: Schema.optional(Schema.Boolean),
+});
+
 export const OrchestrationV2ThreadLaunchWorkspaceStrategy = Schema.Union([
-  Schema.Struct({
-    type: Schema.Literal("root"),
-    branch: Schema.optional(TrimmedNonEmptyString),
-  }),
-  Schema.Struct({
-    type: Schema.Literal("existing_worktree"),
-    worktreePath: TrimmedNonEmptyString,
-    branch: Schema.optional(TrimmedNonEmptyString),
-  }),
-  Schema.Struct({
-    type: Schema.Literal("worktree"),
-    baseRef: TrimmedNonEmptyString,
-    branch: Schema.optional(TrimmedNonEmptyString),
-    startFromOrigin: Schema.optional(Schema.Boolean),
-  }),
+  RootWorkspaceStrategy,
+  ExistingWorktreeStrategy,
+  NewWorktreeStrategy,
 ]);
 export type OrchestrationV2ThreadLaunchWorkspaceStrategy =
   typeof OrchestrationV2ThreadLaunchWorkspaceStrategy.Type;
+
+// Continuation is a composer action. Keep it out of the MCP launch and scheduled task inputs.
+const ComposerWorkspaceStrategy = Schema.Union([
+  RootWorkspaceStrategy,
+  ExistingWorktreeStrategy.mapFields((fields) => ({
+    ...fields,
+    issueContinuation: Schema.optional(IssueContinuationSource),
+  })),
+  NewWorktreeStrategy,
+]);
 
 export const ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE = "workspace_preparation_failed";
 
@@ -802,7 +817,7 @@ export const OrchestrationV2Run = Schema.Struct({
     }),
   ),
   delegatedCompletion: Schema.optional(OrchestrationV2DelegatedCompletionCohort),
-  workspacePreparation: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
+  workspacePreparation: Schema.optional(ComposerWorkspaceStrategy),
   /** Starts a new provider conversation; earlier runs stay visible but never reach the provider. */
   freshContext: Schema.optional(Schema.Boolean),
 });
@@ -3178,7 +3193,7 @@ export const OrchestrationV2Command = Schema.Union([
         titleSeed: Schema.optional(TrimmedNonEmptyString),
         scheduledTaskId: Schema.optional(ScheduledTaskId),
         senderThreadId: Schema.optional(ThreadId),
-        workspaceStrategy: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
+        workspaceStrategy: Schema.optional(ComposerWorkspaceStrategy),
       }),
     ),
   }),
@@ -3455,7 +3470,7 @@ export const OrchestrationV2Command = Schema.Union([
     dispatchMode: Schema.Union([
       Schema.Struct({
         type: Schema.Literal("defer_start"),
-        workspaceStrategy: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
+        workspaceStrategy: Schema.optional(ComposerWorkspaceStrategy),
       }),
       Schema.Struct({ type: Schema.Literal("steer_active"), targetRunId: RunId }),
       Schema.Struct({ type: Schema.Literal("restart_active"), targetRunId: RunId }),
@@ -3970,7 +3985,7 @@ export const OrchestrationV2ThreadLaunchInput = Schema.Struct({
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
-  workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy,
+  workspaceStrategy: ComposerWorkspaceStrategy,
   initialMessage: Schema.optional(
     Schema.Struct({
       messageId: Schema.optional(MessageId),
@@ -4296,6 +4311,7 @@ export class OrchestrationV2ThreadLaunchError extends Schema.TaggedError<Orchest
     commandId: CommandId,
     projectId: ProjectId,
     message: Schema.String,
+    reason: Schema.optional(Schema.Literal("issue-continuation")),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {}

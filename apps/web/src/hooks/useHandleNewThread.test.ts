@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vite-plus/test";
-import type { EnvironmentId, ProjectId, RuntimeMode } from "@t3tools/contracts";
+import type { EnvironmentId, ProjectId, RuntimeMode, ThreadId } from "@t3tools/contracts";
 
 const testState = vi.hoisted(() => {
   let completeProjectFileRead: (value: null) => void = () => undefined;
@@ -33,6 +33,7 @@ const testState = vi.hoisted(() => {
     }),
   };
   const draftStore = {
+    addThreadContexts: vi.fn(),
     getComposerDraft: vi.fn((draftId: string) => ({ draftId })),
     getDraftSessionByLogicalProjectKey: vi.fn(() => storedDraft),
     getDraftSession: vi.fn(() =>
@@ -110,6 +111,7 @@ const testState = vi.hoisted(() => {
       };
       router.state.location.href = "/";
       router.navigate.mockClear();
+      draftStore.addThreadContexts.mockClear();
       draftStore.setDraftThreadContext.mockClear();
       draftStore.setLogicalProjectDraftThreadId.mockClear();
       draftStore.setPrompt.mockClear();
@@ -155,10 +157,6 @@ vi.mock("@t3tools/client-runtime/environment", () => ({
     `${ref.environmentId}:${ref.projectId}`,
   scopeProjectRef: (environmentId: string, projectId: string) => ({ environmentId, projectId }),
   scopeThreadRef: (environmentId: string, threadId: string) => ({ environmentId, threadId }),
-}));
-vi.mock("@t3tools/contracts", () => ({
-  DEFAULT_RUNTIME_MODE: "default",
-  DEFAULT_SERVER_SETTINGS: {},
 }));
 vi.mock("@t3tools/shared/projectSettings", () => ({
   resolveProjectSettings: (
@@ -209,7 +207,9 @@ vi.mock("../lib/chatThreadActions", async (importOriginal) => ({
   hasExplicitComposerModelSelection: () => false,
   resolveNewThreadModelSelectionOverride: () => null,
 }));
-vi.mock("../providerInstances", () => ({ resolveDefaultProviderModelSelection: () => null }));
+vi.mock("../providerInstances", () => ({
+  resolveProjectDefaultProviderModelSelection: () => null,
+}));
 vi.mock("../lib/t3ProjectFileDefaults", () => ({
   readT3ProjectFile: () => testState.projectFileRead,
 }));
@@ -363,6 +363,69 @@ describe.each([
 });
 
 describe("useNewThreadHandler", () => {
+  it.each(["empty", "populated"])(
+    "opens a separate continuation without changing the %s project draft",
+    async (existingContent) => {
+      const projectRef = {
+        environmentId: "environment-ssh" as EnvironmentId,
+        projectId: "project-remote" as ProjectId,
+      };
+      const existingDraft = {
+        draftId: "draft-existing",
+        environmentId: projectRef.environmentId,
+        promotedTo: null,
+        threadId: "thread-existing",
+      };
+      testState.reset(existingDraft);
+      if (existingContent === "populated") testState.giveUserText(existingDraft.draftId);
+      const source = { threadId: "thread-stopped" as ThreadId, issue: issueLink };
+      const title = "Original thread";
+      const prompt = "Continue work on issue #7.";
+
+      const opened = await useNewThreadHandler()(projectRef, {
+        branch: "issue-7",
+        worktreePath: "/remote/worktrees/issue-7",
+        envMode: "worktree",
+        startFromOrigin: false,
+        prompt,
+        issueLink,
+        continuation: { source, title },
+      });
+
+      const { draftStore, router } = testState;
+      expect(opened).toEqual({ draftId: "draft-delayed", threadId: "thread-delayed" });
+      expect(draftStore.setLogicalProjectDraftThreadId).toHaveBeenCalledExactlyOnceWith(
+        "remote-project",
+        projectRef,
+        "draft-delayed",
+        expect.objectContaining({
+          threadId: "thread-delayed",
+          branch: "issue-7",
+          worktreePath: "/remote/worktrees/issue-7",
+          envMode: "worktree",
+          startFromOrigin: false,
+          issueLink,
+          issueContinuation: source,
+        }),
+      );
+      expect(draftStore.setDraftThreadContext).not.toHaveBeenCalled();
+      expect(draftStore.setPrompt).toHaveBeenCalledExactlyOnceWith("draft-delayed", prompt);
+      expect(draftStore.addThreadContexts).toHaveBeenCalledExactlyOnceWith(
+        "draft-delayed",
+        [
+          expect.objectContaining({
+            kind: "thread",
+            environmentId: projectRef.environmentId,
+            threadId: source.threadId,
+            title,
+          }),
+        ],
+        { insertAtCaret: false },
+      );
+      expect(draftStore.addThreadContexts).toHaveBeenCalledBefore(router.navigate);
+    },
+  );
+
   it("keeps the text of a draft that gained some while it waited", async () => {
     testState.reset(null);
     const raced = {

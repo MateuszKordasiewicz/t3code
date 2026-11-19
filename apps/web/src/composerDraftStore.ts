@@ -29,6 +29,7 @@ import {
   type ScopedProjectRef,
   type ScopedThreadRef,
   ThreadId,
+  IssueContinuationSource,
   ThreadIssueLinkTarget,
   SnapShotSource,
   threadIssueKeysEqual,
@@ -423,6 +424,7 @@ const PersistedDraftThreadState = Schema.Struct({
     Schema.Struct({ url: Schema.String, branch: Schema.String }),
   ),
   issueLink: Schema.optionalKey(ThreadIssueLinkTarget),
+  issueContinuation: Schema.optionalKey(IssueContinuationSource),
   promotedTo: Schema.optionalKey(
     Schema.NullOr(
       Schema.Struct({
@@ -523,6 +525,7 @@ export interface DraftSessionState {
   checkoutPullRequest?: DraftCheckoutPullRequest;
   /** The issue a thread started from it links to once the draft is sent. */
   issueLink?: ThreadIssueLinkTarget;
+  issueContinuation?: IssueContinuationSource;
   promotedTo?: ScopedThreadRef | null;
 }
 
@@ -597,6 +600,7 @@ interface ComposerDraftStoreState {
       loadBalancedEnvironmentId?: EnvironmentId | null;
       checkoutPullRequest?: DraftCheckoutPullRequest | null;
       issueLink?: ThreadIssueLinkTarget | null;
+      issueContinuation?: IssueContinuationSource;
     },
   ) => void;
   setProjectDraftThreadId: (
@@ -1910,6 +1914,7 @@ function normalizePersistedCheckoutPullRequest(value: unknown): DraftCheckoutPul
     : null;
 }
 
+const decodePersistedIssueContinuation = Schema.decodeUnknownOption(IssueContinuationSource);
 const decodePersistedIssueLink = Schema.decodeUnknownOption(ThreadIssueLinkTarget);
 
 function normalizePersistedDraftThreads(
@@ -1978,6 +1983,9 @@ function normalizePersistedDraftThreads(
         candidateDraftThread.checkoutPullRequest,
       );
       const issueLink = Option.getOrNull(decodePersistedIssueLink(candidateDraftThread.issueLink));
+      const issueContinuation = Option.getOrNull(
+        decodePersistedIssueContinuation(candidateDraftThread.issueContinuation),
+      );
       const promotedToCandidate = candidateDraftThread.promotedTo;
       const promotedToRecord =
         promotedToCandidate && typeof promotedToCandidate === "object"
@@ -2037,6 +2045,7 @@ function normalizePersistedDraftThreads(
             : {}),
         ...(checkoutPullRequest ? { checkoutPullRequest } : {}),
         ...(issueLink ? { issueLink } : {}),
+        ...(issueContinuation ? { issueContinuation } : {}),
         promotedTo,
       };
     }
@@ -2818,6 +2827,9 @@ function toHydratedDraftThreadState(
       ? { checkoutPullRequest: persistedDraftThread.checkoutPullRequest }
       : {}),
     ...(persistedDraftThread.issueLink ? { issueLink: persistedDraftThread.issueLink } : {}),
+    ...(persistedDraftThread.issueContinuation
+      ? { issueContinuation: persistedDraftThread.issueContinuation }
+      : {}),
     promotedTo: persistedDraftThread.promotedTo
       ? scopeThreadRef(
           persistedDraftThread.promotedTo.environmentId as EnvironmentId,
@@ -2939,6 +2951,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
           }
           set((state) => {
             const existingThread = state.draftThreadsByThreadKey[draftId];
+            if (existingThread?.issueContinuation) return state;
             const previousThreadKeyForLogicalProject =
               state.logicalProjectDraftThreadKeyByLogicalProjectKey[normalizedLogicalProjectKey];
             const nextDraftThread = createDraftThreadState(
@@ -2948,6 +2961,14 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
               existingThread,
               options,
             );
+            if (options?.issueContinuation) {
+              return {
+                draftThreadsByThreadKey: {
+                  ...state.draftThreadsByThreadKey,
+                  [draftId]: { ...nextDraftThread, issueContinuation: options.issueContinuation },
+                },
+              };
+            }
             const hasSameLogicalMapping = previousThreadKeyForLogicalProject === draftId;
             const hasNoStaleMappingsForDraft = Object.entries(
               state.logicalProjectDraftThreadKeyByLogicalProjectKey,
@@ -3083,8 +3104,23 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
               projectChanged,
             );
             const issueLink = resolveIssueLink(existing, options.issueLink, projectChanged);
+            if (
+              existing.issueContinuation &&
+              (projectChanged ||
+                nextWorktreePath !== existing.worktreePath ||
+                nextBranch !== existing.branch ||
+                nextStartFromOrigin !== existing.startFromOrigin ||
+                (options.envMode !== undefined && options.envMode !== existing.envMode) ||
+                options.checkoutPullRequest !== undefined ||
+                options.issueLink !== undefined)
+            ) {
+              return state;
+            }
             const nextDraftThread: DraftThreadState = {
               threadId: existing.threadId,
+              ...(existing.issueContinuation
+                ? { issueContinuation: existing.issueContinuation }
+                : {}),
               environmentId: nextProjectRef.environmentId,
               projectId: nextProjectRef.projectId,
               logicalProjectKey: existing.logicalProjectKey,

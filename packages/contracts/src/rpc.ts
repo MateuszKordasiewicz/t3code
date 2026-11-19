@@ -181,6 +181,8 @@ import {
   IssueListInput,
   IssueListResult,
   IssueOperationError,
+  IssueContinuationResult,
+  IssueContinuationSource,
   IssueReactionInput,
   IssueRef,
   IssueScopeRef,
@@ -631,6 +633,7 @@ export const WS_METHODS = {
   // Issue tracking methods
   issuesList: "issues.list",
   issuesDetail: "issues.detail",
+  issuesCheckContinuation: "issues.checkContinuation",
   issuesComments: "issues.comments",
   issuesTemplates: "issues.templates",
   issuesCandidates: "issues.candidates",
@@ -1347,6 +1350,12 @@ const WsIssuesDetailRpc = Rpc.make(WS_METHODS.issuesDetail, {
 const WsIssuesLinkedThreadsRpc = Rpc.make(WS_METHODS.issuesLinkedThreads, {
   payload: ThreadIssueKey,
   success: IssueLinkedThreadsResult,
+  error: IssueRpcError,
+});
+
+const WsIssuesCheckContinuationRpc = Rpc.make(WS_METHODS.issuesCheckContinuation, {
+  payload: IssueContinuationSource,
+  success: IssueContinuationResult,
   error: IssueRpcError,
 });
 
@@ -2257,6 +2266,8 @@ export class RpcScopeAuthorization extends RpcMiddleware.Service<RpcScopeAuthori
 export const WsRpcGroup = RpcGroup.make(
   WsIssuesListRpc,
   WsIssuesDetailRpc,
+  WsIssuesLinkedThreadsRpc,
+  WsIssuesCheckContinuationRpc,
   WsIssuesCommentsRpc,
   WsIssuesTemplatesRpc,
   WsIssuesCandidatesRpc,

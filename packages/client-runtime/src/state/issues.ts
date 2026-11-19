@@ -232,6 +232,12 @@ export function createIssueEnvironmentAtoms<R, E>(
       staleTimeMs: 0,
       refreshTrigger: ({ environmentId }) => linkedThreadSignals({ environmentId, input: {} }),
     }),
+    checkContinuation: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:issues:check-continuation",
+      tag: WS_METHODS.issuesCheckContinuation,
+      scheduler: commandScheduler,
+      concurrency: serialPerEnvironment,
+    }),
     list,
     refreshList(
       registry: AtomRegistry.AtomRegistry,
