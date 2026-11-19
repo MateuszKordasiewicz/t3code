@@ -156,6 +156,70 @@ describe("layoutIssueGraph", () => {
     expect(layoutIssueGraph(cycle, "tree")).toEqual(first);
   });
 
+  it("collapses bands to their header, hides their nodes and edges, and moves later bands up", () => {
+    const entries = [
+      issue("epic-a", { issueType: "epic", priority: 1 }),
+      issue("a.1", { parentKey: "epic-a", dependsOnKeys: ["b.1"] }),
+      issue("epic-b", { issueType: "epic", priority: 2 }),
+      issue("b.1", { parentKey: "epic-b" }),
+      issue("bug-1", { issueType: "bug" }),
+    ];
+    const open = layoutIssueGraph(entries, "tree");
+    const treeA = `tree:${nodeId("epic-a")}`;
+    const collapsed = layoutIssueGraph(entries, "tree", new Set([treeA, "no-such-band"]));
+
+    const [bandA, bandB, loose] = collapsed.clusters;
+    expect(bandA).toMatchObject({ id: treeA, collapsed: true, y: 0, height: 28 });
+    expect(bandA!.nodeIds).toHaveLength(2);
+    expect(bandA!.projectEntry.key).toBe("epic-a");
+    expect(collapsed.nodes.map((node) => node.entry.key).toSorted()).toEqual([
+      "b.1",
+      "bug-1",
+      "epic-b",
+    ]);
+    // a.1 is hidden, so the edge from b.1 into it goes too.
+    expect(collapsed.edges.map(({ from, to }) => [from, to])).toEqual([
+      [nodeId("epic-b"), nodeId("b.1")],
+    ]);
+    const shift = open.clusters[0]!.height - 28;
+    expect(bandB!.y).toBe(open.clusters[1]!.y - shift);
+    expect(nodeOf(collapsed, "b.1").y).toBe(nodeOf(open, "b.1").y - shift);
+    expect(loose!.y).toBe(open.clusters[2]!.y - shift);
+    expect(collapsed.height).toBe(open.height - shift);
+    expect(collapsed.width).toBe(open.width);
+
+    // Every band collapsed still leaves the headers to expand them from.
+    const all = layoutIssueGraph(entries, "tree", new Set(open.clusters.map((c) => c.id)));
+    expect(all.nodes).toEqual([]);
+    expect(all.clusters.map((c) => c.y)).toEqual([0, 52, 104]);
+    expect(all.height).toBe(132);
+  });
+
+  it("names a band's project by its root issue, otherwise its first issue in list order", () => {
+    const inProject = (entry: EnvironmentIssueEntry, project: string) => ({
+      ...entry,
+      projectId: ProjectId.make(project),
+    });
+    const layout = layoutIssueGraph(
+      [
+        inProject(issue("child", { parentKey: "epic" }), "fork"),
+        inProject(issue("epic", { issueType: "epic" }), "upstream"),
+        inProject(issue("h.1", { parentKey: "hidden" }), "fork"),
+        inProject(issue("h.2", { parentKey: "hidden", priority: 0 }), "upstream"),
+        inProject(issue("task-1", { issueType: "task" }), "fork"),
+        inProject(issue("task-2", { issueType: "task", priority: 1 }), "upstream"),
+      ],
+      "tree",
+    );
+    expect(
+      layout.clusters.map((c) => [c.label, c.projectEntry.key, c.projectEntry.projectId]),
+    ).toEqual([
+      ["hidden", "h.2", "upstream"],
+      ["epic", "epic", "upstream"],
+      ["task", "task-2", "upstream"],
+    ]);
+  });
+
   it("groups by type and by status in a stable order", () => {
     const entries = [
       issue("1", { issueType: "chore", status: "in_progress" }),

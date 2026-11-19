@@ -28,10 +28,18 @@ export interface IssueGraphCluster {
   readonly label: string;
   /** The root issue of a tree; null when that root is not among the entries. */
   readonly rootNodeId: string | null;
+  /**
+   * The issue whose project the band belongs to: the tree's root when it is present, otherwise
+   * the band's first issue in list order.
+   */
+  readonly projectEntry: EnvironmentIssueEntry;
+  /** A collapsed band is only its header: none of its nodes or their edges are placed. */
+  readonly collapsed: boolean;
   readonly x: number;
   readonly y: number;
   readonly width: number;
   readonly height: number;
+  /** Every member; a collapsed band's members are not in `nodes`. */
   readonly nodeIds: ReadonlyArray<string>;
 }
 
@@ -119,9 +127,12 @@ function compareIds(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+const NO_COLLAPSED_CLUSTERS: ReadonlySet<string> = new Set();
+
 export function layoutIssueGraph(
   entries: ReadonlyArray<EnvironmentIssueEntry>,
   groupBy: IssueGraphGroupBy,
+  collapsedClusterIds: ReadonlySet<string> = NO_COLLAPSED_CLUSTERS,
   size: { nodeWidth: number; nodeHeight: number } = DEFAULT_SIZE,
 ): IssueGraphLayout {
   // One node per issue: the same issue read through two projects of one scope is drawn once.
@@ -148,7 +159,7 @@ export function layoutIssueGraph(
   const clusters =
     groupBy === "tree" ? treeClusters(items, byRef) : attributeClusters(items, groupBy);
 
-  return placeClusters(items, edges, clusters, size);
+  return placeClusters(items, edges, clusters, collapsedClusterIds, size);
 }
 
 function collectEdges(
@@ -371,6 +382,7 @@ function placeClusters(
   items: ReadonlyArray<Item>,
   edges: ReadonlyArray<RawEdge>,
   clusters: ReadonlyArray<PendingCluster>,
+  collapsedClusterIds: ReadonlySet<string>,
   size: { nodeWidth: number; nodeHeight: number },
 ): IssueGraphLayout {
   const { nodeWidth, nodeHeight } = size;
@@ -392,6 +404,28 @@ function placeClusters(
   let top = 0;
   let width = 0;
   for (const cluster of clusters) {
+    const rootIndex = cluster.members.find((index) => items[index]!.id === cluster.rootNodeId);
+    const firstIndex = cluster.members.reduce((best, index) =>
+      items[index]!.order < items[best]!.order ? index : best,
+    );
+    const projectEntry = items[rootIndex ?? firstIndex]!.entry;
+    if (collapsedClusterIds.has(cluster.id)) {
+      placed.push({
+        id: cluster.id,
+        kind: cluster.kind,
+        label: cluster.label,
+        rootNodeId: cluster.rootNodeId,
+        projectEntry,
+        collapsed: true,
+        x: 0,
+        y: top,
+        width: 0,
+        height: CLUSTER_HEADER,
+        nodeIds: cluster.members.map((index) => items[index]!.id),
+      });
+      top += CLUSTER_HEADER + CLUSTER_GAP;
+      continue;
+    }
     const clusterEdges = innerEdges.get(cluster.id) ?? [];
     const linked = new Set<number>();
     for (const edge of clusterEdges) linked.add(edge.from).add(edge.to);
@@ -461,6 +495,8 @@ function placeClusters(
       kind: cluster.kind,
       label: cluster.label,
       rootNodeId: cluster.rootNodeId,
+      projectEntry,
+      collapsed: false,
       x: 0,
       y: top,
       width: clusterWidth,
@@ -473,13 +509,13 @@ function placeClusters(
 
   return {
     nodes,
-    edges: edges.map((edge) => ({
-      id: edge.id,
-      from: items[edge.from]!.id,
-      to: items[edge.to]!.id,
-      kind: edge.kind,
-      path: edgePath(nodeAt.get(edge.from)!, nodeAt.get(edge.to)!),
-    })),
+    edges: edges.flatMap((edge) => {
+      const from = nodeAt.get(edge.from);
+      const to = nodeAt.get(edge.to);
+      // An edge into or out of a collapsed band has nothing to point at.
+      if (from === undefined || to === undefined) return [];
+      return [{ id: edge.id, from: from.id, to: to.id, kind: edge.kind, path: edgePath(from, to) }];
+    }),
     clusters: placed,
     width,
     height: placed.length === 0 ? 0 : top - CLUSTER_GAP,

@@ -1,8 +1,12 @@
 import type { EnvironmentIssueEntry } from "@t3tools/client-runtime/issue-list";
 import { msg, useGT, useMessages } from "gt-react";
-import { useId } from "react";
+import { ChevronDownIcon, ChevronRightIcon } from "lucide-react";
+import { useId, useState } from "react";
 
+import { Button } from "~/components/ui/button";
 import { cn } from "~/lib/utils";
+
+import { projectIconColorClassName } from "../../projectIconColors";
 
 import { PULL_REQUEST_ROW_NUMBER_CLASS } from "../pullRequest/PullRequestListRow";
 import type { IssueRowTarget } from "./IssueRow";
@@ -12,6 +16,12 @@ import {
   type IssueGraphGroupBy,
   type IssueGraphNode,
 } from "./issueGraph.logic";
+import { issueGraphBandColor, type IssueGraphBandProject } from "./issueGraphBands.logic";
+import {
+  readCollapsedIssueGraphBands,
+  toggleCollapsedIssueGraphBand,
+  writeCollapsedIssueGraphBands,
+} from "./issueGraphCollapsedBands";
 import { IssueStateGlyph } from "./issuePresentation";
 
 /** The contract's most, so a whole beads project usually lands in one page. */
@@ -27,16 +37,11 @@ const TYPE_NAMES: Partial<Record<string, { readonly plural: string; readonly loo
 
 const capitalise = (text: string) => text.charAt(0).toUpperCase() + text.slice(1);
 
-function ClusterLabel({
-  cluster,
-  root,
-}: {
-  cluster: IssueGraphCluster;
-  root: IssueGraphNode | undefined;
-}) {
+function ClusterLabel({ cluster }: { cluster: IssueGraphCluster }) {
   const gt = useGT();
   const resolve = useMessages();
   if (cluster.kind === "tree") {
+    const root = cluster.rootNodeId === null ? undefined : cluster.projectEntry;
     return (
       <>
         <span
@@ -45,10 +50,10 @@ function ClusterLabel({
             "rounded border border-border bg-muted/40 px-1 leading-4",
           )}
         >
-          {root?.entry.displayKey ?? cluster.label}
+          {root?.displayKey ?? cluster.label}
         </span>
         <span className="truncate text-foreground">
-          {root ? root.entry.title : gt("Parent not in this list")}
+          {root ? root.title : gt("Parent not in this list")}
         </span>
       </>
     );
@@ -78,11 +83,14 @@ function ClusterLabel({
  */
 export function IssueGraphView({
   entries,
+  projects,
   groupBy,
   selectedId,
   onSelect,
 }: {
   entries: ReadonlyArray<EnvironmentIssueEntry>;
+  /** Tint each band with its project's icon colour. */
+  projects: ReadonlyArray<IssueGraphBandProject>;
   groupBy: IssueGraphGroupBy;
   /** `environmentId:issueEntryKey` of the issue open in the panel, the layout's node id. */
   selectedId: string | null;
@@ -90,9 +98,14 @@ export function IssueGraphView({
 }) {
   const gt = useGT();
   const markerId = useId();
-  const layout = layoutIssueGraph(entries, groupBy);
-  if (layout.nodes.length === 0) return null;
-  const nodesById = new Map(layout.nodes.map((node) => [node.id, node] as const));
+  const [collapsedBands, setCollapsedBands] = useState(readCollapsedIssueGraphBands);
+  const layout = layoutIssueGraph(entries, groupBy, new Set(collapsedBands[groupBy]));
+  if (layout.clusters.length === 0) return null;
+  const toggleBand = (bandId: string) => {
+    const next = toggleCollapsedIssueGraphBand(collapsedBands, groupBy, bandId);
+    setCollapsedBands(next);
+    writeCollapsedIssueGraphBands(next);
+  };
   const touchesSelection = (edge: { from: string; to: string }) =>
     selectedId !== null && (edge.from === selectedId || edge.to === selectedId);
   // Edges at the selected issue are drawn last, so they sit on top.
@@ -110,15 +123,33 @@ export function IssueGraphView({
         {layout.clusters.map((cluster) => (
           <section
             key={cluster.id}
-            className="absolute inset-x-0 border-y border-border/50 bg-muted/25"
-            style={{ top: cluster.y, height: cluster.height }}
+            className={cn(
+              "absolute inset-x-0 border-y border-border/50",
+              projectIconColorClassName(issueGraphBandColor(cluster.projectEntry, projects)),
+            )}
+            // The icon colour is the text colour above; a faint mix of it stays behind cards and edges.
+            style={{
+              top: cluster.y,
+              height: cluster.height,
+              backgroundColor: "color-mix(in srgb, currentColor 6%, transparent)",
+            }}
           >
             {/* Sticky, so the label stays in view while the graph scrolls sideways. */}
-            <h3 className="sticky left-0 flex h-7 w-fit max-w-full min-w-0 items-center gap-1.5 px-3 text-xs font-medium text-muted-foreground">
-              <ClusterLabel
-                cluster={cluster}
-                root={cluster.rootNodeId === null ? undefined : nodesById.get(cluster.rootNodeId)}
-              />
+            <h3 className="sticky left-0 flex h-7 w-fit max-w-full min-w-0 items-center gap-1.5 pr-3 pl-1.5 text-xs font-medium text-muted-foreground">
+              <Button
+                size="icon-micro"
+                variant="ghost-muted"
+                aria-expanded={!cluster.collapsed}
+                aria-label={
+                  cluster.collapsed
+                    ? gt("Expand group", { $context: "issue graph" })
+                    : gt("Collapse group", { $context: "issue graph" })
+                }
+                onClick={() => toggleBand(cluster.id)}
+              >
+                {cluster.collapsed ? <ChevronRightIcon /> : <ChevronDownIcon />}
+              </Button>
+              <ClusterLabel cluster={cluster} />
               <span className="shrink-0 font-normal">
                 ·{" "}
                 {gt("{count, plural, one {{count} issue} other {{count} issues}}", {

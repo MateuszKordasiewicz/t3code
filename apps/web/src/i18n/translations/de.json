@@ -5718,6 +5718,8 @@
   "3c512c88ee00f75f": "Lose Issues vom Typ {type}",
   "fefadeaef0b05d39": "Andere Issues",
   "6150bba93ab10093": "Issue-Graph",
+  "af949820b4b2fcd2": "Gruppe aufklappen",
+  "01f38e1474645348": "Gruppe zuklappen",
   "9c1767e821de832c": "{count, plural, one {{count} Issue} other {{count} Issues}}",
   "033f47552810b18b": "Priorität {priority}",
   "d96bcfe5dd2b54e4": "Blockiert durch {keys}",

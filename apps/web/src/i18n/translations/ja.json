@@ -5700,6 +5700,8 @@
   "3c512c88ee00f75f": "単独の {type} Issue",
   "fefadeaef0b05d39": "その他の Issue",
   "6150bba93ab10093": "Issue グラフ",
+  "af949820b4b2fcd2": "グループを展開",
+  "01f38e1474645348": "グループを折りたたむ",
   "9c1767e821de832c": "{count, plural, other {{count} 件の Issue}}",
   "033f47552810b18b": "優先度 {priority}",
   "d96bcfe5dd2b54e4": "{keys} にブロックされています",
