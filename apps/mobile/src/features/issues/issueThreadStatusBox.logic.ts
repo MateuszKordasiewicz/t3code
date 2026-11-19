@@ -24,18 +24,21 @@ const RANK: ReadonlyArray<IssueThreadBoxStatus> = [
   "idle",
 ];
 
-function boxStatus(thread: EnvironmentThreadShell): IssueThreadBoxStatus {
+function listStatus(thread: EnvironmentThreadShell): IssueThreadBoxStatus {
   const status = resolveThreadListV2RowStatus(thread);
   if (status === "ready") return threadHasUnseenCompletion(thread) ? "done" : "idle";
-  // The list shows an idle runtime as waiting; web ranks it so only while background work holds it.
-  if (
-    status === "waiting" &&
-    thread.runtime?.status === "idle" &&
-    !backgroundWorkHoldsCompletion(thread.pendingBackgroundTasks)
-  ) {
-    return "idle";
-  }
+  // The list shows an idle runtime as waiting; it ranks as idle, behind a failure.
+  if (status === "waiting" && thread.runtime?.status === "idle") return "idle";
   return status;
+}
+
+// Web's Waiting pill also covers background work holding the thread, ahead of everything below it.
+function boxStatus(thread: EnvironmentThreadShell): IssueThreadBoxStatus {
+  const status = listStatus(thread);
+  return RANK.indexOf(status) > RANK.indexOf("waiting") &&
+    backgroundWorkHoldsCompletion(thread.pendingBackgroundTasks)
+    ? "waiting"
+    : status;
 }
 
 /** The thread an issue's box shows, by the same priority as web. */

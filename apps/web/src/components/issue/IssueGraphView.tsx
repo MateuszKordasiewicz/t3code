@@ -13,7 +13,11 @@ import {
   type IssueGraphNode,
 } from "./issueGraph.logic";
 import { IssueStateGlyph } from "./issuePresentation";
-import { IssueThreadStatusBox } from "./IssueThreadStatusBox";
+import {
+  IssueThreadStatusBoxSpacer,
+  IssueThreadStatusBoxView,
+  useIssueThreadStatus,
+} from "./IssueThreadStatusBox";
 
 /** The contract's most, so a whole beads project usually lands in one page. */
 export const ISSUE_GRAPH_PAGE_SIZE = 200;
@@ -188,16 +192,6 @@ export function IssueGraphView({
             onSelect={onSelect}
           />
         ))}
-        {/* Outside the cards, which are buttons themselves: it sits on each card's bottom-right edge. */}
-        {layout.nodes.map((node) => (
-          <IssueThreadStatusBox
-            key={node.id}
-            environmentId={node.entry.environmentId}
-            issue={node.entry}
-            className="absolute -translate-x-full -translate-y-1/2"
-            style={{ left: node.x + node.width - 8, top: node.y + node.height + 2 }}
-          />
-        ))}
       </div>
     </div>
   );
@@ -217,47 +211,59 @@ function IssueGraphCard({
   const gt = useGT();
   const { entry } = node;
   const blockers = entry.dependsOnKeys ?? [];
+  const threadStatus = useIssueThreadStatus(entry.environmentId, entry);
   return (
-    <button
-      type="button"
-      aria-current={selected ? "true" : undefined}
-      onClick={() => onSelect(entry)}
-      className={cn(
-        "absolute flex flex-col justify-center gap-1 rounded-lg border bg-background px-2.5 text-left shadow-xs/5 outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
-        selected
-          ? "border-primary bg-accent ring-1 ring-primary ring-inset"
-          : "border-border hover:bg-accent",
-        entry.state.category === "closed" && !selected ? "opacity-70" : null,
-      )}
+    <div
+      className="absolute"
       style={{ left: node.x, top: node.y, width: node.width, height: node.height }}
     >
-      <span className="flex min-w-0 items-center gap-1.5">
-        <IssueStateGlyph state={entry.state} className="size-3.5" />
-        <span
-          className={cn(
-            PULL_REQUEST_ROW_NUMBER_CLASS,
-            "rounded border border-border bg-muted/40 px-1 leading-4",
-          )}
-        >
-          {entry.displayKey}
-        </span>
-        <span className="min-w-0 flex-1" />
-        {showType && entry.issueType ? (
-          <span className="truncate text-2xs text-muted-foreground">{entry.issueType}</span>
-        ) : null}
-        {entry.priority === undefined ? null : (
-          <span className="shrink-0 rounded bg-muted px-1 font-mono text-2xs leading-4 text-muted-foreground">
-            <span aria-hidden>P{entry.priority}</span>
-            <span className="sr-only">
-              {gt("Priority {priority}", { priority: entry.priority })}
-            </span>
-          </span>
+      <button
+        type="button"
+        aria-current={selected ? "true" : undefined}
+        onClick={() => onSelect(entry)}
+        className={cn(
+          "flex size-full flex-col justify-center gap-1 rounded-lg border bg-background px-2.5 text-left shadow-xs/5 outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+          selected
+            ? "border-primary bg-accent ring-1 ring-primary ring-inset"
+            : "border-border hover:bg-accent",
+          entry.state.category === "closed" && !selected ? "opacity-70" : null,
         )}
-      </span>
-      <span className="truncate text-sm text-foreground">{entry.title}</span>
-      {blockers.length > 0 ? (
-        <span className="sr-only">{gt("Blocked by {keys}", { keys: blockers.join(", ") })}</span>
+      >
+        <span className="flex min-w-0 items-center gap-1.5">
+          <IssueStateGlyph state={entry.state} className="size-3.5" />
+          <span
+            className={cn(
+              PULL_REQUEST_ROW_NUMBER_CLASS,
+              "rounded border border-border bg-muted/40 px-1 leading-4",
+            )}
+          >
+            {entry.displayKey}
+          </span>
+          <span className="min-w-0 flex-1" />
+          {showType && entry.issueType ? (
+            <span className="truncate text-2xs text-muted-foreground">{entry.issueType}</span>
+          ) : null}
+          {entry.priority === undefined ? null : (
+            <span className="shrink-0 rounded bg-muted px-1 font-mono text-2xs leading-4 text-muted-foreground">
+              <span aria-hidden>P{entry.priority}</span>
+              <span className="sr-only">
+                {gt("Priority {priority}", { priority: entry.priority })}
+              </span>
+            </span>
+          )}
+        </span>
+        <span className="flex min-w-0 items-center gap-1.5">
+          <span className="min-w-0 flex-1 truncate text-sm text-foreground">{entry.title}</span>
+          {/* Holds the title clear of the box, which cannot sit inside this button. */}
+          {threadStatus ? <IssueThreadStatusBoxSpacer box={threadStatus} /> : null}
+        </span>
+        {blockers.length > 0 ? (
+          <span className="sr-only">{gt("Blocked by {keys}", { keys: blockers.join(", ") })}</span>
+        ) : null}
+      </button>
+      {threadStatus ? (
+        <IssueThreadStatusBoxView box={threadStatus} className="absolute right-[11px] bottom-2" />
       ) : null}
-    </button>
+    </div>
   );
 }

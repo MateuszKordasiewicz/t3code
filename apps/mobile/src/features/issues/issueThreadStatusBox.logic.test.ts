@@ -39,5 +39,10 @@ describe("issueThreadStatusBox", () => {
       pendingBackgroundTasks: [{ kind: "monitor", awaited: true }] as never,
     });
     expect(issueThreadStatusBox([failed, background])?.thread).toBe(background);
+    const failedHeld = thread("failed-held", {
+      runtime: runtime("failed"),
+      pendingBackgroundTasks: [{ kind: "monitor", awaited: true }] as never,
+    });
+    expect(issueThreadStatusBox([failed, failedHeld])?.thread).toBe(failedHeld);
   });
 });
