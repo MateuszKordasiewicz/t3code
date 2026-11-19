@@ -1,10 +1,8 @@
 import {
-  IssueTrackerKind,
   ProjectId,
   ThreadId,
   type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
-  type ThreadIssueLink,
   type ThreadPullRequestLink,
 } from "@t3tools/contracts";
 import { assert, expect, it } from "@effect/vitest";
@@ -233,18 +231,6 @@ it("signals linked-thread changes only when a linked answer could change", () =>
     snapshot: null,
     stack: null,
   };
-  const issue: ThreadIssueLink = {
-    tracker: IssueTrackerKind.make("beads"),
-    host: "beads",
-    scope: "t3code-01da14b2",
-    key: "t3-dxh.5",
-    projectId: ProjectId.make("project-a"),
-    url: "beads://t3code-01da14b2/t3-dxh.5",
-    source: "agent",
-    linkedAt: "2026-11-12T00:00:00.000Z",
-    displayKey: "t3-dxh.5",
-    title: "Issue status button",
-  };
   const base = {
     id: threadId,
     projectId: ProjectId.make("project-a"),
@@ -279,9 +265,6 @@ it("signals linked-thread changes only when a linked answer could change", () =>
         title: "Renamed",
         archivedAt: now,
       }),
-      event("thread.issue-synced", { issues: [issue], title: "Renamed", archivedAt: now }),
-      event("thread.issue-synced", { issues: [issue], title: "Renamed", archivedAt: now }),
-      event("thread.issue-synced", { issues: [], title: "Renamed", archivedAt: now }),
       event("thread.deleted", { pullRequests: [], deletedAt: now }),
     ].map(changed),
   ).toEqual([
@@ -294,11 +277,19 @@ it("signals linked-thread changes only when a linked answer could change", () =>
     "changed",
     "changed",
     "changed",
-    "changed",
-    null,
-    "changed",
     null,
   ]);
+
+  const issue = { tracker: "linear", host: "linear.app", scope: "eng", key: "ENG-7" };
+  const issueLinks = makeLinkedThreadsChangeDetector();
+  expect(
+    [
+      event("thread.created", {}),
+      event("thread.issue-synced", { issues: [issue as never] }),
+      event("thread.issue-synced", { issues: [issue as never] }),
+      event("thread.issue-synced", { issues: [] }),
+    ].map(issueLinks),
+  ).toEqual([null, "changed", null, "changed"]);
 
   const afterRestart = makeLinkedThreadsChangeDetector();
   expect(afterRestart(event("thread.created", { title: "New" }))).toBe(null);

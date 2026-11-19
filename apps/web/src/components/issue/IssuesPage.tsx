@@ -58,6 +58,7 @@ import { resolveFilterOptions } from "../pullRequest/pullRequestListOptions";
 import { IssueFiltersMenu } from "./IssueListFilterPickers";
 import { ISSUE_GRAPH_PAGE_SIZE, IssueGraphView } from "./IssueGraphView";
 import { IssueViewControls } from "./IssueViewControls";
+import { issueFilterProjects } from "./issuesSearch.logic";
 import { ISSUE_SAVED_VIEWS } from "./issueSavedViews";
 import { SavedViewsMenu } from "~/components/SavedViewsMenu";
 import { PullRequestCompactFilterMenu } from "../pullRequest/PullRequestCompactFilterMenu";
@@ -202,27 +203,37 @@ export function IssuesPage() {
     (environment) => environment.serverConfig?.environment.capabilities.issues === true,
   );
   const environmentLabels = new Map(environments.map((e) => [e.environmentId, e.label] as const));
+  const filterProjects = issueFilterProjects(
+    projects.filter((project) =>
+      capableEnvironments.some((e) => e.environmentId === project.environmentId),
+    ),
+    environmentLabels,
+  );
+  const scopedProject =
+    search.issueServer && search.issueProject
+      ? { environmentId: search.issueServer, projectId: search.issueProject }
+      : undefined;
 
   const debouncedQuery = useDebouncedValue(search.q ?? "", 300);
   const listInput: IssueListInput = {
     state: search.status,
     involvement: search.who,
     limit: search.view === "graph" ? ISSUE_GRAPH_PAGE_SIZE : PAGE_SIZE,
+    ...(scopedProject ? { projectId: scopedProject.projectId } : {}),
     ...(search.host ? { host: search.host } : {}),
     ...(debouncedQuery ? { query: debouncedQuery } : {}),
     ...(search.label?.length ? { labels: search.label } : {}),
     ...(search.assignee ? { assignee: search.assignee } : {}),
     ...(search.order ? { sort: search.order } : {}),
   };
-  const targets: ReadonlyArray<IssueListTarget> = capableEnvironments.map((e) => ({
-    environmentId: e.environmentId,
-    input: listInput,
-  }));
+  const targets: ReadonlyArray<IssueListTarget> = capableEnvironments
+    .filter((e) => scopedProject === undefined || e.environmentId === scopedProject.environmentId)
+    .map((e) => ({ environmentId: e.environmentId, input: listInput }));
   const list = useIssueList(targets);
   // Refreshing a list still loading would cancel it and start over, losing the scopes already read.
   useLiveRefresh(
     () => {
-      if (!list.isPending) list.refresh();
+      if (!list.isPending) list.reload();
     },
     { key: JSON.stringify(targets) },
   );
@@ -280,7 +291,7 @@ export function IssuesPage() {
       )
     : held;
   const groups = groupIssues(shown, debouncedQuery, projects, search.order ?? "updated");
-  const filterScopes = issueFilterScopes(shown, projects);
+  const filterScopes = issueFilterScopes(shown, projects, scopedProject);
   const seenLabels = issueLabelsSeen(shown);
 
   const hostOptions = hostOptionsFor(
@@ -294,6 +305,9 @@ export function IssuesPage() {
     const next: IssuesSearch = {
       who: merged.who ?? search.who,
       status: merged.status ?? search.status,
+      ...(merged.issueServer && merged.issueProject
+        ? { issueServer: merged.issueServer, issueProject: merged.issueProject }
+        : {}),
       ...(merged.host ? { host: merged.host } : {}),
       q: merged.q || undefined,
       ...(merged.label?.length ? { label: merged.label } : {}),
@@ -483,7 +497,7 @@ export function IssuesPage() {
   ) : noneAnswered && list.error ? (
     <PullRequestsUnavailableState
       error={list.error}
-      onRetry={list.refresh}
+      onRetry={list.retry}
       refreshing={list.isPending}
     />
   ) : groups.length === 0 ? (
@@ -509,7 +523,7 @@ export function IssuesPage() {
               <Var>{list.error}</Var> Showing the issues that loaded.
             </T>
           </span>
-          <Button size="xs" variant="outline" onClick={list.refresh}>
+          <Button size="xs" variant="outline" onClick={list.retry}>
             <T>Retry</T>
           </Button>
         </div>
@@ -715,6 +729,14 @@ export function IssuesPage() {
                   onLabels={(label) => updateSearch({ label })}
                   assignee={search.assignee}
                   onAssignee={(assignee) => updateSearch({ assignee })}
+                  projects={filterProjects}
+                  project={scopedProject}
+                  onProject={(project) =>
+                    updateSearch({
+                      issueServer: project?.environmentId,
+                      issueProject: project?.projectId,
+                    })
+                  }
                 />
                 <SavedViewsMenu
                   kind={ISSUE_SAVED_VIEWS}
@@ -724,6 +746,8 @@ export function IssuesPage() {
                     updateSearch({
                       who: view.who,
                       status: view.status,
+                      issueServer: view.issueServer,
+                      issueProject: view.issueProject,
                       host: view.host,
                       q: view.q,
                       label: view.label,

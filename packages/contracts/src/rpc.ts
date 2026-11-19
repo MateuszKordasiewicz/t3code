@@ -631,7 +631,6 @@ export const WS_METHODS = {
   // Issue tracking methods
   issuesList: "issues.list",
   issuesDetail: "issues.detail",
-  issuesLinkedThreads: "issues.linkedThreads",
   issuesComments: "issues.comments",
   issuesTemplates: "issues.templates",
   issuesCandidates: "issues.candidates",
@@ -640,6 +639,7 @@ export const WS_METHODS = {
   issuesUpdate: "issues.update",
   issuesSetState: "issues.setState",
   issuesReact: "issues.react",
+  issuesLinkedThreads: "issues.linkedThreads",
   issueTrackersList: "issueTrackers.list",
   issueTrackersConnect: "issueTrackers.connect",
   issueTrackersBindProject: "issueTrackers.bindProject",
@@ -1343,14 +1343,13 @@ const WsIssuesDetailRpc = Rpc.make(WS_METHODS.issuesDetail, {
   error: IssueRpcError,
 });
 
-/** Threads linked to an issue. Refreshes with `pullRequests.subscribeLinkedThreadRefreshes`. */
+/** Older comments, one page at a time, past the cursor the detail handed over. */
 const WsIssuesLinkedThreadsRpc = Rpc.make(WS_METHODS.issuesLinkedThreads, {
   payload: ThreadIssueKey,
   success: IssueLinkedThreadsResult,
   error: IssueRpcError,
 });
 
-/** Older comments, one page at a time, past the cursor the detail handed over. */
 const WsIssuesCommentsRpc = Rpc.make(WS_METHODS.issuesComments, {
   payload: IssueCommentsPageInput,
   success: IssueCommentsPage,
@@ -2258,10 +2257,10 @@ export class RpcScopeAuthorization extends RpcMiddleware.Service<RpcScopeAuthori
 export const WsRpcGroup = RpcGroup.make(
   WsIssuesListRpc,
   WsIssuesDetailRpc,
-  WsIssuesLinkedThreadsRpc,
   WsIssuesCommentsRpc,
   WsIssuesTemplatesRpc,
   WsIssuesCandidatesRpc,
+  WsIssuesLinkedThreadsRpc,
   WsIssuesCreateRpc,
   WsIssuesCommentRpc,
   WsIssuesUpdateRpc,
