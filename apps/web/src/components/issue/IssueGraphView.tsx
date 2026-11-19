@@ -262,7 +262,17 @@ function IssueGraphCard({
         ) : null}
       </button>
       {threadStatus ? (
-        <IssueThreadStatusBoxView box={threadStatus} className="absolute right-[11px] bottom-2" />
+        // On the title line at any text size: 1px border plus px-2.5 across, and below the 2.5rem
+        // of content centred in the card's fixed height.
+        <span
+          className="absolute flex"
+          style={{
+            right: "calc(1px + 0.625rem)",
+            bottom: `calc((${node.height}px - 2.5rem) / 2)`,
+          }}
+        >
+          <IssueThreadStatusBoxView box={threadStatus} />
+        </span>
       ) : null}
     </div>
   );
