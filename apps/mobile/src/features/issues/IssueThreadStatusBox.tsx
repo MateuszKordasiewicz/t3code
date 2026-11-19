@@ -12,7 +12,7 @@ import { AppText as Text } from "../../components/ui/AppText";
 import { cn } from "../../lib/cn";
 import { environmentThreadShells } from "../../state/threads";
 import { DONE_STATUS_LABEL, STATUS_LABEL_BY_STATUS } from "../threads/thread-list-v2-items";
-import { issueThreadStatusBox, type IssueThreadBoxStatus } from "./issueThreadStatusBox";
+import { issueThreadStatusBox, type IssueThreadBoxStatus } from "./issueThreadStatusBox.logic";
 
 const { openIssueThreadsAtom } = createIssueThreadAtoms(
   environmentThreadShells.quietThreadShellsAtom,

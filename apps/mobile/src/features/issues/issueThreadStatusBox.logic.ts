@@ -1,5 +1,6 @@
 import { mostUrgentIssueThread } from "@t3tools/client-runtime/issue-thread-status";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
+import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 
 import {
   resolveThreadListV2RowStatus,
@@ -26,8 +27,14 @@ const RANK: ReadonlyArray<IssueThreadBoxStatus> = [
 function boxStatus(thread: EnvironmentThreadShell): IssueThreadBoxStatus {
   const status = resolveThreadListV2RowStatus(thread);
   if (status === "ready") return threadHasUnseenCompletion(thread) ? "done" : "idle";
-  // The list shows an idle runtime as waiting; it ranks as idle, behind a failure.
-  if (status === "waiting" && thread.runtime?.status === "idle") return "idle";
+  // The list shows an idle runtime as waiting; web ranks it so only while background work holds it.
+  if (
+    status === "waiting" &&
+    thread.runtime?.status === "idle" &&
+    !backgroundWorkHoldsCompletion(thread.pendingBackgroundTasks)
+  ) {
+    return "idle";
+  }
   return status;
 }
 

@@ -29,10 +29,8 @@ export function indexOpenIssueThreads<T extends IssueLinkedShell>(
     ) {
       continue;
     }
-    const linked = new Set(
-      (shell.issues ?? []).map((link) => issueThreadIndexKey(shell.environmentId, link)),
-    );
-    for (const key of linked) {
+    for (const link of shell.issues ?? []) {
+      const key = issueThreadIndexKey(shell.environmentId, link);
       const threads = index.get(key);
       if (threads) threads.push(shell);
       else index.set(key, [shell]);

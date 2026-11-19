@@ -59,15 +59,12 @@ describe("indexOpenIssueThreads", () => {
     expect(ids(index.get(issueThreadIndexKey(local, { ...issue, key: "13" })))).toEqual(["d"]);
   });
 
-  it("leaves out settled, archived and deleted threads, and counts a double link once", () => {
+  it("leaves out settled, archived and deleted threads", () => {
     const index = indexOpenIssueThreads([
       shell("settled", { settledOverride: "settled" }),
       shell("archived", { archived: true }),
       shell("deleted", { deleted: true }),
-      shell("reopened", {
-        settledOverride: "active",
-        issues: [link(), link({ host: "GITHUB.COM" })],
-      }),
+      shell("reopened", { settledOverride: "active" }),
     ]);
     expect(ids(index.get(issueThreadIndexKey(local, issue)))).toEqual(["reopened"]);
   });

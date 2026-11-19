@@ -1,7 +1,7 @@
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
 import { describe, expect, it } from "vite-plus/test";
 
-import { issueThreadStatusBox } from "./issueThreadStatusBox";
+import { issueThreadStatusBox } from "./issueThreadStatusBox.logic";
 
 const thread = (id: string, fields: Partial<EnvironmentThreadShell> = {}) =>
   ({
@@ -11,6 +11,7 @@ const thread = (id: string, fields: Partial<EnvironmentThreadShell> = {}) =>
     latestRun: null,
     lastVisitedAt: null,
     runtime: null,
+    pendingBackgroundTasks: [],
     ...fields,
   }) as unknown as EnvironmentThreadShell;
 const runtime = (status: string) => ({ status, lastErrorClass: null }) as never;
@@ -32,5 +33,11 @@ describe("issueThreadStatusBox", () => {
       others: 2,
     });
     expect(issueThreadStatusBox([idle, thread("ready")])?.status).toBe("idle");
+    // Background work holds an idle runtime short of done, as web's Waiting pill does.
+    const background = thread("background", {
+      runtime: runtime("idle"),
+      pendingBackgroundTasks: [{ kind: "monitor", awaited: true }] as never,
+    });
+    expect(issueThreadStatusBox([failed, background])?.thread).toBe(background);
   });
 });

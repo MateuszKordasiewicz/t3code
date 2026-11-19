@@ -188,14 +188,14 @@ export function IssueGraphView({
             onSelect={onSelect}
           />
         ))}
-        {/* Outside the cards, which are buttons themselves: it sits on each card's top-right edge. */}
+        {/* Outside the cards, which are buttons themselves: it sits on each card's bottom-right edge. */}
         {layout.nodes.map((node) => (
           <IssueThreadStatusBox
             key={node.id}
             environmentId={node.entry.environmentId}
             issue={node.entry}
             className="absolute -translate-x-full -translate-y-1/2"
-            style={{ left: node.x + node.width - 8, top: node.y - 2 }}
+            style={{ left: node.x + node.width - 8, top: node.y + node.height + 2 }}
           />
         ))}
       </div>
