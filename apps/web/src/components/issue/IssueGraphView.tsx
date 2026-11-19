@@ -6,9 +6,11 @@ import { useId, useState } from "react";
 import { cn } from "~/lib/utils";
 
 import { PULL_REQUEST_ROW_NUMBER_CLASS } from "../pullRequest/PullRequestListRow";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import type { IssueRowTarget } from "./IssueRow";
 import {
   layoutIssueGraph,
+  type IssueGraphEdge,
   type IssueGraphGroupBy,
   type IssueGraphNode,
   type IssueGraphRegion,
@@ -19,6 +21,13 @@ import {
   writeCollapsedIssueGraphRows,
   type CollapsedIssueGraphRows,
 } from "./issueGraphCollapsedRows";
+import {
+  ARROW_FILL_CLASS,
+  IssueGraphLegend,
+  LINK_STROKE_CLASS,
+  linkTone,
+  TREE_LINK_GROUP_CLASS,
+} from "./IssueGraphLegend";
 import { IssueStateGlyph } from "./issuePresentation";
 import {
   IssueThreadStatusBoxSpacer,
@@ -119,6 +128,7 @@ export function IssueGraphView({
 
   return (
     <div role="group" aria-label={gt("Issue graph")} className="border-t border-border">
+      <IssueGraphLegend />
       {projects.map((project) => {
         const projectOpen = !collapsed.projects.includes(project.id);
         const Chevron = projectOpen ? ChevronDownIcon : ChevronRightIcon;
@@ -178,10 +188,27 @@ function IssueGraphRegionRow({
   const Chevron = open ? ChevronDownIcon : ChevronRightIcon;
   const touchesSelection = (edge: { from: string; to: string }) =>
     selectedId !== null && (edge.from === selectedId || edge.to === selectedId);
-  // Edges at the selected issue are drawn last, so they sit on top.
-  const edges = region.edges.toSorted(
-    (a, b) => Number(touchesSelection(a)) - Number(touchesSelection(b)),
+  const treeEdges = region.edges.filter(
+    (edge) => edge.kind === "parent" && !touchesSelection(edge),
   );
+  // Edges at the selected issue are drawn last, so they sit on top.
+  const edges = region.edges
+    .filter((edge) => edge.kind === "blocks" || touchesSelection(edge))
+    .toSorted((a, b) => Number(touchesSelection(a)) - Number(touchesSelection(b)));
+  const drawEdge = (edge: IssueGraphEdge) => {
+    const tone = linkTone(edge, touchesSelection(edge));
+    return (
+      <path
+        key={edge.id}
+        d={edge.path}
+        fill="none"
+        strokeWidth={tone === "selected" ? 2 : 1.25}
+        strokeLinejoin="round"
+        markerEnd={edge.kind === "blocks" ? `url(#${markerId}-${tone})` : undefined}
+        className={LINK_STROKE_CLASS[tone]}
+      />
+    );
+  };
   return (
     <>
       <h4>
@@ -211,48 +238,25 @@ function IssueGraphRegionRow({
               height={region.height}
             >
               <defs>
-                {(["muted", "selected"] as const).map((tone) => (
+                {(["open", "closed", "selected"] as const).map((tone) => (
                   <marker
                     key={tone}
                     id={`${markerId}-${tone}`}
                     viewBox="0 0 8 8"
                     refX="7"
                     refY="4"
-                    markerWidth="7"
-                    markerHeight="7"
+                    // 8px at any stroke width, under the 12px between arc ends on a card.
+                    markerUnits="userSpaceOnUse"
+                    markerWidth="8"
+                    markerHeight="8"
                     orient="auto-start-reverse"
                   >
-                    <path
-                      d="M 0 0 L 8 4 L 0 8 z"
-                      className={tone === "selected" ? "fill-primary" : "fill-muted-foreground"}
-                    />
+                    <path d="M 0 0 L 8 4 L 0 8 z" className={ARROW_FILL_CLASS[tone]} />
                   </marker>
                 ))}
               </defs>
-              {edges.map((edge) => {
-                const selected = touchesSelection(edge);
-                return (
-                  <path
-                    key={edge.id}
-                    d={edge.path}
-                    fill="none"
-                    strokeWidth={selected ? 2 : 1.25}
-                    strokeDasharray={edge.kind === "parent" ? "4 4" : undefined}
-                    markerEnd={
-                      edge.kind === "blocks"
-                        ? `url(#${markerId}-${selected ? "selected" : "muted"})`
-                        : undefined
-                    }
-                    className={cn(
-                      selected
-                        ? "stroke-primary"
-                        : edge.kind === "blocks"
-                          ? "stroke-muted-foreground/70"
-                          : "stroke-muted-foreground/35",
-                    )}
-                  />
-                );
-              })}
+              <g className={TREE_LINK_GROUP_CLASS}>{treeEdges.map(drawEdge)}</g>
+              {edges.map(drawEdge)}
             </svg>
             {region.nodes.map((node) => (
               <IssueGraphCard
@@ -282,66 +286,97 @@ function IssueGraphCard({
   onSelect: (entry: IssueRowTarget) => void;
 }) {
   const gt = useGT();
-  const { entry } = node;
-  const blockers = entry.dependsOnKeys ?? [];
+  const { entry, externalBlockers } = node;
+  // An issue listed as its own blocker is malformed data; the layout drops it, so this does too.
+  const blockers = (entry.dependsOnKeys ?? []).filter((key) => key !== entry.key);
   const threadStatus = useIssueThreadStatus(entry.environmentId, entry);
+  const blockedBy = externalBlockers
+    ? gt("Blocked by {keys}", { keys: externalBlockers.keys.join(", ") })
+    : null;
+  const card = (
+    <button
+      type="button"
+      aria-current={selected ? "true" : undefined}
+      onClick={() => onSelect(entry)}
+      className={cn(
+        // A raised tile in both themes: in dark the card token is near the black canvas, so the
+        // fill and border come from the foreground colour instead.
+        "flex size-full flex-col justify-center gap-1 rounded-lg border bg-card px-2.5 text-left shadow-xs/5 outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset dark:bg-foreground/8",
+        selected
+          ? "border-primary bg-accent ring-1 ring-primary ring-inset dark:bg-foreground/12"
+          : "border-foreground/15 hover:border-foreground/30 hover:bg-accent dark:hover:bg-foreground/12",
+        entry.state.category === "closed" && !selected ? "opacity-70" : null,
+      )}
+    >
+      <span className="flex min-w-0 items-center gap-1.5">
+        <IssueStateGlyph state={entry.state} className="size-3.5" />
+        <span
+          className={cn(
+            PULL_REQUEST_ROW_NUMBER_CLASS,
+            "rounded border border-border bg-muted/40 px-1 leading-4",
+          )}
+        >
+          {entry.displayKey}
+        </span>
+        <span className="min-w-0 flex-1" />
+        {showType && entry.issueType ? (
+          <span className="truncate text-2xs text-muted-foreground">{entry.issueType}</span>
+        ) : null}
+        {entry.priority === undefined ? null : (
+          <span className="shrink-0 rounded bg-muted px-1 font-mono text-2xs leading-4 text-muted-foreground">
+            <span aria-hidden>P{entry.priority}</span>
+            <span className="sr-only">
+              {gt("Priority {priority}", { priority: entry.priority })}
+            </span>
+          </span>
+        )}
+      </span>
+      <span className="flex min-w-0 items-center gap-1.5">
+        <span className="min-w-0 flex-1 truncate text-sm text-foreground">{entry.title}</span>
+        {/* Holds the title clear of the box, which cannot sit inside this button. */}
+        {threadStatus ? <IssueThreadStatusBoxSpacer box={threadStatus} /> : null}
+      </span>
+      {externalBlockers ? (
+        // Names only the blockers with no arrow here; the sr-only line below names them all.
+        // Struck through once every one is closed; plain grey when some are not in the list.
+        <span
+          aria-hidden
+          className={cn(
+            "truncate text-2xs leading-4",
+            externalBlockers.tone === "open" ? "text-warning-foreground" : "text-muted-foreground",
+            externalBlockers.tone === "closed" ? "line-through" : null,
+          )}
+        >
+          {blockedBy}
+        </span>
+      ) : null}
+      {blockers.length > 0 ? (
+        <span className="sr-only">{gt("Blocked by {keys}", { keys: blockers.join(", ") })}</span>
+      ) : null}
+    </button>
+  );
   return (
     <div
       className="absolute"
       style={{ left: node.x, top: node.y, width: node.width, height: node.height }}
     >
-      <button
-        type="button"
-        aria-current={selected ? "true" : undefined}
-        onClick={() => onSelect(entry)}
-        className={cn(
-          "flex size-full flex-col justify-center gap-1 rounded-lg border bg-background px-2.5 text-left shadow-xs/5 outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
-          selected
-            ? "border-primary bg-accent ring-1 ring-primary ring-inset"
-            : "border-border hover:bg-accent",
-          entry.state.category === "closed" && !selected ? "opacity-70" : null,
-        )}
-      >
-        <span className="flex min-w-0 items-center gap-1.5">
-          <IssueStateGlyph state={entry.state} className="size-3.5" />
-          <span
-            className={cn(
-              PULL_REQUEST_ROW_NUMBER_CLASS,
-              "rounded border border-border bg-muted/40 px-1 leading-4",
-            )}
-          >
-            {entry.displayKey}
-          </span>
-          <span className="min-w-0 flex-1" />
-          {showType && entry.issueType ? (
-            <span className="truncate text-2xs text-muted-foreground">{entry.issueType}</span>
-          ) : null}
-          {entry.priority === undefined ? null : (
-            <span className="shrink-0 rounded bg-muted px-1 font-mono text-2xs leading-4 text-muted-foreground">
-              <span aria-hidden>P{entry.priority}</span>
-              <span className="sr-only">
-                {gt("Priority {priority}", { priority: entry.priority })}
-              </span>
-            </span>
-          )}
-        </span>
-        <span className="flex min-w-0 items-center gap-1.5">
-          <span className="min-w-0 flex-1 truncate text-sm text-foreground">{entry.title}</span>
-          {/* Holds the title clear of the box, which cannot sit inside this button. */}
-          {threadStatus ? <IssueThreadStatusBoxSpacer box={threadStatus} /> : null}
-        </span>
-        {blockers.length > 0 ? (
-          <span className="sr-only">{gt("Blocked by {keys}", { keys: blockers.join(", ") })}</span>
-        ) : null}
-      </button>
+      {/* The label truncates on a narrow card; hover or focus shows every name. Screen readers
+          already hear them in the button's sr-only line, so the popup stays hidden from them.
+          Always mounted, so a refresh that adds or drops the label keeps the card's focus. */}
+      <Tooltip disabled={!externalBlockers}>
+        <TooltipTrigger render={card} />
+        <TooltipPopup aria-hidden>{blockedBy}</TooltipPopup>
+      </Tooltip>
       {threadStatus ? (
         // On the title line at any text size: 1px border plus px-2.5 across, and below the 2.5rem
-        // of content centred in the card's fixed height.
+        // of content centred in the card's fixed height, or above the 1.25rem blocked-by line.
         <span
           className="absolute flex"
           style={{
             right: "calc(1px + 0.625rem)",
-            bottom: `calc((${node.height}px - 2.5rem) / 2)`,
+            bottom: externalBlockers
+              ? `calc((${node.height}px - 3.75rem) / 2 + 1.25rem)`
+              : `calc((${node.height}px - 2.5rem) / 2)`,
           }}
         >
           <IssueThreadStatusBoxView box={threadStatus} />
