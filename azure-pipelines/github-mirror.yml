@@ -1,0 +1,128 @@
+# Insta Blinds fork: Azure Repos is the source of truth. This pipeline pushes
+# main and all tags to the public GitHub fork, which keeps GitHub's release
+# workflows running. Other branches stay private in Azure.
+# Azure DevOps pipeline: Instablinds/t3code -> t3code-github-mirror.
+# Secret: GITHUB_MIRROR_TOKEN in variable group github-mirror, a fine-grained
+# token for MateuszKordasiewicz/t3code with Contents and Workflows read/write.
+# The group's branch-control check admits only refs/heads/main and refs/tags/*.
+#
+# Azure reads this file at the pushed tag's commit, so a tag on a commit older
+# than this file starts no run; every main run pushes all missing tags anyway.
+#
+# Never force-pushes. If GitHub main has commits Azure lacks, or a tag name
+# points elsewhere on GitHub, the run fails and names them. Tags that exist only
+# on GitHub (the nightly workflow creates them there) are left alone.
+
+trigger:
+  batch: true
+  branches:
+    include: [main]
+  tags:
+    include: ["*"]
+pr: none
+
+pool: { vmImage: ubuntu-24.04 }
+
+variables:
+  - group: github-mirror
+
+jobs:
+  - job: mirror
+    displayName: Push main and tags to GitHub
+    timeoutInMinutes: 10
+    steps:
+      - checkout: none
+
+      - bash: |
+          set -euo pipefail
+          export LC_ALL=C
+          github_url=https://github.com/MateuszKordasiewicz/t3code.git
+          if [ -z "${GITHUB_MIRROR_TOKEN:-}" ]; then
+            echo "##vso[task.logissue type=error]GITHUB_MIRROR_TOKEN is empty: check variable group github-mirror."
+            exit 1
+          fi
+          github_basic=$(printf 'x-access-token:%s' "$GITHUB_MIRROR_TOKEN" | base64 -w0)
+          echo "##vso[task.setsecret]$github_basic"
+          github_auth="AUTHORIZATION: basic $github_basic"
+          azure_auth="AUTHORIZATION: bearer $SYSTEM_ACCESSTOKEN"
+          github() { git -c "http.https://github.com/.extraheader=$github_auth" "$@"; }
+          fetch_azure() {
+            git -c "http.extraheader=$azure_auth" fetch -q --no-tags "$BUILD_REPOSITORY_URI" \
+              '+refs/heads/main:refs/heads/main' '+refs/tags/*:refs/tags/*' || return 3
+            azure_main=$(git rev-parse refs/heads/main)
+            echo "Azure main: $azure_main"
+          }
+
+          echo "Fetching main and tags from Azure Repos..."
+          git init -q mirror && cd mirror
+          fetch_azure
+
+          # Returns 0 when GitHub main = Azure main, 1 on divergence, 2 if the push
+          # was rejected because GitHub main moved after the fetch, 3 if a fetch failed.
+          mirror_main() {
+            echo "Fetching GitHub main..."
+            github fetch -q --no-tags "$github_url" "+refs/heads/main:refs/mirror/github-main" || return 3
+            github_main=$(git rev-parse refs/mirror/github-main)
+            echo "GitHub main: $github_main"
+            if ! git merge-base --is-ancestor "$github_main" "$azure_main"; then
+              # An overlapping run (main and tag runs batch separately) may have
+              # pushed a newer Azure main; recheck against it before failing.
+              echo "GitHub main is not in this run's Azure main; re-fetching Azure..."
+              fetch_azure || return 3
+            fi
+            if [ "$github_main" = "$azure_main" ]; then
+              echo "main is already up to date."
+            elif ! git merge-base --is-ancestor "$github_main" "$azure_main"; then
+              echo "##vso[task.logissue type=error]GitHub main has commits that Azure main does not. Not force-pushing. Push them to Azure (or drop them on GitHub), then re-run."
+              echo "Commits on GitHub main that are missing from Azure main:"
+              git log --oneline "$azure_main..$github_main"
+              return 1
+            else
+              echo "Pushing main ($azure_main) to GitHub..."
+              github push "$github_url" "$azure_main:refs/heads/main" || return 2
+            fi
+          }
+
+          failed=0
+          status=0
+          mirror_main || status=$?
+          if [ "$status" -eq 2 ]; then
+            echo "Pushing main failed; fetching both sides and trying once more..."
+            status=0
+            fetch_azure && mirror_main || status=$?
+          fi
+          if [ "$status" -eq 2 ]; then
+            echo "##vso[task.logissue type=error]Pushing main to GitHub failed twice (see the git errors above). Re-run the pipeline; if GitHub main moved, the re-run names its extra commits."
+          elif [ "$status" -eq 3 ]; then
+            echo "##vso[task.logissue type=error]Fetching main from Azure or GitHub failed, see the git error above."
+          fi
+          [ "$status" -eq 0 ] || failed=1
+
+          echo "Comparing tags..."
+          github ls-remote --tags --refs "$github_url" | awk '{print $2, $1}' | sort > ../github-tags
+          git for-each-ref refs/tags --format='%(refname) %(objectname)' | sort > ../azure-tags
+          # Same name, different object: GitHub would reject it, and we never force.
+          join ../azure-tags ../github-tags | awk '$2 != $3 {print $1, "azure=" $2, "github=" $3}' > ../conflicting-tags
+          join -v1 ../azure-tags ../github-tags | awk '{print $1 ":" $1}' > ../missing-tags
+          if [ -s ../conflicting-tags ]; then
+            echo "##vso[task.logissue type=error]$(wc -l < ../conflicting-tags) tag(s) point to different objects on Azure and GitHub. Not force-pushing."
+            cat ../conflicting-tags
+            failed=1
+          fi
+          if [ -s ../missing-tags ]; then
+            echo "Pushing $(wc -l < ../missing-tags) new tag(s) to GitHub:"
+            sed 's/:.*//' ../missing-tags
+            xargs -d '\n' -a ../missing-tags git -c "http.https://github.com/.extraheader=$github_auth" push "$github_url"
+          else
+            echo "No new tags to push."
+          fi
+
+          if [ "$failed" -ne 0 ]; then
+            echo "Result: mirror FAILED, see errors above."
+            exit 1
+          fi
+          echo "Result: GitHub main = $azure_main, tags in sync."
+        displayName: Mirror to GitHub
+        env:
+          GITHUB_MIRROR_TOKEN: $(GITHUB_MIRROR_TOKEN)
+          SYSTEM_ACCESSTOKEN: $(System.AccessToken)
