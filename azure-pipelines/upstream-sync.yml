@@ -1,0 +1,101 @@
+trigger: none
+pr: none
+
+# Azure cron uses UTC. The prepare job selects the New York offset for that run.
+schedules:
+  - cron: "0 7 * * *"
+    displayName: Eastern daylight time
+    branches:
+      include: [main]
+    always: true
+  - cron: "0 8 * * *"
+    displayName: Eastern standard time
+    branches:
+      include: [main]
+    always: true
+
+parameters:
+  - name: dryRun
+    displayName: Dry run (compute the merge without publishing a branch)
+    type: boolean
+    default: true
+
+pool: { vmImage: ubuntu-24.04 }
+
+variables:
+  runNumber: $(Build.BuildId)
+  T3CODE_TELEMETRY_CHANNEL: dev
+
+stages:
+  - stage: UpstreamSync
+    displayName: Sync upstream
+    condition: or(ne(variables['Build.Reason'], 'Schedule'), eq(variables['UPSTREAM_SYNC_SCHEDULE_ENABLED'], 'true'))
+    jobs:
+      - job: Prepare
+        displayName: Check upstream and prepare candidate
+        timeoutInMinutes: 15
+        steps:
+          - checkout: self
+            fetchDepth: 0
+            fetchTags: false
+          - bash: bash azure-pipelines/upstream-sync.sh prepare
+            name: candidate
+            displayName: Merge upstream and publish candidate branch
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+              DRY_RUN: ${{ parameters.dryRun }}
+              CRON_SCHEDULE: $(Build.CronSchedule.DisplayName)
+
+      - job: Validate
+        displayName: Build and smoke-test the candidate
+        dependsOn: Prepare
+        condition: and(succeeded(), ne(dependencies.Prepare.outputs['candidate.commit'], ''))
+        timeoutInMinutes: 60
+        variables:
+          candidateCommit: $[dependencies.Prepare.outputs['candidate.commit']]
+          candidateRef: $[dependencies.Prepare.outputs['candidate.ref']]
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            fetchTags: false
+          - bash: |
+              set -euo pipefail
+              git -c "http.extraheader=AUTHORIZATION: bearer $SYSTEM_ACCESSTOKEN" \
+                fetch --no-tags --depth=1 origin "$CANDIDATE_REF"
+              test "$(git rev-parse FETCH_HEAD)" = "$CANDIDATE_COMMIT"
+              git checkout --detach "$CANDIDATE_COMMIT"
+              echo "Building exact candidate $CANDIDATE_COMMIT"
+            displayName: Check out the exact candidate
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+              CANDIDATE_COMMIT: $(candidateCommit)
+              CANDIDATE_REF: $(candidateRef)
+          - template: linux-server-steps.yml
+            parameters:
+              sourceCommit: $(candidateCommit)
+              sourceRef: $(candidateRef)
+
+      - job: OpenPullRequest
+        displayName: Open protected pull request
+        dependsOn: [Prepare, Validate]
+        condition: and(succeeded(), eq(dependencies.Validate.result, 'Succeeded'))
+        timeoutInMinutes: 5
+        variables:
+          candidateCommit: $[dependencies.Prepare.outputs['candidate.commit']]
+          candidateRef: $[dependencies.Prepare.outputs['candidate.ref']]
+          candidateBase: $[dependencies.Prepare.outputs['candidate.base']]
+          candidateTree: $[dependencies.Prepare.outputs['candidate.tree']]
+          upstreamCommit: $[dependencies.Prepare.outputs['candidate.upstream']]
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            fetchTags: false
+          - bash: bash azure-pipelines/upstream-sync.sh open-pr
+            displayName: Open PR for the validated candidate
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+              CANDIDATE_COMMIT: $(candidateCommit)
+              CANDIDATE_REF: $(candidateRef)
+              CANDIDATE_BASE: $(candidateBase)
+              CANDIDATE_TREE: $(candidateTree)
+              UPSTREAM_COMMIT: $(upstreamCommit)
