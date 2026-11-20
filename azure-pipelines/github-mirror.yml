@@ -122,6 +122,15 @@ jobs:
             exit 1
           fi
           echo "Result: GitHub main = $azure_main, tags in sync."
+
+          # Tag the Azure build only for main CI. A tag push or manual mirror replay must not start a release.
+          if [[ "$BUILD_SOURCEBRANCH" == refs/heads/main && "$BUILD_REASON" == @(IndividualCI|BatchedCI) ]]; then
+            if ! git merge-base --is-ancestor "$BUILD_SOURCEVERSION" "$azure_main"; then
+              echo "Mirror did not include the triggering main commit $BUILD_SOURCEVERSION." >&2
+              exit 1
+            fi
+            echo "##vso[build.addbuildtag]desktop-release-ready"
+          fi
         displayName: Mirror to GitHub
         env:
           GITHUB_MIRROR_TOKEN: $(GITHUB_MIRROR_TOKEN)

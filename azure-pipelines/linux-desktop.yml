@@ -2,6 +2,15 @@
 trigger: none
 pr: none
 
+resources:
+  pipelines:
+    - pipeline: mirror
+      source: t3code-github-mirror
+      trigger:
+        branches:
+          include: [refs/heads/main]
+        tags: [desktop-release-ready]
+
 parameters:
   - name: publishRelease
     displayName: Publish a public GitHub release from mirrored main
@@ -23,6 +32,22 @@ stages:
             sparseCheckoutPatterns: |
               /*
               !/.repos/
+
+          - bash: |
+              set -euo pipefail
+              if [[ "$TRIGGERING_PIPELINE" != mirror || "$MIRROR_BRANCH" != refs/heads/main ||
+                "$BUILD_SOURCEBRANCH" != "$MIRROR_BRANCH" || "$BUILD_SOURCEVERSION" != "$MIRROR_COMMIT" ]]; then
+                echo "Desktop build must use the triggering mirror's exact main commit." >&2
+                exit 1
+              fi
+              echo "Mirror run $MIRROR_RUN_ID verified main commit $MIRROR_COMMIT."
+            displayName: Verify triggering mirror run and source commit
+            condition: eq(variables['Build.Reason'], 'ResourceTrigger')
+            env:
+              TRIGGERING_PIPELINE: $(resources.triggeringAlias)
+              MIRROR_BRANCH: $(resources.pipeline.mirror.sourceBranch)
+              MIRROR_COMMIT: $(resources.pipeline.mirror.sourceCommit)
+              MIRROR_RUN_ID: $(resources.pipeline.mirror.runID)
 
           - bash: |
               set -euo pipefail
@@ -53,8 +78,13 @@ stages:
               set -euo pipefail
               test "$(git rev-parse HEAD)" = "$BUILD_SOURCEVERSION"
               commit_date="$(TZ=UTC git show -s --format=%cd --date=format-local:%Y%m%d HEAD)"
-              # GitHub's fallback publisher uses run numbers below this range.
-              run_number=$((1000000000 + BUILD_BUILDID))
+              sequence_run_id="$BUILD_BUILDID"
+              if [[ "$BUILD_REASON" == ResourceTrigger ]]; then
+                # A retry of an older mirror must keep its place in the release order.
+                sequence_run_id="$MIRROR_RUN_ID"
+              fi
+              [[ "$sequence_run_id" =~ ^[1-9][0-9]*$ ]]
+              run_number=$((1000000000 + sequence_run_id))
               metadata="$(node scripts/resolve-nightly-release.ts --date "$commit_date" --run-number "$run_number" --sha "$BUILD_SOURCEVERSION")"
               version="$(sed -n 's/^version=//p' <<< "$metadata")"
               tag="$(sed -n 's/^tag=//p' <<< "$metadata")"
@@ -70,6 +100,8 @@ stages:
                 echo "##vso[task.setvariable variable=T3CODE_${key}]$value"
               done
             displayName: Resolve nightly version and public settings
+            env:
+              MIRROR_RUN_ID: $(resources.pipeline.mirror.runID)
 
           - bash: |
               set -euo pipefail
@@ -105,11 +137,17 @@ stages:
             artifact: t3-linux-desktop
             displayName: Upload private AppImage artifact
 
-  - ${{ if and(eq(parameters.publishRelease, true), eq(variables['Build.SourceBranch'], 'refs/heads/main')) }}:
+  - ${{ if and(eq(variables['Build.SourceBranch'], 'refs/heads/main'), or(eq(variables['Build.Reason'], 'ResourceTrigger'), eq(parameters.publishRelease, true))) }}:
       - stage: Publish
         displayName: Publish public fork release
         dependsOn: Build
-        condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+        # The resource metadata is available only at runtime.
+        condition: >-
+          and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+            or(and(eq(variables['Build.Reason'], 'Manual'), ${{ eq(parameters.publishRelease, true) }}),
+              and(eq(variables['Build.Reason'], 'ResourceTrigger'), eq(variables['resources.triggeringAlias'], 'mirror'),
+                eq(variables['resources.pipeline.mirror.sourceBranch'], 'refs/heads/main'),
+                eq(variables['resources.pipeline.mirror.sourceCommit'], variables['Build.SourceVersion']))))
         variables:
           - group: github-mirror
         jobs:
