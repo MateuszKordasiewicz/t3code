@@ -1,0 +1,137 @@
+# Instablinds/t3code -> t3code-linux-desktop
+trigger: none
+pr: none
+
+parameters:
+  - name: publishRelease
+    displayName: Publish a public GitHub release from mirrored main
+    type: boolean
+    default: false
+
+pool: { vmImage: ubuntu-24.04 }
+
+stages:
+  - stage: Build
+    jobs:
+      - job: AppImage
+        displayName: Build Linux x64 AppImage
+        timeoutInMinutes: 60
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            fetchTags: false
+            sparseCheckoutPatterns: |
+              /*
+              !/.repos/
+
+          - bash: |
+              set -euo pipefail
+              sudo apt-get update
+              sudo apt-get install -y libsecret-1-dev pkg-config libgtk-3-0t64 libnss3 libasound2t64 libgbm1 imagemagick python3-yaml xvfb xauth
+              rustup target add --toolchain stable x86_64-unknown-linux-gnu
+              rustup default stable
+            displayName: Install desktop libraries and Rust target
+
+          - bash: |
+              set -euo pipefail
+              vp_version="$(sed -nE 's/^  vite-plus: ([0-9][^ ]*)$/\1/p' pnpm-workspace.yaml)"
+              node_version="$(jq -er '.engines.node' package.json)"
+              export VP_HOME="$HOME/.vite-plus"
+              echo "Installing Vite+ $vp_version with Node.js $node_version"
+              curl -fsSL https://vite.plus | VP_VERSION="$vp_version" VP_NODE_MANAGER=yes bash
+              "$VP_HOME/bin/vp" env use "$node_version"
+              echo "##vso[task.setvariable variable=VP_HOME]$VP_HOME"
+              echo "##vso[task.prependpath]$VP_HOME/bin"
+            displayName: Install Vite+ and Node.js
+            env:
+              VP_DOWNLOAD_TIMEOUT: "120"
+
+          - bash: vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts... --frozen-lockfile
+            displayName: Install dependencies
+
+          - bash: |
+              set -euo pipefail
+              test "$(git rev-parse HEAD)" = "$BUILD_SOURCEVERSION"
+              commit_date="$(TZ=UTC git show -s --format=%cd --date=format-local:%Y%m%d HEAD)"
+              # GitHub's fallback publisher uses run numbers below this range.
+              run_number=$((1000000000 + BUILD_BUILDID))
+              metadata="$(node scripts/resolve-nightly-release.ts --date "$commit_date" --run-number "$run_number" --sha "$BUILD_SOURCEVERSION")"
+              version="$(sed -n 's/^version=//p' <<< "$metadata")"
+              tag="$(sed -n 's/^tag=//p' <<< "$metadata")"
+              test -n "$version"
+              test "$tag" = "v$version"
+              echo "Building $version from $BUILD_SOURCEVERSION"
+              echo "##vso[task.setvariable variable=T3_VERSION]$version"
+              echo "##vso[task.setvariable variable=T3_TAG]$tag"
+              echo "##vso[build.updatebuildnumber]$version"
+              for key in CLERK_PUBLISHABLE_KEY CLERK_JWT_TEMPLATE CLERK_CLI_OAUTH_CLIENT_ID RELAY_URL; do
+                value="$(sed -n "s|^T3CODE_${key}=||p" .env.example)"
+                test -n "$value" || { echo "Missing T3CODE_${key} in .env.example" >&2; exit 1; }
+                echo "##vso[task.setvariable variable=T3CODE_${key}]$value"
+              done
+            displayName: Resolve nightly version and public settings
+
+          - bash: |
+              set -euo pipefail
+              vp run dist:desktop:artifact --platform linux --target AppImage --arch x64 --build-version "$T3_VERSION" --verbose
+            displayName: Package desktop AppImage
+            env:
+              T3CODE_DESKTOP_UPDATE_REPOSITORY: MateuszKordasiewicz/t3code
+
+          - bash: |
+              set -euo pipefail
+              shopt -s nullglob
+              out="$BUILD_ARTIFACTSTAGINGDIRECTORY/t3-linux-desktop"
+              images=(release/*.AppImage)
+              test "${#images[@]}" -eq 1
+              image="$(realpath "${images[0]}")"
+              mkdir -p "$out/assets"
+              cp "$image" release/nightly-linux.yml release/*.blockmap "$out/assets/"
+
+              cd "$(mktemp -d)"
+              "$image" --appimage-extract resources/app-update.yml
+              /usr/bin/python3 "$BUILD_SOURCESDIRECTORY/azure-pipelines/check-linux-desktop.py" \
+                "$out/assets" squashfs-root/resources/app-update.yml "$T3_VERSION"
+              version="$(xvfb-run -a "$image" --appimage-extract-and-run --no-sandbox --version)"
+              test "$version" = "$T3_VERSION" || { echo "AppImage reported $version, expected $T3_VERSION" >&2; exit 1; }
+              echo "AppImage launched and reported $version"
+
+              (cd "$out/assets" && sha256sum * > SHA256SUMS && sha256sum --check SHA256SUMS)
+              jq -n --arg version "$T3_VERSION" --arg tag "$T3_TAG" --arg commit "$BUILD_SOURCEVERSION" \
+                --arg runId "$BUILD_BUILDID" '{version: $version, tag: $tag, commit: $commit, runId: $runId}' > "$out/build-info.json"
+            displayName: Verify AppImage, updater configuration and checksums
+
+          - publish: $(Build.ArtifactStagingDirectory)/t3-linux-desktop
+            artifact: t3-linux-desktop
+            displayName: Upload private AppImage artifact
+
+  - ${{ if and(eq(parameters.publishRelease, true), eq(variables['Build.SourceBranch'], 'refs/heads/main')) }}:
+      - stage: Publish
+        displayName: Publish public fork release
+        dependsOn: Build
+        condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+        variables:
+          - group: github-mirror
+        jobs:
+          - job: GitHubRelease
+            timeoutInMinutes: 20
+            steps:
+              - checkout: self
+                fetchDepth: 1
+                fetchTags: false
+                sparseCheckoutDirectories: azure-pipelines
+
+              - download: current
+                artifact: t3-linux-desktop
+
+              - bash: |
+                  set -euo pipefail
+                  artifact="$PIPELINE_WORKSPACE/t3-linux-desktop"
+                  test "$(jq -er '.commit' "$artifact/build-info.json")" = "$BUILD_SOURCEVERSION"
+                  test "$(jq -er '.runId' "$artifact/build-info.json")" = "$BUILD_BUILDID"
+                  tag="$(jq -er '.tag' "$artifact/build-info.json")"
+                  bash azure-pipelines/publish-fork-linux.sh "$tag" "$BUILD_SOURCEVERSION" "azure-$BUILD_BUILDID" "$artifact/assets"
+                displayName: Publish GitHub release and update feed
+                env:
+                  GH_TOKEN: $(GITHUB_MIRROR_TOKEN)
+                  GH_REPO: MateuszKordasiewicz/t3code

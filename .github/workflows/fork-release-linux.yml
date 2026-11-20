@@ -28,7 +28,6 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
-      short_sha: ${{ steps.version.outputs.short_sha }}
     env:
       T3CODE_DESKTOP_UPDATE_REPOSITORY: MateuszKordasiewicz/t3code
     steps:
@@ -53,6 +52,8 @@ jobs:
           SHA: ${{ github.sha }}
         # The commit's date, not the clock, so re-running a run cannot rank an old commit above newer releases.
         run: |
+          # Azure reserves larger run numbers for its releases.
+          test "$RUN_NUMBER" -lt 1000000000
           node scripts/resolve-nightly-release.ts \
             --date "$(TZ=UTC git show -s --format=%cd --date=format-local:%Y%m%d "$SHA")" \
             --run-number "$RUN_NUMBER" \
@@ -131,7 +132,7 @@ jobs:
           # "Re-run all jobs" uploads again under the same run.
           overwrite: true
 
-  # The only job with write access; it runs no repository code.
+  # Only this job has write access. It runs the shared publisher from main without build dependencies.
   publish:
     name: Publish fork release
     needs: build
@@ -146,55 +147,30 @@ jobs:
     permissions:
       contents: write
     env:
-      GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       TAG: ${{ needs.build.outputs.tag }}
     steps:
+      - name: Checkout release publisher
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        # actions/checkout's credential cleanup fails on the orphaned .repos gitlinks.
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git sparse-checkout set azure-pipelines
+          git checkout --detach FETCH_HEAD
+
       - name: Download build
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: fork-linux-${{ needs.build.outputs.version }}
           path: ${{ runner.temp }}/assets
 
-      # Created as a draft so the updater never sees a release whose files are still uploading.
-      # A re-run keeps an already published release and redoes only an unfinished draft.
-      - name: Publish fork release
+      - name: Publish fork release and update feed
         shell: bash
         env:
-          VERSION: ${{ needs.build.outputs.version }}
-          SHORT_SHA: ${{ needs.build.outputs.short_sha }}
-          SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          draft="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || echo missing)"
-          if [[ "$draft" == "false" ]]; then
-            echo "$TAG is already published; keeping it."
-            exit 0
-          fi
-          if [[ "$draft" == "true" ]]; then
-            gh release delete "$TAG" --yes
-          fi
-          gh release create "$TAG" "$RUNNER_TEMP"/assets/* \
-            --draft --prerelease --latest=false \
-            --target "$SHA" \
-            --title "T3 Code Fork nightly $VERSION ($SHORT_SHA)" \
-            --notes "Fork build of MateuszKordasiewicz/t3code main at $SHA. This app updates only from this fork's releases."
-          gh release edit "$TAG" --draft=false
-
-      # releases.atom also lists the upstream nightly tags this fork carries, so point the patched
-      # updater at the newest fork release the way upstream's update_feed job does. Upstream's
-      # copied tags have no releases, so the release list holds only fork nightlies.
-      - name: Point the update feed at the newest fork release
-        shell: bash
-        run: |
-          set -euo pipefail
-          newest="$(gh release list --exclude-drafts --limit 200 --json tagName --jq '.[].tagName' |
-            grep -E -- '-nightly\.[0-9]{8}\.[0-9]+$' | sort -V | tail -1)"
-          echo "Newest fork nightly: $newest"
-          gh api "repos/$GH_REPO/releases/tags/$newest" --jq '{tag_name, name, body}' > "$RUNNER_TEMP/nightly.json"
-          cat "$RUNNER_TEMP/nightly.json"
-          gh release view update-feed > /dev/null 2>&1 ||
-            gh release create update-feed --prerelease --latest=false --title "Update feed" \
-              --notes "The fork's desktop updater reads this release to find the newest fork nightly. Do not delete it."
-          gh release upload update-feed "$RUNNER_TEMP/nightly.json" --clobber
-          gh release edit update-feed --draft=false --prerelease --latest=false
+          GH_TOKEN: ${{ github.token }}
+        run: bash azure-pipelines/publish-fork-linux.sh "$TAG" "$GITHUB_SHA" "github-$GITHUB_RUN_ID" "$RUNNER_TEMP/assets"
