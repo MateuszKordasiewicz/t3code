@@ -4,6 +4,7 @@ import { visibleLinkedThreads } from "@t3tools/client-runtime/state/threads";
 import { EnvironmentId, ThreadId, type IssueSummary } from "@t3tools/contracts";
 import { Atom } from "effect/reactivity";
 
+import { useEnvironmentServerConfig } from "../../state/entities";
 import { issueEnvironment } from "../../state/issues";
 import { useEnvironmentQuery } from "../../state/query";
 import { environmentThreadShells } from "../../state/threads";
@@ -27,14 +28,16 @@ const linkedThreadShells = Atom.family((key: string) => {
 });
 
 /**
- * The threads linked to an issue and which one its status button opens. A failed read counts as
- * none: a server without `issues.linkedThreads` answers with a failure.
+ * The threads linked to an issue and which one its status button opens. A failed read, or a
+ * server without `issues.linkedThreads`, counts as none.
  */
 export function useIssueThreads(params: IssueParams, issue: IssueSummary | null) {
   const target = issueTarget(params);
   const connected = usePullRequestConnected(params.environmentId);
+  const capabilities = useEnvironmentServerConfig(target.environmentId)?.environment.capabilities;
+  const listsThreads = capabilities?.issueLinkedThreads === true;
   const relations = useEnvironmentQuery(
-    issue
+    issue && listsThreads
       ? issueEnvironment.linkedThreads({
           environmentId: target.environmentId,
           input: {
@@ -66,6 +69,10 @@ export function useIssueThreads(params: IssueParams, issue: IssueSummary | null)
     ...issueThreads(rows, (threadId) => shells[rows.findIndex((row) => row.id === threadId)]),
     // Until then the button stays hidden rather than offering a start it may take back. Offline,
     // no answer comes, and a start waits in the outbox.
-    answered: data !== null || relations.error !== null || !connected,
+    answered:
+      data !== null ||
+      relations.error !== null ||
+      !connected ||
+      (capabilities !== undefined && !listsThreads),
   };
 }

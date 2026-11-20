@@ -29,6 +29,7 @@ import {
   useEnvironmentThreadRefs,
   useQuietThreadShells,
 } from "~/state/entities";
+import { useServerConfigs } from "~/state/entities";
 import { issueEnvironment } from "~/state/issues";
 import { useEnvironmentQuery } from "~/state/query";
 import { useEnvironmentScope } from "~/state/session";
@@ -84,8 +85,12 @@ export function IssueThreadStatusButton({
   const continuation = useIssueContinuation(environmentId);
   const [pending, setPending] = useState(false);
   const { tracker, host, scope, key } = issueThreadLinkTarget(reference, issue);
+  const capabilities = useServerConfigs().get(environmentId)?.environment.capabilities;
+  const listsThreads = capabilities?.issueLinkedThreads === true;
   const linked = useEnvironmentQuery(
-    issueEnvironment.linkedThreads({ environmentId, input: { tracker, host, scope, key } }),
+    listsThreads
+      ? issueEnvironment.linkedThreads({ environmentId, input: { tracker, host, scope, key } })
+      : null,
   );
   const shells = useQuietThreadShells();
   const hiddenKeys = useAtomValue(environmentThreadShells.hiddenThreadKeysAtom);
@@ -94,7 +99,9 @@ export function IssueThreadStatusButton({
 
   const shellOf = (threadId: ThreadId) =>
     shells.find((shell) => shell.environmentId === environmentId && shell.id === threadId);
-  const answered = linked.data !== null || linked.error !== null;
+  // A server without `issues.linkedThreads` counts as having none once its config is known.
+  const answered =
+    linked.data !== null || linked.error !== null || (capabilities !== undefined && !listsThreads);
   const { threads, primary } = issueThreads(
     visibleLinkedThreads(
       linked.data?.threads ?? [],

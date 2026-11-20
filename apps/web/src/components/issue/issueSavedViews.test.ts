@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vite-plus/test";
 
+import { EnvironmentId, ProjectId } from "@t3tools/contracts";
+
 import { issueViewMatches } from "./issueSavedViews";
 
 const preferences = {
   who: "assigned",
   status: "open",
+  issueServer: EnvironmentId.make("env-1"),
+  issueProject: ProjectId.make("project-1"),
   host: "github.com",
   q: "crash",
   label: ["bug", "priority"],
@@ -20,6 +24,7 @@ describe("saved issue views", () => {
     );
     expect(issueViewMatches(view, { ...preferences, assignee: undefined })).toBe(false);
     expect(issueViewMatches(view, { ...preferences, label: ["bug"] })).toBe(false);
+    expect(issueViewMatches(view, { ...preferences, issueProject: undefined })).toBe(false);
   });
 
   it("tells views apart by graph grouping only while the graph is shown", () => {
