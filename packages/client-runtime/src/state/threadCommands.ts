@@ -50,6 +50,7 @@ import {
   reorderPinnedThread,
   reorderActiveThread,
   setThreadAutoSettle,
+  setThreadTriageLabel,
   settleThread,
   snoozeThread,
   startThreadTurn,
@@ -243,6 +244,12 @@ export function createThreadEnvironmentAtoms<R, E>(
     setAutoSettle: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:set-auto-settle",
       execute: setThreadAutoSettle,
+      scheduler,
+      concurrency,
+    }),
+    setTriageLabel: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:set-triage-label",
+      execute: setThreadTriageLabel,
       scheduler,
       concurrency,
     }),

@@ -33,6 +33,7 @@ import {
 import { toServerClock } from "@t3tools/client-runtime/clock";
 import type { SnoozePresetSetting } from "@t3tools/contracts/settings";
 import { canSnooze } from "@t3tools/client-runtime/state/thread-settled";
+import { resolveThreadTriageDisplay } from "@t3tools/client-runtime/state/thread-triage";
 import { threadChipCopyTarget } from "@t3tools/client-runtime/thread-reference";
 import type { MenuAction } from "@react-native-menu/menu";
 import { useNavigation } from "@react-navigation/native";
@@ -153,6 +154,18 @@ export const DONE_STATUS_LABEL: StatusLabel = {
   icon: "checkmark.circle",
   className: "text-adaptive-emerald-700-300",
   iconTintClassName: "accent-adaptive-emerald-700-300",
+};
+const MY_MOVE_STATUS_LABEL: StatusLabel = {
+  label: msg("My move", { $context: "thread status: the user acts next" }),
+  icon: "hand.raised",
+  className: "text-adaptive-orange-600-300",
+  iconTintClassName: "accent-adaptive-orange-600-300",
+};
+const UNSORTED_STATUS_LABEL: StatusLabel = {
+  label: msg("Unsorted", { $context: "thread status: stopped, nobody said who acts next" }),
+  icon: "tray",
+  className: "text-foreground-muted",
+  iconTintClassName: "accent-foreground-muted",
 };
 
 // DM Sans has no tabular figures, so a ticking timer in it reflows the row every second.
@@ -872,16 +885,28 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   const isUnread = status === "ready" && threadHasUnseenCompletion(thread);
   const workingLabel = STATUS_LABEL_BY_STATUS[status];
   const showsWoke = status === "ready" && props.wokeAt !== null;
+  const triage = resolveThreadTriageDisplay(thread, {
+    stopped: status === "ready",
+    snoozed: snoozedRow,
+  });
   const statusEntry =
     (status === "working" && workingLabel !== undefined && thread.goal?.status === "active"
       ? {
           ...workingLabel,
           label: msg("Goal", { $context: "thread status, working toward a goal" }),
         }
-      : workingLabel) ?? (isUnread ? DONE_STATUS_LABEL : undefined);
+      : workingLabel) ??
+    (triage?.kind === "my-move"
+      ? MY_MOVE_STATUS_LABEL
+      : isUnread
+        ? DONE_STATUS_LABEL
+        : triage?.kind === "unsorted"
+          ? UNSORTED_STATUS_LABEL
+          : undefined);
+  const myMoveNote = triage?.kind === "my-move" ? triage.note : null;
   const statusLabel = statusEntry && {
     ...statusEntry,
-    label: statusEntry.label === null ? null : m(statusEntry.label),
+    label: myMoveNote ?? (statusEntry.label === null ? null : m(statusEntry.label)),
   };
   const recede = shouldRecedeThreadRow({ status, selected });
   const isRegeneratingTitle = thread.titleRegeneration != null;
@@ -896,11 +921,13 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
       woke: showsWoke,
       // Working and waiting rows show only an icon and a duration, so name them for speech.
       statusLabel:
-        statusLabel &&
-        (statusLabel.label ??
-          (status === "waiting"
-            ? gt("Waiting", { $context: "thread status" })
-            : gt("Working", { $context: "thread status" }))),
+        myMoveNote !== null
+          ? gt("My move: {note}", { note: myMoveNote })
+          : statusLabel &&
+            (statusLabel.label ??
+              (status === "waiting"
+                ? gt("Waiting", { $context: "thread status" })
+                : gt("Working", { $context: "thread status" }))),
       timeLabel,
       snoozeWakeLabel: snoozedRow ? snoozeWakeLabelText : undefined,
       providerNameLabel,
@@ -1457,8 +1484,10 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
               <Text
                 className={cn(
                   "text-xs font-t3-bold",
+                  myMoveNote !== null && "max-w-28",
                   selected ? selectedThreadRowColors.foregroundClassName : statusLabel.className,
                 )}
+                numberOfLines={myMoveNote === null ? undefined : 1}
               >
                 {statusLabel.label}
                 {status === "working" ? (

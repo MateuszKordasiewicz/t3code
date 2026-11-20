@@ -1,8 +1,9 @@
-import type { ContextMenuItem } from "@t3tools/contracts";
+import type { ContextMenuItem, ThreadTriageLabel } from "@t3tools/contracts";
 import type { SnoozePreset } from "@t3tools/client-runtime/state/thread-settled";
 import { msg } from "gt-react";
 
 import { m, type MessageResolver } from "../i18n/messages";
+import { buildThreadTriageMenuItems, type ThreadTriageMenuId } from "./threadTriageMenu.logic";
 
 export type ThreadActionMenuId =
   | "find"
@@ -20,6 +21,7 @@ export type ThreadActionMenuId =
   | "snooze"
   | `snooze:${string}`
   | "unsnooze"
+  | ThreadTriageMenuId
   | "rename"
   | "regenerate-title"
   | "mark-unread"
@@ -107,6 +109,7 @@ export interface ThreadActionMenuState {
   readonly isSettled: boolean;
   readonly autoSettleEnabled: boolean;
   readonly isSnoozed: boolean;
+  readonly triageLabel?: ThreadTriageLabel | null;
   readonly canSnoozeNow: boolean;
   readonly isRegeneratingTitle: boolean;
   /** Archive rejects attached providers, so disable it while running. */
@@ -200,6 +203,7 @@ export function buildThreadActionMenuItems(
               },
         ]
       : []),
+    ...buildThreadTriageMenuItems(state, resolve),
     {
       id: "rename",
       label: resolve(msg("Rename thread")),

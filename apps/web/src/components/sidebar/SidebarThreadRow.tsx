@@ -1,5 +1,6 @@
 import { useAtomMount } from "@effect/atom-react";
 import { asLaunchingThread } from "@t3tools/client-runtime/state/thread-inbox";
+import { resolveThreadTriageDisplay } from "@t3tools/client-runtime/state/thread-triage";
 import { ThreadHoverCard, ThreadHoverCardPopup } from "../ThreadHoverCard";
 import { ThreadTerminalStatusButton } from "../ThreadStatusIndicators";
 import { discardComposerDraft } from "../../lib/discardComposerDraft";
@@ -48,6 +49,8 @@ import {
   CircleDotDashedIcon,
   ClockIcon,
   GitBranchIcon,
+  HandIcon,
+  InboxIcon,
   MessageCircleQuestionIcon,
   PinIcon,
   PinOffIcon,
@@ -565,6 +568,8 @@ const TOP_STATUS_ICONS = {
   failed: CircleAlertIcon,
   done: CircleCheckIcon,
   woke: AlarmClockIcon,
+  myMove: HandIcon,
+  unsorted: InboxIcon,
 } as const;
 
 function TopStatusIcon(props: { icon: keyof typeof TOP_STATUS_ICONS; className: string }) {
@@ -773,13 +778,19 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
     wokeAtDate !== null &&
     (lastVisitedDate === null || lastVisitedDate < wokeAtDate) &&
     thread.settledOverride !== "settled";
-  const shouldRecede = shouldRecedeSidebarThread({
-    status,
-    isUnread,
-    isWoke,
-    isActive: props.isActive,
-    isSelected,
+  const triage = resolveThreadTriageDisplay(thread, {
+    stopped: status === "ready",
+    snoozed: variantAction === "unsnooze",
   });
+  const shouldRecede =
+    triage?.kind !== "my-move" &&
+    shouldRecedeSidebarThread({
+      status,
+      isUnread,
+      isWoke,
+      isActive: props.isActive,
+      isSelected,
+    });
   const topStatus =
     status === "preparing" || status === "working"
       ? {
@@ -834,13 +845,29 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
                         icon: "woke" as const,
                         className: "text-warning-foreground",
                       }
-                    : isUnread
+                    : triage?.kind === "my-move"
                       ? {
-                          label: gt("Done", { $context: "thread status" }),
-                          icon: "done" as const,
-                          className: "text-success-foreground",
+                          label:
+                            triage.note ??
+                            gt("My move", { $context: "thread status: the user acts next" }),
+                          icon: "myMove" as const,
+                          className: "text-orange-600 dark:text-orange-300",
                         }
-                      : null;
+                      : isUnread
+                        ? {
+                            label: gt("Done", { $context: "thread status" }),
+                            icon: "done" as const,
+                            className: "text-success-foreground",
+                          }
+                        : triage?.kind === "unsorted"
+                          ? {
+                              label: gt("Unsorted", {
+                                $context: "thread status: stopped, nobody said who acts next",
+                              }),
+                              icon: "unsorted" as const,
+                              className: "text-muted-foreground",
+                            }
+                          : null;
   const isWokeStatus = topStatus?.icon === "woke";
 
   const branchMismatch = resolveLocalCheckoutBranchMismatch({
@@ -1063,7 +1090,10 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
 
   const accessibility = resolveSidebarRowAccessibility({
     title: thread.title,
-    statusLabel: topStatus?.label ?? null,
+    statusLabel:
+      topStatus?.icon === "myMove" && triage?.kind === "my-move" && triage.note !== null
+        ? gt("My move: {note}", { note: triage.note })
+        : (topStatus?.label ?? null),
     projectDisplayName: props.projectDisplayName,
     isActive: props.isActive,
   });
@@ -1444,7 +1474,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
                         )}
                       >
                         <TopStatusIcon icon={topStatus.icon} className="size-3" />
-                        {topStatus.label}
+                        <span className="max-w-28 truncate">{topStatus.label}</span>
                       </span>
                     ) : (
                       <span className="text-xs">
@@ -1641,7 +1671,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
                           {/* Not a live region: a collapsed sidebar is inert, so
                             BackgroundThreadAnnouncer and the open thread's
                             timeline speak status changes instead. */}
-                          {topStatus.label}
+                          <span className="max-w-28 truncate">{topStatus.label}</span>
                           {status === "preparing" || status === "working" ? (
                             <span aria-hidden>
                               <WorkingDuration

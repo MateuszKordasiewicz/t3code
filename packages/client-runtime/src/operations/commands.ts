@@ -27,6 +27,7 @@ import {
   type RuntimeRequestId,
   type ThreadId,
   type ThreadEnvMode,
+  type ThreadTriageLabel,
   type UploadChatAttachment,
   type GuestMessageId,
 } from "@t3tools/contracts";
@@ -599,6 +600,20 @@ export const setThreadAutoSettle = Effect.fn("EnvironmentCommands.setThreadAutoS
     enabled: input.enabled,
   });
 });
+
+export interface SetThreadTriageLabelInput extends ThreadCommandInput {
+  readonly label: ThreadTriageLabel | null;
+}
+export const setThreadTriageLabel = Effect.fn("EnvironmentCommands.setThreadTriageLabel")(
+  function* (input: SetThreadTriageLabelInput) {
+    return yield* dispatch({
+      type: "thread.triage-label.set",
+      commandId: yield* allocateCommandId(input),
+      threadId: input.threadId,
+      label: input.label,
+    });
+  },
+);
 
 export const reorderPinnedThread = Effect.fn("EnvironmentCommands.reorderPinnedThread")(function* (
   input: ReorderPinnedThreadInput,

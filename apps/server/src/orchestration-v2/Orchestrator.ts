@@ -210,6 +210,11 @@ import {
   ThreadForkServiceV2,
 } from "./ThreadForkService.ts";
 import { planThreadDeletion } from "./ThreadDeletion.ts";
+import {
+  applyThreadTriageLabel,
+  sentByUser,
+  threadWithTriageLabelRetired,
+} from "./threadTriage.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ServerSettings from "../serverSettings.ts";
 
@@ -648,6 +653,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "thread.pin.reorder":
     case "thread.active.reorder":
     case "thread.tag.set":
+    case "thread.triage-label.set":
     case "thread.visit":
     case "thread.mark-unread":
     case "thread.metadata.update":
@@ -4339,6 +4345,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           | "thread.unpin"
           | "thread.pin.reorder"
           | "thread.tag.set"
+          | "thread.triage-label.set"
           | "thread.active.reorder"
           | "thread.mark-unread"
           | "thread.metadata.update"
@@ -5029,6 +5036,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               : current.filter((tag) => tag !== command.tag),
           };
         }
+        case "thread.triage-label.set":
+          return applyThreadTriageLabel(thread, command.label, now);
         case "thread.mark-unread": {
           // Retire the wake before rewinding the visit, preserving its settlement timer.
           const snoozeExpired =
@@ -5489,6 +5498,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           return "thread.active-reordered" as const;
         case "thread.tag.set":
           return "thread.tags-updated" as const;
+        case "thread.triage-label.set":
+          return "thread.triage-label-updated" as const;
         case "thread.mark-unread":
           return "thread.marked-unread" as const;
         case "thread.metadata.update":
@@ -7340,6 +7351,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         providerInstanceId: thread.providerInstanceId,
         occurredAt: now,
         payload: thread,
+      });
+      projection = applyToProjection(projection, event);
+    }
+    const retiredTriage = sentByUser(command)
+      ? threadWithTriageLabelRetired(projection.thread)
+      : null;
+    if (retiredTriage !== null) {
+      const event = yield* emit(
+        events,
+        command,
+      )({
+        type: "thread.triage-label-updated",
+        threadId: command.threadId,
+        providerInstanceId: retiredTriage.providerInstanceId,
+        occurredAt: yield* DateTime.now,
+        payload: retiredTriage,
       });
       projection = applyToProjection(projection, event);
     }
@@ -15535,6 +15562,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "thread.pin.reorder":
       case "thread.active.reorder":
       case "thread.tag.set":
+      case "thread.triage-label.set":
       case "thread.mark-unread":
       case "thread.pull-request.link":
       case "thread.pull-request.unlink":

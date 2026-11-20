@@ -399,6 +399,10 @@
       "types": "./src/state/threadSort.ts",
       "default": "./src/state/threadSort.ts"
     },
+    "./state/thread-triage": {
+      "types": "./src/state/threadTriage.ts",
+      "default": "./src/state/threadTriage.ts"
+    },
     "./state/thread-inbox": {
       "types": "./src/state/threadInbox.ts",
       "default": "./src/state/threadInbox.ts"

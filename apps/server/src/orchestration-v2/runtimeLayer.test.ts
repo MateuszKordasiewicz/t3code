@@ -12200,6 +12200,21 @@ it.layer(layerSharedApplicationDataPlaneTest)("snooze projection", (it) => {
         awakened.thread.titleRegeneration?.requestId,
         CommandId.make("runtime-layer-snoozed-message"),
       );
+
+      const shellThread = Effect.map(orchestrator.getShellSnapshot(), (snapshot) =>
+        snapshot.threads.find((candidate) => candidate.id === threadId),
+      );
+      const triageLabel = { kind: "my-move", note: "Check the logs" } as const;
+      for (const label of [triageLabel, null]) {
+        yield* orchestrator.dispatch({
+          type: "thread.triage-label.set",
+          commandId: CommandId.make(`runtime-layer-snoozed-triage-${label === null}`),
+          threadId,
+          label,
+        });
+        if (label === null) assert.notProperty(yield* shellThread, "triageLabel");
+        else assert.deepEqual((yield* shellThread)?.triageLabel, label);
+      }
     }),
   );
 
