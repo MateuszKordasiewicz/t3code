@@ -143,7 +143,10 @@ fi
 
 commit=$(git -c user.name='T3 Code upstream sync' -c user.email='t3code-upstream-sync@users.noreply.github.com' \
   commit-tree "$tree" "${parents[@]}" -m 'chore: repair T3 Code upstream merge')
-printf '%s\n^%s\n' "$commit" "$baseline" |
+# The transfer commit makes the hosted merge tree a delta base without changing the candidate's parents.
+transfer=$(git -c user.name='T3 Code upstream sync' -c user.email='t3code-upstream-sync@users.noreply.github.com' \
+  commit-tree "$tree" -p "$baseline" -m 'Transfer upstream repair tree')
+printf '%s\n%s\n^%s\n' "$commit" "$transfer" "$baseline" |
   git pack-objects --stdout --revs --thin > "$work/candidate.pack"
 printf '%s\n' "$commit" > "$work/candidate.commit"
 WORKER

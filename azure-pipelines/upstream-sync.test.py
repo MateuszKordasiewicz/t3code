@@ -93,8 +93,9 @@ class SyncTest(unittest.TestCase):
         tree = self.git("write-tree", cwd=guest).decode().strip()
         args = [arg for parent in parents for arg in ("-p", parent)]
         commit = self.git("commit-tree", tree, *args, "-m", "repair", cwd=guest).decode().strip()
+        transfer = self.git("commit-tree", tree, "-p", baseline, "-m", "transfer", cwd=guest).decode().strip()
         pack = self.git("pack-objects", "--stdout", "--revs", "--thin",
-                        input=f"{commit}\n^{baseline}\n".encode(), cwd=guest)
+                        input=f"{commit}\n{transfer}\n^{baseline}\n".encode(), cwd=guest)
         (self.scratch / "repaired.pack").write_bytes(pack)
         (self.scratch / "repaired.commit").write_text(commit + "\n")
         return commit
