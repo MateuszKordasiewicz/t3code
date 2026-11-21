@@ -116,7 +116,8 @@ else
   fi
   status=0
   timeout --kill-after=5 "$seconds" "$cli" thread start --base-dir "$t3_home" "$PWD" - \
-    --title 'Repair Azure upstream merge conflicts' --wait --json > "$work/turn.json" <<PROMPT || status=$?
+    --title 'Repair Azure upstream merge conflicts' --wait --json \
+    > "$work/turn.json" 2> "$work/turn.stderr" <<PROMPT || status=$?
 Task: Repair the upstream merge conflicts
 
 This repository is a disposable checkout of Azure target $base. Git is merging public upstream $upstream.
@@ -128,6 +129,7 @@ PROMPT
   case "$status" in
     0) ;;
     124|137) exit 124 ;;
+    2) exit 24 ;;
     *) exit 21 ;;
   esac
   test "$mode" != timeout
@@ -159,9 +161,41 @@ systemd-run --quiet --wait --pipe --collect --unit "$unit" --uid=t3 --gid=t3 \
 case "$status" in
   0) ;;
   124|137) guest_error 't3 turn timed out' ;;
-  21) guest_error 't3 turn failed or requested input' ;;
+  21)
+    # Provider diagnostics may contain credentials. Only emit recognized error categories.
+    reason=$(runuser -u t3 -- timeout 5 python3 - "$directory/work" 2>/dev/null <<'PY' || true
+import json
+import re
+import sys
+from pathlib import Path
+
+work = Path(sys.argv[1])
+with (work / "turn.stderr").open(errors="replace") as source:
+    error = source.read(65536)
+with (work / "turn.json").open(errors="replace") as source:
+    try:
+        error += "\n" + (json.loads(source.read(65536)).get("error") or "")
+    except ValueError:
+        pass
+for pattern, message in (
+    (r"read-only file system|os error 30", "read only filesystem"),
+    (r"permission denied|operation not permitted|os error 13", "permission denied"),
+    (r"not authenticated|unauthorized|login required|authentication failed", "provider authentication failed"),
+    (r"usage limit|rate.limit|too many requests|quota exceeded", "provider usage limit"),
+    (r"model.*(?:not found|does not exist|not supported|unavailable)", "provider model unavailable"),
+    (r"no available provider|no provider.*available|provider.*not ready", "provider unavailable"),
+    (r"could not reach|connection refused|server is not running", "t3 server unavailable"),
+):
+    if re.search(pattern, error, re.IGNORECASE):
+        print(message)
+        break
+PY
+)
+    guest_error "t3 turn failed ${reason:-without a recognized diagnostic}"
+    ;;
   22) guest_error 'unresolved merge paths remain' ;;
   23) guest_error 'unstaged tracked changes remain' ;;
+  24) guest_error 't3 turn requested input' ;;
   *) guest_error 'guest checkout or t3 worker failed' ;;
 esac
 
