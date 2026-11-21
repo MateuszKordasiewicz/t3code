@@ -160,6 +160,12 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("deallocation could not be verified", result.stdout)
         (self.scratch / "pilot-deallocated").touch()
+        commands = self.scratch / "pilot-commands"
+        commands.write_text("t3-upstream-42-1-cleanup\n")
+        result = self.sync("release-pilot")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Run Command deletion could not be verified", result.stdout)
+        commands.write_text("")
         self.assert_success(self.sync("release-pilot"))
         self.assert_success(self.sync("acquire-pilot", BUILD_BUILDID="43"))
 

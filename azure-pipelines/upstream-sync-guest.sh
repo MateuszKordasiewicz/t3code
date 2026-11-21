@@ -116,7 +116,7 @@ else
   fi
   status=0
   timeout --kill-after=5 "$seconds" "$cli" thread start --base-dir "$t3_home" "$PWD" - \
-    --title 'Repair Azure upstream merge conflicts' --wait --json \
+    --provider codex --model gpt-6-luna --title 'Repair Azure upstream merge conflicts' --wait --json \
     > "$work/turn.json" 2> "$work/turn.stderr" <<PROMPT || status=$?
 Task: Repair the upstream merge conflicts
 

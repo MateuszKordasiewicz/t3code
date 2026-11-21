@@ -10,7 +10,7 @@ The required [Azure build validation policy](https://learn.microsoft.com/en-us/a
 
 After schedule approval, set the pipeline's default branch to `main` and set its variable `UPSTREAM_SYNC_SCHEDULE_ENABLED` to `true`. Leave queue-time overrides off. Azure cron uses UTC, so the pipeline evaluates both 07:00 and 08:00 UTC and runs the sync at the one that corresponds to 03:00 in `America/New_York`. Manual runs are available independently of this switch.
 
-After a successful disposable trial and approval to activate scheduled repair, set `UPSTREAM_SYNC_VM_REPAIR_ENABLED` to `true` on pipeline 29 with queue-time overrides off. A conflicting scheduled run then gives one T3 turn up to 20 minutes on the existing private pilot. The hosted job sends an expiring download link for the exact merge inputs and retrieves the resulting Git pack through Azure Run Command. The hosted job verifies that Azure deallocated the pilot, then checks the pack, commit parents, and conflict markers before it publishes a candidate. The usual validation and completion policies apply.
+After a successful disposable trial and approval to activate scheduled repair, set `UPSTREAM_SYNC_VM_REPAIR_ENABLED` to `true` on pipeline 29 with queue-time overrides off. A conflicting scheduled run then gives one Codex `gpt-6-luna` turn up to 20 minutes on the existing private pilot. The hosted job sends an expiring download link for the exact merge inputs and retrieves the resulting Git pack through Azure Run Command. The hosted job verifies that Azure deallocated the pilot, then checks the pack, commit parents, and conflict markers before it publishes a candidate. The usual validation and completion policies apply.
 
 ## Daytime trial
 

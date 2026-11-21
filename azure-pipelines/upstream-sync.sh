@@ -216,6 +216,9 @@ release_pilot() {
   if [[ -f "$SYNC_DIR/pilot-start-requested" && ! -f "$SYNC_DIR/pilot-deallocated" ]]; then
     fail "Pilot deallocation could not be verified. The reservation is held for run $BUILD_BUILDID."
   fi
+  if [[ -s "$SYNC_DIR/pilot-commands" ]]; then
+    fail "Pilot Run Command deletion could not be verified. The reservation is held for run $BUILD_BUILDID."
+  fi
   released=$(pilot_commit released "$lease")
   azure_git push --force-with-lease="$pilot_ref:$lease" origin "$released:$pilot_ref"
   echo "Released the pilot reservation."

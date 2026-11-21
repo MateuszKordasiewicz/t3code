@@ -23,14 +23,14 @@ MAX_PACK = 128 * 1024
 SHA = r"[0-9a-f]{40}"
 
 
-def request(url, token, method="GET", body=None, missing_ok=False):
+def request(url, token, method="GET", body=None, missing_ok=False, timeout=25):
     headers = {"Authorization": f"Bearer {token}"}
     if body is not None:
         body = json.dumps(body).encode()
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=25) as response:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             data = response.read()
             return json.loads(data) if data else {}
     except urllib.error.HTTPError as error:
@@ -64,9 +64,9 @@ class Pilot:
             text=True, timeout=30,
         ).strip()
 
-    def api(self, path, method="GET", body=None, *, expand=False, missing_ok=False):
+    def api(self, path, method="GET", body=None, *, expand=False, missing_ok=False, timeout=25):
         url = f"{VM}/{path}?{API}" + ("&%24expand=instanceView" if expand else "")
-        return request(url, self.arm_token, method, body, missing_ok)
+        return request(url, self.arm_token, method, body, missing_ok, timeout)
 
     def power(self):
         view = self.api("instanceView")
@@ -105,8 +105,6 @@ class Pilot:
                                         for name, value in (protected or {}).items()],
             },
         }
-        self.api(path, "PUT", body)
-
         def finished():
             resource = self.api(path, expand=True)
             view = resource.get("properties", {}).get("instanceView") or {}
@@ -120,32 +118,67 @@ class Pilot:
             return None
 
         try:
+            self.api(path, "PUT", body)
             return wait_for(f"pilot command {suffix}", seconds + 35, finished)
         finally:
-            self.remove_command(name)
+            try:
+                self.api(path, "DELETE", missing_ok=True, timeout=5)
+            except RuntimeError as error:
+                print(f"Will retry deletion of {name} during cleanup. {error}", flush=True)
 
-    def remove_command(self, name):
-        self.api(f"runCommands/{name}", "DELETE", missing_ok=True)
+    def drain_commands(self, seconds):
+        if not self.commands.exists():
+            return
         pending = self.commands.read_text().splitlines()
-        self.commands.write_text("".join(f"{item}\n" for item in pending if item != name))
+        requested = set()
+        deadline = time.monotonic() + seconds
+        while pending and time.monotonic() < deadline:
+            for name in pending[:]:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                path = f"runCommands/{name}"
+                try:
+                    resource = self.api(path, missing_ok=True, timeout=min(5, remaining))
+                    if resource is None:
+                        pending.remove(name)
+                    elif name not in requested and resource.get("properties", {}).get("provisioningState") != "Deleting":
+                        remaining = deadline - time.monotonic()
+                        if remaining > 0:
+                            self.api(path, "DELETE", missing_ok=True, timeout=min(5, remaining))
+                            requested.add(name)
+                except RuntimeError:
+                    continue
+            if pending:
+                time.sleep(max(0, min(4, deadline - time.monotonic())))
+        remaining_file = self.commands.with_suffix(".pending")
+        remaining_file.write_text("".join(f"{name}\n" for name in pending))
+        remaining_file.replace(self.commands)
+        if pending:
+            raise RuntimeError("Could not verify Run Command deletion: " + ", ".join(pending))
 
     def cleanup(self, script):
-        if not self.start_requested.exists() or self.deallocated.exists():
+        if not self.start_requested.exists():
             return
         errors = []
-        # Cancel any outstanding Run Command before removing its checkout.
-        if self.commands.exists():
-            for name in self.commands.read_text().splitlines():
-                try:
-                    self.remove_command(name)
-                except RuntimeError as error:
-                    errors.append(str(error))
+        try:
+            self.drain_commands(60)
+        except RuntimeError as error:
+            errors.append(str(error))
+        if self.deallocated.exists():
+            if errors:
+                raise RuntimeError("Pilot cleanup reported: " + " ".join(errors))
+            return
         try:
             if self.power() == "PowerState/running":
                 self.run("cleanup", script, 30, {"T3_SYNC_NAME": self.name, "T3_SYNC_ACTION": "cleanup"})
         except RuntimeError as error:
             errors.append(str(error))
         finally:
+            try:
+                self.drain_commands(40)
+            except RuntimeError as error:
+                errors.append(str(error))
             print("Deallocating the pilot VM.", flush=True)
             requested = False
 
@@ -244,7 +277,13 @@ def main():
                 "T3_SYNC_CHECKSUM": checksum, "T3_SYNC_MODE": mode,
             }, {"T3_SYNC_DOWNLOAD": download_url()})
             collect(pilot, script, view, mode)
-        finally:
+        except Exception:
+            try:
+                pilot.cleanup(script)
+            except (RuntimeError, OSError) as error:
+                print(f"##vso[task.logissue type=error]{error}", flush=True)
+            raise
+        else:
             pilot.cleanup(script)
     elif action == "cleanup":
         pilot.cleanup(script)
