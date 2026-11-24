@@ -1,11 +1,13 @@
 """Focused tests for the Azure upstream sync entry points using disposable Git repos."""
 
 import hashlib
+import importlib.util
 import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).with_name("upstream-sync.sh").resolve()
 
@@ -169,6 +171,50 @@ class SyncTest(unittest.TestCase):
         commands.write_text("")
         self.assert_success(self.sync("release-pilot"))
         self.assert_success(self.sync("acquire-pilot", BUILD_BUILDID="43"))
+
+    def test_pilot_fallback_cannot_release_after_unconfirmed_guest_cleanup(self):
+        self.scratch.mkdir()
+        self.assert_success(self.sync("acquire-pilot"))
+        for marker in ("pilot-start-requested", "pilot-guest-workspace-requested"):
+            (self.scratch / marker).touch()
+
+        spec = importlib.util.spec_from_file_location(
+            "upstream_sync_vm", SCRIPT.with_name("upstream-sync-vm.py"),
+        )
+        vm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(vm)
+        with patch("subprocess.check_output", return_value="test"):
+            pilot = vm.Pilot(self.scratch, "t3-upstream-42-1")
+
+        power = "PowerState/running"
+
+        def api(path, method):
+            nonlocal power
+            self.assertEqual((path, method), ("deallocate", "POST"))
+            power = "PowerState/deallocated"
+
+        with (
+            patch.object(pilot, "power", side_effect=lambda: power),
+            patch.object(pilot, "api", side_effect=api),
+            patch.object(pilot, "drain_commands", side_effect=[RuntimeError("repair still running"), None]),
+            patch.object(pilot, "run") as guest_cleanup,
+            patch.object(vm, "wait_for", side_effect=lambda _, __, check: check() or check()),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "repair still running"):
+                pilot.cleanup("unused")
+            guest_cleanup.assert_not_called()
+        self.assertTrue((self.scratch / "pilot-deallocated").exists())
+
+        with self.assertRaisesRegex(RuntimeError, "guest workspace cleanup could not be verified"):
+            pilot.cleanup("unused")
+
+        result = self.sync("release-pilot")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("guest workspace cleanup could not be verified", result.stdout)
+
+        (self.scratch / "pilot-guest-workspace-cleaned").touch()
+        pilot.cleanup("unused")
+        self.assert_success(self.sync("release-pilot"))
 
 
 if __name__ == "__main__":

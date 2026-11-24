@@ -20,6 +20,6 @@ In pipeline 29, select **Run pipeline** and choose the branch with the repair wo
 
 Select **invalid** to test a wrong-parent result or **timeout** to give the T3 turn three seconds. Both runs should fail before candidate publication and record deallocation. To check the hosted-only paths, select **repair** and use an upstream SHA that merges cleanly or is already an ancestor of the target. The pilot steps should be skipped.
 
-The `sync/azure-upstream-control/pilot` ref prevents simultaneous sync runs from taking the pilot. If a canceled run leaves its reservation in place, inspect the run and verify guest command cleanup and VM deallocation before releasing the reservation.
+The `sync/azure-upstream-control/pilot` ref prevents simultaneous sync runs from taking the pilot. If a failed or canceled run retains its reservation, verify that the guest unit and workspace for that run and attempt were removed, Azure Run Commands were deleted, and the VM is deallocated before releasing the reservation.
 
 Azure DevOps sends failure email for **t3code-upstream-sync** runs. Open the linked run to see the conflicting files or validation error. The PR shows any separate failure from the required merge build.
