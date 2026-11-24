@@ -2,8 +2,10 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
 import {
+  IssueListInput,
   IssueTrackerKind,
   type IssueTrackerProjectBinding,
   SourceControlProviderKind,
@@ -29,6 +31,7 @@ import * as IssueTrackerRegistry from "./IssueTrackerRegistry.ts";
 const GITHUB = IssueTrackerKind.make("github");
 const LINEAR = IssueTrackerKind.make("linear");
 const BEADS = IssueTrackerKind.make("beads");
+const decodeListInput = Schema.decodeEffect(IssueListInput);
 
 /** A standalone tracker shaped like Linear: its own host, team keys for scopes, `ENG-1` keys. */
 function fakeStandaloneTracker(
@@ -311,6 +314,40 @@ describe("IssueService", () => {
         yield* enterprise.resolveUrl("https://code.acme.test/acme/web/issues/7"),
       ).toMatchObject({ projectId: "ghes", host: "code.acme.test", key: "7", writable: true });
 
+      // A fork lists its upstream's issues and its own, counted once, and may write to both.
+      const fork = project({ id: "fork", repository: "acme/web" });
+      const forked = yield* makeService({
+        projects: [
+          {
+            ...fork,
+            repositoryIdentity: {
+              ...fork.repositoryIdentity!,
+              origin: { canonicalKey: "github.com/me/web" },
+            },
+          },
+        ],
+        trackers: [
+          fakeTracker({
+            listIssues: (input) =>
+              Effect.succeed({ items: [issue(input.scope)], nextCursor: null }),
+            comment: (input) =>
+              Effect.sync(() => {
+                writes.push(`${input.scope}#${input.key}`);
+              }),
+          }),
+        ],
+      });
+      const listed = yield* forked.list({ state: "open" });
+      expect(listed.entries.map((entry) => entry.scope).sort()).toEqual(["acme/web", "me/web"]);
+      expect(listed.trackers).toEqual([expect.objectContaining({ projectCount: 1 })]);
+      yield* forked.comment({
+        ...own,
+        projectId: "fork" as ProjectId,
+        scope: "me/web",
+        body: "ok",
+      });
+      expect(writes).toEqual(["acme/web#1", "me/web#1"]);
+
       // Another host is not reachable through this project's credentials at all.
       const elsewhere = yield* Effect.flip(service.detail({ ...own, host: "ghe.example.test" }));
       expect(elsewhere).toMatchObject({
@@ -532,6 +569,40 @@ describe("IssueService", () => {
       });
       expect(listed).toEqual(["acme/web"]);
       expect(through.entries.map((entry) => entry.key)).toEqual(["4"]);
+
+      listed.length = 0;
+      const input = yield* decodeListInput({
+        state: "open",
+        includeProjectIds: ["web-worktree", "docs", "not-owned"],
+      });
+      const included = yield* service.list(input);
+      expect(listed.sort()).toEqual(["acme/docs", "acme/web"]);
+      expect(included.entries.map((entry) => entry.projectId).sort()).toEqual([
+        "docs",
+        "web-worktree",
+        "web-worktree",
+      ]);
+      expect(included.scopes?.map(({ projectId }) => projectId).sort()).toEqual([
+        "docs",
+        "web-worktree",
+      ]);
+      expect(included.errors).toEqual([]);
+
+      listed.length = 0;
+      const continuation = yield* service.list({
+        ...input,
+        cursors: { ...included.nextCursors, "github.com acme/api": "unselected" },
+      });
+      expect(listed).toEqual(["acme/web"]);
+      expect(continuation.entries.map((entry) => [entry.projectId, entry.key])).toEqual([
+        ["web-worktree", "4"],
+      ]);
+
+      listed.length = 0;
+      const emptyInput = { ...input, includeProjectIds: [] };
+      const empty = yield* service.list(emptyInput);
+      expect(listed).toEqual([]);
+      expect(empty).toMatchObject({ entries: [], trackers: [], scopes: [], nextCursors: {} });
     }),
   );
 });
@@ -641,6 +712,9 @@ describe("IssueService with a standalone tracker", () => {
         ["web", "ENG"],
         ["web", "acme/web"],
       ]);
+      listed.length = 0;
+      yield* bound.list({ state: "open", excludeProjectIds: ["web" as ProjectId] });
+      expect(listed).toEqual(["github github.com acme/api"]);
       // A reference picks the project's tracker by kind; both are the project's own, so writable.
       const linearRef = {
         projectId: "web" as ProjectId,
@@ -737,6 +811,7 @@ describe("IssueService with a project-local tracker", () => {
             workspaceRoot: "/w/web/.worktrees/fix",
           }),
           project({ id: "api" }),
+          project({ id: "no-local-tracker" }),
           // Its discovery fails; its git host's issues still list.
           project({ id: "broken", repository: "acme/broken" }),
         ],
@@ -761,6 +836,7 @@ describe("IssueService with a project-local tracker", () => {
         ["web", "web-db", "t3-1"],
       ]);
       expect(result.errors).toEqual([]);
+      expect(result.trackers.map(({ host }) => host).sort()).toEqual(["beads", "github.com"]);
       expect(result.trackers).toContainEqual(
         expect.objectContaining({ tracker: "beads", host: "beads", projectCount: 3 }),
       );

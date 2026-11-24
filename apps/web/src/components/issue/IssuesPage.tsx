@@ -58,7 +58,14 @@ import { resolveFilterOptions } from "../pullRequest/pullRequestListOptions";
 import { IssueFiltersMenu } from "./IssueListFilterPickers";
 import { ISSUE_GRAPH_PAGE_SIZE, IssueGraphView } from "./IssueGraphView";
 import { IssueViewControls } from "./IssueViewControls";
-import { issueFilterProjects } from "./issuesSearch.logic";
+import {
+  filterIssuePages,
+  issueFilterProjects,
+  issueListTargets,
+  issueProjectVisibility,
+  setAllIssueProjectsShown,
+  setIssueProjectShown,
+} from "./issuesSearch.logic";
 import { ISSUE_SAVED_VIEWS } from "./issueSavedViews";
 import { SavedViewsMenu } from "~/components/SavedViewsMenu";
 import { PullRequestCompactFilterMenu } from "../pullRequest/PullRequestCompactFilterMenu";
@@ -71,6 +78,7 @@ import { PanelLayoutControls } from "~/components/chat/PanelLayoutControls";
 import { Button } from "~/components/ui/button";
 import {
   Empty,
+  EmptyContent,
   EmptyDescription,
   EmptyHeader,
   EmptyMedia,
@@ -97,7 +105,7 @@ import { useAtomCommand } from "~/state/use-atom-command";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { useProjects } from "~/state/entities";
 import { useEnvironments, useIssuesSupported } from "~/state/environments";
-import { issueEnvironment, useIssueList, type IssueListTarget } from "~/state/issues";
+import { issueEnvironment, useIssueList } from "~/state/issues";
 import { useDebouncedValue } from "~/state/queries";
 import { primaryServerKeybindingsAtom } from "~/state/server";
 
@@ -209,26 +217,32 @@ export function IssuesPage() {
     ),
     environmentLabels,
   );
-  const scopedProject =
-    search.issueServer && search.issueProject
-      ? { environmentId: search.issueServer, projectId: search.issueProject }
-      : undefined;
+  const projectVisibility = issueProjectVisibility(search);
+  const { includedCount, hiddenCount, isShown } = projectVisibility;
 
   const debouncedQuery = useDebouncedValue(search.q ?? "", 300);
   const listInput: IssueListInput = {
     state: search.status,
     involvement: search.who,
     limit: search.view === "graph" ? ISSUE_GRAPH_PAGE_SIZE : PAGE_SIZE,
-    ...(scopedProject ? { projectId: scopedProject.projectId } : {}),
     ...(search.host ? { host: search.host } : {}),
     ...(debouncedQuery ? { query: debouncedQuery } : {}),
     ...(search.label?.length ? { labels: search.label } : {}),
     ...(search.assignee ? { assignee: search.assignee } : {}),
     ...(search.order ? { sort: search.order } : {}),
   };
-  const targets: ReadonlyArray<IssueListTarget> = capableEnvironments
-    .filter((e) => scopedProject === undefined || e.environmentId === scopedProject.environmentId)
-    .map((e) => ({ environmentId: e.environmentId, input: listInput }));
+  const everyProjectHidden =
+    includedCount === undefined
+      ? filterProjects.length > 0 && !filterProjects.some(isShown)
+      : includedCount === 0;
+  const targets = everyProjectHidden
+    ? []
+    : issueListTargets(
+        capableEnvironments.map((e) => e.environmentId),
+        filterProjects,
+        search,
+        listInput,
+      );
   const list = useIssueList(targets);
   // Refreshing a list still loading would cancel it and start over, losing the scopes already read.
   useLiveRefresh(
@@ -240,15 +254,19 @@ export function IssuesPage() {
 
   const [pages, setPages] = useState<ReadonlyMap<EnvironmentId, HeldIssuePage>>(new Map());
   const held = holdIssuePages(list.answers, pages);
+  const shown = filterIssuePages(held, projectVisibility, search.host?.toLowerCase());
   const loadPage = useAtomCommand(issueEnvironment.listPage, { reportFailure: false });
   const [loadingMore, setLoadingMore] = useState<string | null>(null);
   // One tracker group's button carries on that tracker's scopes only.
   const loadMore = async (environmentId: EnvironmentId, host: string) => {
     const page = held.get(environmentId);
-    const cursors = page ? issueCursorsForHost(page.nextCursors, host) : {};
-    if (!page || Object.keys(cursors).length === 0 || loadingMore !== null) return;
+    const visiblePage = shown.get(environmentId);
+    const input = targets.find((target) => target.environmentId === environmentId)?.input;
+    if (!page || !visiblePage || !input || loadingMore !== null) return;
+    const cursors = issueCursorsForHost(visiblePage.nextCursors, host);
+    if (Object.keys(cursors).length === 0) return;
     setLoadingMore(`${environmentId} ${host}`);
-    const result = await loadPage({ environmentId, input: { ...listInput, cursors } });
+    const result = await loadPage({ environmentId, input: { ...input, cursors } });
     setLoadingMore(null);
     const failure = result._tag === "Failure" ? squashAtomCommandFailure(result) : null;
     setPages((current) => {
@@ -270,28 +288,8 @@ export function IssuesPage() {
     });
   };
 
-  // Rows grouped per tracker account, so a tracker that cannot be read says so where its rows
-  // would be, and each tracker's rows carry on from their own cursors.
-  // The server names every tracker so the menu can switch hosts, but reads only the chosen one.
-  const chosenHost = search.host?.toLowerCase();
-  const shown = chosenHost
-    ? new Map(
-        [...held].map(([environmentId, page]) => [
-          environmentId,
-          {
-            ...page,
-            answer: {
-              ...page.answer,
-              trackers: page.answer.trackers.filter(
-                (tracker) => tracker.host.toLowerCase() === chosenHost,
-              ),
-            },
-          },
-        ]),
-      )
-    : held;
   const groups = groupIssues(shown, debouncedQuery, projects, search.order ?? "updated");
-  const filterScopes = issueFilterScopes(shown, projects, scopedProject);
+  const filterScopes = issueFilterScopes(shown, projects.filter(isShown));
   const seenLabels = issueLabelsSeen(shown);
 
   const hostOptions = hostOptionsFor(
@@ -303,18 +301,12 @@ export function IssuesPage() {
   const updateSearch = (patch: { [Key in keyof IssuesSearch]?: IssuesSearch[Key] | undefined }) => {
     const merged = { ...search, ...patch };
     const next: IssuesSearch = {
-      who: merged.who ?? search.who,
-      status: merged.status ?? search.status,
-      ...(merged.issueServer && merged.issueProject
-        ? { issueServer: merged.issueServer, issueProject: merged.issueProject }
-        : {}),
-      ...(merged.host ? { host: merged.host } : {}),
+      ...issueListPreferences({
+        ...merged,
+        who: merged.who ?? search.who,
+        status: merged.status ?? search.status,
+      }),
       q: merged.q || undefined,
-      ...(merged.label?.length ? { label: merged.label } : {}),
-      ...(merged.assignee ? { assignee: merged.assignee } : {}),
-      ...(merged.order ? { order: merged.order } : {}),
-      ...(merged.view ? { view: merged.view } : {}),
-      ...(merged.group ? { group: merged.group } : {}),
       ...(merged.selectedEnvironmentId
         ? { selectedEnvironmentId: merged.selectedEnvironmentId }
         : {}),
@@ -324,9 +316,11 @@ export function IssuesPage() {
       ...(merged.scope ? { scope: merged.scope } : {}),
       ...(merged.key ? { key: merged.key } : {}),
     };
-    writeIssueListPreferences(issueListPreferences(next));
+    writeIssueListPreferences(next);
     void navigate({ search: next });
   };
+  const setAllProjectsShown = (shown: boolean) =>
+    updateSearch(setAllIssueProjectsShown(filterProjects, shown));
   const clearedSelection = {
     selectedEnvironmentId: undefined,
     selectedProjectId: undefined,
@@ -500,6 +494,22 @@ export function IssuesPage() {
       onRetry={list.retry}
       refreshing={list.isPending}
     />
+  ) : everyProjectHidden ? (
+    <Empty>
+      <EmptyMedia variant="icon">
+        <IssueGlyph.issue />
+      </EmptyMedia>
+      <EmptyHeader>
+        <EmptyTitle>
+          <T>Every project is hidden</T>
+        </EmptyTitle>
+      </EmptyHeader>
+      <EmptyContent>
+        <Button variant="outline" onClick={() => setAllProjectsShown(true)}>
+          <T>Show all projects</T>
+        </Button>
+      </EmptyContent>
+    </Empty>
   ) : groups.length === 0 ? (
     <Empty>
       <EmptyMedia variant="icon">
@@ -730,13 +740,13 @@ export function IssuesPage() {
                   assignee={search.assignee}
                   onAssignee={(assignee) => updateSearch({ assignee })}
                   projects={filterProjects}
-                  project={scopedProject}
-                  onProject={(project) =>
-                    updateSearch({
-                      issueServer: project?.environmentId,
-                      issueProject: project?.projectId,
-                    })
+                  hiddenProjectCount={hiddenCount}
+                  includedProjectCount={includedCount}
+                  isProjectShown={isShown}
+                  onProjectShown={(project, shown) =>
+                    updateSearch(setIssueProjectShown(search, project, shown))
                   }
+                  onAllProjectsShown={setAllProjectsShown}
                 />
                 <SavedViewsMenu
                   kind={ISSUE_SAVED_VIEWS}
@@ -746,6 +756,8 @@ export function IssuesPage() {
                     updateSearch({
                       who: view.who,
                       status: view.status,
+                      hideProjects: view.hideProjects,
+                      showProjects: view.showProjects,
                       issueServer: view.issueServer,
                       issueProject: view.issueProject,
                       host: view.host,
