@@ -14,6 +14,13 @@ trigger:
     include: [main]
 pr: none
 
+schedules:
+  - cron: "0 10 * * *"
+    displayName: Nightly Linux server build
+    branches:
+      include: [main]
+    always: true
+
 # The only line to change for a self-hosted pool: pool: { name: <pool> }.
 # Any agent must be Ubuntu 24.04 (node-pty's glibc ceiling, scripts/linux-glibc.ts)
 # with passwordless sudo for apt, and about 6 GB of free disk.

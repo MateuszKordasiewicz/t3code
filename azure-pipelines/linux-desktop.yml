@@ -2,6 +2,13 @@
 trigger: none
 pr: none
 
+schedules:
+  - cron: "15 11 * * *"
+    displayName: Nightly Linux desktop build
+    branches:
+      include: [main]
+    always: true
+
 resources:
   pipelines:
     - pipeline: mirror
