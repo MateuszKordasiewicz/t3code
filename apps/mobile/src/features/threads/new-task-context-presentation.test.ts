@@ -1,12 +1,24 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  canSelectNewTaskWorktreeRepositories,
   fillNewTaskWorkspaceBranch,
   resolveNewTaskBranchLabel,
   resolveNewTaskBranchWorktreePath,
   resolveNewTaskLocalWorkspaceSelection,
   resolveNewTaskWorkspaceSelection,
 } from "./new-task-context-presentation";
+
+it("offers tracked repositories only when the draft provisions a new task worktree", () => {
+  expect(canSelectNewTaskWorktreeRepositories({ mode: "worktree" })).toBe(true);
+  expect(
+    canSelectNewTaskWorktreeRepositories({
+      mode: "worktree",
+      pullRequestReference: "https://github.com/acme/repo/pull/123",
+    }),
+  ).toBe(false);
+  expect(canSelectNewTaskWorktreeRepositories({ mode: "local" })).toBe(false);
+});
 
 describe("resolveNewTaskWorkspaceSelection", () => {
   const fallback = { mode: "worktree", branch: null, worktreePath: null } as const;
@@ -35,6 +47,36 @@ describe("resolveNewTaskWorkspaceSelection", () => {
       ).toEqual({ mode: "local", branch: null, worktreePath: null });
     },
   );
+
+  it("keeps a worktree of tracked repositories for a non-git project folder", () => {
+    expect(
+      resolveNewTaskWorkspaceSelection({
+        selection: {
+          mode: "worktree",
+          branch: "main",
+          worktreePath: null,
+          startFromOrigin: true,
+          repositories: ["/workspace/api"],
+        },
+        fallback,
+        isGitRepo: false,
+        tracksGitRepositories: true,
+      }),
+    ).toEqual({
+      mode: "worktree",
+      branch: null,
+      worktreePath: null,
+      repositories: ["/workspace/api"],
+    });
+    expect(
+      resolveNewTaskWorkspaceSelection({
+        selection: undefined,
+        fallback,
+        isGitRepo: false,
+        tracksGitRepositories: true,
+      }),
+    ).toEqual(fallback);
+  });
 
   // regression: #21404 use current checkout for non-git projects
   it("preserves the selection and defaults for git projects", () => {

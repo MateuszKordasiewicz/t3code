@@ -9,14 +9,32 @@ import type { ComposerDraftWorkspaceSelection } from "../../state/use-composer-d
 
 type WorkspaceMode = "local" | "worktree";
 
+export function canSelectNewTaskWorktreeRepositories(
+  selection: Pick<ComposerDraftWorkspaceSelection, "mode" | "pullRequestReference">,
+): boolean {
+  return selection.mode === "worktree" && !selection.pullRequestReference;
+}
+
 export function resolveNewTaskWorkspaceSelection(input: {
   readonly selection: ComposerDraftWorkspaceSelection | undefined;
   readonly fallback: ComposerDraftWorkspaceSelection;
   readonly isGitRepo: boolean;
+  /** A project folder that is no repository can still take a worktree of one it tracks. */
+  readonly tracksGitRepositories?: boolean | undefined;
 }): ComposerDraftWorkspaceSelection {
   const selection = input.selection ?? input.fallback;
-  const mode = resolveSendEnvMode({ requestedEnvMode: selection.mode, isGitRepo: input.isGitRepo });
-  return input.isGitRepo ? selection : { mode, branch: null, worktreePath: null };
+  if (input.isGitRepo) return selection;
+  const mode = resolveSendEnvMode({
+    requestedEnvMode: selection.mode,
+    isGitRepo: false,
+    tracksGitRepositories: input.tracksGitRepositories === true,
+  });
+  return {
+    mode,
+    branch: null,
+    worktreePath: null,
+    ...(selection.repositories !== undefined ? { repositories: selection.repositories } : {}),
+  };
 }
 
 export function resolveNewTaskWorkspaceLabel(
@@ -185,6 +203,7 @@ export function resolveNewTaskDraftWorkspace(input: {
   readonly defaultMode: WorkspaceMode;
   readonly defaultModeSettled: boolean;
   readonly isGitRepo: boolean;
+  readonly tracksGitRepositories?: boolean | undefined;
   readonly branches: Parameters<typeof fillNewTaskWorkspaceBranch>[0]["branches"];
   readonly projectCwd: string | null;
 }): ComposerDraftWorkspaceSelection {
@@ -194,6 +213,7 @@ export function resolveNewTaskDraftWorkspace(input: {
       selection,
       fallback: { mode: input.defaultMode, branch: null, worktreePath: null },
       isGitRepo: input.isGitRepo,
+      tracksGitRepositories: input.tracksGitRepositories,
     }),
     branches: input.branches,
     projectCwd: input.projectCwd,

@@ -2912,13 +2912,53 @@ describe("composerDraftStore links made when a draft is sent", () => {
     expect(store().getDraftSession(draftId)?.checkoutPullRequest).toBeUndefined();
     expect(store().getDraftSession(draftId)?.issueLink).toBeUndefined();
 
-    store().setDraftThreadContext(draftId, { checkoutPullRequest: checkout, issueLink });
+    store().setDraftThreadContext(draftId, {
+      checkoutPullRequest: checkout,
+      issueLink,
+      worktreeRepositories: ["/work/api"],
+    });
+    // An unrelated change keeps the repository choice; an empty choice is still a choice.
+    store().setDraftThreadContext(draftId, { envMode: "worktree" });
+    expect(store().getDraftSession(draftId)?.worktreeRepositories).toEqual(["/work/api"]);
+    store().setDraftThreadContext(draftId, { worktreeRepositories: [] });
+    expect(store().getDraftSession(draftId)?.worktreeRepositories).toEqual([]);
+
     store().setDraftThreadContext(draftId, { projectRef: otherProjectRef });
     expect(store().getDraftSession(draftId)?.checkoutPullRequest).toBeUndefined();
     expect(store().getDraftSession(draftId)?.issueLink).toBeUndefined();
+    expect(store().getDraftSession(draftId)?.worktreeRepositories).toBeUndefined();
   });
 
-  it("persists the links and still restores drafts saved without one or with a broken one", async () => {
+  it("keeps a continuation pinned to its existing worktree when repositories are selected", () => {
+    const issueContinuation = {
+      threadId: ThreadId.make("thread-original"),
+      issue: {
+        tracker: IssueTrackerKind.make("beads"),
+        host: "beads",
+        scope: "web-db",
+        key: "t3-1",
+      },
+    };
+    store().setLogicalProjectDraftThreadId(scopedProjectKey(projectRef), projectRef, draftId, {
+      threadId,
+      branch: "issue-1",
+      envMode: "worktree",
+      worktreePath: "/worktrees/issue-1",
+      issueContinuation,
+    });
+
+    store().setDraftThreadContext(draftId, { worktreeRepositories: ["/work/api"] });
+
+    const draft = store().getDraftSession(draftId);
+    expect(draft).toMatchObject({
+      branch: "issue-1",
+      worktreePath: "/worktrees/issue-1",
+      issueContinuation,
+    });
+    expect(draft).not.toHaveProperty("worktreeRepositories");
+  });
+
+  it("persists links and repository choices alongside older drafts", async () => {
     vi.useFakeTimers();
     try {
       await useComposerDraftStore.persist.clearStorage();
@@ -2948,6 +2988,7 @@ describe("composerDraftStore links made when a draft is sent", () => {
               ...persistedDraftThread(threadId),
               checkoutPullRequest: checkout,
               issueLink,
+              worktreeRepositories: ["/work/api"],
             },
             [legacyDraftId]: {
               ...persistedDraftThread(ThreadId.make("thread-legacy")),
@@ -2969,9 +3010,15 @@ describe("composerDraftStore links made when a draft is sent", () => {
       expect(checkoutPullRequestUrlToLink(legacy)).toBeNull();
       expect(legacy?.issueLink).toBeUndefined();
       expect(store().getDraftSession(draftId)?.issueLink).toEqual(issueLink);
+      expect(store().getDraftSession(draftId)?.worktreeRepositories).toEqual(["/work/api"]);
       expect(
         partializeComposerDraftStoreState(store()).draftThreadsByThreadKey[draftId],
-      ).toMatchObject({ checkoutPullRequest: checkout, issueLink });
+      ).toMatchObject({
+        checkoutPullRequest: checkout,
+        issueLink,
+        worktreeRepositories: ["/work/api"],
+      });
+      expect(legacy).not.toHaveProperty("worktreeRepositories");
     } finally {
       await useComposerDraftStore.persist.clearStorage();
       vi.useRealTimers();
