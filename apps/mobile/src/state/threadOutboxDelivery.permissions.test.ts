@@ -703,7 +703,11 @@ describe("queued task whose launch reply is lost", () => {
 
     expect(state.checkout).toHaveBeenCalledOnce();
     const [first, resent] = state.start.mock.calls.map(([call]) => call.input);
-    expect(resent.bootstrap.createThread.worktreePath).toBe("/repo/.t3/worktrees/pr-123");
+    expect(resent.bootstrap.createThread).toMatchObject({
+      branch: "pr-123",
+      worktreePath: "/repo/.t3/worktrees/pr-123",
+    });
+    expect(resent.bootstrap.prepareWorktree).toBeUndefined();
     expect(resent.bootstrap).toEqual(first.bootstrap);
     expect(remaining()).toEqual([]);
   });

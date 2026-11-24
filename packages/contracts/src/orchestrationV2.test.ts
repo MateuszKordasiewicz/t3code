@@ -6,6 +6,7 @@ import {
   EnvironmentId,
   NodeId,
   RunAttemptId,
+  RunId,
   ScheduledTaskId,
   ThreadId,
   TrimmedNonEmptyString,
@@ -13,12 +14,14 @@ import {
 import {
   latestProviderTurnForAttempt,
   OrchestrationV2CheckpointFileSummary,
+  repositoryRewindCheckpoint,
   OrchestrationV2ProviderCapabilities,
   OrchestrationV2ProviderThread,
   OrchestrationV2ProviderThreadJson,
   OrchestrationV2RpcSchemas,
   OrchestrationV2Subagent,
   OrchestrationV2ThreadShellJson,
+  OrchestrationV2ThreadLaunchWorkspaceStrategy,
   OrchestrationV2SubagentJson,
   OrchestrationV2ThreadHistoryPage,
   OrchestrationV2TurnItem,
@@ -45,6 +48,19 @@ const decodeOrchestrationV2ProviderCapabilities = Schema.decodeUnknownSync(
 );
 
 describe("orchestration V2 contracts", () => {
+  it("keeps explicit repository choices when decoding a launch workspace", () => {
+    const decodeWorkspace = Schema.decodeUnknownSync(OrchestrationV2ThreadLaunchWorkspaceStrategy);
+    const workspace = { type: "worktree", baseRef: "main" };
+
+    expect(decodeWorkspace(workspace)).toEqual(workspace);
+    for (const repositories of [[], [{ path: "/work/api" }]]) {
+      expect(decodeWorkspace({ ...workspace, repositories })).toEqual({
+        ...workspace,
+        repositories,
+      });
+    }
+  });
+
   it("decodes thread event types from a newer server as skippable items", () => {
     const decodeWireItems = Schema.decodeUnknownSync(
       Schema.toCodecJson(Schema.Array(OrchestrationV2RpcSchemas.subscribeThread.output)),
@@ -656,6 +672,45 @@ describe("latestProviderTurnForAttempt", () => {
     ];
     expect(latestProviderTurnForAttempt(turns, RunAttemptId.make("goal-attempt"))?.id).toBe("last");
     expect(latestProviderTurnForAttempt(turns, null)).toBeUndefined();
+  });
+});
+
+describe("repositoryRewindCheckpoint", () => {
+  const run = RunId.make("run");
+  // Runs 2 and 6 changed the repository; a rewind to run 3 already discarded what run 5 recorded.
+  // Run 11's snapshot failed, run 12 left the repository alone, run 13 changed it.
+  const checkpoints = [
+    { ordinalWithinScope: 1, runId: null, status: "ready" },
+    { ordinalWithinScope: 2, runId: run, status: "ready" },
+    { ordinalWithinScope: 4, runId: null, status: "stale" },
+    { ordinalWithinScope: 5, runId: run, status: "stale" },
+    { ordinalWithinScope: 5, runId: null, status: "ready" },
+    { ordinalWithinScope: 6, runId: run, status: "ready" },
+    { ordinalWithinScope: 8, runId: null, status: "missing" },
+    { ordinalWithinScope: 9, runId: run, status: "ready" },
+    { ordinalWithinScope: 10, runId: null, status: "missing" },
+    { ordinalWithinScope: 11, runId: run, status: "error" },
+    { ordinalWithinScope: 12, runId: null, status: "ready" },
+    { ordinalWithinScope: 13, runId: run, status: "ready" },
+  ] as const;
+
+  it.each([
+    { target: 0, restores: 1, why: "the baseline before the first change" },
+    { target: 2, restores: 2, why: "the target run's own checkpoint" },
+    { target: 3, restores: 5, why: "the baseline before the next change, past stale records" },
+    { target: 6, restores: 6, why: "the target run's own checkpoint" },
+    { target: 7, restores: null, why: "nothing: the state before run 9 was never snapshotted" },
+    { target: 10, restores: null, why: "nothing: run 11's failed snapshot hides what it changed" },
+    {
+      target: 11,
+      restores: 12,
+      why: "the baseline before the next change, its own snapshot failed",
+    },
+    { target: 14, restores: null, why: "nothing: no later run changed the repository" },
+  ])("a rewind to run $target restores $why", ({ target, restores }) => {
+    expect(repositoryRewindCheckpoint(checkpoints, target)?.ordinalWithinScope ?? null).toBe(
+      restores,
+    );
   });
 });
 

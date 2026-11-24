@@ -425,6 +425,7 @@ const PersistedDraftThreadState = Schema.Struct({
   ),
   issueLink: Schema.optionalKey(ThreadIssueLinkTarget),
   issueContinuation: Schema.optionalKey(IssueContinuationSource),
+  worktreeRepositories: Schema.optionalKey(Schema.Array(Schema.String)),
   promotedTo: Schema.optionalKey(
     Schema.NullOr(
       Schema.Struct({
@@ -526,6 +527,11 @@ export interface DraftSessionState {
   /** The issue a thread started from it links to once the draft is sent. */
   issueLink?: ThreadIssueLinkTarget;
   issueContinuation?: IssueContinuationSource;
+  /**
+   * Tracked repositories a new worktree thread gets a worktree for, by tracked path. Absent
+   * until the user chooses, which leaves the choice to the server's default.
+   */
+  worktreeRepositories?: ReadonlyArray<string>;
   promotedTo?: ScopedThreadRef | null;
 }
 
@@ -636,6 +642,7 @@ interface ComposerDraftStoreState {
       loadBalancedEnvironmentId?: EnvironmentId | null;
       checkoutPullRequest?: DraftCheckoutPullRequest | null;
       issueLink?: ThreadIssueLinkTarget | null;
+      worktreeRepositories?: ReadonlyArray<string> | null;
     },
   ) => void;
   clearProjectDraftThreadId: (projectRef: ScopedProjectRef) => void;
@@ -1796,8 +1803,20 @@ function createDraftThreadState(
     startFromOrigin: nextStartFromOrigin,
     ...(checkoutPullRequest ? { checkoutPullRequest } : {}),
     ...(issueLink ? { issueLink } : {}),
+    ...(!projectChanged && existingThread?.worktreeRepositories !== undefined
+      ? { worktreeRepositories: existingThread.worktreeRepositories }
+      : {}),
     promotedTo: null,
   };
+}
+
+function worktreeRepositoriesEqual(
+  left: ReadonlyArray<string> | undefined,
+  right: ReadonlyArray<string> | undefined,
+): boolean {
+  if (left === right) return true;
+  if (left === undefined || right === undefined || left.length !== right.length) return false;
+  return left.every((path, index) => path === right[index]);
 }
 
 /** An explicit value wins; otherwise a checkout's pull request stays with its project. */
@@ -1873,6 +1892,7 @@ function draftThreadsEqual(left: DraftThreadState | undefined, right: DraftThrea
     left.startFromOrigin === right.startFromOrigin &&
     checkoutPullRequestsEqual(left.checkoutPullRequest, right.checkoutPullRequest) &&
     issueLinksEqual(left.issueLink, right.issueLink) &&
+    worktreeRepositoriesEqual(left.worktreeRepositories, right.worktreeRepositories) &&
     scopedThreadRefsEqual(left.promotedTo, right.promotedTo)
   );
 }
@@ -2055,6 +2075,13 @@ function normalizePersistedDraftThreads(
         ...(checkoutPullRequest ? { checkoutPullRequest } : {}),
         ...(issueLink ? { issueLink } : {}),
         ...(issueContinuation ? { issueContinuation } : {}),
+        ...(Array.isArray(candidateDraftThread.worktreeRepositories)
+          ? {
+              worktreeRepositories: candidateDraftThread.worktreeRepositories.filter(
+                (path): path is string => typeof path === "string",
+              ),
+            }
+          : {}),
         promotedTo,
       };
     }
@@ -2533,7 +2560,11 @@ export function partializeComposerDraftStoreState(
     if (!keptSessionKeys.has(threadKey)) {
       continue;
     }
-    persistedDraftThreadsByThreadKey[threadKey] = draftThread;
+    const { worktreeRepositories, ...persistedDraftThread } = draftThread;
+    persistedDraftThreadsByThreadKey[threadKey] = {
+      ...persistedDraftThread,
+      ...(worktreeRepositories ? { worktreeRepositories: [...worktreeRepositories] } : {}),
+    };
   }
   return {
     draftsByThreadKey: persistedDraftsByThreadKey,
@@ -2838,6 +2869,9 @@ function toHydratedDraftThreadState(
     ...(persistedDraftThread.issueContinuation
       ? { issueContinuation: persistedDraftThread.issueContinuation }
       : {}),
+    ...(persistedDraftThread.worktreeRepositories
+      ? { worktreeRepositories: persistedDraftThread.worktreeRepositories }
+      : {}),
     promotedTo: persistedDraftThread.promotedTo
       ? scopeThreadRef(
           persistedDraftThread.promotedTo.environmentId as EnvironmentId,
@@ -3120,10 +3154,17 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
                 nextStartFromOrigin !== existing.startFromOrigin ||
                 (options.envMode !== undefined && options.envMode !== existing.envMode) ||
                 options.checkoutPullRequest !== undefined ||
-                options.issueLink !== undefined)
+                options.issueLink !== undefined ||
+                options.worktreeRepositories !== undefined)
             ) {
               return state;
             }
+            const worktreeRepositories =
+              options.worktreeRepositories === undefined
+                ? projectChanged
+                  ? undefined
+                  : existing.worktreeRepositories
+                : (options.worktreeRepositories ?? undefined);
             const nextDraftThread: DraftThreadState = {
               threadId: existing.threadId,
               ...(existing.issueContinuation
@@ -3152,6 +3193,7 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
               startFromOrigin: nextStartFromOrigin,
               ...(checkoutPullRequest ? { checkoutPullRequest } : {}),
               ...(issueLink ? { issueLink } : {}),
+              ...(worktreeRepositories ? { worktreeRepositories } : {}),
               promotedTo: existing.promotedTo ?? null,
             };
             const isUnchanged =
@@ -3172,6 +3214,10 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
                 existing.checkoutPullRequest,
               ) &&
               issueLinksEqual(nextDraftThread.issueLink, existing.issueLink) &&
+              worktreeRepositoriesEqual(
+                nextDraftThread.worktreeRepositories,
+                existing.worktreeRepositories,
+              ) &&
               scopedThreadRefsEqual(nextDraftThread.promotedTo, existing.promotedTo);
             if (isUnchanged) {
               return state;

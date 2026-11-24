@@ -168,10 +168,13 @@ export class IssueService extends Context.Service<
     readonly update: (input: IssueUpdateInput) => Effect.Effect<void, IssueError>;
     readonly setState: (input: IssueSetStateInput) => Effect.Effect<void, IssueError>;
     readonly react: (input: IssueReactionInput) => Effect.Effect<void, IssueError>;
-    /** The tracker and container a project's own issues live in, or the one `key` names. */
+    /**
+     * The tracker and container a project's own issues live in: the bound `scope` when named, else
+     * the one `key`'s prefix names, else the project's default.
+     */
     readonly projectScope: (
       projectId: ProjectId,
-      key?: string,
+      select?: { readonly key?: string | undefined; readonly scope?: string | undefined },
     ) => Effect.Effect<IssueScopeRef & { readonly host: string }, IssueError>;
     /**
      * Resolve through a matching project, preferring `preferredProjectId`; other scopes are read-only.
@@ -717,18 +720,28 @@ const make = Effect.gen(function* () {
 
   const projectScope: IssueService["Service"]["projectScope"] = Effect.fn(
     "IssueService.projectScope",
-  )(function* (projectId, key) {
+  )(function* (projectId, select) {
     const { supported } = yield* listProjects({ projectId });
-    const prefix = key?.toLowerCase();
+    if (supported.length === 0) {
+      return yield* new IssueUnavailableError({ reason: "tracker-unsupported" });
+    }
+    const named = select?.scope?.trim().toLowerCase();
+    const prefix = select?.key?.toLowerCase();
     // A discovered database's scope identifies the database, independent of its issue keys.
     const own =
-      supported.find(
-        (candidate) =>
-          candidate.api.discoverProject === undefined &&
-          prefix?.startsWith(`${candidate.scope.toLowerCase()}-`),
-      ) ?? supported[0];
+      named === undefined
+        ? (supported.find(
+            (candidate) =>
+              candidate.api.discoverProject === undefined &&
+              prefix?.startsWith(`${candidate.scope.toLowerCase()}-`),
+          ) ?? supported[0])
+        : supported.find((candidate) => candidate.scope.toLowerCase() === named);
     if (own === undefined) {
-      return yield* new IssueUnavailableError({ reason: "tracker-unsupported" });
+      return yield* new IssueOperationError({
+        operation: "scope",
+        reason: "not-found",
+        detail: `This project does not track ${select?.scope?.trim()}. Use one of: ${[...new Set(supported.map((candidate) => candidate.scope))].join(", ")}.`,
+      });
     }
     return { projectId, tracker: own.tracker, host: own.host, scope: own.scope };
   });
