@@ -1,8 +1,18 @@
 import * as Schema from "effect/Schema";
 
-import { EnvironmentId, IssueInvolvement, IssueListState, ProjectId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ISSUE_LIST_MAX_EXCLUDED_PROJECTS,
+  ISSUE_LIST_MAX_INCLUDED_PROJECTS,
+  IssueInvolvement,
+  IssueListState,
+  ProjectId,
+  type ScopedProjectRef,
+} from "@t3tools/contracts";
 
 import type { IssueGraphGroupBy } from "./issueGraph.logic";
+
+export type IssueProjectPair = readonly [EnvironmentId, ProjectId];
 
 /**
  * What the issues page remembers between visits; the selection in the URL is not part of it.
@@ -13,6 +23,11 @@ import type { IssueGraphGroupBy } from "./issueGraph.logic";
 export interface IssueListPreferences {
   readonly who: IssueInvolvement;
   readonly status: IssueListState;
+  /** Projects left out of the list, so a project added later shows. */
+  readonly hideProjects?: ReadonlyArray<IssueProjectPair> | undefined;
+  /** Only these projects are shown. An empty selection still applies. */
+  readonly showProjects?: ReadonlyArray<IssueProjectPair> | undefined;
+  /** A single-project filter from before the multi-project picker. */
   readonly issueServer?: EnvironmentId | undefined;
   readonly issueProject?: ProjectId | undefined;
   readonly host?: string | undefined;
@@ -37,6 +52,16 @@ const BoundedPreference = Schema.String.check(Schema.isMaxLength(200));
 export const IssueListPreferencesSchema = Schema.Struct({
   who: IssueInvolvement,
   status: IssueListState,
+  hideProjects: Schema.optional(
+    Schema.Array(Schema.Tuple([EnvironmentId, ProjectId])).check(
+      Schema.isMaxLength(ISSUE_LIST_MAX_EXCLUDED_PROJECTS),
+    ),
+  ),
+  showProjects: Schema.optional(
+    Schema.Array(Schema.Tuple([EnvironmentId, ProjectId])).check(
+      Schema.isMaxLength(ISSUE_LIST_MAX_INCLUDED_PROJECTS),
+    ),
+  ),
   issueServer: Schema.optional(EnvironmentId),
   issueProject: Schema.optional(ProjectId),
   host: Schema.optional(BoundedPreference),
@@ -55,26 +80,40 @@ function storage(): PreferenceStorage | undefined {
   return typeof window === "undefined" ? undefined : window.localStorage;
 }
 
+export function legacyIssueProject(
+  search: Pick<
+    IssueListPreferences,
+    "hideProjects" | "showProjects" | "issueServer" | "issueProject"
+  >,
+): ScopedProjectRef | undefined {
+  return search.showProjects === undefined &&
+    search.hideProjects === undefined &&
+    search.issueServer &&
+    search.issueProject
+    ? { environmentId: search.issueServer, projectId: search.issueProject }
+    : undefined;
+}
+
+export function issueIncludedProjects(
+  search: IssueListPreferences,
+): ReadonlyArray<IssueProjectPair> | undefined {
+  const legacy = legacyIssueProject(search);
+  return search.showProjects ?? (legacy ? [[legacy.environmentId, legacy.projectId]] : undefined);
+}
+
 /** Only list controls are remembered. The selected issue remains a URL and right-panel concern. */
-export function issueListPreferences(search: {
-  readonly who: IssueInvolvement;
-  readonly status: IssueListState;
-  readonly issueServer?: EnvironmentId | undefined;
-  readonly issueProject?: ProjectId | undefined;
-  readonly host?: string | undefined;
-  readonly q?: string | undefined;
-  readonly label?: ReadonlyArray<string> | undefined;
-  readonly assignee?: string | undefined;
-  readonly order?: "created" | undefined;
-  readonly view?: "graph" | undefined;
-  readonly group?: Exclude<IssueGraphGroupBy, "tree"> | undefined;
-}): IssueListPreferences {
+export function issueListPreferences(search: IssueListPreferences): IssueListPreferences {
+  const project = legacyIssueProject(search);
   return {
     who: search.who,
     status: search.status,
-    ...(search.issueServer && search.issueProject
-      ? { issueServer: search.issueServer, issueProject: search.issueProject }
+    ...(search.showProjects !== undefined
+      ? { showProjects: search.showProjects.slice(0, ISSUE_LIST_MAX_INCLUDED_PROJECTS) }
       : {}),
+    ...(search.showProjects === undefined && search.hideProjects?.length
+      ? { hideProjects: search.hideProjects.slice(0, ISSUE_LIST_MAX_EXCLUDED_PROJECTS) }
+      : {}),
+    ...(project ? { issueServer: project.environmentId, issueProject: project.projectId } : {}),
     ...(search.host ? { host: search.host } : {}),
     ...(search.q ? { q: search.q } : {}),
     ...(search.label?.length ? { label: search.label } : {}),

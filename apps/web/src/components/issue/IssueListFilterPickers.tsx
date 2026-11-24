@@ -1,12 +1,6 @@
 import { offeredIssueLabels } from "@t3tools/client-runtime/issue-list";
 import type { IssueCandidatesTarget } from "@t3tools/client-runtime/state/issues";
-import type {
-  EnvironmentId,
-  IssueInvolvement,
-  IssueLabel,
-  IssueListState,
-  ProjectId,
-} from "@t3tools/contracts";
+import type { IssueInvolvement, IssueLabel, IssueListState, ProjectId } from "@t3tools/contracts";
 import { FolderGit2Icon, LayersIcon, ListFilterIcon, TagIcon, UserIcon } from "lucide-react";
 import { T, useGT } from "gt-react";
 import { useState } from "react";
@@ -28,7 +22,7 @@ import {
 } from "~/components/ui/menu";
 import { useIssueFilterCandidates } from "~/state/issues";
 
-import type { ProjectFaviconProject } from "../ProjectFavicon";
+import { ProjectFavicon, type ProjectFaviconProject } from "../ProjectFavicon";
 
 import {
   PullRequestFilterRadioSubmenu,
@@ -38,9 +32,10 @@ import {
 import { pullRequestLabelColor } from "../pullRequest/pullRequestList.logic";
 
 const VISIBLE_CHOICES = 30;
-const ALL_PROJECTS = "all";
 const matches = (needle: string, ...fields: ReadonlyArray<string | null | undefined>) =>
   needle.length === 0 || fields.some((field) => field?.toLowerCase().includes(needle));
+
+type FilterProject = ProjectFaviconProject & { readonly id: ProjectId };
 
 /** Every issue list filter behind one button, as the pull request page keeps its own. */
 export function IssueFiltersMenu(props: {
@@ -57,39 +52,24 @@ export function IssueFiltersMenu(props: {
   onLabels: (labels: ReadonlyArray<string>) => void;
   assignee: string | undefined;
   onAssignee: (assignee: string | undefined) => void;
-  projects: ReadonlyArray<ProjectFaviconProject & { readonly id: ProjectId }>;
-  project: { environmentId: EnvironmentId; projectId: ProjectId } | undefined;
-  onProject: (project: { environmentId: EnvironmentId; projectId: ProjectId } | undefined) => void;
+  projects: ReadonlyArray<FilterProject>;
+  hiddenProjectCount: number;
+  includedProjectCount: number | undefined;
+  isProjectShown: (project: FilterProject) => boolean;
+  onProjectShown: (project: FilterProject, shown: boolean) => void;
+  onAllProjectsShown: (shown: boolean) => void;
 }) {
   const gt = useGT();
   const [open, setOpen] = useState(false);
+  const included = props.includedProjectCount;
+  const allProjectsShown = included === undefined && props.hiddenProjectCount === 0;
   const count = [
     props.state !== "open",
     props.involvement !== "all",
-    props.project,
+    !allProjectsShown,
     props.assignee,
     ...props.labels,
   ].filter(Boolean).length;
-  const projectValue = props.project
-    ? pullRequestProjectKey({
-        id: props.project.projectId,
-        environmentId: props.project.environmentId,
-      })
-    : ALL_PROJECTS;
-  const projectOptions: ReadonlyArray<PullRequestFilterOption<string>> = [
-    { value: ALL_PROJECTS, label: gt("All projects"), Icon: LayersIcon },
-    // A remembered project this client does not list stays shown, so the filter can be taken off.
-    ...(projectValue !== ALL_PROJECTS &&
-    !props.projects.some((project) => pullRequestProjectKey(project) === projectValue)
-      ? [{ value: projectValue, label: gt("Unavailable project"), Icon: FolderGit2Icon }]
-      : []),
-    ...props.projects.map((project) => ({
-      value: pullRequestProjectKey(project),
-      label: project.title,
-      Icon: FolderGit2Icon,
-      project,
-    })),
-  ];
   // Read when the menu opens, not with every listing: one request per scope.
   const scopes = open ? props.scopes : [];
   return (
@@ -118,20 +98,34 @@ export function IssueFiltersMenu(props: {
           options={props.involvementOptions}
           onChange={props.onInvolvement}
         />
-        {props.projects.length > 1 || props.project ? (
-          <PullRequestFilterRadioSubmenu
-            label={gt("Project")}
-            value={projectValue}
-            options={projectOptions}
-            onChange={(next) => {
-              const project = props.projects.find((p) => pullRequestProjectKey(p) === next);
-              props.onProject(
-                project
-                  ? { environmentId: project.environmentId, projectId: project.id }
-                  : undefined,
-              );
-            }}
-          />
+        {props.projects.length > 0 || !allProjectsShown ? (
+          <MenuSub>
+            <MenuSubTrigger>
+              <FolderGit2Icon aria-hidden className="size-3.5" />
+              <span className="flex-1">{gt("Projects")}</span>
+              <span className="min-w-0 max-w-32 truncate text-xs text-muted-foreground">
+                {allProjectsShown
+                  ? gt("All projects")
+                  : included === undefined
+                    ? gt("{hidden} hidden", { hidden: props.hiddenProjectCount })
+                    : included === 1
+                      ? (props.projects.find(props.isProjectShown)?.title ??
+                        gt("Unavailable project"))
+                      : gt("{count, plural, one {{count} selected} other {{count} selected}}", {
+                          count: included,
+                        })}
+              </span>
+            </MenuSubTrigger>
+            <MenuSubPopup>
+              <ProjectChoices
+                projects={props.projects}
+                allShown={allProjectsShown}
+                isProjectShown={props.isProjectShown}
+                onProjectShown={props.onProjectShown}
+                onAllProjectsShown={props.onAllProjectsShown}
+              />
+            </MenuSubPopup>
+          </MenuSub>
         ) : null}
         <MenuSeparator />
         <MenuSub>
@@ -175,6 +169,55 @@ export function IssueFiltersMenu(props: {
         </MenuSub>
       </MenuPopup>
     </Menu>
+  );
+}
+
+function ProjectChoices(props: {
+  projects: ReadonlyArray<FilterProject>;
+  allShown: boolean;
+  isProjectShown: (project: FilterProject) => boolean;
+  onProjectShown: (project: FilterProject, shown: boolean) => void;
+  onAllProjectsShown: (shown: boolean) => void;
+}) {
+  const gt = useGT();
+  const [query, setQuery] = useState("");
+  const needle = query.trim().toLowerCase();
+  const visible = props.projects.filter((project) => matches(needle, project.title));
+  return (
+    <>
+      {props.projects.length > 8 ? (
+        <MenuSearchInput
+          autoFocus
+          value={query}
+          onChange={(event) => setQuery(event.currentTarget.value)}
+          placeholder={gt("Search projects")}
+          aria-label={gt("Search projects")}
+        />
+      ) : null}
+      <MenuCheckboxItem checked={props.allShown} onCheckedChange={props.onAllProjectsShown}>
+        <span className="flex min-w-0 items-center gap-2">
+          <LayersIcon aria-hidden className="size-3.5" />
+          <span className="min-w-0 flex-1 truncate">{gt("Show all")}</span>
+        </span>
+      </MenuCheckboxItem>
+      <MenuSeparator />
+      {visible.length === 0 ? <MenuItem disabled>{gt("No matching projects.")}</MenuItem> : null}
+      {visible.map((project) => {
+        const key = pullRequestProjectKey(project);
+        return (
+          <MenuCheckboxItem
+            key={key}
+            checked={props.isProjectShown(project)}
+            onCheckedChange={(shown) => props.onProjectShown(project, shown)}
+          >
+            <span className="flex min-w-0 items-center gap-2">
+              <ProjectFavicon project={project} className="size-3.5" />
+              <span className="min-w-0 flex-1 truncate">{project.title}</span>
+            </span>
+          </MenuCheckboxItem>
+        );
+      })}
+    </>
   );
 }
 
