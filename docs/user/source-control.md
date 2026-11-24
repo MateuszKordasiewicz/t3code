@@ -416,7 +416,9 @@ To list Linear issues beside a project's, connect Linear with an API key under
 Settings → Source control & issues, then pick one or more teams for that project there. Pick
 another team at any time to add it; uncheck every team to unbind the project. Each team's
 issues appear in the Linear group of the issue list, sorted with the rest by last update, and
-each can be loaded further on its own. Agents file new issues in the first team picked unless you name another bound team.
+each can be loaded further on its own. Agents file new issues in the first team picked unless you name another bound team. To
+connect another Linear workspace or user, add another account in the same place; each project
+reads its teams through the account you picked them under.
 
 A project whose repository keeps a beads database lists its beads too, with no setup: the T3
 server reads it with the `bd` command, so `bd` must be on that server's `PATH`. Worktrees of one
