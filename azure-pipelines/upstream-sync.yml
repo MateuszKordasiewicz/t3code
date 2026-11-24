@@ -19,12 +19,31 @@ parameters:
     displayName: Dry run (compute the merge without publishing a branch)
     type: boolean
     default: true
+  - name: trialTarget
+    displayName: Disposable target suffix under sync/azure-upstream-trial/
+    type: string
+    default: none
+  - name: trialBase
+    displayName: Expected Azure target SHA for a disposable trial
+    type: string
+    default: none
+  - name: trialUpstream
+    displayName: Pinned GitHub upstream SHA for a disposable trial
+    type: string
+    default: none
+  - name: trialMode
+    displayName: Disposable trial mode
+    type: string
+    default: repair
+    values: [repair, invalid, timeout]
 
 pool: { vmImage: ubuntu-24.04 }
 
 variables:
   runNumber: $(Build.BuildId)
   T3CODE_TELEMETRY_CHANNEL: dev
+  repairNeeded: "false"
+  syncDir: $(Agent.TempDirectory)/upstream-sync
 
 stages:
   - stage: UpstreamSync
@@ -33,18 +52,74 @@ stages:
     jobs:
       - job: Prepare
         displayName: Check upstream and prepare candidate
-        timeoutInMinutes: 15
+        timeoutInMinutes: 55
+        cancelTimeoutInMinutes: 6
         steps:
           - checkout: self
             fetchDepth: 0
             fetchTags: false
           - bash: bash azure-pipelines/upstream-sync.sh prepare
-            name: candidate
-            displayName: Merge upstream and publish candidate branch
+            displayName: Merge the exact target and upstream
             env:
               SYSTEM_ACCESSTOKEN: $(System.AccessToken)
               DRY_RUN: ${{ parameters.dryRun }}
               CRON_SCHEDULE: $(Build.CronSchedule.DisplayName)
+              VM_REPAIR_ENABLED: $(UPSTREAM_SYNC_VM_REPAIR_ENABLED)
+              SYNC_DIR: $(syncDir)
+              TRIAL_TARGET: ${{ parameters.trialTarget }}
+              TRIAL_BASE: ${{ parameters.trialBase }}
+              TRIAL_UPSTREAM: ${{ parameters.trialUpstream }}
+              TRIAL_MODE: ${{ parameters.trialMode }}
+          - publish: $(syncDir)/artifact
+            artifact: upstream-repair-input-$(System.JobAttempt)
+            displayName: Pin the pilot's Git inputs
+            condition: and(succeeded(), eq(variables['repairNeeded'], 'true'))
+          - bash: bash azure-pipelines/upstream-sync.sh acquire-pilot
+            displayName: Reserve the pilot for this sync
+            condition: and(succeeded(), eq(variables['repairNeeded'], 'true'))
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+              SYNC_DIR: $(syncDir)
+          - task: AzureCLI@2
+            displayName: Run one bounded T3 repair on the pilot
+            condition: and(succeeded(), eq(variables['repairNeeded'], 'true'))
+            inputs:
+              azureSubscription: t3-private-pilot-vm
+              visibleAzLogin: false
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: exec python3 azure-pipelines/upstream-sync-vm.py repair
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+              SYNC_DIR: $(syncDir)
+              TRIAL_MODE: ${{ parameters.trialMode }}
+          - task: AzureCLI@2
+            displayName: Deallocate the pilot if repair was interrupted
+            condition: and(always(), eq(variables['repairNeeded'], 'true'), ne(variables['pilotClean'], 'true'), eq(variables['pilotReserved'], 'true'))
+            inputs:
+              azureSubscription: t3-private-pilot-vm
+              visibleAzLogin: false
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: exec python3 azure-pipelines/upstream-sync-vm.py cleanup
+            env:
+              SYNC_DIR: $(syncDir)
+          - bash: bash azure-pipelines/upstream-sync.sh release-pilot
+            displayName: Release the pilot reservation
+            condition: and(always(), eq(variables['repairNeeded'], 'true'))
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+              SYNC_DIR: $(syncDir)
+          - bash: bash azure-pipelines/upstream-sync.sh publish
+            name: candidate
+            displayName: Verify and publish the candidate branch
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+              SYNC_DIR: $(syncDir)
+              TRIAL_TARGET: ${{ parameters.trialTarget }}
+              TRIAL_BASE: ${{ parameters.trialBase }}
+              TRIAL_UPSTREAM: ${{ parameters.trialUpstream }}
+              TRIAL_MODE: ${{ parameters.trialMode }}
 
       - job: Validate
         displayName: Build and smoke-test the candidate
@@ -99,3 +174,7 @@ stages:
               CANDIDATE_BASE: $(candidateBase)
               CANDIDATE_TREE: $(candidateTree)
               UPSTREAM_COMMIT: $(upstreamCommit)
+              TRIAL_TARGET: ${{ parameters.trialTarget }}
+              TRIAL_BASE: ${{ parameters.trialBase }}
+              TRIAL_UPSTREAM: ${{ parameters.trialUpstream }}
+              TRIAL_MODE: ${{ parameters.trialMode }}
