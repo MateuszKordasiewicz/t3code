@@ -177,7 +177,8 @@ class Pilot:
                 raise RuntimeError("Pilot cleanup reported: " + " ".join(errors))
             return
         try:
-            if needs_guest_cleanup:
+            # A pending repair command could recreate the workspace after cleanup.
+            if needs_guest_cleanup and not errors:
                 if self.power() != "PowerState/running":
                     raise RuntimeError("Pilot guest workspace cleanup could not be verified.")
                 self.run("cleanup", script, 30, {"T3_SYNC_NAME": self.name, "T3_SYNC_ACTION": "cleanup"})
