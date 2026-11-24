@@ -219,6 +219,9 @@ release_pilot() {
   if [[ -s "$SYNC_DIR/pilot-commands" ]]; then
     fail "Pilot Run Command deletion could not be verified. The reservation is held for run $BUILD_BUILDID."
   fi
+  if [[ -f "$SYNC_DIR/pilot-guest-workspace-requested" && ! -f "$SYNC_DIR/pilot-guest-workspace-cleaned" ]]; then
+    fail "Pilot guest workspace cleanup could not be verified. The reservation is held for run $BUILD_BUILDID."
+  fi
   released=$(pilot_commit released "$lease")
   azure_git push --force-with-lease="$pilot_ref:$lease" origin "$released:$pilot_ref"
   echo "Released the pilot reservation."

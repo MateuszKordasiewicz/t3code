@@ -58,6 +58,8 @@ class Pilot:
         self.commands = directory / "pilot-commands"
         self.start_requested = directory / "pilot-start-requested"
         self.deallocated = directory / "pilot-deallocated"
+        self.guest_workspace_requested = directory / "pilot-guest-workspace-requested"
+        self.guest_workspace_cleaned = directory / "pilot-guest-workspace-cleaned"
         self.arm_token = subprocess.check_output(
             ["az", "account", "get-access-token", "--resource", "https://management.azure.com/",
              "--query", "accessToken", "--output", "tsv", "--only-show-errors"],
@@ -165,13 +167,21 @@ class Pilot:
             self.drain_commands(60)
         except RuntimeError as error:
             errors.append(str(error))
+        needs_guest_cleanup = (
+            self.guest_workspace_requested.exists() and not self.guest_workspace_cleaned.exists()
+        )
         if self.deallocated.exists():
+            if needs_guest_cleanup:
+                errors.append("Pilot guest workspace cleanup could not be verified.")
             if errors:
                 raise RuntimeError("Pilot cleanup reported: " + " ".join(errors))
             return
         try:
-            if self.power() == "PowerState/running":
+            if needs_guest_cleanup:
+                if self.power() != "PowerState/running":
+                    raise RuntimeError("Pilot guest workspace cleanup could not be verified.")
                 self.run("cleanup", script, 30, {"T3_SYNC_NAME": self.name, "T3_SYNC_ACTION": "cleanup"})
+                self.guest_workspace_cleaned.touch()
         except RuntimeError as error:
             errors.append(str(error))
         finally:
@@ -271,11 +281,13 @@ def main():
             pilot.boot()
             print("Submitting the exact merge inputs to the pilot.", flush=True)
             mode = os.environ["TRIAL_MODE"]
+            download = download_url()
+            pilot.guest_workspace_requested.touch()
             view = pilot.run("repair", script, 1570, {
                 "T3_SYNC_NAME": name, "T3_SYNC_ACTION": "repair",
                 "T3_SYNC_BASE": base, "T3_SYNC_UPSTREAM": upstream, "T3_SYNC_BASELINE": baseline,
                 "T3_SYNC_CHECKSUM": checksum, "T3_SYNC_MODE": mode,
-            }, {"T3_SYNC_DOWNLOAD": download_url()})
+            }, {"T3_SYNC_DOWNLOAD": download})
             collect(pilot, script, view, mode)
         except Exception:
             try:
