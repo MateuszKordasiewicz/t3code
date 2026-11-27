@@ -486,6 +486,8 @@ it.effect("keeps issue detail cache and answers consistent between hosted and ho
     const initialHosted = yield* readEnvironmentQuery(registry, hosted);
     expect(initialHosted.state).toEqual(openState);
     unmountHosted();
+    // Explicit-host answers must not populate an unresolved hostless entry before the server resolves it.
+    expect(answers).toEqual([{ host: "linear.app", state: "Open" }]);
 
     currentState = doneState;
     const unmountHostless = registry.mount(hostless);
@@ -512,6 +514,7 @@ it.effect("keeps issue detail cache and answers consistent between hosted and ho
       },
       { immediate: true },
     );
+    answers.length = 0;
     registry.refresh(hosted);
     expect(yield* Queue.take(requests)).toEqual(hostedTarget.input);
     const refreshedHosted = yield* readEnvironmentQuery(registry, hosted);
@@ -519,6 +522,10 @@ it.effect("keeps issue detail cache and answers consistent between hosted and ho
     unsubscribeHosted();
     expect(observedStates.length).toBeGreaterThanOrEqual(2);
     expect(new Set(observedStates)).toEqual(new Set(["Done"]));
+    expect(answers).toEqual([
+      { host: "linear.app", state: "Done" },
+      { host: undefined, state: "Done" },
+    ]);
 
     // Taking the environment offline must surface the failure while retaining the mirrored value.
     const unmountOffline = registry.mount(hosted);

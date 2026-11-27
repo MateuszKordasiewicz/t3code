@@ -255,10 +255,7 @@ export function createIssueEnvironmentAtoms<R, E>(
             const counterpartKey = detailKey(environmentId, counterpartInput);
             const counterpartSynced =
               ownInput.host === undefined ||
-              (() => {
-                const resolvedHost = registry.get(mirrorFamily(counterpartKey)).resolvedHost;
-                return resolvedHost === undefined || resolvedHost === value.host;
-              })();
+              registry.get(mirrorFamily(counterpartKey)).resolvedHost === value.host;
             if (counterpartSynced) {
               registry.update(mirrorFamily(counterpartKey), (prev) =>
                 attemptSeq >= prev.answerSeq
