@@ -1,4 +1,7 @@
-trigger: none
+trigger:
+  batch: true
+  branches:
+    include: [main]
 pr: none
 
 # Azure cron uses UTC. The prepare job selects the New York offset for that run.
@@ -48,11 +51,11 @@ variables:
 stages:
   - stage: UpstreamSync
     displayName: Sync upstream
-    condition: or(ne(variables['Build.Reason'], 'Schedule'), eq(variables['UPSTREAM_SYNC_SCHEDULE_ENABLED'], 'true'))
+    condition: or(eq(variables['Build.Reason'], 'Manual'), eq(variables['UPSTREAM_SYNC_SCHEDULE_ENABLED'], 'true'))
     jobs:
       - job: Prepare
         displayName: Check upstream and prepare candidate
-        timeoutInMinutes: 55
+        timeoutInMinutes: 70
         cancelTimeoutInMinutes: 6
         steps:
           - checkout: self
@@ -129,14 +132,15 @@ stages:
         variables:
           candidateCommit: $[dependencies.Prepare.outputs['candidate.commit']]
           candidateRef: $[dependencies.Prepare.outputs['candidate.ref']]
+          candidateBase: $[dependencies.Prepare.outputs['candidate.base']]
         steps:
           - checkout: self
-            fetchDepth: 1
+            fetchDepth: 0
             fetchTags: false
           - bash: |
               set -euo pipefail
               git -c "http.extraheader=AUTHORIZATION: bearer $SYSTEM_ACCESSTOKEN" \
-                fetch --no-tags --depth=1 origin "$CANDIDATE_REF"
+                fetch --no-tags origin "$CANDIDATE_REF"
               test "$(git rev-parse FETCH_HEAD)" = "$CANDIDATE_COMMIT"
               git checkout --detach "$CANDIDATE_COMMIT"
               echo "Building exact candidate $CANDIDATE_COMMIT"
@@ -149,6 +153,7 @@ stages:
             parameters:
               sourceCommit: $(candidateCommit)
               sourceRef: $(candidateRef)
+              sourceBase: $(candidateBase)
 
       - job: OpenPullRequest
         displayName: Open protected pull request

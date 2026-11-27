@@ -2,10 +2,13 @@
 
 import hashlib
 import importlib.util
+import io
+import json
 import os
 import subprocess
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,6 +20,13 @@ class SyncTest(unittest.TestCase):
         scratch = tempfile.TemporaryDirectory(prefix="t3-upstream-test-")
         self.addCleanup(scratch.cleanup)
         self.root = Path(scratch.name)
+        fake_bin = self.root / "bin"
+        fake_bin.mkdir()
+        self.pull_requests = self.root / "pull-requests.json"
+        self.pull_requests.write_text('{"value": []}\n')
+        curl = fake_bin / "curl"
+        curl.write_text(f'#!/bin/sh\ncat "{self.pull_requests}"\n')
+        curl.chmod(0o755)
         self.repo = self.root / "hosted"
         self.repo.mkdir()
         self.git("init", "-q", "-b", "main")
@@ -37,6 +47,7 @@ class SyncTest(unittest.TestCase):
         self.scratch = self.root / "sync"
         self.env = {
             **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
             "BUILD_REASON": "Manual",
             "BUILD_SOURCEBRANCH": "refs/heads/slice",
             "SYSTEM_ACCESSTOKEN": "test",
@@ -47,6 +58,9 @@ class SyncTest(unittest.TestCase):
             "TRIAL_MODE": "repair",
             "SYNC_DIR": str(self.scratch),
             "BUILD_BUILDID": "42",
+            "BUILD_REPOSITORY_ID": "test-repo",
+            "SYSTEM_COLLECTIONURI": "https://dev.azure.com/test/",
+            "SYSTEM_TEAMPROJECTID": "test-project",
             "SYSTEM_JOBATTEMPT": "1",
         }
 
@@ -152,6 +166,102 @@ class SyncTest(unittest.TestCase):
         self.assertIn("Already current", result.stdout)
         self.assertFalse((self.root / "current").exists())
 
+    def test_ci_batch_continuation_publishes_despite_manual_dry_run_default(self):
+        self.git("push", "origin", f"+{self.common}:refs/heads/main")
+        self.pull_requests.write_text(json.dumps({"value": [{
+            "status": "active", "isDraft": True, "targetRefName": "refs/heads/main",
+            "sourceRefName": "refs/heads/sync/azure-upstream/old-proof",
+        }]}))
+        production = {
+            "BUILD_REASON": "BatchedCI", "BUILD_SOURCEBRANCH": "refs/heads/main",
+            "DRY_RUN": "false", "TRIAL_TARGET": "none", "TRIAL_BASE": "none",
+            "TRIAL_UPSTREAM": "none",
+        }
+        result = self.sync("prepare", **{**production, "DRY_RUN": "true"})
+        self.assert_success(result)
+        self.assertIn("Clean candidate", result.stdout)
+        self.assertTrue((self.scratch / "inputs").exists())
+
+    def test_ci_conflict_uses_the_worker_when_repair_is_enabled(self):
+        result = self.sync(
+            "prepare", BUILD_REASON="BatchedCI", BUILD_SOURCEBRANCH="refs/heads/main",
+            DRY_RUN="true", TRIAL_TARGET="none", TRIAL_BASE="none",
+            TRIAL_UPSTREAM="none", VM_REPAIR_ENABLED="true",
+        )
+        self.assert_success(result)
+        self.assertIn("variable=repairNeeded]true", result.stdout)
+
+    def test_pending_upstream_sync_pr_stops_a_new_main_batch(self):
+        self.pull_requests.write_text(json.dumps({"value": [
+            {"status": "active", "targetRefName": "refs/heads/main",
+             "sourceRefName": "refs/heads/feature/unrelated"},
+            {"status": "active", "targetRefName": "refs/heads/main",
+             "sourceRefName": "refs/heads/sync/azure-upstream/pending"},
+        ]}))
+        result = self.sync(
+            "prepare", BUILD_REASON="BatchedCI", BUILD_SOURCEBRANCH="refs/heads/main",
+            TRIAL_TARGET="none", TRIAL_BASE="none", TRIAL_UPSTREAM="none",
+        )
+        self.assert_success(result)
+        self.assertIn("an upstream sync PR is already pending", result.stdout)
+        self.assertFalse(self.scratch.exists())
+
+    def test_production_selects_fifty_commits_and_stops_after_four_merged_batches(self):
+        self.git("checkout", "--detach", self.common)
+        upstream_commits = []
+        for number in range(201):
+            (self.repo / "upstream.txt").write_text(f"change {number}\n")
+            self.git("add", "upstream.txt")
+            self.git("commit", "-qm", f"upstream {number}")
+            upstream_commits.append(self.git("rev-parse", "HEAD").decode().strip())
+        self.git("push", "--force", str(self.upstream), "HEAD:refs/heads/main")
+
+        base = self.base
+        for index in range(4):
+            run_dir = self.root / f"batch-{index}"
+            result = self.sync(
+                "prepare", BUILD_SOURCEBRANCH="refs/heads/main", DRY_RUN="false",
+                TRIAL_TARGET="none", TRIAL_BASE="none", TRIAL_UPSTREAM="none",
+                SYNC_DIR=str(run_dir),
+            )
+            self.assert_success(result)
+            candidate_base, selected, candidate = (run_dir / "inputs").read_text().splitlines()
+            self.assertEqual(candidate_base, base)
+            self.assertEqual(selected, upstream_commits[(index + 1) * 50 - 1])
+            tree = self.git("rev-parse", f"{candidate}^{{tree}}").decode().strip()
+            if index == 0:
+                candidate = self.git(
+                    "commit-tree", tree, "-p", base, "-p", selected,
+                    "-m", "chore: repair T3 Code upstream merge",
+                ).decode().strip()
+            merge = self.git("commit-tree", tree, "-p", base, "-p", candidate,
+                             "-m", "Merge protected upstream PR").decode().strip()
+            self.git("push", "origin", f"{merge}:refs/heads/main")
+            base = merge
+
+        capped = self.sync(
+            "prepare", BUILD_SOURCEBRANCH="refs/heads/main", DRY_RUN="false",
+            TRIAL_TARGET="none", TRIAL_BASE="none", TRIAL_UPSTREAM="none",
+            SYNC_DIR=str(self.root / "capped"),
+        )
+        self.assert_success(capped)
+        self.assertIn("daily cap of four merged upstream batches reached", capped.stdout)
+        self.assertFalse((self.root / "capped").exists())
+
+    def test_disposable_target_selects_only_first_fifty_pinned_commits(self):
+        self.git("checkout", "--detach", self.common)
+        upstream_commits = []
+        for number in range(101):
+            (self.repo / "upstream.txt").write_text(f"change {number}\n")
+            self.git("add", "upstream.txt")
+            self.git("commit", "-qm", f"upstream {number}")
+            upstream_commits.append(self.git("rev-parse", "HEAD").decode().strip())
+        self.git("push", "--force", str(self.upstream), "HEAD:refs/heads/main")
+        result = self.sync("prepare", TRIAL_UPSTREAM=upstream_commits[-1])
+        self.assert_success(result)
+        self.assertEqual((self.scratch / "inputs").read_text().splitlines()[1],
+                         upstream_commits[49])
+
     def test_pilot_reservation_is_held_until_deallocation_is_verified(self):
         self.scratch.mkdir()
         self.assert_success(self.sync("acquire-pilot"))
@@ -170,6 +280,7 @@ class SyncTest(unittest.TestCase):
         self.assertIn("Run Command deletion could not be verified", result.stdout)
         commands.write_text("")
         self.assert_success(self.sync("release-pilot"))
+
         self.assert_success(self.sync("acquire-pilot", BUILD_BUILDID="43"))
 
     def test_pilot_fallback_cannot_release_after_unconfirmed_guest_cleanup(self):
@@ -215,6 +326,135 @@ class SyncTest(unittest.TestCase):
         (self.scratch / "pilot-guest-workspace-cleaned").touch()
         pilot.cleanup("unused")
         self.assert_success(self.sync("release-pilot"))
+
+
+class WorkerRefreshTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location(
+            "upstream_sync_vm", SCRIPT.with_name("upstream-sync-vm.py"),
+        )
+        cls.vm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.vm)
+
+    def test_pilot_artifact_is_a_verified_successful_main_build(self):
+        archive = b"verified T3 archive"
+        info = {
+            "branch": "main", "commit": "a" * 40,
+            "runUrl": "https://dev.azure.com/Instablinds/t3code/_build/results?buildId=42",
+            "version": "0.1.12-nightly.20261127.42",
+        }
+        info_bytes = json.dumps(info).encode()
+        archive_name = f't3-{info["version"]}-linux-x64.tar.gz'
+        manifest = (f'{hashlib.sha256(archive).hexdigest()}  {archive_name}\n'
+                    f'{hashlib.sha256(info_bytes).hexdigest()}  build-info.json\n').encode()
+        zipped = io.BytesIO()
+        with zipfile.ZipFile(zipped, "w") as output:
+            output.writestr(f"t3-linux-server/{archive_name}", archive)
+            output.writestr("t3-linux-server/build-info.json", info_bytes)
+            output.writestr("t3-linux-server/SHA256SUMS", manifest)
+        build = {
+            "id": 42, "sourceVersion": info["commit"], "sourceBranch": "refs/heads/main",
+            "status": "completed", "result": "succeeded", "definition": {"id": 26},
+        }
+        environment = {
+            "SYSTEM_COLLECTIONURI": "https://dev.azure.com/Instablinds/",
+            "SYSTEM_TEAMPROJECTID": "project-id", "SYSTEM_TEAMPROJECT": "t3code",
+            "SYSTEM_ACCESSTOKEN": "test",
+        }
+        with (patch.dict(os.environ, environment),
+              patch.object(self.vm, "request", side_effect=[
+                  {"value": [build]}, {"signedContent": {"url": "https://artifact.example/test"}},
+              ]),
+              patch.object(self.vm.urllib.request, "urlopen", return_value=io.BytesIO(zipped.getvalue()))):
+            result = self.vm.current_worker_artifact()
+        self.assertEqual(result[:5], (42, "a" * 40, archive_name,
+                                      hashlib.sha256(archive).hexdigest(),
+                                      hashlib.sha256(info_bytes).hexdigest()))
+
+        wrong = manifest.replace(hashlib.sha256(archive).hexdigest().encode(), b"0" * 64)
+        zipped = io.BytesIO()
+        with zipfile.ZipFile(zipped, "w") as output:
+            output.writestr(f"t3-linux-server/{archive_name}", archive)
+            output.writestr("t3-linux-server/build-info.json", info_bytes)
+            output.writestr("t3-linux-server/SHA256SUMS", wrong)
+        with (patch.dict(os.environ, environment),
+              patch.object(self.vm, "request", side_effect=[
+                  {"value": [build]}, {"signedContent": {"url": "https://artifact.example/test"}},
+              ]),
+              patch.object(self.vm.urllib.request, "urlopen", return_value=io.BytesIO(zipped.getvalue()))):
+            with self.assertRaisesRegex(RuntimeError, "archive checksum"):
+                self.vm.current_worker_artifact()
+
+    def test_pilot_reports_the_install_stage_that_failed(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            with patch.object(self.vm.subprocess, "check_output", return_value="test"):
+                pilot = self.vm.Pilot(Path(scratch), "t3-upstream-42-1")
+
+            def api(_path, method="GET", _body=None, **_kwargs):
+                if method == "GET":
+                    return {"properties": {"instanceView": {
+                        "executionState": "Failed", "exitCode": 1,
+                        "output": "T3_INSTALL_ERROR download line=16 status=1\n",
+                        "error": "T3_INSTALL_ERROR download_http_403\n",
+                    }}}
+                return {}
+
+            with (patch.object(pilot, "api", side_effect=api),
+                  patch.object(self.vm, "wait_for", side_effect=lambda _, __, check: check())):
+                with self.assertRaisesRegex(RuntimeError, "T3_INSTALL_ERROR download_http_403"):
+                    pilot.run("refresh", "unused", 900, {})
+
+    def test_repair_refreshes_before_starting_a_t3_turn(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            directory = Path(scratch)
+            (directory / "inputs").write_text("a\nb\nc\n")
+            (directory / "input.sha256").write_text("d" * 64)
+            events = []
+            refresh_output = ["Installation complete"]
+
+            class Pilot:
+                name = "t3-upstream-42-1"
+
+                def __init__(self, *_args):
+                    self.directory = directory
+                    self.guest_workspace_requested = directory / "workspace-requested"
+
+                def boot(self):
+                    events.append("boot")
+
+                def run(self, suffix, *_args):
+                    events.append(suffix)
+                    return {"output": refresh_output[0] if suffix == "refresh" else ""}
+
+                def cleanup(self, _script):
+                    events.append("cleanup")
+
+            environment = {
+                "SYNC_DIR": str(directory), "BUILD_BUILDID": "42", "SYSTEM_JOBATTEMPT": "1",
+                "TRIAL_MODE": "repair",
+            }
+            def invoke():
+                with (patch.dict(os.environ, environment),
+                      patch.object(self.vm, "Pilot", Pilot),
+                      patch.object(self.vm, "current_worker_artifact", return_value=(
+                          42, "a" * 40, "archive.tar.gz", "b" * 64, "c" * 64,
+                      )),
+                      patch.object(self.vm, "artifact_signed_url", side_effect=lambda _run: (
+                          events.append("sign") or "https://artifact.example/test"
+                      )),
+                      patch.object(self.vm, "download_url", return_value="https://input.example/test"),
+                      patch.object(self.vm, "collect"),
+                      patch.object(self.vm.sys, "argv", ["upstream-sync-vm.py", "repair"])):
+                    self.vm.main()
+
+            invoke()
+            self.assertEqual(events, ["boot", "sign", "refresh", "repair", "cleanup"])
+            events.clear()
+            refresh_output[0] = ""
+            with self.assertRaisesRegex(RuntimeError, "did not confirm its T3 refresh"):
+                invoke()
+            self.assertEqual(events, ["boot", "sign", "refresh", "cleanup"])
 
 
 if __name__ == "__main__":

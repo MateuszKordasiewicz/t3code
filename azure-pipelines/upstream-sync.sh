@@ -56,6 +56,38 @@ sync_commit() {
     commit-tree "$tree" -p "$base" -p "$upstream" -m "chore: sync T3 Code upstream"
 }
 
+batches_today() {
+  local base=$1 day commit candidate count=0
+  day="$(date -u +%Y-%m-%d)T00:00:00Z"
+  while IFS= read -r commit; do
+    candidate=$(git rev-parse --verify -q "$commit^2" 2>/dev/null || true)
+    if [[ -n "$candidate" ]]; then
+      case "$(git show -s --format=%s "$candidate")" in
+        'chore: sync T3 Code upstream'|'chore: repair T3 Code upstream merge')
+          ((count += 1)) ;;
+      esac
+    fi
+  done < <(git rev-list --first-parent --since="$day" "$base")
+  printf '%s\n' "$count"
+}
+
+select_batch() {
+  local base=$1 tip=$2 anchor
+  anchor=$(git merge-base "$base" "$tip") || fail "The upstream merge base is missing."
+  git rev-list --first-parent "$tip" | grep -Fx "$anchor" >/dev/null ||
+    fail "The upstream merge base is outside upstream's first-parent history."
+  local -a pending
+  mapfile -t pending < <(git rev-list --first-parent --reverse "$anchor..$tip")
+  ((${#pending[@]} > 0)) || fail "No first-parent upstream commits remain to sync."
+  local count=${#pending[@]}
+  if ((count > 50)); then
+    count=50
+  fi
+  printf 'Selected upstream batch: %s of %s remaining first-parent commits, through %s.\n' \
+    "$count" "${#pending[@]}" "${pending[count - 1]}" >&2
+  printf '%s\n' "${pending[count - 1]}"
+}
+
 prepare() {
   if [[ "$BUILD_REASON" == Schedule ]]; then
     case "$CRON_SCHEDULE:$(TZ=America/New_York date +%z)" in
@@ -67,7 +99,7 @@ prepare() {
     esac
   fi
   local dry_run=false
-  if [[ "$BUILD_REASON" != Schedule && "${DRY_RUN,,}" == true ]]; then
+  if [[ "$BUILD_REASON" == Manual && "${DRY_RUN,,}" == true ]]; then
     dry_run=true
   fi
   if [[ "$dry_run" == false && "$target_ref" == "$main_ref" && "$BUILD_SOURCEBRANCH" != "$main_ref" ]]; then
@@ -76,12 +108,13 @@ prepare() {
 
   echo "Fetching Azure target $target_ref and GitHub upstream."
   azure_git fetch --no-tags origin "$target_ref"
-  local base upstream result exit_code=0 tree commit
+  local base upstream tip result exit_code=0 tree commit
   base=$(git rev-parse FETCH_HEAD)
   [[ -z "${TRIAL_BASE:-}" || "$base" == "$TRIAL_BASE" ]] ||
     fail "The fetched Azure target does not match the trial pin."
   git fetch --no-tags "$upstream_url" "${TRIAL_UPSTREAM:-$main_ref}"
   upstream=$(git rev-parse FETCH_HEAD)
+  tip=$upstream
   [[ -z "${TRIAL_UPSTREAM:-}" || "$upstream" == "$TRIAL_UPSTREAM" ]] ||
     fail "The fetched upstream commit does not match the trial pin."
   echo "Azure target: $base"
@@ -93,6 +126,30 @@ prepare() {
     return
   fi
 
+  if [[ "$target_ref" == "$main_ref" ]]; then
+    if [[ "$dry_run" == false && "$(batches_today "$base")" -ge 4 ]]; then
+      echo "Result: daily cap of four merged upstream batches reached (UTC)."
+      return
+    fi
+    if [[ "$dry_run" == false ]]; then
+      local active_prs pending
+      active_prs=$(azure_git_api pullrequests --get \
+        --data-urlencode 'searchCriteria.status=active' \
+        --data-urlencode "searchCriteria.targetRefName=$main_ref" \
+        --data-urlencode '$top=1000')
+      pending=$(jq -er --arg target "$main_ref" '
+        [.value[] | select(.status == "active" and .isDraft != true and .targetRefName == $target
+          and (.sourceRefName | startswith("refs/heads/sync/azure-upstream/")))] | length
+      ' <<< "$active_prs") || fail "Could not inspect active upstream sync PRs."
+      if ((pending > 0)); then
+        echo "Result: an upstream sync PR is already pending."
+        return
+      fi
+    fi
+  fi
+  upstream=$(select_batch "$base" "$tip")
+  echo "Pinned upstream batch tip: $upstream"
+
   result=$(git merge-tree --write-tree --name-only --no-messages "$base" "$upstream") || exit_code=$?
   tree=${result%%$'\n'*}
   case "$exit_code" in
@@ -100,8 +157,7 @@ prepare() {
     1)
       printf 'Conflicting files:\n%s\n' "${result#*$'\n'}"
       if [[ "$dry_run" == true ||
-            ( "$target_ref" == "$main_ref" &&
-              ( "$BUILD_REASON" != Schedule || "${VM_REPAIR_ENABLED:-}" != true ) ) ]]; then
+            ( "$target_ref" == "$main_ref" && "${VM_REPAIR_ENABLED:-}" != true ) ]]; then
         fail "Result: Conflict. Resolve the files listed in this step before syncing."
       fi
       ;;
@@ -328,7 +384,7 @@ open_pr() {
     pr_id=$(jq -er '.pullRequestId' <<< "$response")
     echo "Created by $(jq -er '.createdBy.displayName' <<< "$response")."
   fi
-  if [[ "$BUILD_REASON" == Schedule ]]; then
+  if [[ "$target_ref" == "$main_ref" ]]; then
     enable_auto_complete "$pr_id"
   else
     verify_pr_preview "$pr_id"

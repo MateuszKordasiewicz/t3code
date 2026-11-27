@@ -5,6 +5,9 @@ parameters:
   - name: sourceRef
     type: string
     default: $(Build.SourceBranch)
+  - name: sourceBase
+    type: string
+    default: ""
 
 steps:
   - bash: |
@@ -29,8 +32,25 @@ steps:
       echo "##vso[task.prependpath]$VP_HOME/bin"
     displayName: Install Vite+ and Node.js
 
-  - bash: vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/scripts... --frozen-lockfile
+  - bash: |
+      set -euo pipefail
+      if [[ -n "$T3_SOURCE_BASE" ]]; then
+        vp install --frozen-lockfile
+      else
+        vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/scripts... --frozen-lockfile
+      fi
     displayName: Install dependencies
+    env:
+      T3_SOURCE_BASE: ${{ parameters.sourceBase }}
+
+  - bash: |
+      set -euo pipefail
+      vp run check:changed "$T3_SOURCE_BASE"
+      vp run i18n:check
+    displayName: Check candidate changes and translations
+    condition: and(succeeded(), ne('${{ parameters.sourceBase }}', ''))
+    env:
+      T3_SOURCE_BASE: ${{ parameters.sourceBase }}
 
   - bash: |
       set -euo pipefail

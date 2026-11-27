@@ -94,6 +94,19 @@ if [[ "$mode" == invalid ]]; then
   tree=$(git rev-parse "$base^{tree}")
   parents=(-p "$base")
 else
+  # The merged manifests may still contain conflicts before the agent starts.
+  vp_version=$(git show "${base}:pnpm-workspace.yaml" |
+    sed -nE 's/^  vite-plus: ([0-9][^ ]*)$/\1/p')
+  node_version=$(git show "${base}:package.json" |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["engines"]["node"])')
+  test -n "$vp_version" && test -n "$node_version"
+  export VP_HOME="$work/vite-plus"
+  mkdir -p "$work/vite-home"
+  curl -fsSL https://vite.plus | HOME="$work/vite-home" VP_VERSION="$vp_version" VP_NODE_MANAGER=yes bash \
+    > "$work/vite-plus.log" 2>&1
+  HOME="$work/vite-home" "$VP_HOME/bin/vp" env use "$node_version" \
+    >> "$work/vite-plus.log" 2>&1
+  export PATH="$VP_HOME/bin:$PATH"
   cli=/opt/t3/current/t3
   t3_home="$work/t3-home"
   "$cli" serve --base-dir "$t3_home" --host 127.0.0.1 > "$work/server.log" 2>&1 &
@@ -118,13 +131,12 @@ else
   timeout --kill-after=5 "$seconds" "$cli" thread start --base-dir "$t3_home" "$PWD" - \
     --provider codex --model gpt-6-luna --title 'Repair Azure upstream merge conflicts' --wait --json \
     > "$work/turn.json" 2> "$work/turn.stderr" <<PROMPT || status=$?
-Task: Repair the upstream merge conflicts
+Task: Sync upstream and prepare a full-send candidate
 
-This repository is a disposable checkout of Azure target $base. Git is merging public upstream $upstream.
-Resolve the in-progress merge. Preserve the fork's existing features and upstream's changes where they can coexist.
-Inspect both parents and the merge base. Use focused checks where practical and stage all intended resolutions.
-Leave HEAD and MERGE_HEAD in place. Do not make a commit, push, change other workspaces, launch another agent, or edit Azure pipeline or pilot configuration.
-If the merge cannot be resolved within this turn, leave the remaining conflicts and report the blocker.
+This is the conflict-resolution step of sync-upstream for one bounded batch. The disposable checkout has Azure target $base and is merging pinned public upstream $upstream.
+Follow AGENTS.md. Inspect both parents and the merge base. Keep upstream's structure and reapply the fork's behavior, including Beads and issue links, where both can coexist. Resolve and stage every conflict. Use focused checks where practical.
+Azure handles the full-send steps after your turn: frozen install, changed-file checks, archive build, protected PR and completion on main. Leave HEAD and MERGE_HEAD in place. Do not commit, push, change other workspaces, launch another agent, or edit Azure pipeline or pilot configuration.
+If preserving the fork requires a product choice, or you cannot resolve the batch, leave the conflict and report the specific blocker. Azure will stop without changing main.
 PROMPT
   case "$status" in
     0) ;;
@@ -136,6 +148,18 @@ PROMPT
   test "$(git rev-parse HEAD)" = "$base"
   test "$(git rev-parse MERGE_HEAD)" = "$upstream"
   test -z "$(git ls-files -u)" || exit 22
+  if ! HOME="$work/vite-home" vp install --lockfile-only --frozen-lockfile \
+    > "$work/lockfile-check.log" 2>&1; then
+    if ! grep -Eq 'ERR_PNPM_(INCONSISTENT_PATCH_HASH|LOCKFILE_CONFIG_MISMATCH|LOCKFILE_MISSING_DEPENDENCY)' \
+      "$work/lockfile-check.log"; then
+      exit 25
+    fi
+    HOME="$work/vite-home" vp install --lockfile-only --no-frozen-lockfile --fix-lockfile \
+      > "$work/lockfile-fix.log" 2>&1 || exit 25
+    HOME="$work/vite-home" vp install --lockfile-only --frozen-lockfile \
+      > "$work/lockfile-check.log" 2>&1 || exit 25
+    git add pnpm-lock.yaml
+  fi
   git diff --quiet || exit 23
   tree=$(git write-tree)
   parents=(-p "$base" -p "$upstream")
@@ -199,6 +223,7 @@ PY
   22) guest_error 'unresolved merge paths remain' ;;
   23) guest_error 'unstaged tracked changes remain' ;;
   24) guest_error 't3 turn requested input' ;;
+  25) guest_error 'lockfile consistency check or repair failed' ;;
   *) guest_error 'guest checkout or t3 worker failed' ;;
 esac
 
