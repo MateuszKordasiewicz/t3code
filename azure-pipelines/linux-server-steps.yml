@@ -56,7 +56,7 @@ steps:
 
   - bash: |
       set -euo pipefail
-      vp run check:changed "$T3_SOURCE_BASE"
+      vp run check:changed "$T3_SOURCE_BASE" --timeout 2400
       vp run i18n:check
     displayName: Check candidate changes and translations
     condition: and(succeeded(), ne('${{ parameters.sourceBase }}', ''))

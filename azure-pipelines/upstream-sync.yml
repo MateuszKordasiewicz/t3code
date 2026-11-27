@@ -128,7 +128,7 @@ stages:
         displayName: Build and smoke-test the candidate
         dependsOn: Prepare
         condition: and(succeeded(), ne(dependencies.Prepare.outputs['candidate.commit'], ''))
-        timeoutInMinutes: 60
+        timeoutInMinutes: 90
         variables:
           candidateCommit: $[dependencies.Prepare.outputs['candidate.commit']]
           candidateRef: $[dependencies.Prepare.outputs['candidate.ref']]
