@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eEuo pipefail
+
+stage=preflight
+trap 'printf "T3_INSTALL_ERROR %s line=%s status=%s\n" "$stage" "$LINENO" "$?"' ERR
 
 [[ "$(id -u)" == 0 && "$(uname -m)" == x86_64 ]]
 umask 077
@@ -9,16 +12,22 @@ scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 
 echo 'Downloading the verified Azure main artifact'
+stage=download
 python3 - "$scratch" <<'PY'
+import hashlib
 import os
+import re
 import shutil
 import sys
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path, PurePosixPath
 
 directory = Path(sys.argv[1])
 try:
+    if hashlib.sha256(os.environ["T3_ARTIFACT_URL"].encode()).hexdigest() != os.environ["T3_ARTIFACT_URL_SHA256"]:
+        sys.exit("T3_INSTALL_ERROR download_url_hash_mismatch")
     bundle = directory / "artifact.zip"
     with urllib.request.urlopen(os.environ["T3_ARTIFACT_URL"], timeout=120) as response:
         with bundle.open("wb") as output:
@@ -29,17 +38,27 @@ try:
             with artifact.open(member) as source, (directory / name).open("wb") as output:
                 shutil.copyfileobj(source, output)
     bundle.unlink()
-except Exception:
-    sys.exit("Artifact download failed. Rerun the installer to request a fresh signed URL.")
+except urllib.error.HTTPError as error:
+    body = error.read(2048).decode("utf-8", errors="replace")
+    match = re.search(r"<Code>([A-Za-z0-9]+)</Code>", body)
+    code = error.headers.get("x-ms-error-code") or (match[1] if match else "unknown")
+    sys.exit(f"T3_INSTALL_ERROR download_http_{error.code}_{code.lower()}")
+except Exception as error:
+    sys.exit(f"T3_INSTALL_ERROR download_{type(error).__name__.lower()}")
 PY
 unset T3_ARTIFACT_URL
+stage=checksum
 (
     cd "$scratch"
     printf '%s  %s\n' "$T3_SHA256" "$T3_ARCHIVE" "$T3_BUILD_INFO_SHA256" build-info.json |
         sha256sum --check --strict
 )
+if [[ -n "${T3_SOURCE_COMMIT:-}" && -n "${T3_BUILD_RUN_ID:-}" ]]; then
+    echo "Verified T3 source $T3_SOURCE_COMMIT from Azure main build $T3_BUILD_RUN_ID"
+fi
 
 echo 'Preparing the persistent data disk at Azure LUN 0'
+stage=disk
 device=/dev/disk/azure/scsi1/lun0
 mount_dir=/srv/t3
 udevadm settle
@@ -69,12 +88,14 @@ install -d -m 0700 -o t3 -g t3 "$mount_dir/home" "$mount_dir/workspaces"
 systemctl mask --now ssh.socket ssh.service >/dev/null
 
 echo 'Installing T3 and the provider CLIs'
+stage=packages
 export DEBIAN_FRONTEND=noninteractive
 apt-get -qq update
 apt-get -qq --yes -o DPkg::Lock::Timeout=120 install ca-certificates curl git libatomic1
 install -d -m 0755 /opt/t3 /opt/t3/releases /opt/t3/providers /usr/local/bin
 
 release="/opt/t3/releases/$T3_SHA256"
+stage=release
 if [[ ! -x "$release/t3" ]]; then
     mkdir "$scratch/t3"
     tar --extract --gzip --no-same-owner --file "$scratch/$T3_ARCHIVE" --strip-components=1 -C "$scratch/t3"
@@ -83,6 +104,7 @@ if [[ ! -x "$release/t3" ]]; then
 fi
 
 codex_version=0.171.0
+stage=providers
 codex_dir="/opt/t3/providers/codex-$codex_version"
 if [[ ! -x "$codex_dir/bin/codex" ]]; then
     curl -fsSL --retry 3 "https://registry.npmjs.org/@openai/codex/-/codex-$codex_version-linux-x64.tgz" -o "$scratch/codex.tgz"
@@ -108,6 +130,7 @@ ln -sfn "$claude" /usr/local/bin/claude
 ln -sfn "$release" /opt/t3/current
 ln -sfn /opt/t3/current/t3 /usr/local/bin/t3
 
+stage=service
 cat > /etc/systemd/system/t3-private-pilot.service <<'UNIT'
 [Unit]
 Description=T3 Code private pilot

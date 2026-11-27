@@ -7,11 +7,15 @@ import json
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import zipfile
 from pathlib import Path
 
 VM = ("https://management.azure.com/subscriptions/59e703b0-a79b-49da-9f12-c1604e2ffc11"
@@ -21,6 +25,8 @@ API = "api-version=2025-04-01"
 CHUNK = 5600
 MAX_PACK = 128 * 1024
 SHA = r"[0-9a-f]{40}"
+BUILD_PIPELINE = 26
+BUILD_ARTIFACT = "t3-linux-server"
 
 
 def request(url, token, method="GET", body=None, missing_ok=False, timeout=25):
@@ -114,8 +120,9 @@ class Pilot:
             if state == "Succeeded" and view.get("exitCode") == 0:
                 return view
             if state in {"Succeeded", "Failed", "TimedOut", "Canceled", "Cancelled"}:
-                detail = re.search(r"^T3_REPAIR_ERROR [a-z0-9 -]+$", view.get("output") or "", re.M)
-                message = detail[0] if detail else "No guest diagnostic was returned"
+                channels = f"{view.get('error') or ''}\n{view.get('output') or ''}"
+                detail = re.search(r"^T3_(?:REPAIR|INSTALL)_ERROR [a-z0-9_=: -]+$", channels, re.M)
+                message = detail[0] if detail else f"No guest diagnostic was returned (exit {view.get('exitCode')})"
                 raise RuntimeError(f"Pilot command {suffix} ended with {state}: {message}.")
             return None
 
@@ -226,6 +233,83 @@ def download_url():
     return request(url, os.environ["SYSTEM_ACCESSTOKEN"])["signedContent"]["url"]
 
 
+def artifact_signed_url(run):
+    collection = os.environ["SYSTEM_COLLECTIONURI"]
+    project = os.environ["SYSTEM_TEAMPROJECTID"]
+    token = os.environ["SYSTEM_ACCESSTOKEN"]
+    artifact_url = (f"{collection}{project}/_apis/pipelines/{BUILD_PIPELINE}/runs/{run}/artifacts"
+                    f"?artifactName={BUILD_ARTIFACT}&%24expand=signedContent&api-version=7.1-preview.1")
+    signed_url = request(artifact_url, token)["signedContent"]["url"]
+    if not signed_url.startswith("https://"):
+        raise RuntimeError("The pilot artifact download URL is invalid.")
+    return signed_url
+
+
+def current_worker_artifact():
+    collection = os.environ["SYSTEM_COLLECTIONURI"]
+    project = os.environ["SYSTEM_TEAMPROJECTID"]
+    token = os.environ["SYSTEM_ACCESSTOKEN"]
+    query = urllib.parse.urlencode({
+        "definitions": BUILD_PIPELINE,
+        "branchName": "refs/heads/main",
+        "statusFilter": "completed",
+        "resultFilter": "succeeded",
+        "queryOrder": "finishTimeDescending",
+        "$top": 1,
+        "api-version": "7.1",
+    })
+    builds = request(f"{collection}{project}/_apis/build/builds?{query}", token)["value"]
+    if len(builds) != 1:
+        raise RuntimeError("No successful main build is available to refresh the pilot.")
+    build = builds[0]
+    run = build["id"]
+    commit = build["sourceVersion"]
+    if (build["definition"]["id"] != BUILD_PIPELINE or
+            build["sourceBranch"] != "refs/heads/main" or
+            build["status"] != "completed" or build["result"] != "succeeded" or
+            not re.fullmatch(SHA, commit)):
+        raise RuntimeError("The selected pilot build is not a successful main build.")
+    signed_url = artifact_signed_url(run)
+
+    with tempfile.TemporaryFile() as archive_file:
+        with urllib.request.urlopen(signed_url, timeout=120) as response:
+            shutil.copyfileobj(response, archive_file)
+        archive_file.seek(0)
+        with zipfile.ZipFile(archive_file) as artifact:
+            def read(name):
+                members = [item for item in artifact.namelist() if Path(item).name == name]
+                if len(members) != 1:
+                    raise RuntimeError(f"Pilot artifact has no unique {name}.")
+                return artifact.read(members[0])
+
+            info_bytes = read("build-info.json")
+            info = json.loads(info_bytes)
+            expected_url = f"{collection}{os.environ['SYSTEM_TEAMPROJECT']}/_build/results?buildId={run}"
+            if (info["branch"] != "main" or info["commit"] != commit or
+                    info["runUrl"] != expected_url or
+                    not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+-nightly\.[0-9]+\.[0-9]+",
+                                     info["version"])):
+                raise RuntimeError("Pilot artifact metadata disagrees with the selected build.")
+            archive_name = f't3-{info["version"]}-linux-x64.tar.gz'
+            sums = {}
+            for line in read("SHA256SUMS").decode().splitlines():
+                match = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
+                if not match or match[2] in sums:
+                    raise RuntimeError("Pilot artifact checksum manifest is malformed.")
+                sums[match[2]] = match[1]
+            if sums.keys() != {archive_name, "build-info.json"}:
+                raise RuntimeError("Pilot artifact checksum manifest has unexpected files.")
+            if hashlib.sha256(info_bytes).hexdigest() != sums["build-info.json"]:
+                raise RuntimeError("Pilot artifact metadata checksum does not match.")
+            with artifact.open(next(item for item in artifact.namelist()
+                                    if Path(item).name == archive_name)) as source:
+                digest = hashlib.file_digest(source, "sha256").hexdigest()
+            if digest != sums[archive_name]:
+                raise RuntimeError("Pilot artifact archive checksum does not match.")
+    print(f"Verified pilot T3 build {run} at {commit} (SHA-256 {digest}).", flush=True)
+    return run, commit, archive_name, sums[archive_name], sums["build-info.json"]
+
+
 def collect(pilot, script, view, mode):
     lines = (view.get("output") or "").strip().splitlines()
     if mode == "repair":
@@ -279,7 +363,20 @@ def main():
         base, upstream, baseline = (directory / "inputs").read_text().splitlines()
         checksum = (directory / "input.sha256").read_text().strip()
         try:
+            run, source, archive, archive_sha, info_sha = current_worker_artifact()
             pilot.boot()
+            print("Requesting a fresh artifact URL after pilot startup.", flush=True)
+            artifact_url = artifact_signed_url(run)
+            print(f"Refreshing the pilot from verified main build {run}.", flush=True)
+            install_script = Path(__file__).resolve().parent.parent / "infra/azure-private-pilot/install.sh"
+            refreshed = pilot.run("refresh", install_script.read_text(), 900, {
+                "T3_ARCHIVE": archive, "T3_SHA256": archive_sha,
+                "T3_BUILD_INFO_SHA256": info_sha, "T3_BUILD_RUN_ID": str(run),
+                "T3_SOURCE_COMMIT": source,
+                "T3_ARTIFACT_URL_SHA256": hashlib.sha256(artifact_url.encode()).hexdigest(),
+            }, {"T3_ARTIFACT_URL": artifact_url})
+            if "Installation complete" not in (refreshed.get("output") or ""):
+                raise RuntimeError("The pilot did not confirm its T3 refresh.")
             print("Submitting the exact merge inputs to the pilot.", flush=True)
             mode = os.environ["TRIAL_MODE"]
             download = download_url()
