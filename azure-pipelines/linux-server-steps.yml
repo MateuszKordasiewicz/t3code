@@ -45,6 +45,17 @@ steps:
 
   - bash: |
       set -euo pipefail
+      node apps/server/node_modules/playwright-core/cli.js install --only-shell chromium
+      browser=$(find "$HOME/.cache/ms-playwright" -name chrome-headless-shell -type f -print -quit)
+      test -n "$browser"
+      if ldd "$browser" | grep '=> not found'; then
+        node apps/server/node_modules/playwright-core/cli.js install-deps chromium
+      fi
+    displayName: Install Chromium for candidate tests
+    condition: and(succeeded(), ne('${{ parameters.sourceBase }}', ''))
+
+  - bash: |
+      set -euo pipefail
       vp run check:changed "$T3_SOURCE_BASE"
       vp run i18n:check
     displayName: Check candidate changes and translations
