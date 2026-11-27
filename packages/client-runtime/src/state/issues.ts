@@ -14,6 +14,7 @@ import {
   type IssueScopeRef,
 } from "@t3tools/contracts";
 import type * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Option from "effect/Option";
@@ -21,6 +22,7 @@ import { AsyncResult, Atom, AtomRegistry } from "effect/reactivity";
 
 import {
   type AtomCommandResult,
+  type QueryAnswerHandler,
   createAtomCommandScheduler,
   createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
@@ -156,32 +158,165 @@ export function createIssueCommentPager<E>(
 
 type IssueListRefreshMode = "manual" | "background";
 
+export interface IssueEnvironmentAnswerHandlers {
+  readonly detail?: QueryAnswerHandler<IssueRef, IssueDetail>;
+}
+
 /**
  * Every read goes to a tracker API over the environment, so results are reused for a short while
  * and refreshed explicitly. Mutations run serially per environment: changes to one issue are
  * order-sensitive. Each confirmed write refreshes the detail it touched; the list is refreshed by
  * the page, which knows which listings it is showing.
  */
+const detailRef = ({ projectId, tracker, host, scope, key }: IssueRef): IssueRef => ({
+  projectId,
+  tracker,
+  ...(host === undefined ? {} : { host }),
+  scope,
+  key,
+});
+
+const hostlessDetailRef = ({ projectId, tracker, scope, key }: IssueRef): IssueRef => ({
+  projectId,
+  tracker,
+  scope,
+  key,
+});
+
+const detailKey = (environmentId: EnvironmentId, input: IssueRef): string =>
+  JSON.stringify([environmentId, input]);
+
+interface DetailMirrorEntry {
+  readonly answerSeq: number;
+  readonly resolvedHost?: string;
+  readonly value: IssueDetail | null;
+  readonly timestamp: number;
+}
+
+const emptyDetailMirror: DetailMirrorEntry = {
+  answerSeq: 0,
+  value: null,
+  timestamp: 0,
+};
+
 export function createIssueEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
+  onAnswer: IssueEnvironmentAnswerHandlers = {},
 ) {
   const commandScheduler = createAtomCommandScheduler();
   const serialPerEnvironment = {
     mode: "serial",
     key: ({ environmentId }: { readonly environmentId: string }) => environmentId,
   } as const;
-  const detail = createEnvironmentRpcQueryAtomFamily(runtime, {
+  let nextDetailSeq = 0;
+  const mirrorFamily = Atom.family((_key: string) =>
+    Atom.make<DetailMirrorEntry>(emptyDetailMirror).pipe(Atom.setIdleTTL(5 * 60_000)),
+  );
+  type DetailRequest = ReturnType<typeof request<typeof WS_METHODS.issuesDetail>>;
+  const detailQuery = createEnvironmentQueryAtomFamily(runtime, {
     label: "environment-data:issues:detail",
-    tag: WS_METHODS.issuesDetail,
     staleTimeMs: 30_000,
+    execute: Effect.fnUntraced(function* (
+      input: IssueRef,
+    ): Effect.fn.Return<
+      IssueDetail,
+      Effect.Error<DetailRequest>,
+      Effect.Services<DetailRequest> | AtomRegistry.AtomRegistry
+    > {
+      const registry = yield* AtomRegistry.AtomRegistry;
+      const {
+        target: { environmentId },
+      } = yield* EnvironmentSupervisor.EnvironmentSupervisor;
+      const ownInput = detailRef(input);
+      const ownKey = detailKey(environmentId, ownInput);
+      const attemptSeq = ++nextDetailSeq;
+      return yield* request(WS_METHODS.issuesDetail, ownInput).pipe(
+        Effect.tap(
+          Effect.fnUntraced(function* (value) {
+            const timestamp = yield* Clock.currentTimeMillis;
+            const shouldSyncAnswer = registry.modify(mirrorFamily(ownKey), (prev) => {
+              const shouldNotify = attemptSeq >= prev.answerSeq;
+              const resolvedHost = ownInput.host === undefined ? value.host : prev.resolvedHost;
+              return [
+                shouldNotify,
+                {
+                  answerSeq: Math.max(prev.answerSeq, attemptSeq),
+                  ...(resolvedHost === undefined ? {} : { resolvedHost }),
+                  value: shouldNotify ? value : prev.value,
+                  timestamp: shouldNotify ? timestamp : prev.timestamp,
+                },
+              ] as const;
+            });
+            if (!shouldSyncAnswer) return;
+            const counterpartInput =
+              ownInput.host === undefined
+                ? detailRef({ ...ownInput, host: value.host })
+                : hostlessDetailRef(ownInput);
+            const counterpartKey = detailKey(environmentId, counterpartInput);
+            const counterpartSynced =
+              ownInput.host === undefined ||
+              (() => {
+                const resolvedHost = registry.get(mirrorFamily(counterpartKey)).resolvedHost;
+                return resolvedHost === undefined || resolvedHost === value.host;
+              })();
+            if (counterpartSynced) {
+              registry.update(mirrorFamily(counterpartKey), (prev) =>
+                attemptSeq >= prev.answerSeq
+                  ? {
+                      ...prev,
+                      answerSeq: attemptSeq,
+                      value,
+                      timestamp,
+                    }
+                  : prev,
+              );
+            }
+            if (onAnswer.detail === undefined) return;
+            yield* onAnswer.detail({ environmentId, input: ownInput }, value, registry);
+            if (counterpartSynced) {
+              yield* onAnswer.detail({ environmentId, input: counterpartInput }, value, registry);
+            }
+          }),
+        ),
+      );
+    }),
   });
-  const detailRef = ({ projectId, tracker, host, scope, key }: IssueRef): IssueRef => ({
-    projectId,
-    tracker,
-    ...(host === undefined ? {} : { host }),
-    scope,
-    key,
-  });
+  const wrappedBySource = new WeakMap<
+    ReturnType<typeof detailQuery>,
+    ReturnType<typeof detailQuery>
+  >();
+  const detail = (
+    target: { readonly environmentId: EnvironmentId; readonly input: IssueRef },
+    mountScope?: string,
+  ) => {
+    const input = detailRef(target.input);
+    const source = detailQuery({ environmentId: target.environmentId, input }, mountScope);
+    let wrapped = wrappedBySource.get(source);
+    if (wrapped === undefined) {
+      const mirror = mirrorFamily(detailKey(target.environmentId, input));
+      wrapped = source.pipe(
+        Atom.transform((get) => {
+          const base = get(source);
+          const synced = get(mirror);
+          if (synced.value === null) return base;
+          if (base._tag === "Failure") {
+            return AsyncResult.failureWithPrevious(base.cause, {
+              previous: Option.some(
+                AsyncResult.success(synced.value, { timestamp: synced.timestamp }),
+              ),
+              waiting: base.waiting,
+            });
+          }
+          return AsyncResult.success(synced.value, {
+            waiting: base.waiting,
+            timestamp: synced.timestamp,
+          });
+        }),
+      );
+      wrappedBySource.set(source, wrapped);
+    }
+    return wrapped;
+  };
   const refreshDetail = (
     { environmentId, input }: { readonly environmentId: EnvironmentId; readonly input: IssueRef },
     registry: AtomRegistry.AtomRegistry,

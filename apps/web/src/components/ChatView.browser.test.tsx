@@ -169,6 +169,9 @@ it("opens a linked Linear issue from an inactive thread's sidebar badge", async 
     { ...grouped, issues: [completed, issue] },
   ]);
   const liveTitle = "Add keyboard shortcuts to the sidebar";
+  const openState = { category: "open", name: "Open" } as const;
+  const doneState = { category: "closed", closeReason: "completed", name: "Done" } as const;
+  let currentIssueState: typeof openState | typeof doneState = openState;
   using _detail = answerRpc(WS_METHODS.issuesDetail, (input: IssueRef) => {
     const isCompleted = input.key === completed.key;
     expect(input).toEqual({ ...issueRef, key: isCompleted ? completed.key : issue.key });
@@ -176,9 +179,7 @@ it("opens a linked Linear issue from an inactive thread's sidebar badge", async 
       ...(isCompleted ? completed : issue),
       title: isCompleted ? completed.title : liveTitle,
       author: { login: "sam", name: null, avatarUrl: null },
-      state: isCompleted
-        ? { category: "closed", closeReason: "completed", name: "Done" }
-        : { category: "open", name: "Open" },
+      state: isCompleted ? doneState : currentIssueState,
       createdAt: issue.linkedAt,
       updatedAt: issue.linkedAt,
       closedAt: null,
@@ -186,7 +187,7 @@ it("opens a linked Linear issue from an inactive thread's sidebar badge", async 
       labels: [],
       commentCount: 3,
       projectTitle: "render",
-      writable: false,
+      writable: !isCompleted,
       capabilities: {
         create: false,
         edit: false,
@@ -200,13 +201,13 @@ it("opens a linked Linear issue from an inactive thread's sidebar badge", async 
         search: false,
       },
       viewerPermissions: {
-        setState: false,
+        setState: !isCompleted,
         comment: false,
         edit: false,
         labels: false,
         assignees: false,
       },
-      states: [],
+      states: [openState, doneState],
       viewer: null,
       body: "",
       comments: [],
@@ -214,6 +215,11 @@ it("opens a linked Linear issue from an inactive thread's sidebar badge", async 
       events: [],
       linkedPullRequests: [],
     } satisfies IssueDetail);
+  });
+  using _setState = answerRpc(WS_METHODS.issuesSetState, (input: { state: string }) => {
+    expect(input.state).toBe("Done");
+    currentIssueState = doneState;
+    return Effect.void;
   });
   __setClientSettingsForTests({
     ...DEFAULT_CLIENT_SETTINGS,
@@ -256,6 +262,11 @@ it("opens a linked Linear issue from an inactive thread's sidebar badge", async 
   await userEvent.click(issueRow);
   expect(router.history.location.pathname).toBe(`/${ENVIRONMENT_ID}/${linked.id}`);
   await expect.element(page.getByRole("heading", { name: liveTitle })).toBeVisible();
+  await userEvent.click(page.getByRole("button", { name: "Issue state, Open" }));
+  await userEvent.click(page.getByRole("menuitem", { name: "Done" }));
+  await expect
+    .element(page.getByRole("button", { name: `Issue ${issue.displayKey}: ${issue.title}, Done` }))
+    .toBeVisible();
   await act(() => useRightPanelStore.getState().close(scopeThreadRef(ENVIRONMENT_ID, linked.id)));
   await expect
     .element(

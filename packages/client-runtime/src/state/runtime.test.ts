@@ -6,8 +6,11 @@ import {
   DEFAULT_MAX_TERMINAL_BUFFER_BYTES,
   EnvironmentId,
   type FilesystemBrowseEntry,
+  type IssueDetail,
   type IssueListInput,
   type IssueListResult,
+  type IssueRef,
+  IssueTrackerKind,
   ORCHESTRATION_V2_WS_METHODS,
   type OrchestrationV2ArchivedShellSnapshot,
   ThreadId,
@@ -392,6 +395,144 @@ it.effect("keeps manual Issues refresh intent through an overlapping write", () 
     yield* readEnvironmentQuery(registry, issues.list(target));
     listings.refreshEnvironment(registry, target.environmentId);
     expect(yield* Queue.take(requests)).toEqual({ state: "all" });
+  }),
+);
+
+it.effect("keeps issue detail cache and answers consistent between hosted and hostless refs", () =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("project-1");
+    const tracker = IssueTrackerKind.make("linear");
+    const openState = { category: "open", name: "Open" } as const;
+    const doneState = { category: "closed", closeReason: "completed", name: "Done" } as const;
+    let currentState: IssueDetail["state"] = openState;
+    const makeDetail = (state: IssueDetail["state"]): IssueDetail => ({
+      projectId,
+      projectTitle: "render",
+      tracker,
+      host: "linear.app",
+      scope: "WEB",
+      key: "WEB-1",
+      displayKey: "WEB-1",
+      url: "https://linear.app/example/issue/WEB-1",
+      title: "Keep refs synced",
+      author: { login: "sam", name: null, avatarUrl: null },
+      state,
+      createdAt: "2026-11-27T00:00:00.000Z",
+      updatedAt: "2026-11-27T00:00:00.000Z",
+      closedAt: null,
+      assignees: [],
+      labels: [],
+      commentCount: 0,
+      writable: true,
+      capabilities: {
+        create: false,
+        edit: false,
+        comment: false,
+        labels: false,
+        assignees: false,
+        reactions: false,
+        templates: false,
+        linkedPullRequests: false,
+        events: false,
+        search: false,
+      },
+      viewerPermissions: {
+        setState: true,
+        comment: false,
+        edit: false,
+        labels: false,
+        assignees: false,
+      },
+      states: [openState, doneState],
+      viewer: null,
+      body: "",
+      comments: [],
+      commentsCursor: null,
+      events: [],
+      linkedPullRequests: [],
+    });
+    const requests = yield* Queue.unbounded<IssueRef>();
+    const rpcSession = {
+      client: {
+        [WS_METHODS.issuesDetail]: (input: IssueRef) =>
+          Queue.offer(requests, input).pipe(Effect.as(makeDetail(currentState))),
+      },
+    } as unknown as RpcSession.RpcSession;
+    const { runtime, supervisorState } = yield* makeEnvironmentQueryHarness(Effect.void, {
+      rpcSession,
+    });
+    const answers: Array<{ readonly host: string | undefined; readonly state: string }> = [];
+    const issues = createIssueEnvironmentAtoms(runtime, {
+      detail: (target, value) =>
+        Effect.sync(() => {
+          answers.push({ host: target.input.host, state: value.state.name });
+        }),
+    });
+    const hostedTarget = {
+      environmentId: QUERY_ENVIRONMENT.environmentId,
+      input: { projectId, tracker, host: "linear.app", scope: "WEB", key: "WEB-1" },
+    } as const;
+    const hostlessTarget = {
+      environmentId: QUERY_ENVIRONMENT.environmentId,
+      input: { projectId, tracker, scope: "WEB", key: "WEB-1" },
+    } as const;
+
+    const hosted = issues.detail(hostedTarget);
+    const hostless = issues.detail(hostlessTarget);
+    const registry = AtomRegistry.make();
+    yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
+    const unmountHosted = registry.mount(hosted);
+    expect(yield* Queue.take(requests)).toEqual(hostedTarget.input);
+    const initialHosted = yield* readEnvironmentQuery(registry, hosted);
+    expect(initialHosted.state).toEqual(openState);
+    unmountHosted();
+
+    currentState = doneState;
+    const unmountHostless = registry.mount(hostless);
+    expect(yield* Queue.take(requests)).toEqual(hostlessTarget.input);
+    const updatedHostless = yield* readEnvironmentQuery(registry, hostless);
+    expect(updatedHostless.state).toEqual(doneState);
+    unmountHostless();
+
+    expect(answers).toContainEqual({ host: "linear.app", state: "Done" });
+    const rereadHosted = registry.get(hosted);
+    expect(rereadHosted._tag).toBe("Success");
+    if (rereadHosted._tag === "Success") {
+      expect(rereadHosted.value.state).toEqual(doneState);
+    }
+    expect(yield* Queue.size(requests)).toBe(0);
+
+    // Refreshing the hosted atom after the hostless answer must never emit stale Open mid-refresh.
+    const observedStates: Array<string> = [];
+    const unsubscribeHosted = registry.subscribe(
+      hosted,
+      (result) => {
+        const value = AsyncResult.getOrElse(result, () => null);
+        if (value !== null) observedStates.push(value.state.name);
+      },
+      { immediate: true },
+    );
+    registry.refresh(hosted);
+    expect(yield* Queue.take(requests)).toEqual(hostedTarget.input);
+    const refreshedHosted = yield* readEnvironmentQuery(registry, hosted);
+    expect(refreshedHosted.state).toEqual(doneState);
+    unsubscribeHosted();
+    expect(observedStates.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(observedStates)).toEqual(new Set(["Done"]));
+
+    // Taking the environment offline must surface the failure while retaining the mirrored value.
+    const unmountOffline = registry.mount(hosted);
+    yield* SubscriptionRef.set(
+      supervisorState,
+      queryConnectionState({ network: "offline", phase: "offline" }),
+    );
+    yield* Effect.yieldNow;
+    const offlineResult = registry.get(hosted);
+    expect(offlineResult._tag).toBe("Failure");
+    if (offlineResult._tag === "Failure") {
+      expect(Option.getOrNull(offlineResult.previousSuccess)?.value.state).toEqual(doneState);
+    }
+    unmountOffline();
   }),
 );
 
